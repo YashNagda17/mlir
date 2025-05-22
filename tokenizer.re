@@ -1,3 +1,6 @@
+// Compile with:
+// re2c -b tokenizer.re -o tokenizer.cpp
+
 #include <limits>
 
 #include "tokenizer.h"
