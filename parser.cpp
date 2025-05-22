@@ -332,10 +332,22 @@ public:
 };
 */
 
-void print_all_tokens(const std::string &code) {
-    
+void tokenizer_print_all_tokens(const std::string &input_code) {
+    unsigned char *cur;
+    tokenizer_set_string(input_code, cur);
+    unsigned char *string_start = cur;
+    while (true) {
+        TokenType token_type;
+        uint64_t first, start;
+        tokenizer_get_next_token(string_start, cur,
+            token_type, first, last);
+        std::cout << std::format("Token({}, \"{}\", {}, {})\n",
+             tokentype_to_string(token_type), input_code.substr(first, last-first+1), first, last);
+        if (t.type == TokenType::TOKEN_EOF) {
+            return;
+        }
+    }
 }
-
 
 // Main
 int main() {
@@ -343,6 +355,6 @@ int main() {
                             "  %0 = \"std.constant\"() {value = 42} : () -> i32\n"
                             "  \"std.return\"(%0) : (i32) -> ()\n"
                             "}";
-    print_all_tokens(mlir_code);
+    tokenizer_print_all_tokens(mlir_code);
     return 0;
 }
