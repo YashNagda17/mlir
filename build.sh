@@ -2,4 +2,4 @@
 
 set -ex
 
-clang++ -g -Wall -std=c++17 parser.cpp -o parser
+clang++ -g -Wall -std=c++20 parser.cpp -o parser

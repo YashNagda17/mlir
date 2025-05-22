@@ -6,6 +6,7 @@
 #include <variant>
 #include <stdexcept>
 #include <cctype>
+#include <format>
 
 // MLIR Structures
 enum class AttributeKind { ATTR_INT, ATTR_STRING, ATTR_TYPE, ATTR_ARRAY, ATTR_DICT };
@@ -49,14 +50,29 @@ struct Region {
 enum class TokenType { TOKEN_EOF, TOKEN_IDENTIFIER, TOKEN_VALUE_ID, TOKEN_BLOCK_LABEL, TOKEN_INTEGER, TOKEN_STRING, TOKEN_PUNCTUATION };
 struct Token {
     TokenType type;
-    std::string value;
+    std::string str_value;
     long long int_value = 0;
 };
 
+std::string tokentype_to_string(TokenType tt) {
+#define CASE_TOKEN(x) case TokenType::x: return #x;
+    switch (tt) {
+        CASE_TOKEN(TOKEN_EOF)
+        CASE_TOKEN(TOKEN_IDENTIFIER)
+        CASE_TOKEN(TOKEN_VALUE_ID)
+        CASE_TOKEN(TOKEN_BLOCK_LABEL)
+        CASE_TOKEN(TOKEN_INTEGER)
+        CASE_TOKEN(TOKEN_STRING)
+        CASE_TOKEN(TOKEN_PUNCTUATION)
+        default: abort();
+    }
+}
+
+
 // Lexer
 class Lexer {
-    std::string input;
-    size_t pos = 0;
+    const std::string &input;
+    size_t pos = 0; // Points to the next (untokenized) character
 public:
     Lexer(const std::string& input) : input(input) {}
     Token get_next_token() {
@@ -103,6 +119,17 @@ public:
     }
 };
 
+void print_all_tokens(Lexer &lexer) {
+    while (true) {
+        Token t=lexer.get_next_token();
+        std::cout << std::format("Token({}, '{}', {})\n",
+             tokentype_to_string(t.type), t.str_value, t.int_value);
+        if (t.type == TokenType::TOKEN_EOF) {
+            return;
+        }
+    }
+}
+
 // Symbol Table
 class SymbolTable {
     std::vector<std::unordered_map<std::string, ValueRef>> scopes;
@@ -122,6 +149,7 @@ public:
     }
 };
 
+/*
 // Parser
 class Parser {
     Lexer lexer;
@@ -215,7 +243,7 @@ public:
         }
         expect_token(TokenType::TOKEN_STRING);
         op->opcode = current_token.value;
-        consume_token();
+        //consume_token();
         expect_token(TokenType::TOKEN_PUNCTUATION, "(");
         while (current_token.value != ")") {
             expect_token(TokenType::TOKEN_VALUE_ID);
@@ -229,7 +257,7 @@ public:
             while (current_token.value != "}") {
                 expect_token(TokenType::TOKEN_IDENTIFIER);
                 std::string key = current_token.value;
-                consume_token();
+                //consume_token();
                 expect_token(TokenType::TOKEN_PUNCTUATION, "=");
                 op->attributes[key] = parse_attribute();
                 if (current_token.value == ",") consume_token();
@@ -287,6 +315,7 @@ public:
         return new Operation{"builtin.module", {}, {}, {}, {region}, {}};
     }
 };
+*/
 
 // Main
 int main() {
@@ -295,9 +324,11 @@ int main() {
                             "  \"std.return\"(%0) : (i32) -> ()\n"
                             "}";
     try {
-        Parser parser(mlir_code);
-        auto module = parser.parse_module();
-        std::cout << "Parsed module successfully\n";
+        Lexer lexer(mlir_code);
+        print_all_tokens(lexer);
+        //Parser parser(mlir_code);
+        //auto module = parser.parse_module();
+        //std::cout << "Parsed module successfully\n";
         // TODO: Add recursive deletion of module
     } catch (const std::exception& e) {
         std::cerr << "Parse error: " << e.what() << "\n";
