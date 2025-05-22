@@ -6,9 +6,9 @@
 #include "tokenizer.h"
 
 void token_loc(
-        unsigned char *string_start,
-        unsigned char *tok,
-        unsigned char *cur,
+        const unsigned char *string_start,
+        const unsigned char *tok,
+        const unsigned char *cur,
         uint64_t &first,
         uint64_t &last)
 {
@@ -16,12 +16,12 @@ void token_loc(
     last = cur-string_start-1;
 }
 
-void tokenizer_set_string(const std::string &str, unsigned char &*cur)
+void tokenizer_set_string(const std::string &str, unsigned char *&cur)
 {
     // The input string must be NULL terminated, otherwise the tokenizer will
     // not detect the end of string. After C++11, the std::string is guaranteed
     // to end with \0, but we check this here just in case.
-    LCOMPILERS_ASSERT(str[str.size()] == '\0');
+    //ASSERT(str[str.size()] == '\0');
     cur = (unsigned char *)(&str[0]);
 }
 
@@ -99,7 +99,7 @@ void tokenizer_lex(
         // These two variables are needed by the re2c block below internally,
         // initialization is not needed. One can think of them as local
         // variables of the re2c block.
-        unsigned char *mar, *ctxmar;
+        unsigned char *mar; //, *ctxmar;
         /*!re2c
             re2c:define:YYCURSOR = cur;
             re2c:define:YYMARKER = mar;
@@ -128,7 +128,7 @@ void tokenizer_lex(
             // Keywords
             'abstract' { RET(KW_ABSTRACT) }
             'all' { RET(KW_ALL) }
-            'write' { KW(WRITE) }
+            'write' { RET(KW_WRITE) }
 
             // Single character symbols
             "(" { RET(TK_LPAREN) }
