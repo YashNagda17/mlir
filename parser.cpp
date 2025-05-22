@@ -47,7 +47,16 @@ struct Region {
 };
 
 // Token
-enum class TokenType { TOKEN_EOF, TOKEN_IDENTIFIER, TOKEN_VALUE_ID, TOKEN_BLOCK_LABEL, TOKEN_INTEGER, TOKEN_STRING, TOKEN_PUNCTUATION };
+enum class TokenType {
+    TOKEN_EOF,
+    TOKEN_IDENTIFIER,
+    TOKEN_VALUE_ID,
+    TOKEN_BLOCK_LABEL,
+    TOKEN_INTEGER,
+    TOKEN_STRING,
+    TOKEN_PUNCTUATION,
+    TOKEN_ARROW
+};
 struct Token {
     TokenType type;
     std::string str_value;
@@ -64,6 +73,7 @@ std::string tokentype_to_string(TokenType tt) {
         CASE_TOKEN(TOKEN_INTEGER)
         CASE_TOKEN(TOKEN_STRING)
         CASE_TOKEN(TOKEN_PUNCTUATION)
+        CASE_TOKEN(TOKEN_ARROW)
         default: abort();
     }
 }
@@ -114,6 +124,17 @@ public:
         if (std::string("{}()[],:=<>").find(c) != std::string::npos) {
             pos++;
             return {TokenType::TOKEN_PUNCTUATION, std::string(1, c)};
+        }
+        if (c == '-') {
+            pos++;
+            if (pos >= input.size()) throw std::runtime_error("Unfinished ->");
+            c = input[pos];
+            if (c == '>') {
+                pos++;
+                return {TokenType::TOKEN_ARROW, "->"};
+            } else {
+                throw std::runtime_error("> expected");
+            }
         }
         throw std::runtime_error("Unknown character");
     }
