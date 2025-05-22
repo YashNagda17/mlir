@@ -21,6 +21,9 @@ Faster and simpler MLIR infrastructure.
   need to append more token types to the list that we do not want Bison to
   handle, such as the error token(s), or various temporary tokens to handle
   warnings, none of which will be passed on to the parser.
+* If we don't want that, we can just use the token types from Bison, but return
+  other flags that the caller can check, like an error flag, a warning flag for
+  some tokens, etc.
 * There can be a thin layer between the tokenizer and the parser that ignores
   some tokens (such as white space) or returns some warnings / errors.
 * One can skip whitespace (both first/last needed), but can also return it as a
