@@ -147,6 +147,9 @@ void tokenizer_get_next_token(
             "," { RET(TK_COMMA) }
             "*" { RET(TK_STAR) }
             "|" { RET(TK_VBAR) }
+            "@" { RET(TK_AT) }
+            "^" { RET(TK_CARET) }
+            "." { RET(TK_DOT) }
 
             // Multiple character symbols
             "//" { RET(TK_COMMENT) }
