@@ -16,13 +16,13 @@ void token_loc(
     last = cur-string_start-1;
 }
 
-void tokenizer_set_string(const std::string &str, unsigned char *&cur)
+void tokenizer_set_string(const std::string &str, unsigned char *&string_start)
 {
     // The input string must be NULL terminated, otherwise the tokenizer will
     // not detect the end of string. After C++11, the std::string is guaranteed
     // to end with \0, but we check this here just in case.
     //ASSERT(str[str.size()] == '\0');
-    cur = (unsigned char *)(&str[0]);
+    string_start = (unsigned char *)(&str[0]);
 }
 
 #define RET(x) \

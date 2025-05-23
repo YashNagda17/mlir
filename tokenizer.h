@@ -36,7 +36,7 @@ enum class TokenType {
 
 // Set the string to tokenize. The caller must ensure `str` will stay valid
 // as long as `lex` is being called.
-void tokenizer_set_string(const std::string &str, unsigned char *&cur);
+void tokenizer_set_string(const std::string &str, unsigned char *&string_start);
 
 // Get next token. Token type, first and last string index is returned
 void tokenizer_get_next_token(

@@ -371,14 +371,13 @@ std::string tokentype_to_string(TokenType tt) {
 }
 
 void tokenizer_print_all_tokens(const std::string &input_code) {
-    unsigned char *cur;
-    tokenizer_set_string(input_code, cur);
-    unsigned char *string_start = cur;
+    unsigned char *string_start;
+    tokenizer_set_string(input_code, string_start);
+    unsigned char *cur=string_start;
     while (true) {
         TokenType token_type;
         uint64_t first, last;
-        tokenizer_get_next_token(string_start, cur,
-            token_type, first, last);
+        tokenizer_get_next_token(string_start, cur, token_type, first, last);
         std::cout << std::format("Token({}, \"{}\", {}, {})\n",
              tokentype_to_string(token_type), input_code.substr(first, last-first+1), first, last);
         if (token_type == TokenType::TK_EOF) {
