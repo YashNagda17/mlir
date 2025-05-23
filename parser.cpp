@@ -418,11 +418,14 @@ std::string read_file_ok(const std::string &filename) {
 }
 
 // Main
-int main() {
+int main(int argc, char *argv[]) {
     std::string mlir_code = "module {\n"
                             "  %0 = \"std.constant\"() {value = 42} : () -> i32\n"
                             "  \"std.return\"(%0) : (i32) -> ()\n"
                             "}";
+    if (argc == 2) {
+        mlir_code = read_file_ok(argv[1]);
+    }
     tokenizer_print_all_tokens(mlir_code);
     return 0;
 }
