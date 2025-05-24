@@ -17,6 +17,8 @@ enum class TokenType {
     TK_LANGLE,
     TK_RANGLE,
     TK_EXCLAMATION,
+    TK_DOLLAR,
+    TK_HASH,
     TK_PLUS,
     TK_MINUS,
     TK_EQUAL,

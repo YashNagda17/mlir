@@ -140,6 +140,8 @@ void tokenizer_get_next_token(
             "<" { RET(TK_LANGLE) }
             ">" { RET(TK_RANGLE) }
             "!" { RET(TK_EXCLAMATION) }
+            "$" { RET(TK_DOLLAR) }
+            "#" { RET(TK_HASH) }
             "+" { RET(TK_PLUS) }
             "-" { RET(TK_MINUS) }
             "=" { RET(TK_EQUAL) }
