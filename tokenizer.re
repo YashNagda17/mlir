@@ -119,6 +119,8 @@ void tokenizer_get_next_token(
             real = (significand exp?) | (digit+ exp);
             string = '"' [^"\x00]* '"';
             comment = "//" [^\n\x00]*;
+            register = "%" (name | integer);
+            fn_name = "@" name;
 
             * { RET(TK_ERROR) }
             end { RET(TK_EOF); }
@@ -161,6 +163,8 @@ void tokenizer_get_next_token(
             "->" { RET(TK_ARROW) }
 
             name { RET(TK_NAME) }
+            register { RET(TK_REGISTER) }
+            fn_name { RET(TK_FUNCTION_NAME) }
             integer { RET(TK_INTEGER) }
             real { RET(TK_REAL) }
             string { RET(TK_STRING) }
