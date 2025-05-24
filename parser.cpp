@@ -348,6 +348,8 @@ std::string tokentype_to_string(TokenType tt) {
         CASE_TOKEN(TK_RBRACKET)
         CASE_TOKEN(TK_LBRACE)
         CASE_TOKEN(TK_RBRACE)
+        CASE_TOKEN(TK_LANGLE)
+        CASE_TOKEN(TK_RANGLE)
         CASE_TOKEN(TK_PLUS)
         CASE_TOKEN(TK_MINUS)
         CASE_TOKEN(TK_EQUAL)

@@ -14,6 +14,8 @@ enum class TokenType {
     TK_RBRACKET,
     TK_LBRACE,
     TK_RBRACE,
+    TK_LANGLE,
+    TK_RANGLE,
     TK_PLUS,
     TK_MINUS,
     TK_EQUAL,
