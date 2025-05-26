@@ -92,12 +92,14 @@ typedef enum {
     ARG_INT,
     ARG_DOUBLE,
     ARG_STRING,
+    ARG_STRING2,
     ARG_CHAR
 } ArgType;
 
 // Macro to wrap arguments with type detection
 #define A(x) _Generic((x), \
     char*:  ARG_STRING, \
+    string: ARG_STRING2, \
     double: ARG_DOUBLE, \
     char:   ARG_CHAR, \
     int:    ARG_INT  \
@@ -217,6 +219,14 @@ string format(Arena *arena, string fmt, size_t arg_count, ...) {
                 }
                 break;
             }
+            case ARG_STRING2: {
+                string value = va_arg(ap, string);
+                s = value;
+                if (spec.precision >= 0 && spec.precision < s.size) {
+                    s.size = spec.precision;
+                }
+                break;
+            }
             case ARG_CHAR: {
                 char value = (char)va_arg(ap, int);
                 s = char_to_string(arena, value);
@@ -318,8 +328,8 @@ int main() {
     printf("Formatted char: %.*s\n", (int)result.size, result.str);
 
     // Example with multiple arguments
-    fmt = str_lit("Hello, {}, {}, {}!");
-    result = format(arena, fmt, "world", 35.5, 3);
+    fmt = str_lit("Hello, {}, {}, {}, {}!");
+    result = format(arena, fmt, "world", 35.5, 3, fmt);
     printf("Multiple args: %.*s\n", (int)result.size, result.str);
 
     arena_free(arena);
