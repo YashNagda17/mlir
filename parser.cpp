@@ -455,11 +455,7 @@ int main(int argc, char *argv[]) {
                             "  \"std.return\"(%0) : (i32) -> ()\n"
                             "}";
     Arena *arena = arena_create(10*1024*1024);
-    int *i = arena_alloc(arena, int, 1);
-    *i = 5;
-    if (argc == 2) {
-        mlir_code = read_file_ok(argv[1]);
-    }
     tokenizer_print_all_tokens(mlir_code);
+    arena_free(arena);
     return 0;
 }
