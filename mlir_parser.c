@@ -145,22 +145,14 @@ bool read_file(Arena *arena, const char *filename, char **text) {
         return false;
     }
     fseek(file, 0, SEEK_SET);
-
-    // Allocate memory for bytes
     char *bytes = arena_alloc_array(arena, char, filesize+1);
     if (bytes == NULL) {
         fclose(file);
         return false;
     }
-
-    // Read file contents
     size_t read_size = fread(bytes, 1, filesize, file);
     fclose(file);
-
-    // Null terminate the string
     bytes[read_size] = '\0';
-
-    // Assign to output parameter
     *text = bytes;
     return true;
 }
