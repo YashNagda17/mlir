@@ -344,6 +344,7 @@ std::string tokentype_to_string(TokenType tt) {
         CASE_TOKEN(TK_WHITESPACE)
         CASE_TOKEN(TK_ERROR)
         CASE_TOKEN(TK_NAME)
+        CASE_TOKEN(TK_NAME_DOT_NAME)
         CASE_TOKEN(TK_LPAREN)
         CASE_TOKEN(TK_RPAREN)
         CASE_TOKEN(TK_LBRACKET)

@@ -28,8 +28,18 @@ bool str_eq(string a, string b) {
 }
 
 
+void parser_error(Arena *arena, string msg, uint64_t first, uint64_t last) {
+    printf("Syntax error (%llu:%llu): %s\n", first, last,
+            str_to_cstr_copy(arena, msg));
+    exit(1);
+}
+
+bool parser_peek(Parser *parser, TokenType s) {
+    return parser->sym == s;
+}
+
 bool parser_accept(Parser *parser, TokenType s) {
-    if (parser->sym == s) {
+    if (parser_peek(parser, s)) {
         tokenizer_get_next_token(parser->input, &parser->cur, &parser->sym);
         return true;
     } else {
@@ -37,11 +47,6 @@ bool parser_accept(Parser *parser, TokenType s) {
     }
 }
 
-void parser_error(Arena *arena, string msg, uint64_t first, uint64_t last) {
-    printf("Syntax error (%llu:%llu): %s\n", first, last,
-            str_to_cstr_copy(arena, msg));
-    exit(1);
-}
 
 void parser_expect(Parser *parser, TokenType s) {
     if (parser_accept(parser, s)) {
@@ -59,7 +64,7 @@ string parser_token_str(Parser *parser) {
 }
 
 void parser_expect_name(Parser *parser, string name) {
-    if (parser->sym == TK_NAME && str_eq(parser_token_str(parser), name)) {
+    if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), name)){
         parser_accept(parser, TK_NAME);
         return;
     } else {
@@ -69,22 +74,60 @@ void parser_expect_name(Parser *parser, string name) {
     }
 }
 
+Operation* parse_operation(Parser *parser);
 
 Operation* parse_module(Parser *parser) {
     parser_expect_name(parser, str_lit("module"));
     parser_expect(parser, TK_LBRACE);
-    Operation *op = arena_alloc(parser->arena, Operation);
-    return op;
-    /*
-    symbol_table.push_scope();
-    std::vector<Operation*> ops;
-    while (current_token.value != "}") {
-        ops.push_back(parse_operation());
+    while (!parser_peek(parser, TK_RBRACE)) {
+        parse_operation(parser);
     }
-    expect_token(TokenType::TOKEN_PUNCTUATION, "}");
-    symbol_table.pop_scope();
-    auto block = new Block{{}, ops};
-    auto region = new Region{{block}};
-    return new Operation{"builtin.module", {}, {}, {}, {region}, {}};
-    */
+    parser_expect(parser, TK_RBRACE);
+    Operation *op = arena_alloc(parser->arena, Operation);
+    op->opcode = str_lit("module");
+    return op;
+}
+
+Operation* parse_func_func(Parser *parser) {
+    parser_expect_name(parser, str_lit("func.func"));
+    //string func_name = parser_token_str(parser);
+    parser_expect(parser, TK_FUNCTION_NAME);
+    while (!parser_peek(parser, TK_LBRACE)) {
+        tokenizer_get_next_token(parser->input, &parser->cur, &parser->sym);
+    }
+    parser_expect(parser, TK_LBRACE);
+    while (!parser_peek(parser, TK_RBRACE)) {
+        parse_operation(parser);
+    }
+    parser_expect(parser, TK_RBRACE);
+    Operation *op = arena_alloc(parser->arena, Operation);
+    op->opcode = str_lit("func.func");
+    return op;
+}
+
+Operation* parse_operation(Parser *parser) {
+    if (parser_peek(parser, TK_NAME_DOT_NAME)) {
+        string op_name = parser_token_str(parser);
+        if (str_eq(op_name, str_lit("func.func"))) {
+            return parse_func_func(parser);
+        } else if (str_eq(op_name, str_lit("scf.for"))) {
+            parser_error(parser->arena,
+                    str_lit("unsupported operation: scf.for"),
+                    parser->first, parser->last);
+//            return parse_scf_for(parser);
+        } else {
+            parser_error(parser->arena,
+                    str_lit("unsupported operation"),
+                    parser->first, parser->last);
+        }
+    } else if (parser_peek(parser, TK_REGISTER)) {
+        parser_error(parser->arena,
+                str_lit("unsupported operation reg"),
+                parser->first, parser->last);
+    } else {
+        parser_error(parser->arena,
+                str_lit("expected a name or a register"),
+                parser->first, parser->last);
+    }
+    return NULL;
 }

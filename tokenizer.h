@@ -12,6 +12,7 @@ typedef enum {
     TK_WHITESPACE,
     TK_ERROR,
     TK_NAME,
+    TK_NAME_DOT_NAME,
     TK_LPAREN,
     TK_RPAREN,
     TK_LBRACKET,
