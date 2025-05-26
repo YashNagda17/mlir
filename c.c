@@ -184,9 +184,12 @@ string format(Arena *arena, string fmt, Arg args[], size_t arg_count) {
 int main() {
     Arena* arena = arena_create(1024);
 
-    // Example 2: One argument
-    string fmt2 = str_lit("Hello, {}!");
-    string result2 = format(arena, fmt2, A("world"));
+    string fmt2 = str_lit("Hello!");
+    string result2 = format(arena, fmt2);
+    printf("Result 2: %.*s\n", (int)result2.size, result2.str);
+
+    fmt2 = str_lit("Hello, {}!");
+    result2 = format(arena, fmt2, A("world"));
     printf("Result 2: %.*s\n", (int)result2.size, result2.str);
 
     fmt2 = str_lit("Hello, {}, {}!");
