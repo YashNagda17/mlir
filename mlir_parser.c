@@ -28,6 +28,10 @@ bool str_eq(string a, string b) {
     }
 }
 
+string str_substr(string str, uint64_t min, uint64_t max) {
+    return (string){.str=str.str+min, .size=max-min};
+}
+
 
 void parser_error(Arena *arena, string msg, uint64_t first, uint64_t last) {
     printf("Syntax error (%llu:%llu): %s\n", first, last,

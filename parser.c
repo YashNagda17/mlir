@@ -1,18 +1,8 @@
-#include <iostream>
-#include <vector>
-#include <map>
-#include <unordered_map>
-#include <string>
-#include <variant>
-#include <stdexcept>
-#include <cctype>
-#include <format>
-#include <fstream>
-#include <iomanip>
-#include <sstream>
+#include <stdbool.h>
 
 #include "tokenizer.h"
 #include "arena.h"
+#include "mlir_parser.h"
 
 /*
 
@@ -340,8 +330,8 @@ public:
 };
 */
 
-std::string tokentype_to_string(TokenType tt) {
-#define CASE_TOKEN(x) case TokenType::x: return #x;
+string tokentype_to_string(TokenType tt) {
+#define CASE_TOKEN(x) case x: return str_lit(#x);
     switch (tt) {
         CASE_TOKEN(TK_EOF)
         CASE_TOKEN(TK_NEWLINE)
@@ -388,9 +378,9 @@ std::string tokentype_to_string(TokenType tt) {
     }
 }
 
-void tokenizer_print_all_tokens(const std::string &input_code) {
+void tokenizer_print_all_tokens(const string input_code) {
     unsigned char *string_start;
-    string_start = (unsigned char *)(&input_code[0]);
+    string_start = (unsigned char*)input_code.str;
     uint64_t cur=0;
     while (true) {
         TokenType token_type;
@@ -398,8 +388,10 @@ void tokenizer_print_all_tokens(const std::string &input_code) {
         first = cur;
         tokenizer_get_next_token(string_start, &cur, &token_type);
         last = cur-1;
-        std::cout << std::format("Token({}, \"{}\", {}, {})\n",
-             tokentype_to_string(token_type), input_code.substr(first, last-first+1), first, last);
+        printf("Token(%s, \"%s\", %d, %d)\n",
+            str_to_cstr_copy(arena, tokentype_to_string(token_type)),
+            input_code.substr(first, last-first+1),
+            first, last);
         if (token_type == TokenType::TK_EOF) {
             return;
         }
