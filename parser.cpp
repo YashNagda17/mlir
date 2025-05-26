@@ -12,6 +12,7 @@
 #include <sstream>
 
 #include "tokenizer.h"
+#include "arena.h"
 
 // MLIR Structures
 enum class AttributeKind { ATTR_INT, ATTR_STRING, ATTR_TYPE, ATTR_ARRAY, ATTR_DICT };
@@ -400,6 +401,23 @@ void tokenizer_print_all_tokens(const std::string &input_code) {
     }
 }
 
+/*
+    Operation* parse_module() {
+        expect_token(TokenType::TOKEN_IDENTIFIER, "module");
+        expect_token(TokenType::TOKEN_PUNCTUATION, "{");
+        symbol_table.push_scope();
+        std::vector<Operation*> ops;
+        while (current_token.value != "}") {
+            ops.push_back(parse_operation());
+        }
+        expect_token(TokenType::TOKEN_PUNCTUATION, "}");
+        symbol_table.pop_scope();
+        auto block = new Block{{}, ops};
+        auto region = new Region{{block}};
+        return new Operation{"builtin.module", {}, {}, {}, {region}, {}};
+    }
+    */
+
 bool read_file(const std::string &filename, std::string &text)
 {
     if (filename.empty()) return false;
@@ -436,6 +454,7 @@ int main(int argc, char *argv[]) {
                             "  %0 = \"std.constant\"() {value = 42} : () -> i32\n"
                             "  \"std.return\"(%0) : (i32) -> ()\n"
                             "}";
+    Arena *arena = arena_create(10*1024*1024);
     if (argc == 2) {
         mlir_code = read_file_ok(argv[1]);
     }

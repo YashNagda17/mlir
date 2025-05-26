@@ -1,11 +1,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-typedef struct {
-    char* start;    // Start of the memory block
-    char* current;  // Next available position
-    char* end;      // End of the memory block
-} Arena;
+#include "arena.h"
 
 Arena* arena_create(size_t size) {
     // TODO: merge the two allocations
