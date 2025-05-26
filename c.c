@@ -262,27 +262,35 @@ string format(Arena *arena, string fmt, size_t arg_count, ...) {
     return result;
 }
 
-// Macros to apply A() to each argument
+
+#define GET_ARG_COUNT(_1, _2, _3, _4, _5, _6, _7, _8, N, ...) N
+#define COUNT_ARGS(...) GET_ARG_COUNT(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+
 #define APPLY_A0()
 #define APPLY_A1(a) A(a)
-#define APPLY_A2(a,b) A(a), A(b)
-#define APPLY_A3(a,b,c) A(a), A(b), A(c)
-#define APPLY_A4(a,b,c,d) A(a), A(b), A(c), A(d)
-#define APPLY_A5(a,b,c,d,e) A(a), A(b), A(c), A(d), A(e)
-#define APPLY_A6(a,b,c,d,e,f) A(a), A(b), A(c), A(d), A(e), A(f)
-#define APPLY_A7(a,b,c,d,e,f,g) A(a), A(b), A(c), A(d), A(e), A(f), A(g)
-#define APPLY_A8(a,b,c,d,e,f,g,h) A(a), A(b), A(c), A(d), A(e), A(f), A(g), A(h)
+#define APPLY_A2(a, b) A(a), A(b)
+#define APPLY_A3(a, b, c) A(a), A(b), A(c)
+#define APPLY_A4(a, b, c, d) A(a), A(b), A(c), A(d)
+#define APPLY_A5(a, b, c, d, e) A(a), A(b), A(c), A(d), A(e)
+#define APPLY_A6(a, b, c, d, e, f) A(a), A(b), A(c), A(d), A(e), A(f)
+#define APPLY_A7(a, b, c, d, e, f, g) A(a), A(b), A(c), A(d), A(e), A(f), A(g)
+#define APPLY_A8(a, b, c, d, e, f, g, h) A(a), A(b), A(c), A(d), A(e), A(f), A(g), A(h)
 
-// Macro to select the appropriate APPLY_A macro based on the number of arguments
-#define APPLY_A_N(N, ...) APPLY_A##N(__VA_ARGS__)
+#define APPLY_A_FOR_COUNT_0 APPLY_A0
+#define APPLY_A_FOR_COUNT_1 APPLY_A1
+#define APPLY_A_FOR_COUNT_2 APPLY_A2
+#define APPLY_A_FOR_COUNT_3 APPLY_A3
+#define APPLY_A_FOR_COUNT_4 APPLY_A4
+#define APPLY_A_FOR_COUNT_5 APPLY_A5
+#define APPLY_A_FOR_COUNT_6 APPLY_A6
+#define APPLY_A_FOR_COUNT_7 APPLY_A7
+#define APPLY_A_FOR_COUNT_8 APPLY_A8
 
-// Macro to count arguments
-#define GET_ARG_COUNT(_1,_2,_3,_4,_5,_6,_7,_8,N,...) N
-#define COUNT_ARGS(...) GET_ARG_COUNT(__VA_ARGS__,8,7,6,5,4,3,2,1,0)
+#define CONCAT_AFTER_EXPAND(prefix, count) prefix ## count
+#define APPLY_WITH_COUNT(count, ...) CONCAT_AFTER_EXPAND(APPLY_A_FOR_COUNT_, count)(__VA_ARGS__)
 
-// Format macro with automatic A() wrapping
 #define format(arena, fmt, ...) \
-    format(arena, fmt, COUNT_ARGS(__VA_ARGS__), APPLY_A_N(COUNT_ARGS(__VA_ARGS__), __VA_ARGS__))
+    format(arena, fmt, COUNT_ARGS(__VA_ARGS__), APPLY_WITH_COUNT(COUNT_ARGS(__VA_ARGS__), __VA_ARGS__))
 
 // Main function with examples
 int main() {
