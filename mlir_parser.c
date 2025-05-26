@@ -134,31 +134,20 @@ Operation* parse_operation(Parser *parser) {
 }
 
 
-bool read_file(const char *filename, char **text) {
-    // Check for empty filename
-    if (filename == NULL || *filename == '\0') {
-        return false;
-    }
-
-    // Open file in binary mode
+bool read_file(Arena *arena, const char *filename, char **text) {
+    if (filename == NULL || *filename == '\0') return false;
     FILE *file = fopen(filename, "rb");
-    if (file == NULL) {
-        return false;
-    }
-
-    // Get file size
+    if (file == NULL) return false;
     fseek(file, 0, SEEK_END);
-    long filesize = ftell(file);
+    uint64_t filesize = ftell(file);
     if (filesize < 0) {
         fclose(file);
         return false;
     }
-
-    // Seek back to start
     fseek(file, 0, SEEK_SET);
 
     // Allocate memory for bytes
-    char *bytes = (char *)malloc(filesize + 1); // +1 for null terminator
+    char *bytes = arena_alloc_array(arena, char, filesize+1);
     if (bytes == NULL) {
         fclose(file);
         return false;
