@@ -28,8 +28,8 @@ bool str_eq(string a, string b) {
     }
 }
 
-string str_substr(string str, uint64_t min, uint64_t max) {
-    return (string){.str=str.str+min, .size=max-min};
+string str_substr(string str, uint64_t min, uint64_t size) {
+    return (string){.str=str.str+min, .size=size};
 }
 
 
