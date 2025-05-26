@@ -53,9 +53,7 @@ enum TokenType {
 void tokenizer_get_next_token(
         const unsigned char *string_start,
         uint64_t *current_position,
-        enum TokenType *token_type,
-        uint64_t *first,
-        uint64_t *last);
+        enum TokenType *token_type);
 
 #ifdef __cplusplus
 }

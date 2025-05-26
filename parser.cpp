@@ -390,7 +390,7 @@ void tokenizer_print_all_tokens(const std::string &input_code) {
         TokenType token_type;
         uint64_t first, last;
         first = cur;
-        tokenizer_get_next_token(string_start, &cur, &token_type, &last, &last);
+        tokenizer_get_next_token(string_start, &cur, &token_type);
         last = cur-1;
         std::cout << std::format("Token({}, \"{}\", {}, {})\n",
              tokentype_to_string(token_type), input_code.substr(first, last-first+1), first, last);

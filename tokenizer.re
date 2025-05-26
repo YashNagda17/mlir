@@ -17,17 +17,14 @@ void token_loc(
 }
 
 #define RET(x) \
-    token_loc(string_start, tok, cur, first, last); \
     *token_type=x; \
-    *current_position = *last+1; \
+    *current_position = cur-string_start; \
     return;
 
 void tokenizer_get_next_token(
         const unsigned char *string_start,
         uint64_t *current_position,
-        enum TokenType *token_type,
-        uint64_t *first,
-        uint64_t *last)
+        enum TokenType *token_type)
 {
     unsigned char *cur = string_start + *current_position;
     while (true) {
