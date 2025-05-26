@@ -136,9 +136,10 @@ Operation* parse_operation(Parser *parser) {
 
 // Returns the file contents as a null-terminated string in `text`.
 // Returns `true` on success, otherwise `false`.
-bool read_file(Arena *arena, const char *filename, string *text) {
-    if (filename == NULL || *filename == '\0') return false;
-    FILE *file = fopen(filename, "rb");
+bool read_file(Arena *arena, const string filename, string *text) {
+    char *cfilename = str_to_cstr_copy(arena, filename);
+    if (cfilename == NULL || *cfilename == '\0') return false;
+    FILE *file = fopen(cfilename, "rb");
     if (file == NULL) return false;
     fseek(file, 0, SEEK_END);
     uint64_t filesize = ftell(file);
