@@ -2,9 +2,11 @@
 
 set -ex
 
+CFLAGS="-fsanitize=address -g -Wall -ferror-limit=1"
+
 re2c -b tokenizer.re -o tokenizer.c
-clang -g -Wall -ferror-limit=1 -c tokenizer.c -o tokenizer.o
-clang -g -Wall -ferror-limit=1 -c arena.c -o arena.o
-clang++ -g -Wall -std=c++20 -ferror-limit=1 -c parser.cpp -o parser.o
-clang++ -g -Wall -std=c++20 -o parser parser.o tokenizer.o arena.o
+clang $CFLAGS -c tokenizer.c -o tokenizer.o
+clang $CFLAGS -c arena.c -o arena.o
+clang++ $CFLAGS -std=c++20 -c parser.cpp -o parser.o
+clang++ $CFLAGS -std=c++20 -o parser parser.o tokenizer.o arena.o
 ./parser
