@@ -1,4 +1,5 @@
 // clang c.c && ./a.out
+// cl /std:c11 c.c
 //
 
 #include <stdio.h>
