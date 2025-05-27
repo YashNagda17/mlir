@@ -2,7 +2,7 @@
 #include <stdio.h>
 
 #include "tokenizer.h"
-#include "arena.h"
+#include <base/arena.h>
 #include "mlir_parser.h"
 
 /*
