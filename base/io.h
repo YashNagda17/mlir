@@ -1,3 +1,5 @@
+#pragma once
+
 #include <stdbool.h>
 #include <base/arena.h>
 #include <base/string.h>

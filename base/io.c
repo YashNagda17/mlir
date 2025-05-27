@@ -1,7 +1,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-#include <base/arena.h>
+#include <base/io.h>
 
 
 // Returns the file contents as a null-terminated string in `text`.
