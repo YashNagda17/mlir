@@ -1,4 +1,4 @@
-// clang c.c && ./a.out
+// cl /std:c++20 c.cpp
 //
 
 #include <stdio.h>
