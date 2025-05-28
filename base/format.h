@@ -20,9 +20,8 @@ typedef enum {
 
 string format_explicit(Arena *arena, string fmt, size_t arg_count, ...);
 
-
-#define GET_ARG_COUNT(_1, _2, _3, _4, _5, _6, _7, _8, N, ...) N
-#define COUNT_ARGS(...) GET_ARG_COUNT(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#define GET_ARG_COUNT(_0, _1, _2, _3, _4, _5, _6, _7, _8, N, ...) N
+#define COUNT_ARGS(...) GET_ARG_COUNT(0 __VA_OPT__(,) __VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0)
 
 #define A(x) _Generic((x), \
     char*:  ARG_STRING, \
