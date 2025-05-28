@@ -6,7 +6,7 @@
 #include <base/string.h>
 
 string str_from_cstr_view(char *cstr) {
-    return (string){.str=cstr, .size=strlen(cstr)-1};
+    return (string){.str=cstr, .size=strlen(cstr)};
 }
 
 string str_from_cstr_len_view(char *cstr, uint64_t size) {
