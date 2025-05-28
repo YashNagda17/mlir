@@ -11,10 +11,19 @@
 #include <assert.h>
 
 #include <base/format.h>
+#include <base/io.h>
 
+void test_io() {
+    Arena* arena = arena_create(1024);
 
-// Main function with examples
-int main() {
+    string text;
+    bool ok = read_file(arena, str_lit("does not exist"), &text);
+    assert(!ok);
+
+    arena_free(arena);
+}
+
+void test_format() {
     Arena* arena = arena_create(1024);
     double pi = 3.1415926535;
 
@@ -53,5 +62,10 @@ int main() {
     printf("Multiple args: %.*s\n", (int)result.size, result.str);
 
     arena_free(arena);
+}
+
+int main() {
+    test_format();
+    test_io();
     return 0;
 }
