@@ -16,6 +16,8 @@ typedef enum {
     ARG_CHAR
 } ArgType;
 
+string format_explicit_varg(Arena *arena, string fmt, size_t arg_count,
+        va_list ap);
 string format_explicit(Arena *arena, string fmt, size_t arg_count, ...);
 
 #define GET_ARG_COUNT(_0, _1, _2, _3, _4, _5, _6, _7, _8, N, ...) N

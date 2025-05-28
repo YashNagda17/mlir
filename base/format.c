@@ -43,9 +43,8 @@ FormatSpec parse_format_spec(string spec) {
 }
 
 // Core formatting function with variadic arguments
-string format_explicit(Arena *arena, string fmt, size_t arg_count, ...) {
-    va_list ap;
-    va_start(ap, arg_count);
+string format_explicit_varg(Arena *arena, string fmt, size_t arg_count,
+        va_list ap) {
     string result = {.str = arena_alloc_array(arena, char, 1), .size = 0};
     result.str[0] = '\0';
     const char *p = fmt.str;
@@ -170,6 +169,12 @@ string format_explicit(Arena *arena, string fmt, size_t arg_count, ...) {
     //if (arg_index < arg_count) {
     //    return str_from_cstr_view("Error: excess arguments");
     //}
-    va_end(ap);
     return result;
+}
+
+string format_explicit(Arena *arena, string fmt, size_t arg_count, ...) {
+    va_list ap;
+    va_start(ap, arg_count);
+    return format_explicit_varg(arena, fmt, arg_count, ap);
+    va_end(ap);
 }

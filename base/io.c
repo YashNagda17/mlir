@@ -43,3 +43,12 @@ string read_file_ok(Arena *arena, const string filename) {
         abort();
     }
 }
+
+void println_explicit(Arena *arena, string fmt, size_t arg_count, ...) {
+    va_list varg;
+    va_start(varg, arg_count);
+    string text = format_explicit_varg(arena, fmt, arg_count, varg);
+    va_end(varg);
+    text = str_concat(arena, text, str_lit("\n"));
+    printf("%s", str_to_cstr_copy(arena, text));
+}
