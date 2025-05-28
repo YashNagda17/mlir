@@ -49,8 +49,7 @@ int main() {
 
     // Example with multiple arguments
     fmt = str_lit("Hello, {}, {}, {}, {}!");
-    string t = str_lit("XX");
-    result = format(arena, fmt, "world", 35.5, t, 3);
+    result = format(arena, fmt, "world", 35.5, str_lit("XX"), 3);
     printf("Multiple args: %.*s\n", (int)result.size, result.str);
 
     arena_free(arena);
