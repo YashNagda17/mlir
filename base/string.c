@@ -6,11 +6,13 @@
 #include <base/string.h>
 
 string str_from_cstr_view(char *cstr) {
-    return (string){.str=cstr, .size=strlen(cstr)};
+    string result = {cstr, strlen(cstr)};
+    return result;
 }
 
 string str_from_cstr_len_view(char *cstr, uint64_t size) {
-    return (string){.str=cstr, .size=size};
+    string result = {cstr, size};
+    return result;
 }
 
 char *str_to_cstr_copy(Arena *arena, string str) {
@@ -29,7 +31,8 @@ bool str_eq(string a, string b) {
 }
 
 string str_substr(string str, uint64_t min, uint64_t size) {
-    return (string){.str=str.str+min, .size=size};
+    string result = {str.str+min, size};
+    return result;
 }
 
 string int_to_string(Arena *arena, int value) {
@@ -37,7 +40,8 @@ string int_to_string(Arena *arena, int value) {
     int len = snprintf(buf, sizeof(buf), "%d", value);
     char *str = arena_alloc_array(arena, char, len + 1);
     memcpy(str, buf, len + 1);
-    return (string){.str = str, .size = len};
+    string result = {str, len};
+    return result;
 }
 
 string double_to_string(Arena *arena, double value, int precision) {
@@ -50,13 +54,15 @@ string double_to_string(Arena *arena, double value, int precision) {
     }
     char *str = arena_alloc_array(arena, char, len + 1);
     memcpy(str, buf, len + 1);
-    return (string){.str = str, .size = len};
+    string result = {str, len};
+    return result;
 }
 
 string char_to_string(Arena *arena, char c) {
     char *buf = arena_alloc_array(arena, char, 1);
     *buf = c;
-    return (string){.str = buf, .size = 1};
+    string result = {buf, 1};
+    return result;
 }
 
 string str_concat(Arena *arena, string a, string b) {
@@ -64,5 +70,6 @@ string str_concat(Arena *arena, string a, string b) {
     memcpy(str, a.str, a.size);
     memcpy(str + a.size, b.str, b.size);
     str[a.size + b.size] = '\0';
-    return (string){.str = str, .size = a.size + b.size};
+    string result = {str, a.size + b.size};
+    return result;
 }
