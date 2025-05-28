@@ -401,6 +401,12 @@ void tokenizer_print_all_tokens(Arena *arena, const string input_code) {
     }
 }
 
+void parser_init(Arena *arena, Parser *parser, string text) {
+    string text_null = str_concat(arena, text, str_lit("\0"));
+    parser->input = (unsigned char*) text_null.str;
+    parser->cur = 0;
+    tokenizer_get_next_token(parser->input, &parser->cur, &parser->sym);
+}
 
 // Main
 int main(int argc, char *argv[]) {
@@ -413,6 +419,11 @@ int main(int argc, char *argv[]) {
         mlir_code = read_file_ok(arena, str_from_cstr_view(argv[1]));
     }
     tokenizer_print_all_tokens(arena, mlir_code);
+
+    Parser parser;
+    parser_init(arena, &parser, mlir_code);
+    Operation* op = parse_module(&parser);
+
     arena_free(arena);
     return 0;
 }

@@ -45,7 +45,7 @@ FormatSpec parse_format_spec(string spec) {
 // Core formatting function with variadic arguments
 string format_explicit_varg(Arena *arena, string fmt, size_t arg_count,
         va_list ap) {
-    string result = {.str = arena_alloc_array(arena, char, 1), .size = 0};
+    string result = {arena_alloc_array(arena, char, 1), 0};
     result.str[0] = '\0';
     const char *p = fmt.str;
     const char *end = fmt.str + fmt.size;
@@ -103,6 +103,11 @@ string format_explicit_varg(Arena *arena, string fmt, size_t arg_count,
         string s;
         switch (type) {
             case ARG_INT: {
+                int value = va_arg(ap, int);
+                s = int_to_string(arena, value);
+                break;
+            }
+            case ARG_UINT64: {
                 int value = va_arg(ap, int);
                 s = int_to_string(arena, value);
                 break;

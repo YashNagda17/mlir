@@ -4,13 +4,13 @@
 #include <stdlib.h>
 
 #include <base/string.h>
+#include <base/io.h>
 
 #include "mlir_parser.h"
 
 
 void parser_error(Arena *arena, string msg, uint64_t first, uint64_t last) {
-    printf("Syntax error (%llu:%llu): %s\n", first, last,
-            str_to_cstr_copy(arena, msg));
+    println(arena, str_lit("Syntax error ({}:{}): {}"), first, last, msg);
     exit(1);
 }
 

@@ -40,6 +40,7 @@ struct Region {
     uint64_t n_blocks;
 };
 
+Operation* parse_module(Parser *parser);
 
 #ifdef __cplusplus
 }

@@ -10,6 +10,7 @@
 
 typedef enum {
     ARG_INT,
+    ARG_UINT64,
     ARG_DOUBLE,
     ARG_STRING,
     ARG_STRING2,
@@ -28,7 +29,8 @@ string format_explicit(Arena *arena, string fmt, size_t arg_count, ...);
     string: ARG_STRING2, \
     double: ARG_DOUBLE, \
     char:   ARG_CHAR, \
-    int:    ARG_INT  \
+    int:    ARG_INT,  \
+    uint64_t: ARG_UINT64  \
     ), (x)
 
 #define APPLY_A0()
