@@ -40,6 +40,7 @@ struct Region {
     uint64_t n_blocks;
 };
 
+void parser_init(Arena *arena, Parser *parser, string text);
 Operation* parse_module(Parser *parser);
 
 #ifdef __cplusplus

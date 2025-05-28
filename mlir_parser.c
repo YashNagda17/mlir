@@ -14,13 +14,32 @@ void parser_error(Arena *arena, string msg, uint64_t first, uint64_t last) {
     exit(1);
 }
 
+void parser_next_token(Parser *parser) {
+    parser->first = parser->cur;
+    tokenizer_get_next_token(parser->input, &parser->cur, &parser->sym);
+    parser->last = parser->cur-1;
+    while (parser->sym == TK_WHITESPACE) {
+        parser->first = parser->cur;
+        tokenizer_get_next_token(parser->input, &parser->cur, &parser->sym);
+        parser->last = parser->cur-1;
+    }
+}
+
+void parser_init(Arena *arena, Parser *parser, string text) {
+    string text_null = str_concat(arena, text, str_lit("\0"));
+    parser->arena = arena;
+    parser->input = (unsigned char*) text_null.str;
+    parser->cur = 0;
+    parser_next_token(parser);
+}
+
 bool parser_peek(Parser *parser, TokenType s) {
     return parser->sym == s;
 }
 
 bool parser_accept(Parser *parser, TokenType s) {
     if (parser_peek(parser, s)) {
-        tokenizer_get_next_token(parser->input, &parser->cur, &parser->sym);
+        parser_next_token(parser);
         return true;
     } else {
         return false;
@@ -73,7 +92,7 @@ Operation* parse_func_func(Parser *parser) {
     //string func_name = parser_token_str(parser);
     parser_expect(parser, TK_FUNCTION_NAME);
     while (!parser_peek(parser, TK_LBRACE)) {
-        tokenizer_get_next_token(parser->input, &parser->cur, &parser->sym);
+        parser_next_token(parser);
     }
     parser_expect(parser, TK_LBRACE);
     while (!parser_peek(parser, TK_RBRACE)) {
