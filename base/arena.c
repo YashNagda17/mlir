@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include <base/arena.h>
 
@@ -48,7 +49,8 @@ void* arena_alloc_(Arena* arena, size_t size) {
     char* aligned = (char*)aligned_addr;
     if (aligned + size > arena->end) {
         // Not enough space
-        exit(2);
+        printf("Arena out of space.\n");
+        exit(3);
         return NULL;
     }
 

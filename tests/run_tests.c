@@ -14,8 +14,8 @@
 #include <base/io.h>
 
 void test_io() {
-    printf("test_io()\n");
     Arena* arena = arena_create(1024);
+    println(arena, str_lit("test_io()"));
 
     string text;
     bool ok = read_file(arena, str_lit("does not exist"), &text);
@@ -29,12 +29,12 @@ void test_io() {
 
     println(arena, str_lit("Hello from io."));
 
+    println(arena, str_lit("Success()"));
     arena_free(arena);
-    printf("Success\n");
 }
 
 void test_format() {
-    Arena* arena = arena_create(1024);
+    Arena* arena = arena_create(1024*10);
     double pi = 3.1415926535;
 
     // Example with no arguments
@@ -47,29 +47,29 @@ void test_format() {
     fmt = str_lit("Hello, {}!");
     result = format(arena, fmt, str_lit("world"));
     assert(str_eq(result, str_lit("Hello, world!")));
-    printf("One arg: %.*s\n", (int)result.size, result.str);
+    println(arena, str_lit("One arg: {}"), result);
 
     fmt = str_lit("Hello, {}!");
     result = format(arena, fmt, 5);
     assert(str_eq(result, str_lit("Hello, 5!")));
-    printf("No args: %.*s\n", (int)result.size, result.str);
+    println(arena, str_lit("One arg: {}"), result);
 
     // Example with formatted double
     fmt = str_lit("Value: {:10.5f}");
     result = format(arena, fmt, pi);
     assert(str_eq(result, str_lit("Value:    3.14159")));
-    printf("Formatted double: %.*s\n", (int)result.size, result.str);
+    println(arena, str_lit("Formatted double: {}"), result);
 
     // Example with formatted char
     fmt = str_lit("Char: |{:^5}|");
     result = format(arena, fmt, 'x');
     assert(str_eq(result, str_lit("Char: | 120 |")));
-    printf("Formatted char: %.*s\n", (int)result.size, result.str);
+    println(arena, str_lit("Formatted char: {}"), result);
 
     // Example with multiple arguments
     fmt = str_lit("Hello, {}, {}, {}, {}!");
     result = format(arena, fmt, "world", 35.5, str_lit("XX"), 3);
-    printf("Multiple args: %.*s\n", (int)result.size, result.str);
+    println(arena, str_lit("Multiple args: {}"), result);
 
     arena_free(arena);
 }
