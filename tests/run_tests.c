@@ -14,7 +14,7 @@
 #include <base/io.h>
 
 void test_io() {
-    Arena* arena = arena_create(1024);
+    Arena* arena = arena_create(1024*20);
     println(arena, str_lit("test_io()"));
 
     string text;
@@ -23,9 +23,10 @@ void test_io() {
 
     text.size = 0;
     assert(text.size == 0);
-    //ok = read_file(arena, str_lit("README.md"), &text);
-    //assert(ok);
-    //assert(text.size > 10);
+    ok = read_file(arena, str_lit("README.md"), &text);
+    assert(ok);
+    assert(text.size > 10);
+    println(arena, text);
 
     println(arena, str_lit("Hello from io."));
 
