@@ -1,24 +1,33 @@
 #include <base/vector.h>
 
-#define VecType int64_t
+#define _IMPL_CONCAT2(a, b) a##b
+#define CONCAT2(a, b) _IMPL_CONCAT2(a, b)
 
-void vector_VecType_reserve(Arena *arena, vector_VecType *vec, size_t max) {
+#define _IMPL_CONCAT3(a, b, c) a##b##c
+#define CONCAT3(a, b, c) _IMPL_CONCAT3(a, b, c)
+
+#define T int64_t
+
+#define VECTOR_NAME CONCAT2(vector_, T)
+#define VECTOR_FUNC(suffix) CONCAT3(vector_, T, _##suffix)
+
+void VECTOR_FUNC(reserve)(Arena *arena, VECTOR_NAME *vec, size_t max) {
     vec->n = 0;
     if (max == 0) max++;
     assert(max > 0)
     vec->max = max;
-    vec->p = arena_alloc_array(arena, VecType, max);
+    vec->p = arena_alloc_array(arena, T, max);
 #ifdef WITH_LFORTRAN_ASSERT
     vec->reserve_called = vec_called_const;
 #endif
 }
 
-void vector_VecType_push_back(Arena *arena, vector_VecType *vec, VecType x) {
+void VECTOR_FUNC(push_back)(Arena *arena, VECTOR_NAME *vec, T x) {
     assert(vec->reserve_called == vec_called_const);
     if (vec->n == vec->max) {
         size_t max2 = 2*vec->max;
-        VecType* p2 = arena_alloc_array(arena, VecType, max2);
-        std::memcpy(p2, vec->p, sizeof(VecType) * vec->max);
+        T* p2 = arena_alloc_array(arena, T, max2);
+        std::memcpy(p2, vec->p, sizeof(T) * vec->max);
         vec->p = p2;
         vec->max = max2;
     }
@@ -27,4 +36,11 @@ void vector_VecType_push_back(Arena *arena, vector_VecType *vec, VecType x) {
 }
 
 
-#undef VecType
+
+#undef T
+#undef VECTOR_NAME
+#undef VECTOR_FUNC
+#undef CONCAT2
+#undef _IMPL_CONCAT2
+#undef CONCAT3
+#undef _IMPL_CONCAT3
