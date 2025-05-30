@@ -416,7 +416,7 @@ int main(int argc, char *argv[]) {
     Parser parser;
     parser_init(arena, &parser, mlir_code);
     // Uncomment to run parser (will currently fail with a syntax error):
-    //Operation* op = parse_module(&parser);
+    Operation* op = parse_module(&parser);
 
     arena_free(arena);
     return 0;

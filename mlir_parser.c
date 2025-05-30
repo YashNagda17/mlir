@@ -82,7 +82,7 @@ void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last) {
     // Print the error message, line, and caret string
     println(parser->arena, str_lit("Syntax error ({}:{}): {}"),
             line_first, column_first, msg);
-    println(parser->arena, line);
+    println(parser->arena, str_lit("{}"), line);
     println(parser->arena, caret_str);
 
     exit(1);
@@ -192,6 +192,9 @@ Operation* parse_operation(Parser *parser) {
                     parser->first, parser->last);
         }
     } else if (parser_peek(parser, TK_REGISTER)) {
+        string reg = parser_token_str(parser);
+        parser_accept(parser, TK_REGISTER);
+        parser_accept(parser, TK_EQUAL);
         parser_error(parser,
                 str_lit("unsupported operation reg"),
                 parser->first, parser->last);
