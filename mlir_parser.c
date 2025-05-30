@@ -160,10 +160,20 @@ Operation* parse_module(Parser *parser) {
         vector_int64_t_push_back(parser->arena, &operations, (int64_t)(op));
     }
     parser_expect(parser, TK_RBRACE);
+
+    Block *block = arena_alloc(parser->arena, Block);
+    block->operations = (Operation **)operations.data;
+    block->n_operations = operations.size;
+
+    Region *region = arena_alloc(parser->arena, Region);
+    region->blocks = &block;
+    region->n_blocks = 1;
+
     Operation *op = arena_alloc(parser->arena, Operation);
     op->opcode = str_lit("module");
-    op->regions = (Operation *)operations.data;
-    op->n_regions = operations.size;
+    op->regions = &region;
+    op->n_regions = 1;
+
     return op;
 }
 
