@@ -10,6 +10,9 @@
 
 #include "mlir_parser.h"
 
+// TODO: move this to the tokenizer
+string tokentype_to_string(TokenType tt);
+
 void get_newlines(Arena *arena, const string s, vector_int64_t *newlines) {
     for (int64_t pos=0; pos < s.size; pos++) {
         if (s.str[pos] == '\n') vector_int64_t_push_back(arena, newlines, pos);
@@ -188,7 +191,10 @@ Operation* parse_operation(Parser *parser) {
                 parser->first, parser->last);
     } else {
         parser_error(parser,
-                str_lit("expected a name or a register"),
+                format(parser->arena,
+                    str_lit("expected a name or a register, got {}"),
+                    tokentype_to_string(parser->sym)
+                    ),
                 parser->first, parser->last);
     }
     return NULL;
