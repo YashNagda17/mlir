@@ -141,6 +141,7 @@ Operation* parse_operation(Parser *parser);
 Operation* parse_module(Parser *parser) {
     parser_expect_name(parser, str_lit("module"));
     parser_expect(parser, TK_LBRACE);
+    parser_expect(parser, TK_NEWLINE);
     while (!parser_peek(parser, TK_RBRACE)) {
         parse_operation(parser);
     }
