@@ -22,9 +22,22 @@ typedef struct {
 
 typedef struct Region Region;
 
+typedef enum ValueKind {
+    BLOCK_ARG,
+    OP_RESULT
+} ValueKind;
+
+typedef struct ValueRef {
+    ValueKind kind;
+    void* def; // Block* or Operation*
+    uint64_t index;
+} ValueRef;
+
 typedef struct Operation Operation;
 struct Operation {
     string opcode;
+    ValueRef **operands;
+    uint64_t n_operands;
     Region **regions;
     uint64_t n_regions;
 };
