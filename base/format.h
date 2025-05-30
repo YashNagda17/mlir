@@ -6,6 +6,7 @@
 #include <stdarg.h>
 
 #include <base/string.h>
+#include <base/vector.h>
 
 
 typedef enum {
@@ -15,7 +16,8 @@ typedef enum {
     ARG_DOUBLE,
     ARG_STRING,
     ARG_STRING2,
-    ARG_CHAR
+    ARG_CHAR,
+    ARG_VECTOR_INT64
 } ArgType;
 
 string format_explicit_varg(Arena *arena, string fmt, size_t arg_count,
@@ -32,7 +34,8 @@ string format_explicit(Arena *arena, string fmt, size_t arg_count, ...);
     char:   ARG_CHAR, \
     int:    ARG_INT,  \
     int64_t: ARG_INT64,  \
-    uint64_t: ARG_UINT64  \
+    uint64_t: ARG_UINT64,  \
+    vector_int64_t: ARG_VECTOR_INT64  \
     ), (x)
 
 #define APPLY_A0()

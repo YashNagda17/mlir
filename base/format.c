@@ -143,6 +143,22 @@ string format_explicit_varg(Arena *arena, string fmt, size_t arg_count,
                 s = char_to_string(arena, value);
                 break;
             }
+            case ARG_VECTOR_INT64: {
+                vector_int64_t value = va_arg(ap, vector_int64_t);
+                s = str_lit("{");
+                for (int i=0; i<value.size; i++) {
+                    s = str_concat(arena, s,
+                            int_to_string(arena, value.data[i]));
+                    if (i < value.size-1) {
+                        s = str_concat(arena, s, str_lit(", "));
+                    }
+                }
+                s = str_concat(arena, s, str_lit("}"));
+                if (spec.precision >= 0 && spec.precision < s.size) {
+                    s.size = spec.precision;
+                }
+                break;
+            }
             default:
                 s = str_from_cstr_view("Unknown type");
         }
