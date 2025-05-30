@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <assert.h>
 
 #include <base/string.h>
 #include <base/io.h>
@@ -13,6 +14,28 @@ void get_newlines(Arena *arena, const string s, vector_int64_t *newlines) {
     for (int64_t pos=0; pos < s.size; pos++) {
         if (s.str[pos] == '\n') vector_int64_t_push_back(arena, newlines, pos);
     }
+    // Append end of file if not already present (doesn't end with \n)
+    if (!(newlines->size > 0 && newlines->data[newlines->size-1] == '\n')) {
+        vector_int64_t_push_back(arena, newlines, s.size);
+    }
+}
+
+void linear_to_line_column(const vector_int64_t newlines, uint64_t first,
+        int64_t *start_of_line,
+        int64_t *end_of_line,
+        int64_t *line_first,
+        int64_t *column_first) {
+    // Find the line index (number of newlines before 'first')
+    int64_t line_idx = 0;
+    while (line_idx < newlines.size && newlines.data[line_idx] < first) {
+        line_idx++;
+    }
+    int64_t line_number = line_idx + 1;
+    *start_of_line = (line_idx == 0) ? 0 : newlines.data[line_idx - 1] + 1;
+    assert(line_idx < newlines.size);
+    *end_of_line = newlines.data[line_idx];
+    *line_first = line_number;
+    *column_first = first - *start_of_line + 1;
 }
 
 void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last) {
@@ -21,15 +44,9 @@ void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last) {
     vector_int64_t_reserve(parser->arena, &newlines, 16);
     get_newlines(parser->arena, s, &newlines);
 
-    // Find the line index (number of newlines before 'first')
-    int64_t line_idx = 0;
-    while (line_idx < newlines.size && newlines.data[line_idx] < first) {
-        line_idx++;
-    }
-    int64_t line_number = line_idx + 1;
-    int64_t start_of_line = (line_idx == 0) ? 0 : newlines.data[line_idx - 1] + 1;
-    int64_t end_of_line = (line_idx < newlines.size) ? newlines.data[line_idx] : s.size;
-    int64_t column_first = first - start_of_line + 1;
+    int64_t start_of_line, end_of_line, line_first, column_first;
+    linear_to_line_column(newlines, first, &start_of_line, &end_of_line,
+            &line_first, &column_first);
 
     // Extract the line as a string
     string line = { .str = s.str + start_of_line, .size = end_of_line - start_of_line };
@@ -46,7 +63,8 @@ void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last) {
     string caret_str = { .str = caret_buf, .size = first - start_of_line + token_length };
 
     // Print the error message, line, and caret string
-    println(parser->arena, str_lit("Syntax error at line {} column {}: {}"), line_number, column_first, msg);
+    println(parser->arena, str_lit("Syntax error ({}:{}): {}"),
+            line_first, column_first, msg);
     println(parser->arena, line);
     println(parser->arena, caret_str);
 
