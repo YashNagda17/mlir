@@ -195,9 +195,9 @@ Operation* parse_operation(Parser *parser) {
                     parser->first, parser->last);
         }
     } else {
-        string op_name;
+        string op_name = str_lit("");
         if (parser_peek(parser, TK_REGISTER)) {
-            string reg = parser_token_str(parser);
+            //string reg = parser_token_str(parser);
             parser_expect(parser, TK_REGISTER);
             parser_expect(parser, TK_EQUAL);
         }
@@ -213,7 +213,7 @@ Operation* parse_operation(Parser *parser) {
         }
         parser_expect(parser, TK_LPAREN);
         if (parser_peek(parser, TK_REGISTER)) {
-            string reg = parser_token_str(parser);
+            //string reg = parser_token_str(parser);
             parser_expect(parser, TK_REGISTER);
         }
         parser_expect(parser, TK_RPAREN);
@@ -243,4 +243,5 @@ Operation* parse_operation(Parser *parser) {
         op->opcode = op_name;
         return op;
     }
+    return NULL;
 }

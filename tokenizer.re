@@ -75,7 +75,7 @@ void tokenizer_get_next_token(const unsigned char *string,
         // These two variables are needed by the re2c block below internally,
         // initialization is not needed. One can think of them as local
         // variables of the re2c block.
-        const unsigned char *mar, *ctxmar;
+        const unsigned char *mar; //, *ctxmar;
         /*!re2c
             re2c:define:YYCURSOR = cur;
             re2c:define:YYMARKER = mar;
