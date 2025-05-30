@@ -404,8 +404,22 @@ void tokenizer_print_all_tokens(Arena *arena, const string input_code) {
     }
 }
 
-string print_module(Arena *arena, Operation *op) {
-    return format(arena, str_lit("Operation(opcode={})"), op->opcode);
+
+string print_region(Arena *arena, Region *region) {
+    return format(arena, str_lit("Region()"));
+}
+
+string print_operation(Arena *arena, Operation *op) {
+    string result = str_lit("");
+    result = str_concat(arena, result,
+        format(arena, str_lit("Operation(opcode={}) {{\n"), op->opcode)
+        );
+    for (int i=0; i < op->n_regions; i++) {
+        result = str_concat(arena, result,
+            print_region(arena, op->regions[i])
+            );
+    }
+    return result;
 }
 
 // Main
@@ -425,7 +439,7 @@ int main(int argc, char *argv[]) {
     // Uncomment to run parser (will currently fail with a syntax error):
     Operation* op = parse_module(&parser);
     println(arena, str_lit("MLIR:"));
-    println(arena, str_lit("{}"), print_module(arena, op));
+    println(arena, str_lit("{}"), print_operation(arena, op));
 
     arena_free(arena);
     return 0;

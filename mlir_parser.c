@@ -153,12 +153,17 @@ Operation* parse_module(Parser *parser) {
     parser_expect_name(parser, str_lit("module"));
     parser_expect(parser, TK_LBRACE);
     parser_expect(parser, TK_NEWLINE);
+    vector_int64_t operations;
+    vector_int64_t_reserve(parser->arena, &operations, 16);
     while (!parser_peek(parser, TK_RBRACE)) {
-        parse_operation(parser);
+        Operation *op = parse_operation(parser);
+        vector_int64_t_push_back(parser->arena, &operations, (int64_t)(op));
     }
     parser_expect(parser, TK_RBRACE);
     Operation *op = arena_alloc(parser->arena, Operation);
     op->opcode = str_lit("module");
+    op->regions = (Operation *)operations.data;
+    op->n_regions = operations.size;
     return op;
 }
 
@@ -241,6 +246,8 @@ Operation* parse_operation(Parser *parser) {
 
         Operation *op = arena_alloc(parser->arena, Operation);
         op->opcode = op_name;
+        op->regions = NULL;
+        op->n_regions = 0;
         return op;
     }
     return NULL;

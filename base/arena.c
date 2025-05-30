@@ -50,7 +50,7 @@ void* arena_alloc_(Arena* arena, size_t size) {
     if (aligned + size > arena->end) {
         // Not enough space
         printf("Arena out of space.\n");
-        exit(3);
+        abort();
         return NULL;
     }
 
