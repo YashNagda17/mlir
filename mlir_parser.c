@@ -18,6 +18,8 @@ void get_newlines(Arena *arena, const string s, vector_int64_t *newlines) {
     if (!(s.size > 0 && s.str[s.size-1] == '\n')) {
         vector_int64_t_push_back(arena, newlines, s.size);
     }
+    assert(newlines->size > 0);
+    assert(newlines->data[newlines->size-1] >= s.size-1);
 }
 
 void linear_to_line_column(const vector_int64_t newlines, uint64_t first,
@@ -36,9 +38,12 @@ void linear_to_line_column(const vector_int64_t newlines, uint64_t first,
     *end_of_line = newlines.data[line_idx];
     *line_first = line_number;
     *column_first = first - *start_of_line + 1;
+    assert(first >= *start_of_line);
+    assert(first <= *end_of_line);
 }
 
 void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last) {
+    assert(first <= last);
     string s = str_from_cstr_view((char*)parser->input);
     vector_int64_t newlines;
     vector_int64_t_reserve(parser->arena, &newlines, 16);
@@ -53,6 +58,7 @@ void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last) {
 
     // Create the caret string (spaces followed by carets)
     int64_t token_length = last - first + 1; // Assuming 'last' is inclusive
+    assert(first >= start_of_line);
     char* caret_buf = arena_alloc_array(parser->arena, char, first - start_of_line + token_length);
     for (int64_t i = 0; i < first - start_of_line; i++) {
         caret_buf[i] = ' ';
