@@ -404,41 +404,48 @@ void tokenizer_print_all_tokens(Arena *arena, const string input_code) {
     }
 }
 
-string print_operation(Arena *arena, Operation *op);
+string print_operation(Arena *arena, int indent_level, Operation *op);
 
-string print_block(Arena *arena, int i, Block *block) {
-    string result = format(arena, str_lit("^bb{}\n"), i);
-    result = str_concat(arena, result, str_lit("Block:"));
+string indent(Arena *arena, int indent_level) {
+    return format(arena, str_lit("{}:"), indent_level);
+}
+
+string print_block(Arena *arena, int bb_index, int indent_level, Block *block) {
+    string result = format(arena, str_lit("{}^bb{}\n"),
+            indent(arena, indent_level), bb_index);
     for (int i=0; i < block->n_operations; i++) {
         result = str_concat(arena, result,
-            print_operation(arena, block->operations[i])
+            print_operation(arena, indent_level+1, block->operations[i])
             );
     }
     return result;
 }
 
-string print_region(Arena *arena, Region *region) {
+string print_region(Arena *arena, int indent_level, Region *region) {
     string result = str_lit("");
     result = str_concat(arena, result, str_lit("{\n"));
     for (int i=0; i < region->n_blocks; i++) {
         result = str_concat(arena, result,
-            print_block(arena, i, region->blocks[i])
+            print_block(arena, i, indent_level+1, region->blocks[i])
             );
     }
-    result = str_concat(arena, result, str_lit("}\n"));
+    result = str_concat(arena, result, str_lit("}"));
     return result;
 }
 
-string print_operation(Arena *arena, Operation *op) {
-    string result = str_lit("");
+string print_operation(Arena *arena, int indent_level, Operation *op) {
+    string result = indent(arena, indent_level);
     result = str_concat(arena, result,
-        format(arena, str_lit("Operation(opcode={}) {{\n"), op->opcode)
+        format(arena, str_lit("Operation(opcode={})"), op->opcode)
         );
-    for (int i=0; i < op->n_regions; i++) {
-        result = str_concat(arena, result,
-            print_region(arena, op->regions[i])
-            );
+    if (op->n_regions > 0) {
+        for (int i=0; i < op->n_regions; i++) {
+            result = str_concat(arena, result,
+                print_region(arena, indent_level+1, op->regions[i])
+                );
+        }
     }
+    result = str_concat(arena, result, str_lit("\n"));
     return result;
 }
 
@@ -459,7 +466,7 @@ int main(int argc, char *argv[]) {
     // Uncomment to run parser (will currently fail with a syntax error):
     Operation* op = parse_module(&parser);
     println(arena, str_lit("MLIR:"));
-    println(arena, str_lit("{}"), print_operation(arena, op));
+    println(arena, str_lit("{}"), print_operation(arena, 0, op));
 
     arena_free(arena);
     return 0;
