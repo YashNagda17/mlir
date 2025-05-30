@@ -194,17 +194,16 @@ Operation* parse_operation(Parser *parser) {
                     str_lit("unsupported operation"),
                     parser->first, parser->last);
         }
-    } else if (parser_peek(parser, TK_REGISTER)) {
-        string reg = parser_token_str(parser);
-        parser_expect(parser, TK_REGISTER);
-        parser_expect(parser, TK_EQUAL);
+    } else {
+        string op_name;
+        if (parser_peek(parser, TK_REGISTER)) {
+            string reg = parser_token_str(parser);
+            parser_expect(parser, TK_REGISTER);
+            parser_expect(parser, TK_EQUAL);
+        }
         if (parser_peek(parser, TK_STRING)) {
-            string op_name = parser_token_str(parser);
+            op_name = parser_token_str(parser);
             parser_expect(parser, TK_STRING);
-            parser_expect(parser, TK_LPAREN);
-            parser_expect(parser, TK_RPAREN);
-            parser_expect(parser, TK_LBRACE);
-            parser_expect(parser, TK_RBRACE);
         } else {
             parser_error(parser,
                 format(parser->arena,
@@ -212,17 +211,36 @@ Operation* parse_operation(Parser *parser) {
                     tokentype_to_string(parser->sym)),
                     parser->first, parser->last);
         }
-        parser_error(parser,
-                str_lit("unsupported operation reg"),
-                parser->first, parser->last);
+        parser_expect(parser, TK_LPAREN);
+        if (parser_peek(parser, TK_REGISTER)) {
+            string reg = parser_token_str(parser);
+            parser_expect(parser, TK_REGISTER);
+        }
+        parser_expect(parser, TK_RPAREN);
+        if (parser_peek(parser, TK_LBRACE)) {
+            parser_expect(parser, TK_LBRACE);
+            parser_expect(parser, TK_NAME);
+            parser_expect(parser, TK_EQUAL);
+            parser_expect(parser, TK_INTEGER);
+            parser_expect(parser, TK_RBRACE);
+        }
+        parser_expect(parser, TK_COLON);
+        parser_expect(parser, TK_LPAREN);
+        if (parser_peek(parser, TK_NAME)) {
+            parser_expect(parser, TK_NAME);
+        }
+        parser_expect(parser, TK_RPAREN);
+        parser_expect(parser, TK_ARROW);
+        if (parser_peek(parser, TK_NAME)) {
+            parser_expect(parser, TK_NAME);
+        } else {
+            parser_expect(parser, TK_LPAREN);
+            parser_expect(parser, TK_RPAREN);
+        }
+        parser_expect(parser, TK_NEWLINE);
 
-    } else {
-        parser_error(parser,
-                format(parser->arena,
-                    str_lit("expected a name or a register, got {}"),
-                    tokentype_to_string(parser->sym)
-                    ),
-                parser->first, parser->last);
+        Operation *op = arena_alloc(parser->arena, Operation);
+        op->opcode = op_name;
+        return op;
     }
-    return NULL;
 }
