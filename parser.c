@@ -406,8 +406,8 @@ void tokenizer_print_all_tokens(Arena *arena, const string input_code) {
 
 string print_operation(Arena *arena, Operation *op);
 
-string print_block(Arena *arena, Block *block) {
-    string result = str_lit("");
+string print_block(Arena *arena, int i, Block *block) {
+    string result = format(arena, str_lit("^bb{}\n"), i);
     result = str_concat(arena, result, str_lit("Block:"));
     for (int i=0; i < block->n_operations; i++) {
         result = str_concat(arena, result,
@@ -419,12 +419,13 @@ string print_block(Arena *arena, Block *block) {
 
 string print_region(Arena *arena, Region *region) {
     string result = str_lit("");
-    result = str_concat(arena, result, str_lit("Region:"));
+    result = str_concat(arena, result, str_lit("{\n"));
     for (int i=0; i < region->n_blocks; i++) {
         result = str_concat(arena, result,
-            print_block(arena, region->blocks[i])
+            print_block(arena, i, region->blocks[i])
             );
     }
+    result = str_concat(arena, result, str_lit("}\n"));
     return result;
 }
 
