@@ -22,6 +22,10 @@ typedef struct {
 
 typedef struct Region Region;
 
+typedef struct Type {
+    string str; // For now we keep the type as a string
+} Type;
+
 typedef enum ValueKind {
     BLOCK_ARG,
     OP_RESULT
@@ -36,6 +40,8 @@ typedef struct ValueRef {
 typedef struct Operation Operation;
 struct Operation {
     string opcode;
+    Type **result_types;
+    uint64_t n_result_types;
     ValueRef **operands;
     uint64_t n_operands;
     Region **regions;
