@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include <base/arena.h>
 
 #ifdef WITH_BASE_ASSERT
