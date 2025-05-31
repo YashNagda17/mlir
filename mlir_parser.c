@@ -115,19 +115,9 @@ bool parser_peek(Parser *parser, TokenType s) {
     return parser->sym == s;
 }
 
-bool parser_accept(Parser *parser, TokenType s) {
+void parser_expect(Parser *parser, TokenType s) {
     if (parser_peek(parser, s)) {
         parser_next_token(parser);
-        return true;
-    } else {
-        return false;
-    }
-}
-
-
-void parser_expect(Parser *parser, TokenType s) {
-    if (parser_accept(parser, s)) {
-        return;
     } else {
         parser_error(parser,
             format(parser->arena,
@@ -145,7 +135,7 @@ string parser_token_str(Parser *parser) {
 
 void parser_expect_name(Parser *parser, string name) {
     if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), name)){
-        parser_accept(parser, TK_NAME);
+        parser_expect(parser, TK_NAME);
         return;
     } else {
         parser_error(parser,
@@ -160,6 +150,21 @@ void parser_expect_name(Parser *parser, string name) {
 Operation* parse_operation(Parser *parser);
 
 Operation* parse_module(Parser *parser) {
+    while (!parser_peek(parser, TK_NAME)) {
+        if (parser_peek(parser, TK_HASH_NAME)) {
+            while (!parser_peek(parser, TK_NEWLINE)) {
+                parser_next_token(parser);
+            }
+            parser_expect(parser, TK_NEWLINE);
+        } else {
+            parser_error(parser,
+                format(parser->arena,
+                    str_lit("Expected TK_NAME or TK_HASH_NAME, got {}"),
+                    tokentype_to_string(parser->sym)
+                ), parser->first, parser->last);
+        }
+    }
+
     parser_expect_name(parser, str_lit("module"));
     parser_expect(parser, TK_LBRACE);
     parser_expect(parser, TK_NEWLINE);
