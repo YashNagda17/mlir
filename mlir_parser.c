@@ -161,7 +161,7 @@ Operation* parse_module(Parser *parser) {
         } else {
             parser_error(parser,
                 format(parser->arena,
-                    str_lit("Expected TK_NAME or TK_HASH_NAME, got {}"),
+                    str_lit("Expected TK_NAME, TK_HASH_NAME or TK_NEWLINE, got {}"),
                     tokentype_to_string(parser->sym)
                 ), parser->first, parser->last);
         }
