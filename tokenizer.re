@@ -1,5 +1,5 @@
 // Compile with:
-// re2c -b tokenizer.re -o tokenizer.cpp
+// re2c --no-generation-date -b tokenizer.re -o tokenizer.c
 
 #include <stdbool.h>
 
