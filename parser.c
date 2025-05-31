@@ -345,7 +345,8 @@ void tokenizer_print_all_tokens(Arena *arena, const string input_code) {
         bool debug = false;
         if (debug) {
             string token_str = str_substr(input_code, first, last-first+1);
-            if (token_type == TK_WHITESPACE || token_type == TK_NEWLINE) {
+            if (token_type == TK_WHITESPACE || token_type == TK_NEWLINE
+                    || token_type == TK_EOF) {
                 token_str = str_lit("");
             }
             println(arena, str_lit("Token({}, \"{}\", {},{})"),
