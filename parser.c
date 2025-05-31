@@ -385,9 +385,10 @@ string print_region(Arena *arena, int indent_level, Region *region) {
     result = str_concat(arena, result, str_lit("{\n"));
     for (int i=0; i < region->n_blocks; i++) {
         result = str_concat(arena, result,
-            print_block(arena, i, indent_level+1, region->blocks[i])
+            print_block(arena, i, indent_level, region->blocks[i])
             );
     }
+    result = str_concat(arena, result, indent(arena, indent_level));
     result = str_concat(arena, result, str_lit("}"));
     return result;
 }
