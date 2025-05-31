@@ -84,41 +84,41 @@ void tokenizer_get_next_token(const unsigned char *string,
 	unsigned char yych;
 	unsigned int yyaccept = 0;
 	static const unsigned char yybm[256] = {
-		  0, 128, 128, 128, 128, 128, 128, 128,
-		128, 144, 128, 144, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		144, 128,   0, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
+		  0, 192, 192, 192, 192, 192, 192, 192,
+		192, 200,  64, 200, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		200, 192, 128, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		240, 240, 240, 240, 240, 240, 240, 240,
+		240, 240, 192, 192, 192, 192, 192, 192,
+		192, 224, 224, 224, 224, 224, 224, 224,
 		224, 224, 224, 224, 224, 224, 224, 224,
-		224, 224, 128, 128, 128, 128, 128, 128,
-		128, 192, 192, 192, 192, 192, 192, 192,
+		224, 224, 224, 224, 224, 224, 224, 224,
+		224, 224, 224, 192, 192, 192, 192, 224,
+		192, 224, 224, 224, 224, 224, 224, 224,
+		224, 224, 224, 224, 224, 224, 224, 224,
+		224, 224, 224, 224, 224, 224, 224, 224,
+		224, 224, 224, 192, 192, 192, 192, 192,
 		192, 192, 192, 192, 192, 192, 192, 192,
 		192, 192, 192, 192, 192, 192, 192, 192,
-		192, 192, 192, 128, 128, 128, 128, 192,
-		128, 192, 192, 192, 192, 192, 192, 192,
 		192, 192, 192, 192, 192, 192, 192, 192,
 		192, 192, 192, 192, 192, 192, 192, 192,
-		192, 192, 192, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128,
-		128, 128, 128, 128, 128, 128, 128, 128
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192,
+		192, 192, 192, 192, 192, 192, 192, 192
 	};
 	yych = *cur;
-	if (yybm[0+yych] & 16) goto yy4;
+	if (yybm[0+yych] & 8) goto yy4;
 	switch (yych) {
 		case 0x00: goto yy1;
 		case '\t':
@@ -228,7 +228,7 @@ yy3:
 #line 229 "tokenizer.c"
 yy4:
 	yych = *++cur;
-	if (yybm[0+yych] & 16) goto yy4;
+	if (yybm[0+yych] & 8) goto yy4;
 #line 104 "tokenizer.re"
 	{ RET(TK_WHITESPACE) }
 #line 235 "tokenizer.c"
@@ -333,7 +333,7 @@ yy21:
 yy22:
 	yyaccept = 1;
 	yych = *(mar = ++cur);
-	if (yybm[0+yych] & 32) goto yy22;
+	if (yybm[0+yych] & 16) goto yy22;
 	if (yych <= 'E') {
 		if (yych == '.') goto yy53;
 		if (yych >= 'D') goto yy56;
@@ -410,7 +410,7 @@ yy33:
 	yyaccept = 2;
 	yych = *(mar = ++cur);
 yy34:
-	if (yybm[0+yych] & 64) goto yy33;
+	if (yybm[0+yych] & 32) goto yy33;
 	if (yych == '.') goto yy61;
 	goto yy32;
 yy35:
@@ -468,7 +468,7 @@ yy42:
 yy43:
 	yych = *++cur;
 yy44:
-	if (yybm[0+yych] & 128) goto yy43;
+	if (yybm[0+yych] & 64) goto yy43;
 	if (yych >= 0x01) goto yy46;
 yy45:
 	cur = mar;
@@ -562,10 +562,11 @@ yy54:
 	{ RET(TK_REAL) }
 #line 564 "tokenizer.c"
 yy55:
-	++cur;
+	yych = *++cur;
+	if (yybm[0+yych] & 128) goto yy55;
 #line 138 "tokenizer.re"
 	{ RET(TK_COMMENT) }
-#line 569 "tokenizer.c"
+#line 570 "tokenizer.c"
 yy56:
 	yych = *++cur;
 	if (yych <= ',') {
@@ -586,7 +587,7 @@ yy57:
 yy58:
 #line 149 "tokenizer.re"
 	{ RET(TK_TYPE_DIM) }
-#line 590 "tokenizer.c"
+#line 591 "tokenizer.c"
 yy59:
 	yych = *++cur;
 	if (yych <= 'Z') {
@@ -604,7 +605,7 @@ yy59:
 yy60:
 #line 147 "tokenizer.re"
 	{ RET(TK_FUNCTION_NAME) }
-#line 608 "tokenizer.c"
+#line 609 "tokenizer.c"
 yy61:
 	yych = *++cur;
 	if (yych <= '^') {
@@ -651,13 +652,13 @@ yy65:
 yy66:
 #line 142 "tokenizer.re"
 	{ RET(TK_CARET_NAME); }
-#line 655 "tokenizer.c"
+#line 656 "tokenizer.c"
 yy67:
 	++cur;
 	cur = ctxmar;
 #line 118 "tokenizer.re"
 	{ RET(TK_LBRACE_END) }
-#line 661 "tokenizer.c"
+#line 662 "tokenizer.c"
 yy68:
 	yych = *++cur;
 	if (yych == '\n') goto yy67;
@@ -698,7 +699,7 @@ yy73:
 yy74:
 #line 145 "tokenizer.re"
 	{ RET(TK_NAME_DOT_NAME) }
-#line 702 "tokenizer.c"
+#line 703 "tokenizer.c"
 yy75:
 	yyaccept = 2;
 	yych = *(mar = ++cur);
@@ -708,12 +709,12 @@ yy75:
 yy76:
 	yyaccept = 6;
 	yych = *(mar = ++cur);
-	if (yybm[0+yych] & 64) goto yy33;
+	if (yybm[0+yych] & 32) goto yy33;
 	if (yych == '.') goto yy61;
 yy77:
 #line 109 "tokenizer.re"
 	{ RET(KW_ALL) }
-#line 717 "tokenizer.c"
+#line 718 "tokenizer.c"
 yy78:
 	yyaccept = 2;
 	yych = *(mar = ++cur);
@@ -741,12 +742,12 @@ yy81:
 yy82:
 	yyaccept = 7;
 	yych = *(mar = ++cur);
-	if (yybm[0+yych] & 64) goto yy33;
+	if (yybm[0+yych] & 32) goto yy33;
 	if (yych == '.') goto yy61;
 yy83:
 #line 110 "tokenizer.re"
 	{ RET(KW_WRITE) }
-#line 750 "tokenizer.c"
+#line 751 "tokenizer.c"
 yy84:
 	yyaccept = 2;
 	yych = *(mar = ++cur);
@@ -760,12 +761,12 @@ yy85:
 yy86:
 	yyaccept = 8;
 	yych = *(mar = ++cur);
-	if (yybm[0+yych] & 64) goto yy33;
+	if (yybm[0+yych] & 32) goto yy33;
 	if (yych == '.') goto yy61;
 yy87:
 #line 108 "tokenizer.re"
 	{ RET(KW_ABSTRACT) }
-#line 769 "tokenizer.c"
+#line 770 "tokenizer.c"
 }
 #line 152 "tokenizer.re"
 

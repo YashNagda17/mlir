@@ -135,7 +135,7 @@ void tokenizer_get_next_token(const unsigned char *string,
             "." { RET(TK_DOT) }
 
             // Multiple character symbols
-            "//" { RET(TK_COMMENT) }
+            "//" [^\n\x00]* { RET(TK_COMMENT) }
             "->" { RET(TK_ARROW) }
 
             "#" name { RET(TK_HASH_NAME); }

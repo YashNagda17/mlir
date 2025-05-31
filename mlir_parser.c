@@ -100,7 +100,7 @@ void parser_next_token(Parser *parser) {
         parser->first = parser->cur;
         tokenizer_get_next_token(parser->input, &parser->cur, &parser->sym);
         parser->last = parser->cur-1;
-    } while (parser->sym == TK_WHITESPACE);
+    } while (parser->sym == TK_WHITESPACE || parser->sym == TK_COMMENT);
 }
 
 void parser_init(Arena *arena, Parser *parser, string text) {
@@ -150,14 +150,15 @@ void parser_expect_opname(Parser *parser, string name) {
 
 Operation* parse_operation(Parser *parser);
 
-// Parses a region from { to } inclusive
-Region* parse_region(Parser *parser) {
-    parser_expect(parser, TK_LBRACE_END);
-    parser_expect(parser, TK_NEWLINE);
+Block* parse_block(Parser *parser) {
+    if (parser_peek(parser, TK_CARET_NAME)) {
+        parser_expect(parser, TK_CARET_NAME);
+        parser_expect(parser, TK_COLON);
+        parser_expect(parser, TK_NEWLINE);
+    }
     vector_int64_t operations;
     vector_int64_t_reserve(parser->arena, &operations, 16);
-    while (!parser_peek(parser, TK_RBRACE)) {
-        // TODO: We should be parsing blocks here, but for now we skip that
+    while (! (parser_peek(parser, TK_RBRACE) || parser_peek(parser, TK_CARET_NAME))) {
         Operation *op = parse_operation(parser);
         vector_int64_t_push_back(parser->arena, &operations, (int64_t)(op));
         parser_expect(parser, TK_NEWLINE);
@@ -167,18 +168,29 @@ Region* parse_region(Parser *parser) {
             parser_expect(parser, TK_NEWLINE);
         }
     }
-    parser_expect(parser, TK_RBRACE);
 
-    // TODO: We assume one implicit block for now
     Block *block = arena_alloc(parser->arena, Block);
     block->operations = (Operation **)operations.data;
     block->n_operations = operations.size;
 
+    return block;
+}
+
+// Parses a region from { to } inclusive
+Region* parse_region(Parser *parser) {
+    parser_expect(parser, TK_LBRACE_END);
+    parser_expect(parser, TK_NEWLINE);
+    vector_int64_t blocks;
+    vector_int64_t_reserve(parser->arena, &blocks, 8);
+    while (!parser_peek(parser, TK_RBRACE)) {
+        Block *block = parse_block(parser);
+        vector_int64_t_push_back(parser->arena, &blocks, (int64_t)(block));
+    }
+    parser_expect(parser, TK_RBRACE);
+
     Region *region = arena_alloc(parser->arena, Region);
-    Block **block2 = arena_alloc(parser->arena, Block*);
-    block2[0] = block;
-    region->blocks = block2;
-    region->n_blocks = 1;
+    region->blocks = (Block **)blocks.data;
+    region->n_blocks = blocks.size;
 
     return region;
 }
