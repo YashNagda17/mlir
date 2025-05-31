@@ -160,6 +160,7 @@ Region* parse_region(Parser *parser) {
         // TODO: We should be parsing blocks here, but for now we skip that
         Operation *op = parse_operation(parser);
         vector_int64_t_push_back(parser->arena, &operations, (int64_t)(op));
+        parser_expect(parser, TK_NEWLINE);
     }
     parser_expect(parser, TK_RBRACE);
 
@@ -195,16 +196,10 @@ Operation* parse_module(Parser *parser) {
         }
     }
 
-    parser_expect_opname(parser, str_lit("module"));
-    Region *region = parse_region(parser);
-
-    Operation *op = arena_alloc(parser->arena, Operation);
-    op->opname = str_lit("module");
-    Region **regions = arena_alloc(parser->arena, Region*);
-    regions[0] = region;
-    op->regions = regions;
-    op->n_regions = 1;
-    op->n_result_types = 0;
+    Operation *op = parse_operation(parser);
+    if (!str_eq(op->opname, str_lit("module"))) {
+        parser_error(parser, str_lit("expected module"), 0, 0);
+    }
 
     return op;
 }
@@ -323,8 +318,6 @@ Operation* parse_operation(Parser *parser) {
         op->regions = regions;
         op->n_regions = 1;
     }
-
-    parser_expect(parser, TK_NEWLINE);
 
     return op;
 }
