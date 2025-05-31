@@ -132,7 +132,6 @@ void tokenizer_get_next_token(const unsigned char *string,
             "*" { RET(TK_STAR) }
             "|" { RET(TK_VBAR) }
             "@" { RET(TK_AT) }
-            "^" { RET(TK_CARET) }
             "." { RET(TK_DOT) }
 
             // Multiple character symbols
@@ -140,6 +139,7 @@ void tokenizer_get_next_token(const unsigned char *string,
             "->" { RET(TK_ARROW) }
 
             "#" name { RET(TK_HASH_NAME); }
+            "^" name { RET(TK_CARET_NAME); }
 
             name { RET(TK_NAME) }
             name "." name { RET(TK_NAME_DOT_NAME) }

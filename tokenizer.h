@@ -14,6 +14,7 @@ extern "C" {
     X(TK_NAME) \
     X(TK_NAME_DOT_NAME) \
     X(TK_HASH_NAME) \
+    X(TK_CARET_NAME) \
     X(TK_COMMENT) \
     X(TK_LPAREN) \
     X(TK_RPAREN) \
@@ -37,7 +38,6 @@ extern "C" {
     X(TK_COMMA) \
     X(TK_VBAR) \
     X(TK_AT) \
-    X(TK_CARET) \
     X(TK_DOT) \
     X(TK_ARROW) \
     X(TK_INTEGER) \
