@@ -149,8 +149,11 @@ void parser_expect_name(Parser *parser, string name) {
         return;
     } else {
         parser_error(parser,
-                str_lit("expect: unexpected symbol"),
-                parser->first, parser->last);
+            format(parser->arena,
+                str_lit("Expected TK_NAME '{}', got {}"),
+                name,
+                tokentype_to_string(parser->sym)
+            ), parser->first, parser->last);
     }
 }
 
