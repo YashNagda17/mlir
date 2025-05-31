@@ -234,6 +234,10 @@ Operation* parse_operation(Parser *parser) {
         //string reg = parser_token_str(parser);
         op->n_result_types = 1;
         parser_expect(parser, TK_REGISTER);
+        if (parser_peek(parser, TK_COLON)) {
+            parser_expect(parser, TK_COLON);
+            parser_expect(parser, TK_INTEGER);
+        }
         parser_expect(parser, TK_EQUAL);
     }
 
