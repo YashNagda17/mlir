@@ -161,6 +161,11 @@ Region* parse_region(Parser *parser) {
         Operation *op = parse_operation(parser);
         vector_int64_t_push_back(parser->arena, &operations, (int64_t)(op));
         parser_expect(parser, TK_NEWLINE);
+
+        // Skip empty lines
+        while (parser_peek(parser, TK_NEWLINE)) {
+            parser_expect(parser, TK_NEWLINE);
+        }
     }
     parser_expect(parser, TK_RBRACE);
 
