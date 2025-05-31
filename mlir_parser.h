@@ -39,7 +39,7 @@ typedef struct ValueRef {
 
 typedef struct Operation Operation;
 struct Operation {
-    string opcode;
+    string opname;
     Type **result_types;
     uint64_t n_result_types;
     ValueRef **operands;

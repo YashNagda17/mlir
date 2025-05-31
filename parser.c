@@ -29,7 +29,7 @@ struct ValueRef {
 };
 
 struct Operation {
-    std::string opcode;
+    std::string opname;
     std::vector<ValueRef> operands;
     std::vector<Type*> result_types;
     std::map<std::string, Attribute*> attributes;
@@ -257,7 +257,7 @@ public:
             expect_token(TokenType::TOKEN_PUNCTUATION, "=");
         }
         expect_token(TokenType::TOKEN_STRING);
-        op->opcode = current_token.value;
+        op->opname = current_token.value;
         //consume_token();
         expect_token(TokenType::TOKEN_PUNCTUATION, "(");
         while (current_token.value != ")") {
@@ -403,7 +403,7 @@ string print_operation(Arena *arena, int indent_level, Operation *op) {
         reg_idx++;
     }
     result = str_concat(arena, result,
-        format(arena, str_lit("{}"), op->opcode)
+        format(arena, str_lit("{}"), op->opname)
         );
     if (op->n_regions > 0) {
         result = str_concat(arena, result, str_lit(" "));

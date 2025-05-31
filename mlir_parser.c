@@ -150,6 +150,33 @@ void parser_expect_opname(Parser *parser, string name) {
 
 Operation* parse_operation(Parser *parser);
 
+// Parses a region from { to } inclusive
+Region* parse_region(Parser *parser) {
+    parser_expect(parser, TK_LBRACE);
+    parser_expect(parser, TK_NEWLINE);
+    vector_int64_t operations;
+    vector_int64_t_reserve(parser->arena, &operations, 16);
+    while (!parser_peek(parser, TK_RBRACE)) {
+        // TODO: We should be parsing blocks here, but for now we skip that
+        Operation *op = parse_operation(parser);
+        vector_int64_t_push_back(parser->arena, &operations, (int64_t)(op));
+    }
+    parser_expect(parser, TK_RBRACE);
+
+    // TODO: We assume one implicit block for now
+    Block *block = arena_alloc(parser->arena, Block);
+    block->operations = (Operation **)operations.data;
+    block->n_operations = operations.size;
+
+    Region *region = arena_alloc(parser->arena, Region);
+    Block **block2 = arena_alloc(parser->arena, Block*);
+    block2[0] = block;
+    region->blocks = block2;
+    region->n_blocks = 1;
+
+    return region;
+}
+
 Operation* parse_module(Parser *parser) {
     while (!parser_peek(parser, TK_NAME)) {
         if (parser_peek(parser, TK_HASH_NAME)) {
@@ -190,7 +217,7 @@ Operation* parse_module(Parser *parser) {
     region->n_blocks = 1;
 
     Operation *op = arena_alloc(parser->arena, Operation);
-    op->opcode = str_lit("module");
+    op->opname = str_lit("module");
     Region **regions = arena_alloc(parser->arena, Region*);
     regions[0] = region;
     op->regions = regions;
@@ -212,13 +239,43 @@ Operation* parse_func_func(Parser *parser) {
     }
     parser_expect(parser, TK_RBRACE);
     Operation *op = arena_alloc(parser->arena, Operation);
-    op->opcode = str_lit("func.func");
+    op->opname = str_lit("func.func");
     return op;
 }
 
 Operation* parse_operation(Parser *parser) {
+    Operation *op = arena_alloc(parser->arena, Operation);
+    op->regions = NULL;
+    op->n_regions = 0;
+    op->n_result_types = 0;
+    op->opname = str_lit("");
+
+    // Parse return registers if any
+    if (parser_peek(parser, TK_REGISTER)) {
+        //string reg = parser_token_str(parser);
+        op->n_result_types = 1;
+        parser_expect(parser, TK_REGISTER);
+        parser_expect(parser, TK_EQUAL);
+    }
+
+    // Parse operation name
     if (parser_peek(parser, TK_NAME) || parser_peek(parser, TK_NAME_DOT_NAME)) {
-        string op_name = parser_token_str(parser);
+        op->opname = parser_token_str(parser);
+    } else if (parser_peek(parser, TK_STRING)) {
+        op->opname = parser_token_str(parser);
+        op->opname = str_substr(op->opname, 1, op->opname.size-2);
+        parser_expect(parser, TK_STRING);
+    } else {
+        parser_error(parser,
+            format(parser->arena,
+                str_lit("Expected operation name (TK_NAME, TK_NAME_DOT_NAME or TK_STRING), got {}"),
+                tokentype_to_string(parser->sym)
+            ), parser->first, parser->last);
+    }
+
+    // Here we dispatch based on specific opnames
+
+    /*
         if (str_eq(op_name, str_lit("func.func"))) {
             return parse_func_func(parser);
         } else if (str_eq(op_name, str_lit("scf.for"))) {
@@ -231,29 +288,11 @@ Operation* parse_operation(Parser *parser) {
                     str_lit("unsupported operation"),
                     parser->first, parser->last);
         }
-    } else {
-        Operation *op = arena_alloc(parser->arena, Operation);
-        op->regions = NULL;
-        op->n_regions = 0;
-        op->n_result_types = 0;
-        op->opcode = str_lit("");
-        if (parser_peek(parser, TK_REGISTER)) {
-            //string reg = parser_token_str(parser);
-            op->n_result_types = 1;
-            parser_expect(parser, TK_REGISTER);
-            parser_expect(parser, TK_EQUAL);
-        }
-        if (parser_peek(parser, TK_STRING)) {
-            op->opcode = parser_token_str(parser);
-            op->opcode = str_substr(op->opcode, 1, op->opcode.size-2);
-            parser_expect(parser, TK_STRING);
-        } else {
-            parser_error(parser,
-                format(parser->arena,
-                    str_lit("Expected string, got {}"),
-                    tokentype_to_string(parser->sym)),
-                    parser->first, parser->last);
-        }
+    */
+
+
+    // Parse details
+    /*
         parser_expect(parser, TK_LPAREN);
         if (parser_peek(parser, TK_REGISTER)) {
             //string reg = parser_token_str(parser);
@@ -280,9 +319,24 @@ Operation* parse_operation(Parser *parser) {
             parser_expect(parser, TK_LPAREN);
             parser_expect(parser, TK_RPAREN);
         }
-        parser_expect(parser, TK_NEWLINE);
+    */
 
-        return op;
+    // Parse regions (if any), for now we assume 0 or 1 regions
+    while (!(parser_peek(parser, TK_LBRACE)
+                || parser_peek(parser, TK_NEWLINE))) {
+        parser_next_token(parser);
     }
-    return NULL;
+    if (parser_peek(parser, TK_LBRACE)) {
+        Region *region = parse_region(parser);
+
+        // TODO: for now we assume one region
+        Region **regions = arena_alloc(parser->arena, Region*);
+        regions[0] = region;
+        op->regions = regions;
+        op->n_regions = 1;
+    }
+
+    parser_expect(parser, TK_NEWLINE);
+
+    return op;
 }
