@@ -12,6 +12,7 @@
 
 #include <base/format.h>
 #include <base/io.h>
+#include <base/hashtable.h>
 
 void test_io() {
     Arena* arena = arena_create(1024*20);
@@ -75,8 +76,27 @@ void test_format() {
     arena_free(arena);
 }
 
+#define MapIntString_HASH(key) ((size_t)(key))
+#define MapIntString_EQUAL(key1, key2) ((key1) == (key2))
+
+DEFINE_HASHTABLE_FOR_TYPES(int, char*, MapIntString)
+
+void test_hashtable() {
+    Arena* arena = arena_create(1024*10);
+
+    MapIntString ht;
+    MapIntString_init(arena, &ht, 16);
+    MapIntString_insert(arena, &ht, 42, "forty-two");
+    char** value = MapIntString_get(&ht, 42);
+    assert(value);
+    printf("Value for key 42: %s\n", *value);
+
+    arena_free(arena);
+}
+
 int main() {
     test_format();
     test_io();
+    test_hashtable();
     return 0;
 }
