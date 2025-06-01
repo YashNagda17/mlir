@@ -134,4 +134,4 @@
 
 
 
-DEFINE_VECTOR_FOR_TYPE(int64_t, vector_int64_t)
+DEFINE_VECTOR_FOR_TYPE(int64_t, vector_i64)

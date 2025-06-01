@@ -144,7 +144,7 @@ string format_explicit_varg(Arena *arena, string fmt, size_t arg_count,
                 break;
             }
             case ARG_VECTOR_INT64: {
-                vector_int64_t value = va_arg(ap, vector_int64_t);
+                vector_i64 value = va_arg(ap, vector_i64);
                 s = str_lit("{");
                 for (int i=0; i<value.size; i++) {
                     s = str_concat(arena, s,

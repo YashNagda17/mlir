@@ -20,19 +20,19 @@ string tokentype_to_string(TokenType tt) {
 }
 
 
-void get_newlines(Arena *arena, const string s, vector_int64_t *newlines) {
+void get_newlines(Arena *arena, const string s, vector_i64 *newlines) {
     for (int64_t pos=0; pos < s.size; pos++) {
-        if (s.str[pos] == '\n') vector_int64_t_push_back(arena, newlines, pos);
+        if (s.str[pos] == '\n') vector_i64_push_back(arena, newlines, pos);
     }
     // Append end of file if not already present (doesn't end with \n)
     if (!(s.size > 0 && s.str[s.size-1] == '\n')) {
-        vector_int64_t_push_back(arena, newlines, s.size);
+        vector_i64_push_back(arena, newlines, s.size);
     }
     assert(newlines->size > 0);
     assert(newlines->data[newlines->size-1] >= s.size-1);
 }
 
-void linear_to_line_column(const vector_int64_t newlines, uint64_t first,
+void linear_to_line_column(const vector_i64 newlines, uint64_t first,
         int64_t *start_of_line,
         int64_t *end_of_line,
         int64_t *line_first,
@@ -55,8 +55,8 @@ void linear_to_line_column(const vector_int64_t newlines, uint64_t first,
 void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last) {
     assert(first <= last);
     string s = str_from_cstr_view((char*)parser->input);
-    vector_int64_t newlines;
-    vector_int64_t_reserve(parser->arena, &newlines, 16);
+    vector_i64 newlines;
+    vector_i64_reserve(parser->arena, &newlines, 16);
     get_newlines(parser->arena, s, &newlines);
 
     int64_t start_of_line, end_of_line, line_first, column_first;
@@ -158,11 +158,11 @@ Block* parse_block(Parser *parser) {
         }
         parser_expect(parser, TK_NEWLINE);
     }
-    vector_int64_t operations;
-    vector_int64_t_reserve(parser->arena, &operations, 16);
+    vector_i64 operations;
+    vector_i64_reserve(parser->arena, &operations, 16);
     while (! (parser_peek(parser, TK_RBRACE) || parser_peek(parser, TK_CARET_NAME))) {
         Operation *op = parse_operation(parser);
-        vector_int64_t_push_back(parser->arena, &operations, (int64_t)(op));
+        vector_i64_push_back(parser->arena, &operations, (int64_t)(op));
         parser_expect(parser, TK_NEWLINE);
 
         // Skip empty lines
@@ -182,11 +182,11 @@ Block* parse_block(Parser *parser) {
 Region* parse_region(Parser *parser) {
     parser_expect(parser, TK_LBRACE_END);
     parser_expect(parser, TK_NEWLINE);
-    vector_int64_t blocks;
-    vector_int64_t_reserve(parser->arena, &blocks, 8);
+    vector_i64 blocks;
+    vector_i64_reserve(parser->arena, &blocks, 8);
     while (!parser_peek(parser, TK_RBRACE)) {
         Block *block = parse_block(parser);
-        vector_int64_t_push_back(parser->arena, &blocks, (int64_t)(block));
+        vector_i64_push_back(parser->arena, &blocks, (int64_t)(block));
     }
     parser_expect(parser, TK_RBRACE);
 
