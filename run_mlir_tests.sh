@@ -9,3 +9,4 @@ set -ex
 ./parser test_mlir/conv2d.ttir
 ./parser test_mlir/chunked_cross_entropy_forward.ttir
 ./parser test_mlir/sumrow.ttir
+./parser test_mlir/triton_mm.ttir
