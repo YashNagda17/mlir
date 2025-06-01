@@ -10,3 +10,5 @@ set -ex
 ./parser test_mlir/chunked_cross_entropy_forward.ttir
 ./parser test_mlir/sumrow.ttir
 ./parser test_mlir/triton_mm.ttir
+./parser test_mlir/add1.ttir
+./parser test_mlir/matmul1.ttir
