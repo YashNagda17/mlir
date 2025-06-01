@@ -37,7 +37,10 @@ typedef struct ValueRef {
     uint64_t index;
 } ValueRef;
 
-// TODO: make all ** just *, since the type is known
+// Note: we use ** instead of *, because Value has a pointer to Operation or
+// Block, so we can't easily move them later. When parsing we do not know how
+// many items we will need, so we use pointers, which we can grow by copying as
+// needed.
 
 typedef struct Operation {
     string opname;
