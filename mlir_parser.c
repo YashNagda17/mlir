@@ -265,6 +265,22 @@ void parse_scf_if(Parser *parser, Operation *op) {
     op->n_regions = n_regions;
 }
 
+void parse_scf_for(Parser *parser, Operation *op) {
+    while (!parser_peek(parser, TK_LBRACE_END)) {
+        parser_next_token(parser);
+    }
+    Region *region1 = parse_region(parser);
+
+    while (!parser_peek(parser, TK_NEWLINE)) {
+        parser_next_token(parser);
+    }
+
+    Region **regions = arena_alloc(parser->arena, Region*);
+    regions[0] = region1;
+    op->regions = regions;
+    op->n_regions = 1;
+}
+
 Operation* parse_operation(Parser *parser) {
     Operation *op = arena_alloc(parser->arena, Operation);
     op->regions = NULL;
@@ -323,6 +339,8 @@ Operation* parse_operation(Parser *parser) {
         parse_tt_func(parser, op);
     } else if (str_eq(op->opname, str_lit("scf.if"))) {
         parse_scf_if(parser, op);
+    } else if (str_eq(op->opname, str_lit("scf.for"))) {
+        parse_scf_for(parser, op);
     } else {
         // Then we parse a general opname
 
