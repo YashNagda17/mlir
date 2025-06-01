@@ -153,13 +153,9 @@ Operation* parse_operation(Parser *parser);
 Block* parse_block(Parser *parser) {
     if (parser_peek(parser, TK_CARET_NAME)) {
         parser_expect(parser, TK_CARET_NAME);
-        if (parser_peek(parser, TK_LPAREN)) {
-            while (!(parser_peek(parser, TK_RPAREN))) {
-                parser_next_token(parser);
-            }
-            parser_expect(parser, TK_RPAREN);
+        while (!(parser_peek(parser, TK_NEWLINE))) {
+            parser_next_token(parser);
         }
-        parser_expect(parser, TK_COLON);
         parser_expect(parser, TK_NEWLINE);
     }
     vector_int64_t operations;
