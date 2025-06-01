@@ -12,3 +12,8 @@ set -ex
 ./parser test_mlir/triton_mm.ttir
 ./parser test_mlir/add1.ttir
 ./parser test_mlir/matmul1.ttir
+./parser test_mlir/effect.mlir
+./parser test_mlir/simple.mlir
+./parser test_mlir/t1.mlir
+./parser test_mlir/t2.mlir
+./parser test_mlir/t3.mlir
