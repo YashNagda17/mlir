@@ -10,7 +10,4 @@ clang $CFLAGS -I. -o run_tests tests/run_tests.c base/arena.c base/string.c base
 re2c --no-generation-date -b tokenizer.re -o tokenizer.c
 clang $CFLAGS -I. -o parser parser.c tokenizer.c mlir_parser.c base/arena.c base/string.c base/format.c base/io.c base/vector.c
 ./parser
-./parser a.mlir
-./parser b.mlir
-./parser c.mlir
-./parser d.mlir
+./run_mlir_tests.sh
