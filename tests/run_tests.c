@@ -79,17 +79,17 @@ void test_format() {
 #define MapIntString_HASH(key) ((size_t)(key))
 #define MapIntString_EQUAL(key1, key2) ((key1) == (key2))
 
-DEFINE_HASHTABLE_FOR_TYPES(int, char*, MapIntString)
+DEFINE_HASHTABLE_FOR_TYPES(int, string, MapIntString)
 
 void test_hashtable() {
     Arena* arena = arena_create(1024*10);
 
     MapIntString ht;
     MapIntString_init(arena, &ht, 16);
-    MapIntString_insert(arena, &ht, 42, "forty-two");
-    char** value = MapIntString_get(&ht, 42);
+    MapIntString_insert(arena, &ht, 42, str_lit("forty-two"));
+    string *value = MapIntString_get(&ht, 42);
     assert(value);
-    printf("Value for key 42: %s\n", *value);
+    println(arena, str_lit("Value for key 42: {}"), *value);
 
     arena_free(arena);
 }
