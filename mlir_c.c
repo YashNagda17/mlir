@@ -996,12 +996,14 @@ int main() {
 
     // Reference expected output
     const char *expected =
-        "func.func @example_func(%arg0: i32, %arg1: i32) {\n"
-        "  %0 = arith.constant 5 : i32\n"
-        "  %1 = arith.addi %arg0, %arg1 : i32\n"
-        "  %2 = arith.muli %1, %0 : i32\n"
-        "  \"custom.my_op\" (unregistered)\n"
-        "  func.return %2 : i32\n"
+        "module {\n"
+        "  func.func @example_func(%arg0: i32, %arg1: i32) {\n"
+        "    %0 = arith.constant 5 : i32\n"
+        "    %1 = arith.addi %arg0, %arg1 : i32\n"
+        "    %2 = arith.muli %1, %0 : i32\n"
+        "    \"custom.my_op\" (unregistered)\n"
+        "    func.return %2 : i32\n"
+        "  }\n"
         "}\n";
 
     // Test comparison
