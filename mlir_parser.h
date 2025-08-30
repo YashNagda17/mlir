@@ -78,9 +78,65 @@ typedef enum {
 
 typedef struct Region Region;
 
+// Type kinds for MLIR type system
+typedef enum {
+    TYPE_KIND_INTEGER,
+    TYPE_KIND_FLOAT,
+    TYPE_KIND_MEMREF,
+    TYPE_KIND_TENSOR,
+    TYPE_KIND_FUNCTION,
+    TYPE_KIND_INDEX
+} TypeKind;
+
+// MLIR Type representation
 typedef struct Type {
-    string str; // For now we keep the type as a string
+    TypeKind kind;
+    string str; // TODO: remove later
+    union {
+        struct {
+            uint32_t width;     // Bit width for integers
+            bool is_signed;
+        } integer;
+        struct {
+            uint32_t width;     // 16, 32, 64, etc.
+        } floating;
+        struct {
+            struct Type *element_type;
+            int64_t *shape;     // NULL-terminated or use rank
+            uint32_t rank;
+        } shaped;  // For memref and tensor
+    } data;
 } Type;
+
+// Attribute representation
+typedef struct Attribute {
+    enum {
+        ATTR_KIND_INTEGER,
+        ATTR_KIND_FLOAT,
+        ATTR_KIND_STRING,
+        ATTR_KIND_BOOL,
+        ATTR_KIND_ARRAY,
+        ATTR_KIND_DICT
+    } kind;
+    union {
+        int64_t integer_value;
+        double float_value;
+        const char *string_value;
+        bool bool_value;
+        struct {
+            struct Attribute **elements;
+            size_t count;
+        } array;
+    } data;
+    const char *name;
+} Attribute;
+
+// Named attribute for dictionaries
+typedef struct NamedAttribute {
+    const char *name;
+    Attribute *value;
+} NamedAttribute;
+
 
 typedef enum ValueKind {
     BLOCK_ARG,
@@ -108,6 +164,8 @@ typedef struct Operation {
     uint64_t n_operands;
     Type **result_types;
     uint64_t n_result_types;
+    Attribute **attributes;
+    uint64_t n_attributes;
     Region **regions;
     uint64_t n_regions;
     string opname; // Only used for unregistered ops
