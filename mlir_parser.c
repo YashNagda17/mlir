@@ -314,6 +314,19 @@ void parse_scf_while(Parser *parser, Operation *op) {
     op->n_regions = n_regions;
 }
 
+// Helper function to parse register number from %0, %1, etc.
+int parse_register_number(string reg_str) {
+    if (reg_str.size > 1 && reg_str.str[0] == '%') {
+        // Simple parsing - just assume it's %0, %1, etc.
+        if (reg_str.size == 2 && reg_str.str[1] >= '0' && reg_str.str[1] <= '9') {
+            return reg_str.str[1] - '0';
+        }
+        // For multi-digit numbers, would need more complex parsing
+        return 0;
+    }
+    return -1;
+}
+
 Operation* parse_operation(Parser *parser) {
     Operation *op = arena_alloc(parser->arena, Operation);
     op->regions = NULL;
@@ -402,38 +415,93 @@ Operation* parse_operation(Parser *parser) {
     } else if (str_eq(op->opname, str_lit("scf.while"))) {
         parse_scf_while(parser, op);
     } else {
-        // Then we parse a general opname
-
-
-    // Parse details
-    /*
-        parser_expect(parser, TK_LPAREN);
-        if (parser_peek(parser, TK_REGISTER)) {
-            //string reg = parser_token_str(parser);
-            parser_expect(parser, TK_REGISTER);
+        // Parse general operations with operands and types
+        
+        // Parse operands if operation expects them (for arith operations)
+        if (op->op_type == OP_TYPE_ARITH_CONSTANT) {
+            // arith.constant value : type
+            if (parser_peek(parser, TK_INTEGER)) {
+                // Parse the constant value as an attribute
+                string value_str = parser_token_str(parser);
+                parser_expect(parser, TK_INTEGER);
+                
+                op->n_attributes = 1;
+                op->attributes = arena_alloc_array(parser->arena, Attribute*, 1);
+                op->attributes[0] = arena_alloc(parser->arena, Attribute);
+                op->attributes[0]->kind = ATTR_KIND_INTEGER;
+                op->attributes[0]->data.integer_value = 0; // TODO: parse actual value
+                op->attributes[0]->name = "value";
+            }
+        } else if (op->op_type == OP_TYPE_ARITH_ADDI || op->op_type == OP_TYPE_ARITH_MULI || 
+                   op->op_type == OP_TYPE_ARITH_ADDF || op->op_type == OP_TYPE_ARITH_SUBI ||
+                   op->op_type == OP_TYPE_ARITH_SUBF || op->op_type == OP_TYPE_ARITH_MULF ||
+                   op->op_type == OP_TYPE_ARITH_DIVI || op->op_type == OP_TYPE_ARITH_DIVF) {
+            // Binary arith operations: operand1, operand2 : type
+            VecValueRef operands;
+            VecValueRef_reserve(parser->arena, &operands, 2);
+            
+            // Parse first operand
+            if (parser_peek(parser, TK_REGISTER)) {
+                string reg_str = parser_token_str(parser);
+                ValueRef *operand = arena_alloc(parser->arena, ValueRef);
+                operand->kind = OP_RESULT;
+                operand->result_index = parse_register_number(reg_str);
+                operand->type = arena_alloc(parser->arena, Type);
+                operand->type->str = str_lit("i32"); // TODO: infer from context
+                VecValueRef_push_back(parser->arena, &operands, operand);
+                parser_expect(parser, TK_REGISTER);
+                
+                if (parser_peek(parser, TK_COMMA)) {
+                    parser_expect(parser, TK_COMMA);
+                    
+                    // Parse second operand
+                    if (parser_peek(parser, TK_REGISTER)) {
+                        string reg_str2 = parser_token_str(parser);
+                        ValueRef *operand2 = arena_alloc(parser->arena, ValueRef);
+                        operand2->kind = OP_RESULT;
+                        operand2->result_index = parse_register_number(reg_str2);
+                        operand2->type = arena_alloc(parser->arena, Type);
+                        operand2->type->str = str_lit("i32"); // TODO: infer from context
+                        VecValueRef_push_back(parser->arena, &operands, operand2);
+                        parser_expect(parser, TK_REGISTER);
+                    }
+                }
+            }
+            
+            op->operands = operands.data;
+            op->n_operands = operands.size;
         }
-        parser_expect(parser, TK_RPAREN);
-        if (parser_peek(parser, TK_LBRACE)) {
-            parser_expect(parser, TK_LBRACE);
-            parser_expect(parser, TK_NAME);
-            parser_expect(parser, TK_EQUAL);
-            parser_expect(parser, TK_INTEGER);
-            parser_expect(parser, TK_RBRACE);
+        
+        // Parse result type for arith operations (: type)
+        if (op->op_type >= OP_TYPE_ARITH_ADDI && op->op_type <= OP_TYPE_ARITH_CMPF) {
+            if (parser_peek(parser, TK_COLON)) {
+                parser_expect(parser, TK_COLON);
+                
+                // Parse the result type
+                if (parser_peek(parser, TK_NAME)) {
+                    string type_str = parser_token_str(parser);
+                    parser_expect(parser, TK_NAME);
+                    
+                    op->n_result_types = 1;
+                    op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+                    op->result_types[0] = arena_alloc(parser->arena, Type);
+                    op->result_types[0]->str = type_str;
+                    
+                    // Set type kind based on type string
+                    if (str_eq(type_str, str_lit("i32")) || str_eq(type_str, str_lit("i64"))) {
+                        op->result_types[0]->kind = TYPE_KIND_INTEGER;
+                        op->result_types[0]->data.integer.width = str_eq(type_str, str_lit("i32")) ? 32 : 64;
+                        op->result_types[0]->data.integer.is_signed = true;
+                    } else if (str_eq(type_str, str_lit("f32")) || str_eq(type_str, str_lit("f64"))) {
+                        op->result_types[0]->kind = TYPE_KIND_FLOAT;
+                        op->result_types[0]->data.floating.width = str_eq(type_str, str_lit("f32")) ? 32 : 64;
+                    } else {
+                        // Complex type like tensor<16xf32> - for now just store the string
+                        op->result_types[0]->kind = TYPE_KIND_TENSOR;
+                    }
+                }
+            }
         }
-        parser_expect(parser, TK_COLON);
-        parser_expect(parser, TK_LPAREN);
-        if (parser_peek(parser, TK_NAME)) {
-            parser_expect(parser, TK_NAME);
-        }
-        parser_expect(parser, TK_RPAREN);
-        parser_expect(parser, TK_ARROW);
-        if (parser_peek(parser, TK_NAME)) {
-            parser_expect(parser, TK_NAME);
-        } else {
-            parser_expect(parser, TK_LPAREN);
-            parser_expect(parser, TK_RPAREN);
-        }
-    */
 
         // Parse regions (if any), for now we assume 0 or 1 regions
         while (!(

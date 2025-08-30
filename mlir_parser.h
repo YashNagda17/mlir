@@ -174,6 +174,7 @@ typedef struct Operation {
     string opname; // Only used for unregistered ops
 } Operation;
 DEFINE_VECTOR_FOR_TYPE(Operation*, VecOperation)
+DEFINE_VECTOR_FOR_TYPE(ValueRef*, VecValueRef)
 
 typedef struct Block {
     Operation **operations;
