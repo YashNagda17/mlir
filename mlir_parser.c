@@ -371,6 +371,26 @@ Operation* parse_operation(Parser *parser) {
                 tokentype_to_string(parser->sym)
             ), parser->first, parser->last);
     }
+    
+    // Set op_type based on operation name
+    if (str_eq(op->opname, str_lit("module"))) {
+        op->op_type = OP_TYPE_MODULE;
+    } else if (str_eq(op->opname, str_lit("arith.addi"))) {
+        op->op_type = OP_TYPE_ARITH_ADDI;
+    } else if (str_eq(op->opname, str_lit("arith.subi"))) {
+        op->op_type = OP_TYPE_ARITH_SUBI;
+    } else if (str_eq(op->opname, str_lit("arith.muli"))) {
+        op->op_type = OP_TYPE_ARITH_MULI;
+    } else if (str_eq(op->opname, str_lit("arith.constant"))) {
+        op->op_type = OP_TYPE_ARITH_CONSTANT;
+    } else if (str_eq(op->opname, str_lit("func.func"))) {
+        op->op_type = OP_TYPE_FUNC_FUNC;
+    } else if (str_eq(op->opname, str_lit("func.return"))) {
+        op->op_type = OP_TYPE_FUNC_RETURN;
+    } else {
+        op->op_type = OP_TYPE_UNREGISTERED;
+    }
+    
 
     // First we handle specific opnames with special parsing rules
     if (str_eq(op->opname, str_lit("tt.func"))) {

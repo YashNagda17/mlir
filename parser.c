@@ -469,7 +469,7 @@ string print_operation(Arena *arena, int indent_level, Operation *op) {
     
     // Print operation name with quotes
     result = str_concat(arena, result, str_lit("\""));
-    if (op->op_type == OP_TYPE_UNREGISTERED) {
+    if (op->opname.size > 0) {
         result = str_concat(arena, result, op->opname);
     } else {
         result = str_concat(arena, result, str_from_cstr_view((char*)op_type_to_string(op->op_type)));
@@ -787,6 +787,7 @@ int main(int argc, char *argv[]) {
         if (input_file) {
             mlir_code = read_file_ok(arena, str_from_cstr_view(input_file));
         }
+        
         tokenizer_print_all_tokens(arena, mlir_code);
 
         Parser parser;
