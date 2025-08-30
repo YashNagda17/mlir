@@ -444,14 +444,6 @@ Operation* create_unregistered_operation(const char *name,
     return op;
 }
 
-// ============================================================================
-// Printer Modes
-// ============================================================================
-
-typedef enum {
-    PRINTER_MODE_SPECIFIC,  // Operation-specific formatting
-    PRINTER_MODE_GENERIC    // Generic formatting for all operations
-} PrinterMode;
 
 // ============================================================================
 // String Buffer for Printer
@@ -806,8 +798,19 @@ static void register_all_printers(void) {
     // Register more as needed...
 }
 
-// Generic operation printer - same format for all operations
-static void buffer_print_operation_generic(StringBuffer *buf, Operation *op, int indent_level) {
+// Forward declaration
+static void buffer_print_operation_generic_internal(StringBuffer *buf, Operation *op, int indent_level);
+
+// Generic operation printer - returns string for any operation
+static char* print_operation_generic(Operation *op) {
+    StringBuffer buf;
+    buffer_init(&buf, 1024);
+    buffer_print_operation_generic_internal(&buf, op, 0);
+    return buf.buffer;  // Caller must free
+}
+
+// Internal generic operation printer - same format for all operations
+static void buffer_print_operation_generic_internal(StringBuffer *buf, Operation *op, int indent_level) {
     // Add indentation
     for (int i = 0; i < indent_level; i++) {
         buffer_append(buf, "  ");
@@ -895,7 +898,7 @@ static void buffer_print_operation_generic(StringBuffer *buf, Operation *op, int
                 // Print operations in block
                 Operation *block_op = block->first_op;
                 while (block_op) {
-                    buffer_print_operation_generic(buf, block_op, indent_level + 1);
+                    buffer_print_operation_generic_internal(buf, block_op, indent_level + 1);
                     block_op = block_op->next_op;
                 }
                 
@@ -1132,26 +1135,22 @@ static Operation* create_func_operation(const char *name, Block *body) {
 }
 
 // Print a complete module to string buffer
-static char* print_module_to_string(Operation *module, PrinterMode mode) {
+static char* print_module_to_string(Operation *module) {
     StringBuffer buf;
     buffer_init(&buf, 2048);
 
-    if (mode == PRINTER_MODE_GENERIC) {
-        buffer_print_operation_generic(&buf, module, 0);
-    } else {
-        buffer_append(&buf, "module {\n");
+    buffer_append(&buf, "module {\n");
 
-        // Walk through all operations in module's body
-        Region *body_region = operation_get_regions(module);
-        Block *body_block = body_region->first_block;
-        Operation *op = body_block->first_op;
-        while (op) {
-            buffer_print_operation(&buf, op);
-            op = op->next_op;
-        }
-
-        buffer_append(&buf, "}\n");
+    // Walk through all operations in module's body
+    Region *body_region = operation_get_regions(module);
+    Block *body_block = body_region->first_block;
+    Operation *op = body_block->first_op;
+    while (op) {
+        buffer_print_operation(&buf, op);
+        op = op->next_op;
     }
+
+    buffer_append(&buf, "}\n");
 
     return buf.buffer;  // Caller must free
 }
@@ -1276,7 +1275,7 @@ int main() {
 
     // Test 1: Specific printer mode
     printf("=== Test 1: Specific Printer Mode ===\n");
-    char *result1 = print_module_to_string(module, PRINTER_MODE_SPECIFIC);
+    char *result1 = print_module_to_string(module);
     printf("%s", result1);
 
     // Reference expected output for specific mode
@@ -1304,7 +1303,7 @@ int main() {
 
     // Test 2: Generic printer mode
     printf("=== Test 2: Generic Printer Mode ===\n");
-    char *result2 = print_module_to_string(module, PRINTER_MODE_GENERIC);
+    char *result2 = print_operation_generic(module);
     printf("%s", result2);
 
     // Reference expected output for generic mode
