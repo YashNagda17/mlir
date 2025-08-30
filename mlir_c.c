@@ -1,3 +1,5 @@
+// clang -g mlir_c.c && ./a.out
+//
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
