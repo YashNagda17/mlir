@@ -296,8 +296,8 @@ static inline void dispatch_operation_switch(Operation *op) {
             // Find "value" attribute
             for (int i = 0; i < op->num_attributes; i++) {
                 if (strcmp(attrs[i].name, "value") == 0) {
-                    printf("  %p = arith.constant %ld\n", result, 
-                           attrs[i].value->data.integer_value);
+                    printf("  %p = arith.constant %lld\n", result, 
+                           (long long)attrs[i].value->data.integer_value);
                     break;
                 }
             }
@@ -425,7 +425,7 @@ static void print_type(Type *type) {
                 if (type->data.shaped.shape[i] < 0) {
                     printf("?");
                 } else {
-                    printf("%ld", type->data.shaped.shape[i]);
+                    printf("%lld", (long long)type->data.shaped.shape[i]);
                 }
                 if (i < type->data.shaped.rank - 1) printf("x");
             }
@@ -483,7 +483,7 @@ static void print_arith_constant(Operation *op, void *ctx) {
             Attribute *attr = attrs[i].value;
             switch (attr->kind) {
                 case ATTR_KIND_INTEGER:
-                    printf("%ld", attr->data.integer_value);
+                    printf("%lld", (long long)attr->data.integer_value);
                     break;
                 case ATTR_KIND_FLOAT:
                     printf("%f", attr->data.float_value);
@@ -590,7 +590,7 @@ static void print_unregistered(Operation *op, void *ctx) {
             Attribute *attr = attrs[i].value;
             switch (attr->kind) {
                 case ATTR_KIND_INTEGER:
-                    printf("%ld", attr->data.integer_value);
+                    printf("%lld", (long long)attr->data.integer_value);
                     break;
                 case ATTR_KIND_STRING:
                     printf("\"%s\"", attr->data.string_value);
@@ -603,6 +603,30 @@ static void print_unregistered(Operation *op, void *ctx) {
     }
     
     printf("\n");
+}
+
+// ============================================================================
+// Walking Operations in a Block
+// ============================================================================
+
+static inline void walk_block_operations(Block *block, OpHandler handler, void *context) {
+    Operation *op = block->first_op;
+    while (op) {
+        Operation *next = op->next_op;  // Save next before handler (might delete op)
+        
+        // Prefetch next operation for cache performance
+        if (next) {
+            __builtin_prefetch(next, 0, 1);
+        }
+        
+        if (handler) {
+            handler(op, context);
+        } else {
+            dispatch_operation_direct(op, context);
+        }
+        
+        op = next;
+    }
 }
 
 // Register all printers
@@ -740,30 +764,6 @@ void example_create_and_print(void) {
     }
     
     printf("}\n");
-}
-
-// ============================================================================
-// Walking Operations in a Block
-// ============================================================================
-
-static inline void walk_block_operations(Block *block, OpHandler handler, void *context) {
-    Operation *op = block->first_op;
-    while (op) {
-        Operation *next = op->next_op;  // Save next before handler (might delete op)
-        
-        // Prefetch next operation for cache performance
-        if (next) {
-            __builtin_prefetch(next, 0, 1);
-        }
-        
-        if (handler) {
-            handler(op, context);
-        } else {
-            dispatch_operation_direct(op, context);
-        }
-        
-        op = next;
-    }
 }
 
 #endif // MLIR_C_CORE_H
