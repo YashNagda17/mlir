@@ -1,8 +1,3 @@
-// mlir_c_core.h - High-performance C implementation of MLIR core structures
-
-#ifndef MLIR_C_CORE_H
-#define MLIR_C_CORE_H
-
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -663,7 +658,7 @@ static void print_function(Block *entry_block, const char *name) {
 }
 
 // Example: Create and print a simple function
-void example_create_and_print(void) {
+int main() {
     printf("=== C MLIR Printer Example ===\n\n");
     
     // Register all printers
@@ -764,6 +759,5 @@ void example_create_and_print(void) {
     }
     
     printf("}\n");
+    return 0;
 }
-
-#endif // MLIR_C_CORE_H
