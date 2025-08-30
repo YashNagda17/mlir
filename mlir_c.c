@@ -13,7 +13,7 @@
 typedef enum {
     // Core ops
     OP_TYPE_UNREGISTERED = 0,  // For dynamic/unregistered operations
-    
+
     // Arithmetic dialect
     OP_TYPE_ARITH_ADDI,
     OP_TYPE_ARITH_SUBI,
@@ -26,28 +26,28 @@ typedef enum {
     OP_TYPE_ARITH_CONSTANT,
     OP_TYPE_ARITH_CMPI,
     OP_TYPE_ARITH_CMPF,
-    
+
     // Memory dialect
     OP_TYPE_MEMREF_LOAD,
     OP_TYPE_MEMREF_STORE,
     OP_TYPE_MEMREF_ALLOC,
     OP_TYPE_MEMREF_DEALLOC,
-    
+
     // Control flow
     OP_TYPE_CF_BR,
     OP_TYPE_CF_COND_BR,
     OP_TYPE_CF_SWITCH,
-    
+
     // Function dialect
     OP_TYPE_FUNC_FUNC,
     OP_TYPE_FUNC_RETURN,
     OP_TYPE_FUNC_CALL,
-    
+
     // SCF dialect
     OP_TYPE_SCF_FOR,
     OP_TYPE_SCF_WHILE,
     OP_TYPE_SCF_IF,
-    
+
     OP_TYPE_COUNT  // Total number of operation types
 } OpType;
 
@@ -131,7 +131,7 @@ struct Value {
     uint32_t result_index;   // Which result of the operation
     Type *type;              // Type of this value
     uint32_t ssa_number;     // Unique SSA number for printing
-    
+
     // Use-def chain (simplified - in practice, would be more sophisticated)
     Operation **users;       // Operations using this value
     size_t num_users;
@@ -142,14 +142,14 @@ struct Value {
 struct Block {
     Operation *first_op;
     Operation *last_op;
-    
+
     // Block arguments
     Value **arguments;
     size_t num_arguments;
-    
+
     // Parent region
     Region *parent;
-    
+
     // Linked list of blocks in region
     Block *next_block;
     Block *prev_block;
@@ -160,7 +160,7 @@ struct Region {
     Block *first_block;
     Block *last_block;
     size_t num_blocks;
-    
+
     Operation *parent_op;  // Operation that contains this region
 };
 
@@ -168,13 +168,13 @@ struct Region {
 struct Operation {
     // Type identification - FIRST for fastest access
     OpType op_type;              // 4 bytes - enum for registered ops
-    
+
     // For unregistered ops, store the string name
     const char *unregistered_name;  // 8 bytes - NULL for registered ops
-    
+
     // Location information
     Location location;           // 16 bytes (pointer + 2 ints)
-    
+
     // Operands and results - using flexible array members for cache locality
     uint16_t num_operands;       // 2 bytes
     uint16_t num_results;        // 2 bytes
@@ -182,16 +182,16 @@ struct Operation {
     uint16_t num_regions;        // 2 bytes
     uint16_t num_successors;     // 2 bytes
     // 6 bytes padding here for alignment
-    
+
     // Linked list pointers for block
     Operation *next_op;          // 8 bytes
     Operation *prev_op;          // 8 bytes
     Block *parent_block;         // 8 bytes
-    
+
     // These are allocated right after the Operation structure
     // for better cache locality (using flexible array member pattern)
     // Order: operands, results, attributes, regions, successors
-    
+
     // Flexible array member for trailing data
     void *trailing_data[];  // Contains Value*, Value*, NamedAttribute*, Region*, Block**
 };
@@ -222,20 +222,20 @@ static inline Value* operation_get_results(Operation *op) {
 }
 
 static inline NamedAttribute* operation_get_attributes(Operation *op) {
-    return (NamedAttribute*)((char*)op->trailing_data + 
+    return (NamedAttribute*)((char*)op->trailing_data +
                             op->num_operands * sizeof(Value*) +
                             op->num_results * sizeof(Value));
 }
 
 static inline Region* operation_get_regions(Operation *op) {
-    return (Region*)((char*)op->trailing_data + 
+    return (Region*)((char*)op->trailing_data +
                      op->num_operands * sizeof(Value*) +
                      op->num_results * sizeof(Value) +
                      op->num_attributes * sizeof(NamedAttribute));
 }
 
 static inline Block** operation_get_successors(Operation *op) {
-    return (Block**)((char*)op->trailing_data + 
+    return (Block**)((char*)op->trailing_data +
                      op->num_operands * sizeof(Value*) +
                      op->num_results * sizeof(Value) +
                      op->num_attributes * sizeof(NamedAttribute) +
@@ -292,7 +292,7 @@ static inline void dispatch_operation_switch(Operation *op) {
             // Find "value" attribute
             for (int i = 0; i < op->num_attributes; i++) {
                 if (strcmp(attrs[i].name, "value") == 0) {
-                    printf("  %p = arith.constant %lld\n", result, 
+                    printf("  %p = arith.constant %lld\n", result,
                            (long long)attrs[i].value->data.integer_value);
                     break;
                 }
@@ -327,7 +327,7 @@ static inline void dispatch_operations_batch(Operation **ops, size_t count, void
         if (i + 1 < count) {
             __builtin_prefetch(ops[i + 1], 0, 1);  // Prefetch next op for read
         }
-        
+
         OpHandler handler = dispatch_table[ops[i]->op_type];
         if (handler) {
             handler(ops[i], context);
@@ -351,32 +351,32 @@ static void assign_ssa_number(Value *val) {
 // Operation Creation
 // ============================================================================
 
-Operation* create_operation(OpType type, 
+Operation* create_operation(OpType type,
                            uint16_t num_operands,
                            uint16_t num_results,
                            uint16_t num_attributes,
                            uint16_t num_regions,
                            uint16_t num_successors) {
-    size_t size = operation_size(num_operands, num_results, 
+    size_t size = operation_size(num_operands, num_results,
                                 num_attributes, num_regions, num_successors);
-    
+
     // Round size up to multiple of 64 for aligned_alloc
     size_t aligned_size = ((size + 63) / 64) * 64;
-    
+
     // Allocate with proper alignment
     Operation *op = (Operation*)aligned_alloc(64, aligned_size);  // 64-byte aligned for cache
     if (!op) {
         return NULL;  // Handle allocation failure
     }
     memset(op, 0, aligned_size);
-    
+
     op->op_type = type;
     op->num_operands = num_operands;
     op->num_results = num_results;
     op->num_attributes = num_attributes;
     op->num_regions = num_regions;
     op->num_successors = num_successors;
-    
+
     // Initialize results as embedded Values
     Value *results = operation_get_results(op);
     for (int i = 0; i < num_results; i++) {
@@ -384,13 +384,13 @@ Operation* create_operation(OpType type,
         results[i].result_index = i;
         assign_ssa_number(&results[i]);
     }
-    
+
     // Initialize regions
     Region *regions = operation_get_regions(op);
     for (int i = 0; i < num_regions; i++) {
         regions[i].parent_op = op;
     }
-    
+
     return op;
 }
 
@@ -398,7 +398,7 @@ Operation* create_operation(OpType type,
 Operation* create_unregistered_operation(const char *name,
                                         uint16_t num_operands,
                                         uint16_t num_results) {
-    Operation *op = create_operation(OP_TYPE_UNREGISTERED, 
+    Operation *op = create_operation(OP_TYPE_UNREGISTERED,
                                     num_operands, num_results, 0, 0, 0);
     op->unregistered_name = strdup(name);  // Would need to manage this memory
     return op;
@@ -423,7 +423,7 @@ static void print_type(Type *type) {
         printf("<null>");
         return;
     }
-    
+
     switch (type->kind) {
         case TYPE_KIND_INTEGER:
             printf("i%d", type->data.integer.width);
@@ -457,7 +457,7 @@ static void print_type(Type *type) {
 static void print_arith_addi(Operation *op, void *ctx) {
     Value **operands = operation_get_operands(op);
     Value *result = operation_get_results(op);
-    
+
     printf("  ");
     print_value(result);
     printf(" = arith.addi ");
@@ -472,7 +472,7 @@ static void print_arith_addi(Operation *op, void *ctx) {
 static void print_arith_muli(Operation *op, void *ctx) {
     Value **operands = operation_get_operands(op);
     Value *result = operation_get_results(op);
-    
+
     printf("  ");
     print_value(result);
     printf(" = arith.muli ");
@@ -487,11 +487,11 @@ static void print_arith_muli(Operation *op, void *ctx) {
 static void print_arith_constant(Operation *op, void *ctx) {
     Value *result = operation_get_results(op);
     NamedAttribute *attrs = operation_get_attributes(op);
-    
+
     printf("  ");
     print_value(result);
     printf(" = arith.constant ");
-    
+
     // Find and print the value attribute
     for (int i = 0; i < op->num_attributes; i++) {
         if (strcmp(attrs[i].name, "value") == 0) {
@@ -509,7 +509,7 @@ static void print_arith_constant(Operation *op, void *ctx) {
             break;
         }
     }
-    
+
     printf(" : ");
     print_type(result->type);
     printf("\n");
@@ -518,7 +518,7 @@ static void print_arith_constant(Operation *op, void *ctx) {
 static void print_memref_load(Operation *op, void *ctx) {
     Value **operands = operation_get_operands(op);
     Value *result = operation_get_results(op);
-    
+
     printf("  ");
     print_value(result);
     printf(" = memref.load ");
@@ -535,7 +535,7 @@ static void print_memref_load(Operation *op, void *ctx) {
 
 static void print_memref_store(Operation *op, void *ctx) {
     Value **operands = operation_get_operands(op);
-    
+
     printf("  memref.store ");
     print_value(operands[0]);  // value to store
     printf(", ");
@@ -552,7 +552,7 @@ static void print_memref_store(Operation *op, void *ctx) {
 
 static void print_func_return(Operation *op, void *ctx) {
     Value **operands = operation_get_operands(op);
-    
+
     printf("  func.return");
     if (op->num_operands > 0) {
         printf(" ");
@@ -571,7 +571,7 @@ static void print_func_return(Operation *op, void *ctx) {
 
 static void print_unregistered(Operation *op, void *ctx) {
     printf("  \"%s\"", op->unregistered_name);
-    
+
     // Print operands
     if (op->num_operands > 0) {
         printf("(");
@@ -582,7 +582,7 @@ static void print_unregistered(Operation *op, void *ctx) {
         }
         printf(")");
     }
-    
+
     // Print results
     if (op->num_results > 0) {
         printf(" -> (");
@@ -593,7 +593,7 @@ static void print_unregistered(Operation *op, void *ctx) {
         }
         printf(")");
     }
-    
+
     // Print attributes
     if (op->num_attributes > 0) {
         printf(" {");
@@ -616,7 +616,7 @@ static void print_unregistered(Operation *op, void *ctx) {
         }
         printf("}");
     }
-    
+
     printf("\n");
 }
 
@@ -628,18 +628,18 @@ static inline void walk_block_operations(Block *block, OpHandler handler, void *
     Operation *op = block->first_op;
     while (op) {
         Operation *next = op->next_op;  // Save next before handler (might delete op)
-        
+
         // Prefetch next operation for cache performance
         if (next) {
             __builtin_prefetch(next, 0, 1);
         }
-        
+
         if (handler) {
             handler(op, context);
         } else {
             dispatch_operation_direct(op, context);
         }
-        
+
         op = next;
     }
 }
@@ -653,14 +653,14 @@ static void register_all_printers(void) {
     register_handler(OP_TYPE_MEMREF_STORE, print_memref_store);
     register_handler(OP_TYPE_FUNC_RETURN, print_func_return);
     register_handler(OP_TYPE_UNREGISTERED, print_unregistered);
-    
+
     // Register more as needed...
 }
 
 // Print a complete function
 static void print_function(Block *entry_block, const char *name) {
     printf("func.func @%s(", name);
-    
+
     // Print block arguments
     for (size_t i = 0; i < entry_block->num_arguments; i++) {
         if (i > 0) printf(", ");
@@ -668,36 +668,36 @@ static void print_function(Block *entry_block, const char *name) {
         printf(": ");
         print_type(entry_block->arguments[i]->type);
     }
-    
+
     printf(") {\n");
-    
+
     // Walk and print all operations in the block
     walk_block_operations(entry_block, NULL, NULL);  // Uses dispatch_operation_direct
-    
+
     printf("}\n");
 }
 
 // Example: Create and print a simple function
 int main() {
     printf("=== C MLIR Printer Example ===\n\n");
-    
+
     // Register all printers
     register_all_printers();
-    
+
     // Create types
     Type *i32_type = malloc(sizeof(Type));
     i32_type->kind = TYPE_KIND_INTEGER;
     i32_type->data.integer.width = 32;
     i32_type->data.integer.is_signed = true;
-    
+
     Type *i64_type = malloc(sizeof(Type));
     i64_type->kind = TYPE_KIND_INTEGER;
     i64_type->data.integer.width = 64;
     i64_type->data.integer.is_signed = true;
-    
+
     // Create a block
     Block *block = calloc(1, sizeof(Block));
-    
+
     // Create block arguments
     block->num_arguments = 2;
     block->arguments = malloc(2 * sizeof(Value*));
@@ -707,12 +707,12 @@ int main() {
     block->arguments[1] = calloc(1, sizeof(Value));
     block->arguments[1]->type = i32_type;
     block->arguments[1]->ssa_number = 1;  // %arg1
-    
+
     // Start SSA numbering after block arguments
     next_ssa_number = 0;
-    
+
     // Create operations
-    
+
     // %0 = arith.constant 5 : i32
     Operation *const_op = create_operation(OP_TYPE_ARITH_CONSTANT, 0, 1, 1, 0, 0);
     Value *const_result = operation_get_results(const_op);
@@ -722,7 +722,7 @@ int main() {
     const_attrs[0].value = malloc(sizeof(Attribute));
     const_attrs[0].value->kind = ATTR_KIND_INTEGER;
     const_attrs[0].value->data.integer_value = 5;
-    
+
     // %1 = arith.addi %arg0, %arg1 : i32
     Operation *add_op = create_operation(OP_TYPE_ARITH_ADDI, 2, 1, 0, 0, 0);
     Value **add_operands = operation_get_operands(add_op);
@@ -730,7 +730,7 @@ int main() {
     add_operands[1] = block->arguments[1];
     Value *add_result = operation_get_results(add_op);
     add_result->type = i32_type;
-    
+
     // %2 = arith.muli %1, %0 : i32
     Operation *mul_op = create_operation(OP_TYPE_ARITH_MULI, 2, 1, 0, 0, 0);
     Value **mul_operands = operation_get_operands(mul_op);
@@ -738,19 +738,19 @@ int main() {
     mul_operands[1] = const_result;
     Value *mul_result = operation_get_results(mul_op);
     mul_result->type = i32_type;
-    
+
     // func.return %2 : i32
     Operation *ret_op = create_operation(OP_TYPE_FUNC_RETURN, 1, 0, 0, 0, 0);
     Value **ret_operands = operation_get_operands(ret_op);
     ret_operands[0] = mul_result;
-    
+
     // Create an unregistered operation for demonstration
     Operation *custom_op = create_unregistered_operation("custom.my_op", 1, 1);
     Value **custom_operands = operation_get_operands(custom_op);
     custom_operands[0] = mul_result;
     Value *custom_result = operation_get_results(custom_op);
     custom_result->type = i64_type;
-    
+
     // Link operations in block
     block->first_op = const_op;
     const_op->next_op = add_op;
@@ -762,27 +762,16 @@ int main() {
     custom_op->next_op = ret_op;
     ret_op->prev_op = custom_op;
     block->last_op = ret_op;
-    
+
     // Set parent block for all operations
     const_op->parent_block = block;
     add_op->parent_block = block;
     mul_op->parent_block = block;
     custom_op->parent_block = block;
     ret_op->parent_block = block;
-    
+
     // Print the function
     print_function(block, "example_func");
-    
-    printf("\n=== Using direct dispatch to print again ===\n");
-    printf("func.func @example_func(%%arg0: i32, %%arg1: i32) {\n");
-    
-    // Walk through operations using direct dispatch
-    Operation *op = block->first_op;
-    while (op) {
-        dispatch_operation_direct(op, NULL);
-        op = op->next_op;
-    }
-    
-    printf("}\n");
+
     return 0;
 }
