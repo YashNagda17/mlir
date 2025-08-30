@@ -16,6 +16,7 @@
 typedef enum {
     // Core ops
     OP_TYPE_UNREGISTERED = 0,  // For dynamic/unregistered operations
+    OP_TYPE_MODULE,            // Module operation
 
     // Arithmetic dialect
     OP_TYPE_ARITH_ADDI,
@@ -766,7 +767,7 @@ static void buffer_print_operation(StringBuffer *buf, Operation *op) {
         case OP_TYPE_ARITH_ADDI: {
             Value **operands = operation_get_operands(op);
             Value *result = operation_get_results(op);
-            buffer_append(buf, "  ");
+            buffer_append(buf, "    ");
             buffer_print_value(buf, result);
             buffer_append(buf, " = arith.addi ");
             buffer_print_value(buf, operands[0]);
@@ -780,7 +781,7 @@ static void buffer_print_operation(StringBuffer *buf, Operation *op) {
         case OP_TYPE_ARITH_MULI: {
             Value **operands = operation_get_operands(op);
             Value *result = operation_get_results(op);
-            buffer_append(buf, "  ");
+            buffer_append(buf, "    ");
             buffer_print_value(buf, result);
             buffer_append(buf, " = arith.muli ");
             buffer_print_value(buf, operands[0]);
@@ -794,7 +795,7 @@ static void buffer_print_operation(StringBuffer *buf, Operation *op) {
         case OP_TYPE_ARITH_CONSTANT: {
             Value *result = operation_get_results(op);
             NamedAttribute *attrs = operation_get_attributes(op);
-            buffer_append(buf, "  ");
+            buffer_append(buf, "    ");
             buffer_print_value(buf, result);
             buffer_append(buf, " = arith.constant ");
 
@@ -823,7 +824,7 @@ static void buffer_print_operation(StringBuffer *buf, Operation *op) {
         }
         case OP_TYPE_FUNC_RETURN: {
             Value **operands = operation_get_operands(op);
-            buffer_append(buf, "  func.return");
+            buffer_append(buf, "    func.return");
             if (op->num_operands > 0) {
                 buffer_append(buf, " ");
                 for (int i = 0; i < op->num_operands; i++) {
@@ -839,11 +840,62 @@ static void buffer_print_operation(StringBuffer *buf, Operation *op) {
             buffer_append(buf, "\n");
             break;
         }
+        case OP_TYPE_FUNC_FUNC: {
+            NamedAttribute *attrs = operation_get_attributes(op);
+            Region *regions = operation_get_regions(op);
+
+            // Find function name
+            const char *func_name = "unknown";
+            for (int i = 0; i < op->num_attributes; i++) {
+                if (strcmp(attrs[i].name, "sym_name") == 0) {
+                    func_name = attrs[i].value->data.string_value;
+                    break;
+                }
+            }
+
+            Block *body = regions[0].first_block;
+            buffer_printf(buf, "  func.func @%s(", func_name);
+
+            // Print block arguments
+            for (size_t i = 0; i < body->num_arguments; i++) {
+                if (i > 0) buffer_append(buf, ", ");
+                buffer_print_value(buf, body->arguments[i]);
+                buffer_append(buf, ": ");
+                buffer_print_type(buf, body->arguments[i]->type);
+            }
+
+            buffer_append(buf, ") {\n");
+
+            // Print function body
+            Operation *body_op = body->first_op;
+            while (body_op) {
+                buffer_print_operation(buf, body_op);
+                body_op = body_op->next_op;
+            }
+
+            buffer_append(buf, "  }\n");
+            break;
+        }
+        case OP_TYPE_MODULE: {
+            buffer_append(buf, "module {\n");
+
+            // Print module body
+            Region *body_region = operation_get_regions(op);
+            Block *body_block = body_region->first_block;
+            Operation *body_op = body_block->first_op;
+            while (body_op) {
+                buffer_print_operation(buf, body_op);
+                body_op = body_op->next_op;
+            }
+
+            buffer_append(buf, "}\n");
+            break;
+        }
         case OP_TYPE_UNREGISTERED:
-            buffer_printf(buf, "  \"%s\" (unregistered)\n", op->unregistered_name);
+            buffer_printf(buf, "    \"%s\" (unregistered)\n", op->unregistered_name);
             break;
         default:
-            buffer_printf(buf, "  Unknown operation type: %d\n", op->op_type);
+            buffer_printf(buf, "    Unknown operation type: %d\n", op->op_type);
             break;
     }
 }
@@ -867,6 +919,79 @@ static char* print_function_to_string(Block *entry_block, const char *name) {
 
     // Walk and print all operations in the block
     Operation *op = entry_block->first_op;
+    while (op) {
+        buffer_print_operation(&buf, op);
+        op = op->next_op;
+    }
+
+    buffer_append(&buf, "}\n");
+
+    return buf.buffer;  // Caller must free
+}
+
+// ============================================================================
+// Module Creation and Management
+// ============================================================================
+
+static Operation* create_module(void) {
+    Operation *module = create_operation(OP_TYPE_MODULE, 0, 0, 0, 1, 0);
+
+    // Initialize the module's body region
+    Region *body_region = operation_get_regions(module);
+    body_region->first_block = calloc(1, sizeof(Block));
+    body_region->last_block = body_region->first_block;
+    body_region->num_blocks = 1;
+    body_region->first_block->parent = body_region;
+
+    return module;
+}
+
+static void module_add_operation(Operation *module, Operation *op) {
+    Region *body_region = operation_get_regions(module);
+    Block *body_block = body_region->first_block;
+
+    if (!body_block->first_op) {
+        body_block->first_op = op;
+        body_block->last_op = op;
+    } else {
+        body_block->last_op->next_op = op;
+        op->prev_op = body_block->last_op;
+        body_block->last_op = op;
+    }
+    op->parent_block = body_block;
+}
+
+static Operation* create_func_operation(const char *name, Block *body) {
+    Operation *func_op = create_operation(OP_TYPE_FUNC_FUNC, 0, 0, 1, 1, 0);
+
+    // Set function name as attribute
+    NamedAttribute *attrs = operation_get_attributes(func_op);
+    attrs[0].name = "sym_name";
+    attrs[0].value = malloc(sizeof(Attribute));
+    attrs[0].value->kind = ATTR_KIND_STRING;
+    attrs[0].value->data.string_value = strdup(name);
+
+    // Set body region
+    Region *regions = operation_get_regions(func_op);
+    regions[0].first_block = body;
+    regions[0].last_block = body;
+    regions[0].num_blocks = 1;
+    body->parent = &regions[0];
+
+    return func_op;
+}
+
+// Print a complete module to string buffer
+static char* print_module_to_string(Operation *module) {
+    StringBuffer buf;
+    buffer_init(&buf, 2048);
+
+    buffer_append(&buf, "module {\n");
+
+    // Walk through all operations in module's body
+    Region *body_region = operation_get_regions(module);
+    Block *body_block = body_region->first_block;
+    Operation *op = body_block->first_op;
     while (op) {
         buffer_print_operation(&buf, op);
         op = op->next_op;
@@ -990,8 +1115,13 @@ int main() {
     custom_op->parent_block = block;
     ret_op->parent_block = block;
 
-    // Print the function using string printer
-    char *result = print_function_to_string(block, "example_func");
+    // Create module and add function
+    Operation *module = create_module();
+    Operation *func_op = create_func_operation("example_func", block);
+    module_add_operation(module, func_op);
+
+    // Print the module using string printer
+    char *result = print_module_to_string(module);
     printf("%s", result);
 
     // Reference expected output
