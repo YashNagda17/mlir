@@ -1045,7 +1045,7 @@ static void buffer_print_operation(StringBuffer *buf, Operation *op) {
             break;
         }
         case OP_TYPE_UNREGISTERED:
-            buffer_printf(buf, "    \"%s\" (unregistered)\n", op->unregistered_name);
+            buffer_print_operation_generic_internal(buf, op, 2);
             break;
         default:
             buffer_printf(buf, "    Unknown operation type: %d\n", op->op_type);
@@ -1285,7 +1285,7 @@ int main() {
         "    %0 = arith.constant 5 : i32\n"
         "    %1 = arith.addi %arg0, %arg1 : i32\n"
         "    %2 = arith.muli %1, %0 : i32\n"
-        "    \"custom.my_op\" (unregistered)\n"
+        "    %3 = \"custom.my_op\"(%2) : i64\n"
         "    func.return %2 : i32\n"
         "  }\n"
         "}\n";
