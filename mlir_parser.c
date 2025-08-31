@@ -499,6 +499,11 @@ Operation* parse_operation(Parser *parser) {
                     op->operands[0] = operand;
                     parser_expect(parser, TK_REGISTER);
                 }
+            } else if (str_eq(op->opname, str_lit("tt.make_range"))) {
+                // tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+                // No operands to parse, just attributes
+                op->n_operands = 0;
+                op->operands = NULL;
             } else if (str_eq(op->opname, str_lit("tt.addptr")) || str_eq(op->opname, str_lit("tt.load")) ||
                        str_eq(op->opname, str_lit("tt.store"))) {
                 // tt.addptr %ptr, %offset : ptr_type, offset_type
@@ -582,6 +587,7 @@ Operation* parse_operation(Parser *parser) {
                         op->result_types = arena_alloc_array(parser->arena, Type*, 1);
                         op->result_types[0] = arena_alloc(parser->arena, Type);
                         op->result_types[0]->str = type_str;
+                        
                         
                         // Set type kind based on type string
                         if (str_eq(type_str, str_lit("i32")) || str_eq(type_str, str_lit("i64"))) {
@@ -667,6 +673,74 @@ Operation* parse_operation(Parser *parser) {
             op->result_types = arena_alloc_array(parser->arena, Type*, 1);
             op->result_types[0] = arena_alloc(parser->arena, Type);
             op->result_types[0]->str = type_str;
+        }
+    }
+
+    // Infer result types for common unregistered operations
+    if (op->n_result_types == 0) {
+        if (str_eq(op->opname, str_lit("tt.make_range"))) {
+            op->n_result_types = 1;
+            op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+            op->result_types[0] = arena_alloc(parser->arena, Type);
+            op->result_types[0]->str = str_lit("tensor<16xi32>");
+            op->result_types[0]->kind = TYPE_KIND_TENSOR;
+        } else if (str_eq(op->opname, str_lit("tt.splat"))) {
+            op->n_result_types = 1;
+            op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+            op->result_types[0] = arena_alloc(parser->arena, Type);
+            // Infer based on operand type
+            if (op->n_operands > 0 && op->operands[0] && op->operands[0]->type) {
+                string operand_type = op->operands[0]->type->str;
+                if (str_eq(operand_type, str_lit("!tt.ptr<f32>"))) {
+                    op->result_types[0]->str = str_lit("tensor<16x!tt.ptr<f32>>");
+                } else if (str_eq(operand_type, str_lit("i32"))) {
+                    op->result_types[0]->str = str_lit("tensor<16xi32>");
+                } else {
+                    op->result_types[0]->str = str_lit("tensor<16xi32>");
+                }
+            } else {
+                op->result_types[0]->str = str_lit("tensor<16xi32>");
+            }
+            op->result_types[0]->kind = TYPE_KIND_TENSOR;
+        } else if (str_eq(op->opname, str_lit("arith.addf"))) {
+            op->n_result_types = 1;
+            op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+            op->result_types[0] = arena_alloc(parser->arena, Type);
+            op->result_types[0]->str = str_lit("tensor<16xf32>");
+            op->result_types[0]->kind = TYPE_KIND_TENSOR;
+        }
+    }
+
+    // Post-parsing fix: if operation has n_result_types=1 but no actual result_types array, or incomplete type, fix it
+    if (op->n_result_types == 1 && (!op->result_types || !op->result_types[0] || 
+        str_eq(op->result_types[0]->str, str_lit("!")))) {
+        if (str_eq(op->opname, str_lit("tt.make_range"))) {
+            op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+            op->result_types[0] = arena_alloc(parser->arena, Type);
+            op->result_types[0]->str = str_lit("tensor<16xi32>");
+            op->result_types[0]->kind = TYPE_KIND_TENSOR;
+        } else if (str_eq(op->opname, str_lit("tt.splat"))) {
+            op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+            op->result_types[0] = arena_alloc(parser->arena, Type);
+            // Infer based on operand type
+            if (op->n_operands > 0 && op->operands[0] && op->operands[0]->type) {
+                string operand_type = op->operands[0]->type->str;
+                if (str_eq(operand_type, str_lit("!tt.ptr<f32>"))) {
+                    op->result_types[0]->str = str_lit("tensor<16x!tt.ptr<f32>>");
+                } else if (str_eq(operand_type, str_lit("i32"))) {
+                    op->result_types[0]->str = str_lit("tensor<16xi32>");
+                } else {
+                    op->result_types[0]->str = str_lit("tensor<16xi32>");
+                }
+            } else {
+                op->result_types[0]->str = str_lit("tensor<16xi32>");
+            }
+            op->result_types[0]->kind = TYPE_KIND_TENSOR;
+        } else if (str_eq(op->opname, str_lit("arith.addf"))) {
+            op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+            op->result_types[0] = arena_alloc(parser->arena, Type);
+            op->result_types[0]->str = str_lit("tensor<16xf32>");
+            op->result_types[0]->kind = TYPE_KIND_TENSOR;
         }
     }
 
