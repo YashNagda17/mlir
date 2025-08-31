@@ -25,11 +25,7 @@ log.setLevel(level)
 
 
 TESTER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
-LIBASR_DIR = os.path.dirname(TESTER_DIR)
-SRC_DIR = os.path.dirname(LIBASR_DIR)
-if "lpython" in SRC_DIR:
-    SRC_DIR = os.path.join(os.path.dirname(os.path.dirname(SRC_DIR)), "src")
-ROOT_DIR = os.path.dirname(SRC_DIR)
+ROOT_DIR = os.path.dirname(TESTER_DIR)
 
 no_color = False
 
@@ -439,9 +435,9 @@ def tester_main(compiler, single_test, is_lcompilers_executable_installed=False)
             exit(1)
 
     # So that the tests find the `lcompiler` executable
-    if not is_lcompilers_executable_installed:
-        os.environ["PATH"] = os.path.join(SRC_DIR, "bin") \
-            + os.pathsep + os.environ["PATH"]
+    #if not is_lcompilers_executable_installed:
+    #    os.environ["PATH"] = os.path.join(SRC_DIR, "bin") \
+    #        + os.pathsep + os.environ["PATH"]
     test_data = toml.load(open(os.path.join(ROOT_DIR, "tests", "tests.toml")))
     test_for_duplicates(test_data)
     filtered_tests = test_data["test"]
