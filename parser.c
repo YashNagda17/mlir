@@ -467,8 +467,9 @@ string print_operation(Arena *arena, int indent_level, Operation *op) {
         reg_idx += op->n_result_types;
     }
     
-    // Print operation name (quotes only for unregistered operations)
-    if (op->op_type == OP_TYPE_UNREGISTERED) {
+    // Print operation name (quotes only for unregistered operations, except tt.func)
+    bool is_tt_func = (op->opname.size > 0 && str_eq(op->opname, str_lit("tt.func")));
+    if (op->op_type == OP_TYPE_UNREGISTERED && !is_tt_func) {
         result = str_concat(arena, result, str_lit("\""));
         if (op->opname.size > 0) {
             result = str_concat(arena, result, op->opname);
