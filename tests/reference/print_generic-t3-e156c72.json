@@ -1,0 +1,13 @@
+{
+    "basename": "print_generic-t3-e156c72",
+    "cmd": "./parser {infile} > {outfile}",
+    "infile": "tests/t3.mlir",
+    "infile_hash": "f880377afbe6e9dd24ccfa1099014e9aefacd2ec0a46655cee525cc2",
+    "outfile": "print_generic-t3-e156c72.out",
+    "outfile_hash": "fdfcc67f519b7a68cda5f4162af3d7f37a6aa0cfbd300b4d90704798",
+    "stdout": null,
+    "stdout_hash": null,
+    "stderr": null,
+    "stderr_hash": null,
+    "returncode": 0
+}

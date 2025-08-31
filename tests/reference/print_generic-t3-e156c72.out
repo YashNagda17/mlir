@@ -1,0 +1,37 @@
+Starting main...
+Arena created...
+Parsing args...
+Arg 1: tests/t3.mlir
+Arg 2: --no-error-banner
+Arg 3: --line=-1
+Arg 4: --column=-1
+Done parsing args. use_construction=0
+MLIR:
+module() {
+^bb0:
+    func.func() {
+    ^bb0:
+        %0 = "memref.alloc"() -> ?
+        %1 = arith.constant() {value = 0} -> index
+        %2 = arith.constant() {value = 0} -> index
+        %3 = arith.subi(%c10: i32, %c0: i32) -> index
+        %4 = arith.constant() {value = 0} -> index
+        %5 = arith.constant() {value = 0} -> index
+        %6 = arith.constant() {value = 0} -> index
+        %7 = arith.subi(%c20: i32, %c0_0: i32) -> index
+        %8 = arith.constant() {value = 0} -> index
+        %9 = arith.constant() {value = 0} -> index
+        "gpu.launch"() {
+        ^bb0:
+            %10 = arith.addi(%c0: i32, %arg2: i32) -> index
+            %11 = arith.addi(%c0_0: i32, %arg5: i32) -> index
+            %12 = "memref.load"() -> ?
+            %13 = "memref.load"() -> ?
+            %14 = "arith.addf"() -> tensor<16xf32>
+            "memref.store"()
+            "gpu.terminator"()
+        }
+        "return"()
+    }
+}
+

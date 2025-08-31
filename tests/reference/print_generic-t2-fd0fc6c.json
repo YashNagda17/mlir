@@ -1,0 +1,13 @@
+{
+    "basename": "print_generic-t2-fd0fc6c",
+    "cmd": "./parser {infile} > {outfile}",
+    "infile": "tests/t2.mlir",
+    "infile_hash": "c371c8f3273fd2d065e5fd1d5e56d33a01e449089781b6a6425137ee",
+    "outfile": "print_generic-t2-fd0fc6c.out",
+    "outfile_hash": "fd733ccdeda802ee13f57ed3edcd5a9bf5e7b48635b1e4dc68aade98",
+    "stdout": null,
+    "stdout_hash": null,
+    "stderr": null,
+    "stderr_hash": null,
+    "returncode": 0
+}

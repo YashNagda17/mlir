@@ -1,0 +1,13 @@
+{
+    "basename": "print_generic-t1-658e059",
+    "cmd": "./parser {infile} > {outfile}",
+    "infile": "tests/t1.mlir",
+    "infile_hash": "a9c66d7274d4805f7aaf4de36698dbbd77d6e571c21c18c7bf075365",
+    "outfile": "print_generic-t1-658e059.out",
+    "outfile_hash": "ee70d7b282e6eb6f533c873f1c6cf0602e172bd0142cf7393bd4cd74",
+    "stdout": null,
+    "stdout_hash": null,
+    "stderr": null,
+    "stderr_hash": null,
+    "returncode": 0
+}

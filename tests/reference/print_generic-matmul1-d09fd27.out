@@ -1,0 +1,113 @@
+Starting main...
+Arena created...
+Parsing args...
+Arg 1: tests/matmul1.ttir
+Arg 2: --no-error-banner
+Arg 3: --line=-1
+Arg 4: --column=-1
+Done parsing args. use_construction=0
+MLIR:
+module() {
+^bb0:
+    tt.func(%arg0: !tt.ptr<f32,1>) {
+    ^bb0:
+        %0 = arith.constant() {value = 0} -> i32
+        %1 = arith.constant() {value = 0} -> i32
+        %2 = arith.constant() {value = 0} -> i32
+        %3 = arith.constant() {value = 0} -> i32
+        %4 = arith.constant() {value = 0} -> i32
+        %5 = arith.constant() -> ?
+        %6 = arith.constant() -> ?
+        %7 = arith.constant() -> ?
+        %8 = arith.constant() -> ?
+        %9 = arith.constant() {value = 0} -> i32
+        %10 = arith.constant() {value = 0} -> i32
+        %11 = arith.constant() {value = 0} -> i32
+        %12 = arith.constant() {value = 0} -> i32
+        %13 = "tt.get_program_id"() -> i32
+        %14 = arith.addi(%arg3: i32, %c31_i32: i32) -> i32
+        %15 = "arith.divsi"() -> ?
+        %16 = arith.addi(%arg4: i32, %c63_i32: i32) -> i32
+        %17 = "arith.divsi"() -> ?
+        %18 = arith.muli(%4: i32, %c8_i32: i32) -> i32
+        %19 = "arith.divsi"() -> ?
+        %20 = arith.muli(%6: i32, %c8_i32: i32) -> i32
+        %21 = arith.subi(%2: i32, %7: i32) -> i32
+        %22 = "arith.minsi"() -> ?
+        %23 = "arith.remsi"() -> ?
+        %24 = arith.addi(%7: i32, %10: i32) -> i32
+        %25 = "arith.remsi"() -> ?
+        %26 = "arith.divsi"() -> ?
+        %27 = arith.muli(%11: i32, %c32_i32: i32) -> i32
+        %28 = "tt.make_range"() {end = 16 : i32, start = 0 : i32} -> tensor<32xi32>
+        %29 = "tt.splat"(%14: i32) -> tensor<16xi32>
+        %30 = arith.addi(%16: i32, %15: i32) -> tensor<32xi32>
+        %31 = "tt.splat"(%arg3: !tt.ptr<f32>) -> tensor<16x!tt.ptr<f32>>
+        %32 = "arith.remsi"() -> ?
+        %33 = arith.muli(%13: i32, %c64_i32: i32) -> i32
+        %34 = "tt.make_range"() {end = 16 : i32, start = 0 : i32} -> tensor<64xi32>
+        %35 = "tt.splat"(%20: i32) -> tensor<16xi32>
+        %36 = arith.addi(%22: i32, %21: i32) -> tensor<64xi32>
+        %37 = "tt.splat"(%arg4: !tt.ptr<f32>) -> tensor<16x!tt.ptr<f32>>
+        %38 = "arith.remsi"() -> ?
+        %39 = "tt.make_range"() {end = 16 : i32, start = 0 : i32} -> tensor<16xi32>
+        %40 = "tt.expand_dims"() -> ?
+        %41 = "tt.splat"(%arg6: !tt.ptr<f32>) -> tensor<16x!tt.ptr<f32>>
+        %42 = arith.muli(%27: i32, %28: i32) -> tensor<32x1xi32>
+        %43 = "tt.expand_dims"() -> ?
+        %44 = "tt.broadcast"() -> ?
+        %45 = "tt.broadcast"() -> ?
+        %46 = arith.addi(%31: i32, %32: i32) -> tensor<32x16xi32>
+        %47 = "tt.splat"(%arg0: !tt.ptr<f32>) -> tensor<16x!tt.ptr<f32>>
+        %48 = "tt.addptr"(%34: i32, %33: i32) -> tensor<32x16x!tt.ptr<f32,1>
+        %49 = "tt.expand_dims"() -> ?
+        %50 = "tt.splat"(%arg7: !tt.ptr<f32>) -> tensor<16x!tt.ptr<f32>>
+        %51 = arith.muli(%36: i32, %37: i32) -> tensor<16x1xi32>
+        %52 = "tt.expand_dims"() -> ?
+        %53 = "tt.broadcast"() -> ?
+        %54 = "tt.broadcast"() -> ?
+        %55 = arith.addi(%40: i32, %41: i32) -> tensor<16x64xi32>
+        %56 = "tt.splat"(%arg1: !tt.ptr<f32>) -> tensor<16x!tt.ptr<f32>>
+        %57 = "tt.addptr"(%43: i32, %42: i32) -> tensor<16x64x!tt.ptr<f32,1>
+        %58 = arith.addi(%arg5: i32, %c15_i32: i32) -> i32
+        %59 = "arith.divsi"() -> ?
+        %60 = arith.muli(%arg7: i32, %c16_i32: i32) -> i32
+        %61 = "tt.splat"(%47: i32) -> tensor<16xi32>
+        %62 = "scf.for"() -> ? {
+        ^bb0:
+            %63 = arith.muli(%arg9: i32, %c16_i32: i32) -> i32
+            %64 = arith.subi(%arg5: i32, %66: i32) -> i32
+            %65 = "tt.splat"(%67: i32) -> tensor<16xi32>
+            %66 = "arith.cmpi"() -> ?
+            %67 = "tt.broadcast"() -> ?
+            %68 = "tt.load"(%arg11: !tt.ptr<f32>, %70: i32, %cst_2: i32) -> ?
+            %69 = "tt.splat"(%67: i32) -> tensor<16xi32>
+            %70 = "arith.cmpi"() -> ?
+            %71 = "tt.broadcast"() -> ?
+            %72 = "tt.load"(%arg12: !tt.ptr<f32>, %74: i32, %cst_1: i32) -> ?
+            %73 = "tt.dot"() -> ?
+            %74 = "tt.addptr"(%arg11: !tt.ptr<f32>, %cst: i32) -> tensor<32x16x!tt.ptr<f32,1>
+            %75 = "tt.addptr"(%arg12: !tt.ptr<f32>, %48: i32) -> tensor<16x64x!tt.ptr<f32,1>
+            "scf.yield"()
+        }
+        %76 = "tt.expand_dims"() -> ?
+        %77 = "tt.splat"(%arg8: !tt.ptr<f32>) -> tensor<16x!tt.ptr<f32>>
+        %78 = arith.muli(%51: i32, %50: i32) -> tensor<32x1xi32>
+        %79 = "tt.splat"(%arg2: !tt.ptr<f32>) -> tensor<16x!tt.ptr<f32>>
+        %80 = "tt.addptr"(%53: i32, %52: i32) -> tensor<32x1x!tt.ptr<f32,1>
+        %81 = "tt.expand_dims"() -> ?
+        %82 = "tt.broadcast"() -> ?
+        %83 = "tt.broadcast"() -> ?
+        %84 = "tt.addptr"(%56: i32, %57: i32) -> tensor<32x64x!tt.ptr<f32,1>
+        %85 = "tt.splat"(%arg3: !tt.ptr<f32>) -> tensor<16x!tt.ptr<f32>>
+        %86 = "arith.cmpi"() -> ?
+        %87 = "tt.splat"(%arg4: !tt.ptr<f32>) -> tensor<16x!tt.ptr<f32>>
+        %88 = "arith.cmpi"() -> ?
+        %89 = "tt.broadcast"() -> ?
+        %90 = "tt.broadcast"() -> ?
+        %91 = "arith.andi"() -> ?
+        "tt.store"(%58: i32, %49: i32)
+        "tt.return"()
+    }
+}
+

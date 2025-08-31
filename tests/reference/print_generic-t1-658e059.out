@@ -1,0 +1,28 @@
+Starting main...
+Arena created...
+Parsing args...
+Arg 1: tests/t1.mlir
+Arg 2: --no-error-banner
+Arg 3: --line=-1
+Arg 4: --column=-1
+Done parsing args. use_construction=0
+MLIR:
+module() {
+^bb0:
+    func.func() {
+    ^bb0:
+        %0 = "memref.alloc"() -> ?
+        "affine.for"() {
+        ^bb0:
+            "affine.for"() {
+            ^bb0:
+                %1 = "memref.load"() -> ?
+                %2 = "memref.load"() -> ?
+                %3 = "arith.addf"() -> tensor<16xf32>
+                "memref.store"()
+            }
+        }
+        func.return()
+    }
+}
+

@@ -1,0 +1,13 @@
+{
+    "basename": "print_generic-matmul1-d09fd27",
+    "cmd": "./parser {infile} > {outfile}",
+    "infile": "tests/matmul1.ttir",
+    "infile_hash": "4f9818648397af5506124429dd2e9a25bed36f16c98900df87d66764",
+    "outfile": "print_generic-matmul1-d09fd27.out",
+    "outfile_hash": "7170e720486cd0c1549c2b592cd1759d2c7b1ea6c3daaa5885c9076a",
+    "stdout": null,
+    "stdout_hash": null,
+    "stderr": null,
+    "stderr_hash": null,
+    "returncode": 0
+}

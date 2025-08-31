@@ -1,0 +1,35 @@
+Starting main...
+Arena created...
+Parsing args...
+Arg 1: tests/simple.mlir
+Arg 2: --no-error-banner
+Arg 3: --line=-1
+Arg 4: --column=-1
+Done parsing args. use_construction=0
+MLIR:
+module() {
+^bb0:
+    func.func()
+    func.func() {
+    ^bb0:
+        %0 = arith.constant() {value = 0} -> i64
+        "cf.br"()
+    ^bb1:
+        %1 = arith.constant() {value = 0} -> i64
+        %2 = "arith.cmpi"() -> ?
+        %3 = "arith.extui"() -> ?
+        %4 = arith.constant() {value = 0} -> i64
+        %5 = "arith.cmpi"() -> ?
+        "cf.cond_br"()
+    ^bb2:
+        %6 = arith.constant() {value = 0} -> i64
+        %7 = arith.addi(%0: i32, %c48_i64: i32) -> i64
+        %8 = "call"() -> ?
+        %9 = arith.constant() {value = 0} -> i64
+        %10 = arith.addi(%0: i32, %c1_i64: i32) -> i64
+        "cf.br"()
+    ^bb3:
+        "return"()
+    }
+}
+

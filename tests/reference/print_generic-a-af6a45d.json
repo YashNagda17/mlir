@@ -1,0 +1,13 @@
+{
+    "basename": "print_generic-a-af6a45d",
+    "cmd": "./parser {infile} > {outfile}",
+    "infile": "tests/a.mlir",
+    "infile_hash": "355bb738c0469d26570a0ed814891aa9a83f87591bf42f972182a2a9",
+    "outfile": "print_generic-a-af6a45d.out",
+    "outfile_hash": "b4e76655360225d5ed5fb9e78ffeee639784f20bc50bbdd1cab2564c",
+    "stdout": null,
+    "stdout_hash": null,
+    "stderr": null,
+    "stderr_hash": null,
+    "returncode": 0
+}
