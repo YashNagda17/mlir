@@ -65,6 +65,12 @@ clang $CFLAGS -I. -o run_tests tests/run_tests.c base/arena.c base/string.c base
 
 ## Testing
 
+After every change ensure we can build the code and run all tests:
+```
+./build.sh
+uv run run_tests.py
+```
+
 ### Test Structure
 - `tests/run_tests.c`: Unit tests for base utilities (arena, string, format, I/O)
 - `test_mlir/`: Collection of MLIR files for parser testing
@@ -76,7 +82,7 @@ clang $CFLAGS -I. -o run_tests tests/run_tests.c base/arena.c base/string.c base
 ```bash
 ./run_tests              # Unit tests
 ./run_mlir_tests.sh      # MLIR parser tests  
-python run_tests.py      # Full test suite with comparisons
+uv run run_tests.py      # Run the full diff-test testsuite
 ```
 
 ## Usage Modes
