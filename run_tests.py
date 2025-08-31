@@ -139,7 +139,7 @@ def single_test(test: Dict, verbose: bool, no_llvm: bool, skip_run_with_dbg: boo
         run_test(
             filename,
             "print_generic",
-            "parser {infile} > {outfile}",
+            "./parser {infile} > {outfile}",
             filename,
             update_reference,
             verify_hash,
