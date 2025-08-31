@@ -1,3 +1,67 @@
 [[test]]
 filename = "add_kernel.ttir"
 print_generic = true
+
+[[test]]
+filename = "a.mlir"
+print_generic = true
+
+[[test]]
+filename = "b.mlir"
+print_generic = true
+
+[[test]]
+filename = "c.mlir"
+print_generic = true
+
+[[test]]
+filename = "d.mlir"
+print_generic = true
+
+[[test]]
+filename = "effect.mlir"
+print_generic = true
+
+[[test]]
+filename = "simple.mlir"
+print_generic = true
+
+[[test]]
+filename = "t1.mlir"
+print_generic = true
+
+[[test]]
+filename = "t2.mlir"
+print_generic = true
+
+[[test]]
+filename = "t3.mlir"
+print_generic = true
+
+[[test]]
+filename = "add1.ttir"
+print_generic = true
+
+[[test]]
+filename = "add_kernel.ttir"
+print_generic = true
+
+[[test]]
+filename = "chunked_cross_entropy_forward.ttir"
+print_generic = true
+
+[[test]]
+filename = "conv2d.ttir"
+print_generic = true
+
+[[test]]
+filename = "matmul1.ttir"
+print_generic = true
+
+[[test]]
+filename = "sumrow.ttir"
+print_generic = true
+
+[[test]]
+filename = "triton_mm.ttir"
+print_generic = true
