@@ -145,11 +145,16 @@ typedef enum ValueKind {
 
 typedef struct ValueRef {
     ValueKind kind;
-    // use an index
+    // TODO: Use an index
     void* def; // Block* or Operation* that produced it
     uint32_t result_index;   // Which result of the operation
     Type *type;              // Type of this value
-    string register_name;    // For parsed register names like %0, %c16_i32
+
+    // For parsed register names like %0, %c16_i32. These names are not unique
+    // in an MLIR module. Two different Values in different regions can have the
+    // same name. If this is used for printing, then extra care must be taken
+    // that the printed Value name is unique.
+    string register_name;
 
     // Maybe later:
     //Operation **users;
