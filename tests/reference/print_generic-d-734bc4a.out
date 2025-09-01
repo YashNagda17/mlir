@@ -29,21 +29,21 @@ module() {
         %10 = "tensor.from_elements"() -> ?
         %11 = scf.if() -> ? {
         ^bb0:
-            "scf.yield"()
+            scf.yield(%10: i32)
         }{
         ^bb0:
-            "scf.yield"()
+            scf.yield(%10: i32)
         }
         %12 = "tensor.splat"() -> ?
         %13 = "linalg.copy"() -> ?
         %14 = "tensor.collapse_shape"() -> ?
         %15 = "index.constant"() -> ?
-        %18 = scf.for() -> ? {
-        ^bb0:
+        %18 = scf.for(%1: i32, %15: i32, %2: i32, %6: i16) -> ? {
+        ^bb0(%arg0: index, %arg1: i16):
             %16 = "tensor.extract"() -> ?
-            %17 = arith.addi(%999: i32, %16: i32) -> i16
+            %17 = arith.addi(%arg1: i16, %16: i32) -> i16
             "vector.print"()
-            "scf.yield"()
+            scf.yield(%17: i16)
         }
         %19 = "tensor.collapse_shape"() -> ?
         %20 = "tensor.collapse_shape"() -> ?
