@@ -512,8 +512,13 @@ string print_operation_internal(PrintCtx *ctx, int indent_level, Operation *op) 
 
             // Assign/get SSA number for the result value (after preassigning children)
             if (op->n_results > i && op->results && op->results[i]) {
-                uint32_t num = get_or_assign_ssa(ctx, op->results[i]);
-                result = str_concat(arena, result, format(arena, str_lit("%{}"), (int64_t)num));
+                ValueRef *res = op->results[i];
+                if (res->register_name.size > 0) {
+                    result = str_concat(arena, result, res->register_name);
+                } else {
+                    uint32_t num = get_or_assign_ssa(ctx, res);
+                    result = str_concat(arena, result, format(arena, str_lit("%{}"), (int64_t)num));
+                }
             } else {
                 // Should not happen; emit placeholder
                 result = str_concat(arena, result, str_lit("%_"));
@@ -549,8 +554,8 @@ string print_operation_internal(PrintCtx *ctx, int indent_level, Operation *op) 
             result = str_concat(arena, result, str_lit("NULL_OPERAND"));
             continue;
         }
-        // Use original register name for BLOCK_ARG; for results prefer parsed numeric name
-        if (operand->kind == BLOCK_ARG && operand->register_name.size > 0) {
+        // Prefer original register name when available; otherwise compute SSA number
+        if (operand->register_name.size > 0) {
             result = str_concat(arena, result, operand->register_name);
         } else {
             uint32_t num = get_or_assign_ssa(ctx, operand);

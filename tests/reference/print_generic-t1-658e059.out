@@ -11,14 +11,14 @@ module() {
 ^bb0:
     func.func() {
     ^bb0:
-        %0 = memref.alloc() -> ?
+        %result = memref.alloc() -> ?
         "affine.for"() {
         ^bb0:
             "affine.for"() {
             ^bb0:
-                %1 = memref.load() -> ?
-                %2 = memref.load() -> ?
-                %3 = arith.addf(%1: i32, %2: i32) -> f32
+                %lhs = memref.load() -> ?
+                %rhs = memref.load() -> ?
+                %sum = arith.addf(%lhs: i32, %rhs: i32) -> f32
                 memref.store()
             }
         }
