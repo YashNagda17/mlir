@@ -115,6 +115,10 @@ string op_type_to_string(OpType type) {
         case OP_TYPE_TT_GET_PROGRAM_ID: return str_lit("tt.get_program_id");
         case OP_TYPE_TT_LOAD: return str_lit("tt.load");
         case OP_TYPE_TT_STORE: return str_lit("tt.store");
+        case OP_TYPE_TT_MAKE_RANGE: return str_lit("tt.make_range");
+        case OP_TYPE_TT_SPLAT: return str_lit("tt.splat");
+        case OP_TYPE_TT_ADDPTR: return str_lit("tt.addptr");
+        case OP_TYPE_TT_RETURN: return str_lit("tt.return");
         default: return str_lit("unknown");
     }
 }
@@ -176,6 +180,14 @@ OpType op_string_to_type(string opname) {
         return OP_TYPE_TT_LOAD;
     } else if (str_eq(opname, str_lit("tt.store"))) {
         return OP_TYPE_TT_STORE;
+    } else if (str_eq(opname, str_lit("tt.make_range"))) {
+        return OP_TYPE_TT_MAKE_RANGE;
+    } else if (str_eq(opname, str_lit("tt.splat"))) {
+        return OP_TYPE_TT_SPLAT;
+    } else if (str_eq(opname, str_lit("tt.addptr"))) {
+        return OP_TYPE_TT_ADDPTR;
+    } else if (str_eq(opname, str_lit("tt.return"))) {
+        return OP_TYPE_TT_RETURN;
     } else {
         return OP_TYPE_UNREGISTERED;
     }

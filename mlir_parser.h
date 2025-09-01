@@ -110,6 +110,10 @@ typedef enum {
     OP_TYPE_TT_GET_PROGRAM_ID,
     OP_TYPE_TT_LOAD,
     OP_TYPE_TT_STORE,
+    OP_TYPE_TT_MAKE_RANGE,
+    OP_TYPE_TT_SPLAT,
+    OP_TYPE_TT_ADDPTR,
+    OP_TYPE_TT_RETURN,
 
     OP_TYPE_COUNT  // Total number of operation types
 } OpType;
