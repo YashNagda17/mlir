@@ -113,6 +113,8 @@ string op_type_to_string(OpType type) {
         case OP_TYPE_SCF_WHILE: return str_lit("scf.while");
         case OP_TYPE_SCF_IF: return str_lit("scf.if");
         case OP_TYPE_TT_GET_PROGRAM_ID: return str_lit("tt.get_program_id");
+        case OP_TYPE_TT_LOAD: return str_lit("tt.load");
+        case OP_TYPE_TT_STORE: return str_lit("tt.store");
         default: return str_lit("unknown");
     }
 }
@@ -128,12 +130,46 @@ OpType op_string_to_type(string opname) {
         return OP_TYPE_ARITH_SUBI;
     } else if (str_eq(opname, str_lit("arith.muli"))) {
         return OP_TYPE_ARITH_MULI;
+    } else if (str_eq(opname, str_lit("arith.divi"))) {
+        return OP_TYPE_ARITH_DIVI;
+    } else if (str_eq(opname, str_lit("arith.subf"))) {
+        return OP_TYPE_ARITH_SUBF;
+    } else if (str_eq(opname, str_lit("arith.mulf"))) {
+        return OP_TYPE_ARITH_MULF;
+    } else if (str_eq(opname, str_lit("arith.divf"))) {
+        return OP_TYPE_ARITH_DIVF;
     } else if (str_eq(opname, str_lit("arith.constant"))) {
         return OP_TYPE_ARITH_CONSTANT;
+    } else if (str_eq(opname, str_lit("arith.cmpi"))) {
+        return OP_TYPE_ARITH_CMPI;
+    } else if (str_eq(opname, str_lit("arith.cmpf"))) {
+        return OP_TYPE_ARITH_CMPF;
+    } else if (str_eq(opname, str_lit("memref.load"))) {
+        return OP_TYPE_MEMREF_LOAD;
+    } else if (str_eq(opname, str_lit("memref.store"))) {
+        return OP_TYPE_MEMREF_STORE;
+    } else if (str_eq(opname, str_lit("memref.alloc"))) {
+        return OP_TYPE_MEMREF_ALLOC;
+    } else if (str_eq(opname, str_lit("memref.dealloc"))) {
+        return OP_TYPE_MEMREF_DEALLOC;
+    } else if (str_eq(opname, str_lit("cf.br"))) {
+        return OP_TYPE_CF_BR;
+    } else if (str_eq(opname, str_lit("cf.cond_br"))) {
+        return OP_TYPE_CF_COND_BR;
+    } else if (str_eq(opname, str_lit("cf.switch"))) {
+        return OP_TYPE_CF_SWITCH;
     } else if (str_eq(opname, str_lit("func.func"))) {
         return OP_TYPE_FUNC_FUNC;
     } else if (str_eq(opname, str_lit("func.return"))) {
         return OP_TYPE_FUNC_RETURN;
+    } else if (str_eq(opname, str_lit("func.call"))) {
+        return OP_TYPE_FUNC_CALL;
+    } else if (str_eq(opname, str_lit("scf.for"))) {
+        return OP_TYPE_SCF_FOR;
+    } else if (str_eq(opname, str_lit("scf.while"))) {
+        return OP_TYPE_SCF_WHILE;
+    } else if (str_eq(opname, str_lit("scf.if"))) {
+        return OP_TYPE_SCF_IF;
     } else if (str_eq(opname, str_lit("tt.get_program_id"))) {
         return OP_TYPE_TT_GET_PROGRAM_ID;
     } else if (str_eq(opname, str_lit("tt.load"))) {
