@@ -47,13 +47,13 @@ module() {
         %29 = "arith.divsi"() -> ?
         %30 = arith.muli(%27: i32, %14: i32) -> i32
         %31 = tt.make_range() {end = 16 : i32, start = 0 : i32} -> tensor<64xi32>
-        %32 = tt.splat(%30: i32) -> i32
-        %33 = arith.addi(%32: i32, %31: tensor<64xi32>) -> tensor<64xi32>
+        %32 = tt.splat(%30: i32) -> tensor<16xi32>
+        %33 = arith.addi(%32: tensor<16xi32>, %31: tensor<64xi32>) -> tensor<64xi32>
         %34 = arith.muli(%29: i32, %13: i32) -> i32
         %35 = tt.make_range() {end = 16 : i32, start = 0 : i32} -> tensor<128xi32>
-        %36 = tt.splat(%34: i32) -> i32
-        %37 = arith.addi(%36: i32, %35: tensor<128xi32>) -> tensor<128xi32>
-        %38 = tt.splat(%arg3: i32) -> i32
+        %36 = tt.splat(%34: i32) -> tensor<16xi32>
+        %37 = arith.addi(%36: tensor<16xi32>, %35: tensor<128xi32>) -> tensor<128xi32>
+        %38 = tt.splat(%arg3: i32) -> tensor<16xi32>
         %39 = "arith.remsi"() -> ?
         %40 = "arith.remsi"() -> ?
         %41 = tt.make_range() {end = 16 : i32, start = 0 : i32} -> tensor<32xi32>
@@ -84,7 +84,7 @@ module() {
         }
         %64 = "tt.expand_dims"(%33: tensor<64xi32>) -> tensor<64xi32>
         %65 = "tt.expand_dims"(%37: tensor<128xi32>) -> tensor<128xi32>
-        %66 = tt.splat(%arg3: i32) -> i32
+        %66 = tt.splat(%arg3: i32) -> tensor<16xi32>
         %67 = arith.cmpi() -> ?
         %68 = arith.cmpi() -> ?
         %69 = "tt.broadcast"(%67: i32) -> tensor<64x1xi1>

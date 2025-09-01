@@ -1536,8 +1536,9 @@ Operation* parse_operation(Parser *parser) {
 
         // Parse result type for operations that have : type syntax (excluding void operations)
         bool is_void_tt_op = (str_eq(op->opname, str_lit("tt.store")) || str_eq(op->opname, str_lit("tt.return")));
+        bool is_tt_splat = str_eq(op->opname, str_lit("tt.splat"));
         if ((op->op_type >= OP_TYPE_ARITH_ADDI && op->op_type <= OP_TYPE_ARITH_CMPF) ||
-            ((op->opname.size > 3 && op->opname.str[0] == 't' && op->opname.str[1] == 't' && op->opname.str[2] == '.') && !is_void_tt_op) ||
+            ((op->opname.size > 3 && op->opname.str[0] == 't' && op->opname.str[1] == 't' && op->opname.str[2] == '.') && !is_void_tt_op && !is_tt_splat) ||
             (op->op_type == OP_TYPE_UNREGISTERED && parser_peek(parser, TK_COLON))) {
             if (parser_peek(parser, TK_COLON)) {
                 parser_expect(parser, TK_COLON);
@@ -1634,7 +1635,7 @@ Operation* parse_operation(Parser *parser) {
     }
 
     // Parse result types (applies to all operations if not already set)
-    if (op->n_result_types == 0 && parser_peek(parser, TK_ARROW)) {
+    if (!op->result_types && parser_peek(parser, TK_ARROW)) {
         parser_expect(parser, TK_ARROW);
 
         // Parse result type
