@@ -19,7 +19,7 @@ module() {
                 %lhs = memref.load(%arg0: unknown, %arg0: index, %arg0: index) -> memref<10x20xf32>
                 %rhs = memref.load(%arg1: unknown, %arg0: index, %arg0: index) -> memref<10x20xf32>
                 %sum = arith.addf(%lhs: memref<10x20xf32>, %rhs: memref<10x20xf32>) -> f32
-                %_ = memref.store(%sum: f32, %result: i32, %arg0: index, %arg0: index) -> memref<10x20xf32>
+                memref.store(%sum: f32, %result: i32, %arg0: index, %arg0: index)
             }
         }
         func.return(%result: i32)

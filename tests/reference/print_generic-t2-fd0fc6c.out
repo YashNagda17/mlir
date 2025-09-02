@@ -25,7 +25,7 @@ module() {
                 %0 = memref.load(%arg0: unknown, %arg0: index, %arg0: index) -> memref<10x20xf32>
                 %1 = memref.load(%arg1: unknown, %arg0: index, %arg0: index) -> memref<10x20xf32>
                 %2 = arith.addf(%0: memref<10x20xf32>, %1: memref<10x20xf32>) -> f32
-                %_ = memref.store(%2: f32, %alloc: i32, %arg0: index, %arg0: index) -> memref<10x20xf32>
+                memref.store(%2: f32, %alloc: i32, %arg0: index, %arg0: index)
             }
         }
         "return"(%alloc: i32)

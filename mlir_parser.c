@@ -1140,6 +1140,68 @@ static void parse_memref_load_or_store(Parser *parser, Operation *op) {
     op->n_operands = operands.size;
 }
 
+// Parse memref.store: operands, optional indices and trailing type; no results
+static void parse_memref_store(Parser *parser, Operation *op) {
+    // Reuse common operand + index parsing
+    parse_memref_load_or_store(parser, op);
+
+    // Consume trailing ": memref<...>" conservatively and optional loc()
+    if (parser_peek(parser, TK_COLON)) {
+        parser_expect(parser, TK_COLON);
+        int angle = 0;
+        while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
+            if (parser_peek(parser, TK_LANGLE)) angle++;
+            else if (parser_peek(parser, TK_RANGLE) && angle > 0) angle--;
+            if (angle == 0 && parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
+            parser_next_token(parser);
+        }
+        if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
+            parse_loc(parser);
+        }
+    }
+    // Ensure no results
+    op->n_result_types = 0;
+}
+
+// Parse vector.print: operands and trailing type; no results
+static void parse_vector_print(Parser *parser, Operation *op) {
+    // Parse a single operand (conservatively allow more, comma-separated)
+    VecValueRef operands; VecValueRef_reserve(parser->arena, &operands, 2);
+    while (parser_peek(parser, TK_REGISTER)) {
+        string reg = parser_token_str(parser);
+        parser_expect(parser, TK_REGISTER);
+        ValueRef *val = symbol_table_lookup(&parser->symbol_table, reg);
+        if (!val) {
+            val = create_value_ref(parser->arena, BLOCK_ARG);
+            val->register_name = reg;
+            val->type = arena_alloc(parser->arena, Type);
+            val->type->str = str_lit("unknown");
+            val->type->kind = TYPE_KIND_INTEGER;
+        }
+        VecValueRef_push_back(parser->arena, &operands, val);
+        if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
+    }
+    op->operands = operands.data;
+    op->n_operands = operands.size;
+
+    // Consume trailing ": type" and optional loc()
+    if (parser_peek(parser, TK_COLON)) {
+        parser_expect(parser, TK_COLON);
+        int angle = 0;
+        while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
+            if (parser_peek(parser, TK_LANGLE)) angle++;
+            else if (parser_peek(parser, TK_RANGLE) && angle > 0) angle--;
+            if (angle == 0 && parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
+            parser_next_token(parser);
+        }
+        if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
+            parse_loc(parser);
+        }
+    }
+    // Ensure no results
+    op->n_result_types = 0;
+}
+
 // Generic/unregistered operation parsing: operands, attrs/result types, optional region, loc
 static void parse_generic_operation(Parser *parser, Operation *op) {
     // Parse operands until attributes, result type, or region begin
@@ -2015,8 +2077,14 @@ Operation* parse_operation(Parser *parser) {
         parse_tt_store(parser, op);
     } else if (str_eq(op->opname, str_lit("affine.for"))) {
         parse_affine_for(parser, op);
-    } else if (str_eq(op->opname, str_lit("memref.load")) || str_eq(op->opname, str_lit("memref.store"))) {
+    } else if (str_eq(op->opname, str_lit("memref.load"))) {
         parse_memref_load_or_store(parser, op);
+    } else if (str_eq(op->opname, str_lit("memref.store"))) {
+        parse_memref_store(parser, op);
+        skip_generic_tail = true;
+    } else if (str_eq(op->opname, str_lit("vector.print"))) {
+        parse_vector_print(parser, op);
+        skip_generic_tail = true;
     } else if (str_eq(op->opname, str_lit("tensor.extract"))) {
         parse_tensor_extract(parser, op);
     } else {
@@ -2053,9 +2121,7 @@ Operation* parse_operation(Parser *parser) {
         op->results = arena_alloc_array(parser->arena, ValueRef*, 1);
         op->results[0] = result_value;
     } else if (op->n_result_types > 0) {
-        // If operation produces a result but no explicit register name was parsed,
-        // it might be an error, but let's handle it gracefully for unregistered ops
-        // that produce results without explicit SSA names
+        parser_warning(parser, str_lit("ICE: parsed no result"), parser->first, parser->last);
     }
 
     return op;
