@@ -6,6 +6,23 @@ Arg 2: --no-error-banner
 Arg 3: --line=-1
 Arg 4: --column=-1
 Done parsing args. use_construction=0
-Syntax error (6:16): Use of undefined SSA value
-	affine.for %i = 0 to 10 {
-               ^
+MLIR:
+module() {
+^bb0:
+    func.func() {
+    ^bb0:
+        %result = memref.alloc() -> ?
+        "affine.for"() {
+        ^bb0(%arg0: index):
+            "affine.for"() {
+            ^bb0(%arg0: index):
+                %lhs = memref.load(%arg0: unknown, %arg0: index, %arg0: index) -> memref<10x20xf32>
+                %rhs = memref.load(%arg1: unknown, %arg0: index, %arg0: index) -> memref<10x20xf32>
+                %sum = arith.addf(%lhs: memref<10x20xf32>, %rhs: memref<10x20xf32>) -> f32
+                %_ = memref.store(%sum: f32, %result: i32, %arg0: index, %arg0: index) -> memref<10x20xf32>
+            }
+        }
+        func.return(%result: i32)
+    }
+}
+
