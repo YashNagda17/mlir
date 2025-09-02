@@ -29,7 +29,7 @@ module() {
         %6 = arith.addi(%0: i64, %c1_i64: i64) -> i64
         cf.br()
     ^bb3:
-        %_ = "return"(%0: i64) -> i64
+        "return"(%0: i64)
     }
 }
 

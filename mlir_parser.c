@@ -628,8 +628,13 @@ static void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
     if (parser_peek(parser, TK_COLON)) {
         parser_expect(parser, TK_COLON);
 
-        // Do not assign a result type for void ops like tt.store/tt.return; just consume
-        if (str_eq(op->opname, str_lit("tt.store")) || str_eq(op->opname, str_lit("tt.return"))) {
+        // Do not assign a result type for void ops; just consume
+        if (str_eq(op->opname, str_lit("tt.store")) ||
+            str_eq(op->opname, str_lit("tt.return")) ||
+            str_eq(op->opname, str_lit("return")) ||
+            str_eq(op->opname, str_lit("func.return")) ||
+            str_eq(op->opname, str_lit("std.return")) ||
+            str_eq(op->opname, str_lit("scf.yield"))) {
             while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
                 if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
                     parse_loc(parser);
