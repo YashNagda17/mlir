@@ -628,23 +628,6 @@ static void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
     if (parser_peek(parser, TK_COLON)) {
         parser_expect(parser, TK_COLON);
 
-        // Do not assign a result type for void ops; just consume
-        if (str_eq(op->opname, str_lit("tt.store")) ||
-            str_eq(op->opname, str_lit("tt.return")) ||
-            str_eq(op->opname, str_lit("return")) ||
-            str_eq(op->opname, str_lit("func.return")) ||
-            str_eq(op->opname, str_lit("std.return")) ||
-            str_eq(op->opname, str_lit("scf.yield"))) {
-            while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
-                if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
-                    parse_loc(parser);
-                    break;
-                }
-                parser_next_token(parser);
-            }
-            return;
-        }
-
         // Handle forms like ": (type, ...) -> type"
         if (parser_peek(parser, TK_LPAREN)) {
             // Consume argument type list inside parens
@@ -729,16 +712,8 @@ static void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
                     op->result_types[0]->str = type_right;
                 }
             } else if (parser_peek(parser, TK_COMMA)) {
-                // Operand type list ": type, type, ..."
-                // For tt.addptr specifically, set result type to the first operand type
-                if (str_eq(op->opname, str_lit("tt.addptr"))) {
-                    op->n_result_types = 1;
-                    op->result_types = arena_alloc_array(parser->arena, Type*, 1);
-                    op->result_types[0] = arena_alloc(parser->arena, Type);
-                    op->result_types[0]->str = type_left;
-                }
-                // Consume until end of list
-                while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE)) {
+                // Operand type list ": type, type, ..." — consume conservatively
+                while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
                     if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
                     parser_next_token(parser);
                 }
@@ -1506,7 +1481,7 @@ Operation* parse_operation(Parser *parser) {
         }
     }
 
-    // Check for void operations that start with operation name instead of result assignment
+    // Check for operations that start with operation name instead of result assignment
     if (parser_peek(parser, TK_NAME) || parser_peek(parser, TK_NAME_DOT_NAME)) {
         string potential_opname = parser_token_str(parser);
         if (str_eq(potential_opname, str_lit("scf.yield"))) {
@@ -1545,6 +1520,49 @@ Operation* parse_operation(Parser *parser) {
                 parser_next_token(parser);
             }
             
+            return op;
+        } else if (
+            str_eq(potential_opname, str_lit("return")) ||
+            str_eq(potential_opname, str_lit("func.return")) ||
+            str_eq(potential_opname, str_lit("std.return")) ||
+            str_eq(potential_opname, str_lit("tt.return"))
+        ) {
+            // Handle return-like ops generically: parse operands, no result type
+            op->opname = potential_opname;
+            op->op_type = op_string_to_type(potential_opname);
+            parser_next_token(parser); // consume operation name
+
+            // Parse optional operands
+            VecValueRef operands;
+            VecValueRef_reserve(parser->arena, &operands, 2);
+            while (parser_peek(parser, TK_REGISTER)) {
+                string reg_str = parser_token_str(parser);
+                parser_expect(parser, TK_REGISTER);
+                ValueRef *operand = symbol_table_lookup(&parser->symbol_table, reg_str);
+                if (!operand) {
+                    parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
+                    return NULL;
+                }
+                VecValueRef_push_back(parser->arena, &operands, operand);
+                if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
+            }
+            op->operands = operands.data;
+            op->n_operands = operands.size;
+
+            // Consume any trailing ": ..." types or loc(), without assigning result types
+            if (parser_peek(parser, TK_COLON)) {
+                // Consume tokens until newline/brace
+                do {
+                    if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
+                        parse_loc(parser);
+                        break;
+                    }
+                    parser_next_token(parser);
+                } while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE) && !parser_peek(parser, TK_EOF));
+            }
+
+            // Done with this op line
+            while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
             return op;
         }
     }
