@@ -951,6 +951,40 @@ static void parse_tt_addptr_load_store(Parser *parser, Operation *op) {
     }
 }
 
+// Parse tt.store: operands, optional attribute dict, and trailing type list; no results
+static void parse_tt_store(Parser *parser, Operation *op) {
+    // Reuse common operand parsing for tt.addptr/load/store
+    parse_tt_addptr_load_store(parser, op);
+
+    // Optional attribute dict after operands
+    if (parser_peek(parser, TK_LBRACE)) {
+        parser_expect(parser, TK_LBRACE);
+        int brace_depth = 1;
+        while (brace_depth > 0 && !parser_peek(parser, TK_EOF)) {
+            if (parser_peek(parser, TK_LBRACE)) brace_depth++;
+            else if (parser_peek(parser, TK_RBRACE)) brace_depth--;
+            parser_next_token(parser);
+        }
+    }
+
+    // Trailing operand type list ": ..." (consume conservatively)
+    if (parser_peek(parser, TK_COLON)) {
+        parser_expect(parser, TK_COLON);
+        int angle = 0;
+        while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
+            if (parser_peek(parser, TK_LANGLE)) angle++;
+            else if (parser_peek(parser, TK_RANGLE) && angle > 0) angle--;
+            // Allow loc() to be parsed by the generic helper
+            if (angle == 0 && parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
+            parser_next_token(parser);
+        }
+        // Optional trailing loc()
+        if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
+            parse_loc(parser);
+        }
+    }
+}
+
 static void parse_tensor_extract(Parser *parser, Operation *op) {
     VecValueRef operands;
     VecValueRef_reserve(parser->arena, &operands, 2);
@@ -1856,36 +1890,7 @@ Operation* parse_operation(Parser *parser) {
     } else if (str_eq(op->opname, str_lit("tt.addptr")) || str_eq(op->opname, str_lit("tt.load"))) {
         parse_tt_addptr_load_store(parser, op);
     } else if (str_eq(op->opname, str_lit("tt.store"))) {
-        // Parse operands then consume trailing type list and optional loc without producing results
-        parse_tt_addptr_load_store(parser, op);
-        // Optional attribute dict after operands
-        if (parser_peek(parser, TK_LBRACE)) {
-            parser_expect(parser, TK_LBRACE);
-            int brace_depth = 1;
-            while (brace_depth > 0 && !parser_peek(parser, TK_EOF)) {
-                if (parser_peek(parser, TK_LBRACE)) brace_depth++;
-                else if (parser_peek(parser, TK_RBRACE)) brace_depth--;
-                parser_next_token(parser);
-            }
-        }
-        // Consume trailing ": ..." conservatively
-        if (parser_peek(parser, TK_COLON)) {
-            parser_expect(parser, TK_COLON);
-            // Consume until newline or closing brace; allow nested angle brackets
-            int angle = 0;
-            while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
-                if (parser_peek(parser, TK_LANGLE)) angle++;
-                else if (parser_peek(parser, TK_RANGLE) && angle > 0) angle--;
-                // Stop before loc() to allow proper loc parsing
-                if (angle == 0 && parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
-                parser_next_token(parser);
-            }
-            // Optional trailing loc()
-            if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
-                parse_loc(parser);
-            }
-        }
-        skip_generic_tail = true;
+        parse_tt_store(parser, op);
     } else if (str_eq(op->opname, str_lit("affine.for"))) {
         parse_affine_for(parser, op);
     } else if (str_eq(op->opname, str_lit("memref.load")) || str_eq(op->opname, str_lit("memref.store"))) {
