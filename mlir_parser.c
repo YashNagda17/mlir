@@ -2633,6 +2633,45 @@ string get_register_name(string reg_str) {
     return str_lit("%unknown");
 }
 
+void parse_return_operation(Parser *parser, Operation *op) {
+    // Consume optional operands, with or without parentheses
+    if (parser_peek(parser, TK_LPAREN)) {
+        parser_expect(parser, TK_LPAREN);
+        bool first = true;
+        while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
+            if (!first && parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
+            first = false;
+            if (parser_peek(parser, TK_REGISTER)) {
+                parser_expect(parser, TK_REGISTER);
+            } else {
+                parser_next_token(parser);
+            }
+        }
+        parser_expect(parser, TK_RPAREN);
+    } else {
+        while (parser_peek(parser, TK_REGISTER)) {
+            parser_expect(parser, TK_REGISTER);
+            if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
+        }
+    }
+    // Consume optional ": ..." and loc()
+    if (parser_peek(parser, TK_COLON)) {
+        parser_expect(parser, TK_COLON);
+        int angle = 0, paren = 0;
+        while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
+            if (parser_peek(parser, TK_LANGLE)) angle++;
+            else if (parser_peek(parser, TK_RANGLE) && angle > 0) angle--;
+            else if (parser_peek(parser, TK_LPAREN)) paren++;
+            else if (parser_peek(parser, TK_RPAREN) && paren > 0) paren--;
+            if (angle == 0 && paren == 0 && parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
+            parser_next_token(parser);
+        }
+        if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) parse_loc(parser);
+    }
+    // No results
+    op->n_result_types = 0;
+}
+
 Operation* parse_operation(Parser *parser) {
     bool parse_generic_tail = false; // when specialized parser fully consumes tail
     Operation *op = arena_alloc(parser->arena, Operation);
@@ -2874,42 +2913,7 @@ Operation* parse_operation(Parser *parser) {
                str_eq(op->opname, str_lit("std.return")) ||
                str_eq(op->opname, str_lit("func.return")) ||
                str_eq(op->opname, str_lit("return"))) {
-        // Consume optional operands, with or without parentheses
-        if (parser_peek(parser, TK_LPAREN)) {
-            parser_expect(parser, TK_LPAREN);
-            bool first = true;
-            while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
-                if (!first && parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
-                first = false;
-                if (parser_peek(parser, TK_REGISTER)) {
-                    parser_expect(parser, TK_REGISTER);
-                } else {
-                    parser_next_token(parser);
-                }
-            }
-            parser_expect(parser, TK_RPAREN);
-        } else {
-            while (parser_peek(parser, TK_REGISTER)) {
-                parser_expect(parser, TK_REGISTER);
-                if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
-            }
-        }
-        // Consume optional ": ..." and loc()
-        if (parser_peek(parser, TK_COLON)) {
-            parser_expect(parser, TK_COLON);
-            int angle = 0, paren = 0;
-            while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
-                if (parser_peek(parser, TK_LANGLE)) angle++;
-                else if (parser_peek(parser, TK_RANGLE) && angle > 0) angle--;
-                else if (parser_peek(parser, TK_LPAREN)) paren++;
-                else if (parser_peek(parser, TK_RPAREN) && paren > 0) paren--;
-                if (angle == 0 && paren == 0 && parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
-                parser_next_token(parser);
-            }
-            if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) parse_loc(parser);
-        }
-        // No results
-        op->n_result_types = 0;
+        parse_return_operation(parser, op);
     } else if (str_eq(op->opname, str_lit("tensor.extract"))) {
         parse_tensor_extract(parser, op);
         parse_generic_tail = true;
