@@ -123,6 +123,23 @@ string op_type_to_string(OpType type) {
         case OP_TYPE_TT_SPLAT: return str_lit("tt.splat");
         case OP_TYPE_TT_ADDPTR: return str_lit("tt.addptr");
         case OP_TYPE_TT_RETURN: return str_lit("tt.return");
+        case OP_TYPE_ARITH_SELECT: return str_lit("arith.select");
+        case OP_TYPE_TT_FUNC: return str_lit("tt.func");
+        case OP_TYPE_TT_CALL: return str_lit("tt.call");
+        case OP_TYPE_TT_REDUCE: return str_lit("tt.reduce");
+        case OP_TYPE_GPU_LAUNCH: return str_lit("gpu.launch");
+        case OP_TYPE_AFFINE_FOR: return str_lit("affine.for");
+        case OP_TYPE_AFFINE_LOAD: return str_lit("affine.load");
+        case OP_TYPE_VECTOR_PRINT: return str_lit("vector.print");
+        case OP_TYPE_STD_CONSTANT: return str_lit("std.constant");
+        case OP_TYPE_STD_RETURN: return str_lit("std.return");
+        case OP_TYPE_TENSOR_EXTRACT: return str_lit("tensor.extract");
+        case OP_TYPE_TENSOR_SPLAT: return str_lit("tensor.splat");
+        case OP_TYPE_TENSOR_COLLAPSE_SHAPE: return str_lit("tensor.collapse_shape");
+        case OP_TYPE_LINALG_FILL: return str_lit("linalg.fill");
+        case OP_TYPE_INDEX_CONSTANT: return str_lit("index.constant");
+        case OP_TYPE_RETURN: return str_lit("return");
+        case OP_TYPE_TT_REDUCE_RETURN: return str_lit("tt.reduce.return");
         default: return str_lit("unknown");
     }
 }
@@ -196,6 +213,40 @@ OpType op_string_to_type(string opname) {
         return OP_TYPE_TT_ADDPTR;
     } else if (str_eq(opname, str_lit("tt.return"))) {
         return OP_TYPE_TT_RETURN;
+    } else if (str_eq(opname, str_lit("arith.select"))) {
+        return OP_TYPE_ARITH_SELECT;
+    } else if (str_eq(opname, str_lit("tt.func"))) {
+        return OP_TYPE_TT_FUNC;
+    } else if (str_eq(opname, str_lit("tt.call"))) {
+        return OP_TYPE_TT_CALL;
+    } else if (str_eq(opname, str_lit("tt.reduce"))) {
+        return OP_TYPE_TT_REDUCE;
+    } else if (str_eq(opname, str_lit("gpu.launch"))) {
+        return OP_TYPE_GPU_LAUNCH;
+    } else if (str_eq(opname, str_lit("affine.for"))) {
+        return OP_TYPE_AFFINE_FOR;
+    } else if (str_eq(opname, str_lit("affine.load"))) {
+        return OP_TYPE_AFFINE_LOAD;
+    } else if (str_eq(opname, str_lit("vector.print"))) {
+        return OP_TYPE_VECTOR_PRINT;
+    } else if (str_eq(opname, str_lit("std.constant"))) {
+        return OP_TYPE_STD_CONSTANT;
+    } else if (str_eq(opname, str_lit("std.return"))) {
+        return OP_TYPE_STD_RETURN;
+    } else if (str_eq(opname, str_lit("tensor.extract"))) {
+        return OP_TYPE_TENSOR_EXTRACT;
+    } else if (str_eq(opname, str_lit("tensor.splat"))) {
+        return OP_TYPE_TENSOR_SPLAT;
+    } else if (str_eq(opname, str_lit("tensor.collapse_shape"))) {
+        return OP_TYPE_TENSOR_COLLAPSE_SHAPE;
+    } else if (str_eq(opname, str_lit("linalg.fill"))) {
+        return OP_TYPE_LINALG_FILL;
+    } else if (str_eq(opname, str_lit("index.constant"))) {
+        return OP_TYPE_INDEX_CONSTANT;
+    } else if (str_eq(opname, str_lit("return"))) {
+        return OP_TYPE_RETURN;
+    } else if (str_eq(opname, str_lit("tt.reduce.return"))) {
+        return OP_TYPE_TT_REDUCE_RETURN;
     } else {
         return OP_TYPE_UNREGISTERED;
     }
@@ -778,14 +829,14 @@ static void parse_arith_constant(Parser *parser, Operation *op) {
         // Handle boolean constants: true or false
         if (str_eq(name_str, str_lit("true")) || str_eq(name_str, str_lit("false"))) {
             parser_expect(parser, TK_NAME);
-            
+
             op->n_attributes = 1;
             op->attributes = arena_alloc_array(parser->arena, Attribute*, 1);
             op->attributes[0] = arena_alloc(parser->arena, Attribute);
             op->attributes[0]->kind = ATTR_KIND_INTEGER;
             op->attributes[0]->data.integer_value = str_eq(name_str, str_lit("true")) ? 1 : 0;
             op->attributes[0]->name = str_lit("value");
-            
+
             // Boolean constants have implicit i1 type
             op->n_result_types = 1;
             op->result_types = arena_alloc_array(parser->arena, Type*, 1);
@@ -867,10 +918,10 @@ static void parse_func_call(Parser *parser, Operation *op) {
     // Parse operands in parentheses
     if (parser_peek(parser, TK_LPAREN)) {
         parser_expect(parser, TK_LPAREN);
-        
+
         VecValueRef operands;
         VecValueRef_reserve(parser->arena, &operands, 4);
-        
+
         while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
             if (parser_peek(parser, TK_REGISTER)) {
                 string reg_str = parser_token_str(parser);
@@ -884,18 +935,18 @@ static void parse_func_call(Parser *parser, Operation *op) {
             } else {
                 parser_next_token(parser); // skip unknown tokens
             }
-            
+
             if (parser_peek(parser, TK_COMMA)) {
                 parser_expect(parser, TK_COMMA);
             } else if (!parser_peek(parser, TK_RPAREN)) {
                 break;
             }
         }
-        
+
         if (parser_peek(parser, TK_RPAREN)) {
             parser_expect(parser, TK_RPAREN);
         }
-        
+
         op->operands = operands.data;
         op->n_operands = operands.size;
     }
@@ -903,7 +954,7 @@ static void parse_func_call(Parser *parser, Operation *op) {
     // Parse function signature: : (arg_types) -> result_type
     if (parser_peek(parser, TK_COLON)) {
         parser_expect(parser, TK_COLON);
-        
+
         // Skip arg types in parentheses
         if (parser_peek(parser, TK_LPAREN)) {
             parser_expect(parser, TK_LPAREN);
@@ -914,7 +965,7 @@ static void parse_func_call(Parser *parser, Operation *op) {
                 parser_next_token(parser);
             }
         }
-        
+
         // Parse arrow and result type
         if (parser_peek(parser, TK_ARROW)) {
             parser_expect(parser, TK_ARROW);
@@ -2633,8 +2684,75 @@ string get_register_name(string reg_str) {
     return str_lit("%unknown");
 }
 
+void parse_scf_yield(Parser *parser, Operation *op) {
+    // Parse scf.yield operands
+    VecValueRef operands;
+    VecValueRef_reserve(parser->arena, &operands, 2);
+
+    while (parser_peek(parser, TK_REGISTER)) {
+        string reg_str = parser_token_str(parser);
+        parser_expect(parser, TK_REGISTER);
+
+        ValueRef *operand = symbol_table_lookup(&parser->symbol_table, reg_str);
+        if (!operand) {
+            parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
+            return;
+        }
+        VecValueRef_push_back(parser->arena, &operands, operand);
+
+        if (parser_peek(parser, TK_COMMA)) {
+            parser_expect(parser, TK_COMMA);
+        } else {
+            break;
+        }
+    }
+
+    op->operands = operands.data;
+    op->n_operands = operands.size;
+    op->op_type = OP_TYPE_SCF_YIELD;
+
+    // Skip remaining tokens (like : type)
+    while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) {
+        parser_next_token(parser);
+    }
+}
+
+void parse_return_operation(Parser *parser, Operation *op) {
+    // Parse optional operands
+    VecValueRef operands;
+    VecValueRef_reserve(parser->arena, &operands, 2);
+    while (parser_peek(parser, TK_REGISTER)) {
+        string reg_str = parser_token_str(parser);
+        parser_expect(parser, TK_REGISTER);
+        ValueRef *operand = symbol_table_lookup(&parser->symbol_table, reg_str);
+        if (!operand) {
+            parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
+            return;
+        }
+        VecValueRef_push_back(parser->arena, &operands, operand);
+        if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
+    }
+    // Do not keep operands for return-like ops in generic mode
+    op->operands = NULL;
+    op->n_operands = 0;
+
+    // Consume any trailing ": ..." types or loc(), without assigning result types
+    if (parser_peek(parser, TK_COLON)) {
+        // Consume tokens until newline/brace
+        do {
+            if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
+                parse_loc(parser);
+                break;
+            }
+            parser_next_token(parser);
+        } while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE) && !parser_peek(parser, TK_EOF));
+    }
+
+    // Done with this op line
+    while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
+}
+
 Operation* parse_operation(Parser *parser) {
-    bool parse_generic_tail = false; // when specialized parser fully consumes tail
     Operation *op = arena_alloc(parser->arena, Operation);
     op->regions = NULL;
     op->n_regions = 0;
@@ -2663,94 +2781,6 @@ Operation* parse_operation(Parser *parser) {
         } else {
             // Shouldn't happen
             abort();
-        }
-    }
-
-    // Check for operations that start with operation name instead of result assignment
-    if (parser_peek(parser, TK_NAME) || parser_peek(parser, TK_NAME_DOT_NAME)) {
-        string potential_opname = parser_token_str(parser);
-        if (str_eq(potential_opname, str_lit("scf.yield"))) {
-            // Handle scf.yield specially - it starts with opname, not result assignment
-            op->opname = potential_opname;
-            parser_next_token(parser); // consume operation name
-
-            // Parse scf.yield operands
-            VecValueRef operands;
-            VecValueRef_reserve(parser->arena, &operands, 2);
-
-            while (parser_peek(parser, TK_REGISTER)) {
-                string reg_str = parser_token_str(parser);
-                parser_expect(parser, TK_REGISTER);
-
-                ValueRef *operand = symbol_table_lookup(&parser->symbol_table, reg_str);
-                if (!operand) {
-                    parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
-                    return NULL;
-                }
-                VecValueRef_push_back(parser->arena, &operands, operand);
-
-                if (parser_peek(parser, TK_COMMA)) {
-                    parser_expect(parser, TK_COMMA);
-                } else {
-                    break;
-                }
-            }
-
-            op->operands = operands.data;
-            op->n_operands = operands.size;
-            op->op_type = OP_TYPE_SCF_YIELD;
-
-            // Skip remaining tokens (like : type)
-            while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) {
-                parser_next_token(parser);
-            }
-
-            return op;
-        } else if (
-            str_eq(potential_opname, str_lit("return")) ||
-            str_eq(potential_opname, str_lit("func.return")) ||
-            str_eq(potential_opname, str_lit("std.return")) ||
-            str_eq(potential_opname, str_lit("tt.return")) ||
-            str_eq(potential_opname, str_lit("tt.reduce.return"))
-        ) {
-            // Handle return-like ops generically: parse operands, no result type
-            op->opname = potential_opname;
-            op->op_type = op_string_to_type(potential_opname);
-            parser_next_token(parser); // consume operation name
-
-            // Parse optional operands
-            VecValueRef operands;
-            VecValueRef_reserve(parser->arena, &operands, 2);
-            while (parser_peek(parser, TK_REGISTER)) {
-                string reg_str = parser_token_str(parser);
-                parser_expect(parser, TK_REGISTER);
-                ValueRef *operand = symbol_table_lookup(&parser->symbol_table, reg_str);
-                if (!operand) {
-                    parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
-                    return NULL;
-                }
-                VecValueRef_push_back(parser->arena, &operands, operand);
-                if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
-            }
-            // Do not keep operands for return-like ops in generic mode
-            op->operands = NULL;
-            op->n_operands = 0;
-
-            // Consume any trailing ": ..." types or loc(), without assigning result types
-            if (parser_peek(parser, TK_COLON)) {
-                // Consume tokens until newline/brace
-                do {
-                    if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
-                        parse_loc(parser);
-                        break;
-                    }
-                    parser_next_token(parser);
-                } while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE) && !parser_peek(parser, TK_EOF));
-            }
-
-            // Done with this op line
-            while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
-            return op;
         }
     }
 
@@ -2801,164 +2831,162 @@ Operation* parse_operation(Parser *parser) {
             ), parser->first, parser->last);
     }
 
+
     // Set op_type based on operation name
     op->op_type = op_string_to_type(op->opname);
 
 
     // First we handle specific opnames with special parsing rules
-    if (str_eq(op->opname, str_lit("tt.func"))) {
-        parse_tt_func(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("gpu.launch"))) {
-        parse_gpu_launch(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("scf.if"))) {
-        parse_scf_if(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("scf.for"))) {
-        parse_scf_for(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("scf.while"))) {
-        parse_scf_while(parser, op);
-        parse_generic_tail = true;
-    } else if (op->op_type == OP_TYPE_ARITH_CONSTANT) {
-        parse_arith_constant(parser, op);
-        parse_generic_tail = true;
-    } else if (op->op_type == OP_TYPE_ARITH_ADDI || op->op_type == OP_TYPE_ARITH_MULI ||
-               op->op_type == OP_TYPE_ARITH_ADDF || op->op_type == OP_TYPE_ARITH_SUBI ||
-               op->op_type == OP_TYPE_ARITH_SUBF || op->op_type == OP_TYPE_ARITH_MULF ||
-               op->op_type == OP_TYPE_ARITH_DIVI || op->op_type == OP_TYPE_ARITH_DIVF) {
-        parse_arith_binary(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("arith.select"))) {
-        parse_arith_select(parser, op);
-    } else if (str_eq(op->opname, str_lit("tt.get_program_id"))) {
-        parse_tt_get_program_id(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("tt.splat"))) {
-        parse_tt_splat(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("tt.make_range"))) {
-        parse_tt_make_range(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("tt.addptr")) || str_eq(op->opname, str_lit("tt.load"))) {
-        parse_tt_addptr_load_store(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("tt.store"))) {
-        parse_tt_store(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("tt.call"))) {
-        parse_tt_call(parser, op);
-    } else if (str_eq(op->opname, str_lit("func.func"))) {
-        parse_func_func(parser, op);
-        parse_generic_tail = true;
-    } else if (op->op_type == OP_TYPE_FUNC_CALL) {
-        parse_func_call(parser, op);
-    } else if (str_eq(op->opname, str_lit("affine.for"))) {
-        parse_affine_for(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("memref.load"))) {
-        parse_memref_load_or_store(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("memref.store"))) {
-        parse_memref_store(parser, op);
-    } else if (str_eq(op->opname, str_lit("vector.print"))) {
-        parse_vector_print(parser, op);
-    } else if (str_eq(op->opname, str_lit("std.constant"))) {
-        parse_std_constant(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("tt.reduce"))) {
-        parse_tt_reduce(parser, op);
-    } else if (str_eq(op->opname, str_lit("tt.reduce.return")) ||
-               str_eq(op->opname, str_lit("tt.return")) ||
-               str_eq(op->opname, str_lit("std.return")) ||
-               str_eq(op->opname, str_lit("func.return")) ||
-               str_eq(op->opname, str_lit("return"))) {
-        // Consume optional operands, with or without parentheses
-        if (parser_peek(parser, TK_LPAREN)) {
-            parser_expect(parser, TK_LPAREN);
-            bool first = true;
-            while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
-                if (!first && parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
-                first = false;
-                if (parser_peek(parser, TK_REGISTER)) {
-                    parser_expect(parser, TK_REGISTER);
-                } else {
-                    parser_next_token(parser);
-                }
-            }
-            parser_expect(parser, TK_RPAREN);
-        } else {
-            while (parser_peek(parser, TK_REGISTER)) {
-                parser_expect(parser, TK_REGISTER);
-                if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
-            }
-        }
-        // Consume optional ": ..." and loc()
-        if (parser_peek(parser, TK_COLON)) {
-            parser_expect(parser, TK_COLON);
-            int angle = 0, paren = 0;
-            while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
-                if (parser_peek(parser, TK_LANGLE)) angle++;
-                else if (parser_peek(parser, TK_RANGLE) && angle > 0) angle--;
-                else if (parser_peek(parser, TK_LPAREN)) paren++;
-                else if (parser_peek(parser, TK_RPAREN) && paren > 0) paren--;
-                if (angle == 0 && paren == 0 && parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
-                parser_next_token(parser);
-            }
-            if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) parse_loc(parser);
-        }
-        // No results
-        op->n_result_types = 0;
-    } else if (str_eq(op->opname, str_lit("tensor.extract"))) {
-        parse_tensor_extract(parser, op);
-        parse_generic_tail = true;
-    } else if (str_eq(op->opname, str_lit("cf.br"))) {
-        parse_cf_br(parser, op);
-    } else if (str_eq(op->opname, str_lit("linalg.fill"))) {
-        parse_linalg_fill(parser, op);
-    } else if (str_eq(op->opname, str_lit("affine.load"))) {
-        parse_affine_load(parser, op);
-    } else if (str_eq(op->opname, str_lit("index.constant"))) {
-        parse_index_constant(parser, op);
-    } else if (str_eq(op->opname, str_lit("tensor.splat"))) {
-        parse_tensor_splat(parser, op);
-    } else if (str_eq(op->opname, str_lit("tensor.collapse_shape"))) {
-        parse_tensor_collapse_shape(parser, op);
-    } else {
-        // Generic/unregistered operations
-        parse_generic_operation(parser, op);
-    }
-
-    // Ensure attrs/result types are handled for specialized op paths too
-    if (parse_generic_tail) {
-        parse_generic_attrs_and_result_type(parser, op);
+    switch (op->op_type) {
+        case OP_TYPE_TT_FUNC:
+            parse_tt_func(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_GPU_LAUNCH:
+            parse_gpu_launch(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_SCF_IF:
+            parse_scf_if(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_SCF_FOR:
+            parse_scf_for(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_SCF_WHILE:
+            parse_scf_while(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_ARITH_CONSTANT:
+            parse_arith_constant(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_ARITH_ADDI:
+        case OP_TYPE_ARITH_MULI:
+        case OP_TYPE_ARITH_ADDF:
+        case OP_TYPE_ARITH_SUBI:
+        case OP_TYPE_ARITH_SUBF:
+        case OP_TYPE_ARITH_MULF:
+        case OP_TYPE_ARITH_DIVI:
+        case OP_TYPE_ARITH_DIVF:
+            parse_arith_binary(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_ARITH_SELECT:
+            parse_arith_select(parser, op);
+            break;
+        case OP_TYPE_TT_GET_PROGRAM_ID:
+            parse_tt_get_program_id(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_TT_SPLAT:
+            parse_tt_splat(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_TT_MAKE_RANGE:
+            parse_tt_make_range(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_TT_ADDPTR:
+        case OP_TYPE_TT_LOAD:
+            parse_tt_addptr_load_store(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_TT_STORE:
+            parse_tt_store(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_TT_CALL:
+            parse_tt_call(parser, op);
+            break;
+        case OP_TYPE_FUNC_FUNC:
+            parse_func_func(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_FUNC_CALL:
+            parse_func_call(parser, op);
+            break;
+        case OP_TYPE_AFFINE_FOR:
+            parse_affine_for(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_MEMREF_LOAD:
+            parse_memref_load_or_store(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_MEMREF_STORE:
+            parse_memref_store(parser, op);
+            break;
+        case OP_TYPE_VECTOR_PRINT:
+            parse_vector_print(parser, op);
+            break;
+        case OP_TYPE_STD_CONSTANT:
+            parse_std_constant(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_TT_REDUCE:
+            parse_tt_reduce(parser, op);
+            break;
+        case OP_TYPE_TT_REDUCE_RETURN:
+        case OP_TYPE_TT_RETURN:
+        case OP_TYPE_STD_RETURN:
+        case OP_TYPE_FUNC_RETURN:
+        case OP_TYPE_RETURN:
+            parse_return_operation(parser, op);
+            break;
+        case OP_TYPE_TENSOR_EXTRACT:
+            parse_tensor_extract(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_CF_BR:
+            parse_cf_br(parser, op);
+            break;
+        case OP_TYPE_LINALG_FILL:
+            parse_linalg_fill(parser, op);
+            break;
+        case OP_TYPE_AFFINE_LOAD:
+            parse_affine_load(parser, op);
+            break;
+        case OP_TYPE_INDEX_CONSTANT:
+            parse_index_constant(parser, op);
+            break;
+        case OP_TYPE_TENSOR_SPLAT:
+            parse_tensor_splat(parser, op);
+            break;
+        case OP_TYPE_TENSOR_COLLAPSE_SHAPE:
+            parse_tensor_collapse_shape(parser, op);
+            break;
+        case OP_TYPE_SCF_YIELD:
+            parse_scf_yield(parser, op);
+            break;
+        default:
+            // Generic/unregistered operations
+            parse_generic_operation(parser, op);
+            break;
     }
 
     // Handle return value(s) for all operations
     if (result_value) {
-        if (op->n_result_types == 0) {
-            parser_error(parser, str_lit("Missing result type number for SSA result"), parser->first, parser->last);
-        }
-        if (op->result_types == NULL) {
-            parser_error(parser, str_lit("Missing result type for SSA result I"), parser->first, parser->last);
-        }
-        if (op->result_types[0] == NULL) {
-            parser_error(parser, str_lit("Missing result type for SSA result II"), parser->first, parser->last);
-        }
-        // Set the type
-        result_value->type = op->result_types[0];
-        result_value->def = op;
-        symbol_table_add_value(parser->arena, &parser->symbol_table, result_value->register_name, result_value);
+        if (op->n_result_types > 0) {
+            // If op->n_result_types > 0, then op->result_types must be set:
+            assert(op->result_types != NULL);
+            assert(op->result_types[0] != NULL);
+            // Set the type
+            result_value->type = op->result_types[0];
+            result_value->def = op;
+            symbol_table_add_value(parser->arena, &parser->symbol_table, result_value->register_name, result_value);
 
-        // Link result to operation
-        op->n_results = 1;
-        op->results = arena_alloc_array(parser->arena, ValueRef*, 1);
-        op->results[0] = result_value;
+            // Link result to operation
+            op->n_results = 1;
+            op->results = arena_alloc_array(parser->arena, ValueRef*, 1);
+            op->results[0] = result_value;
+        } else {
+            parser_error(parser, str_lit("Result Value parsed on LHS but no Type present on RHS"), parser->first, parser->last);
+        }
     } else {
         if (op->n_result_types > 0) {
-            // Operation declares results but has no SSA name on LHS: error
-            parser_error(parser, str_lit("Result type declared but no SSA result name"), parser->first, parser->last);
+            parser_error(parser, str_lit("Result Type parsed on RHS but no result Value on LHS"), parser->first, parser->last);
         }
     }
 

@@ -28,7 +28,7 @@ module() {
                 memref.store(%2: f32, %alloc: memref<10x20xf32>, %arg0: index, %arg0: index)
             }
         }
-        "return"()
+        return()
     }
 }
 
