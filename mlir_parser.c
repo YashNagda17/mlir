@@ -898,6 +898,13 @@ void parse_loc(Parser *parser) {
     parser_expect(parser, TK_RPAREN);
 }
 
+static inline void consume_optional_hash_selector(Parser *parser) {
+    // Consume tokens like #0, #1 after a register (e.g., %49#0) and ignore them
+    if (parser_peek(parser, TK_HASH_NAME)) {
+        parser_next_token(parser);
+    }
+}
+
 void parse_gpu_launch(Parser *parser, Operation *op) {
     // Parse gpu.launch blocks(%arg2, %arg3, %arg4) in (...) threads(%arg5, %arg6, %arg7) in (...) {
 
@@ -3291,10 +3298,4 @@ Operation* parse_operation(Parser *parser) {
     }
 
     return op;
-}
-static inline void consume_optional_hash_selector(Parser *parser) {
-    // Consume tokens like #0, #1 after a register (e.g., %49#0) and ignore them
-    if (parser_peek(parser, TK_HASH_NAME)) {
-        parser_next_token(parser);
-    }
 }
