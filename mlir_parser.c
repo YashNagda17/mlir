@@ -2673,7 +2673,6 @@ void parse_return_operation(Parser *parser, Operation *op) {
 }
 
 Operation* parse_operation(Parser *parser) {
-    bool parse_generic_tail = false; // when specialized parser fully consumes tail
     Operation *op = arena_alloc(parser->arena, Operation);
     op->regions = NULL;
     op->n_regions = 0;
@@ -2847,65 +2846,65 @@ Operation* parse_operation(Parser *parser) {
     // First we handle specific opnames with special parsing rules
     if (str_eq(op->opname, str_lit("tt.func"))) {
         parse_tt_func(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("gpu.launch"))) {
         parse_gpu_launch(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("scf.if"))) {
         parse_scf_if(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("scf.for"))) {
         parse_scf_for(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("scf.while"))) {
         parse_scf_while(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (op->op_type == OP_TYPE_ARITH_CONSTANT) {
         parse_arith_constant(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (op->op_type == OP_TYPE_ARITH_ADDI || op->op_type == OP_TYPE_ARITH_MULI ||
                op->op_type == OP_TYPE_ARITH_ADDF || op->op_type == OP_TYPE_ARITH_SUBI ||
                op->op_type == OP_TYPE_ARITH_SUBF || op->op_type == OP_TYPE_ARITH_MULF ||
                op->op_type == OP_TYPE_ARITH_DIVI || op->op_type == OP_TYPE_ARITH_DIVF) {
         parse_arith_binary(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("arith.select"))) {
         parse_arith_select(parser, op);
     } else if (str_eq(op->opname, str_lit("tt.get_program_id"))) {
         parse_tt_get_program_id(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("tt.splat"))) {
         parse_tt_splat(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("tt.make_range"))) {
         parse_tt_make_range(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("tt.addptr")) || str_eq(op->opname, str_lit("tt.load"))) {
         parse_tt_addptr_load_store(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("tt.store"))) {
         parse_tt_store(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("tt.call"))) {
         parse_tt_call(parser, op);
     } else if (str_eq(op->opname, str_lit("func.func"))) {
         parse_func_func(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (op->op_type == OP_TYPE_FUNC_CALL) {
         parse_func_call(parser, op);
     } else if (str_eq(op->opname, str_lit("affine.for"))) {
         parse_affine_for(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("memref.load"))) {
         parse_memref_load_or_store(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("memref.store"))) {
         parse_memref_store(parser, op);
     } else if (str_eq(op->opname, str_lit("vector.print"))) {
         parse_vector_print(parser, op);
     } else if (str_eq(op->opname, str_lit("std.constant"))) {
         parse_std_constant(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("tt.reduce"))) {
         parse_tt_reduce(parser, op);
     } else if (str_eq(op->opname, str_lit("tt.reduce.return")) ||
@@ -2916,7 +2915,7 @@ Operation* parse_operation(Parser *parser) {
         parse_return_operation(parser, op);
     } else if (str_eq(op->opname, str_lit("tensor.extract"))) {
         parse_tensor_extract(parser, op);
-        parse_generic_tail = true;
+        parse_generic_attrs_and_result_type(parser, op);
     } else if (str_eq(op->opname, str_lit("cf.br"))) {
         parse_cf_br(parser, op);
     } else if (str_eq(op->opname, str_lit("linalg.fill"))) {
@@ -2932,11 +2931,6 @@ Operation* parse_operation(Parser *parser) {
     } else {
         // Generic/unregistered operations
         parse_generic_operation(parser, op);
-    }
-
-    // Ensure attrs/result types are handled for specialized op paths too
-    if (parse_generic_tail) {
-        parse_generic_attrs_and_result_type(parser, op);
     }
 
     if (result_value) {
