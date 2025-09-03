@@ -441,19 +441,339 @@ static bool parse_type_string(Parser *parser, string *out) {
     return true;
 }
 
-void parser_expect_opname(Parser *parser, string name) {
-    if (parser_peek(parser, TK_NAME) || parser_peek(parser, TK_NAME_DOT_NAME)) {
-        if (str_eq(parser_token_str(parser), name)) {
-            parser_next_token(parser);
-            return;
+Type* parse_type_from_string(Arena *arena, string type_str) {
+    Type *type = arena_alloc(arena, Type);
+
+    // Unknown type (printed as '?')
+    if (str_eq(type_str, str_lit("?"))) {
+        type->kind = TYPE_KIND_UNKNOWN;
+    }
+    // Opaque/unspecified type (printed as 'unknown')
+    else if (str_eq(type_str, str_lit("unknown")) || str_eq(type_str, str_lit("!unknown"))) {
+        type->kind = TYPE_KIND_OPAQUE;
+    }
+    // Parse index type first (before integer check below)
+    else if (str_eq(type_str, str_lit("index"))) {
+        type->kind = TYPE_KIND_INDEX;
+    }
+    // Parse integer types like "i32", "i64", etc.
+    else if (type_str.size >= 2 && type_str.str[0] == 'i') {
+        // Require that all remaining characters are digits
+        bool all_digits = true;
+        for (size_t i = 1; i < type_str.size; i++) {
+            char c = type_str.str[i];
+            if (c < '0' || c > '9') { all_digits = false; break; }
+        }
+        if (!all_digits) {
+            // Fallback to default unknown integer width
+            type->kind = TYPE_KIND_INTEGER;
+            type->data.integer.is_signed = true;
+            type->data.integer.width = 32;
+            return type;
+        }
+        type->kind = TYPE_KIND_INTEGER;
+        type->data.integer.is_signed = true;
+
+        // Extract width
+        string width_str = str_substr(type_str, 1, type_str.size - 1);
+        if (str_eq(width_str, str_lit("1"))) type->data.integer.width = 1;
+        else if (str_eq(width_str, str_lit("8"))) type->data.integer.width = 8;
+        else if (str_eq(width_str, str_lit("16"))) type->data.integer.width = 16;
+        else if (str_eq(width_str, str_lit("32"))) type->data.integer.width = 32;
+        else if (str_eq(width_str, str_lit("64"))) type->data.integer.width = 64;
+        else type->data.integer.width = 32; // Default
+    }
+    // Parse floating point types like "f32", "f64", etc.
+    else if (type_str.size >= 2 && type_str.str[0] == 'f') {
+        type->kind = TYPE_KIND_FLOAT;
+        type->data.floating.is_bfloat = false;
+        // Extract width
+        string width_str = str_substr(type_str, 1, type_str.size - 1);
+        if (str_eq(width_str, str_lit("16"))) type->data.floating.width = 16;
+        else if (str_eq(width_str, str_lit("32"))) type->data.floating.width = 32;
+        else if (str_eq(width_str, str_lit("64"))) type->data.floating.width = 64;
+        else type->data.floating.width = 32; // Default
+    }
+    // bfloat16
+    else if (str_eq(type_str, str_lit("bf16"))) {
+        type->kind = TYPE_KIND_FLOAT;
+        type->data.floating.width = 16;
+        type->data.floating.is_bfloat = true;
+    }
+    // Parse pointer types like "!tt.ptr<f32, 1>"
+    else if (type_str.size >= 7 && str_eq(str_substr(type_str, 0, 7), str_lit("!tt.ptr"))) {
+        type->kind = TYPE_KIND_POINTER;
+        type->data.pointer.address_space = 1; // Default
+        type->data.pointer.has_address_space = false;
+        type->data.pointer.element_type = arena_alloc(arena, Type);
+
+        // Find the content inside < >
+        size_t start = 8; // After "!tt.ptr<"
+        size_t end = type_str.size - 1; // Before ">"
+        if (start < end && type_str.str[7] == '<' && type_str.str[end] == '>') {
+            string content = str_substr(type_str, start, end - start);
+            // Find comma to separate element type from address space
+            size_t comma_pos = content.size;
+            for (size_t i = 0; i < content.size; i++) {
+                if (content.str[i] == ',') {
+                    comma_pos = i;
+                    break;
+                }
+            }
+
+            if (comma_pos < content.size) {
+                // Parse element type on the left of comma
+                string elem_type_str = str_substr(content, 0, comma_pos);
+                // Trim whitespace
+                while (elem_type_str.size > 0 && elem_type_str.str[0] == ' ') {
+                    elem_type_str = str_substr(elem_type_str, 1, elem_type_str.size - 1);
+                }
+                while (elem_type_str.size > 0 && elem_type_str.str[elem_type_str.size - 1] == ' ') {
+                    elem_type_str = str_substr(elem_type_str, 0, elem_type_str.size - 1);
+                }
+                type->data.pointer.element_type = parse_type_from_string(arena, elem_type_str);
+
+                // Parse address space from right of comma (trim spaces)
+                string addr_str = str_substr(content, comma_pos + 1, content.size - comma_pos - 1);
+                while (addr_str.size > 0 && addr_str.str[0] == ' ') {
+                    addr_str = str_substr(addr_str, 1, addr_str.size - 1);
+                }
+                while (addr_str.size > 0 && addr_str.str[addr_str.size - 1] == ' ') {
+                    addr_str = str_substr(addr_str, 0, addr_str.size - 1);
+                }
+                uint32_t as = 0;
+                for (size_t i = 0; i < addr_str.size; i++) {
+                    if (addr_str.str[i] >= '0' && addr_str.str[i] <= '9') {
+                        as = as * 10 + (uint32_t)(addr_str.str[i] - '0');
+                    }
+                }
+                type->data.pointer.address_space = as;
+                type->data.pointer.has_address_space = true;
+            } else {
+                // No comma, assume f32 and address space 1
+                type->data.pointer.element_type = parse_type_from_string(arena, content);
+                type->data.pointer.address_space = 1;
+                type->data.pointer.has_address_space = false;
+            }
+        } else {
+            // Malformed, default to f32 pointer
+            type->data.pointer.element_type = parse_type_from_string(arena, str_lit("f32"));
+            type->data.pointer.address_space = 1;
+            type->data.pointer.has_address_space = false;
         }
     }
-    parser_error(parser,
-        format(parser->arena,
-            str_lit("Expected TK_NAME or TK_NAME_DOT_NAME '{}', got {}"),
-            name,
-            tokentype_to_string(parser->sym)
-        ), parser->first, parser->last);
+    // Parse tensor types like "tensor<4xi32>" or "tensor<4x!tt.ptr<f32,1>>"
+    else if (type_str.size >= 6 && str_eq(str_substr(type_str, 0, 6), str_lit("tensor"))) {
+        type->kind = TYPE_KIND_TENSOR;
+
+        // Find the content inside < >
+        size_t start = 7; // After "tensor<"
+        size_t end = type_str.size - 1; // Before ">"
+        if (start < end && type_str.str[6] == '<' && type_str.str[end] == '>') {
+            string content = str_substr(type_str, start, end - start);
+
+            // Parse dimensions and element type (e.g., "4xi32" or "4x!tt.ptr<f32,1>")
+            // Find the last 'x' to separate dimensions from element type
+            int last_x_pos = -1;
+            int bracket_depth = 0;
+            for (int i = content.size - 1; i >= 0; i--) {
+                if (content.str[i] == '>') bracket_depth++;
+                else if (content.str[i] == '<') bracket_depth--;
+                else if (content.str[i] == 'x' && bracket_depth == 0) {
+                    last_x_pos = i;
+                    break;
+                }
+            }
+
+            if (last_x_pos > 0) {
+                string elem_type_str = str_substr(content, last_x_pos + 1, content.size - last_x_pos - 1);
+                type->data.shaped.element_type = parse_type_from_string(arena, elem_type_str);
+
+                // Parse shape dims from tokens separated by 'x'
+                string shape_str = str_substr(content, 0, last_x_pos);
+                uint32_t dims = 1;
+                for (size_t i = 0; i < shape_str.size; i++) if (shape_str.str[i] == 'x') dims++;
+                type->data.shaped.rank = dims;
+                type->data.shaped.shape = arena_alloc_array(arena, int64_t, dims);
+                size_t pos = 0; uint32_t dim_idx = 0;
+                while (pos <= shape_str.size && dim_idx < dims) {
+                    size_t next = pos;
+                    while (next < shape_str.size && shape_str.str[next] != 'x') next++;
+                    string tok = str_substr(shape_str, pos, next - pos);
+                    if (tok.size == 1 && tok.str[0] == '?') {
+                        type->data.shaped.shape[dim_idx++] = -1;
+                    } else {
+                        int64_t val = 0;
+                        for (size_t j = 0; j < tok.size; j++) {
+                            if (tok.str[j] >= '0' && tok.str[j] <= '9') {
+                                val = val * 10 + (tok.str[j] - '0');
+                            }
+                        }
+                        type->data.shaped.shape[dim_idx++] = val;
+                    }
+                    pos = next + 1;
+                }
+            } else {
+                // No 'x' found, assume it's just the element type
+                type->data.shaped.element_type = parse_type_from_string(arena, content);
+                type->data.shaped.rank = 0;
+                type->data.shaped.shape = NULL;
+            }
+        } else {
+            // Malformed tensor, default to f32
+            type->data.shaped.element_type = parse_type_from_string(arena, str_lit("f32"));
+            type->data.shaped.rank = 0;
+            type->data.shaped.shape = NULL;
+        }
+    }
+    // Parse memref types like "memref<2x3xf32>"
+    else if (type_str.size >= 6 && str_eq(str_substr(type_str, 0, 6), str_lit("memref"))) {
+        type->kind = TYPE_KIND_MEMREF;
+        type->data.shaped.element_type = NULL;
+        type->data.shaped.shape = NULL;
+        type->data.shaped.rank = 0;
+        // Extract inside of angle brackets
+        size_t start = 7; // after "memref<"
+        size_t end = type_str.size - 1; // before '>'
+        if (start < end && type_str.str[6] == '<' && type_str.str[end] == '>') {
+            string content = str_substr(type_str, start, end - start);
+            // Find last 'x' not inside nested '<>' to split shape and element type
+            int last_x_pos = -1;
+            int bracket_depth = 0;
+            for (int i = (int)content.size - 1; i >= 0; i--) {
+                char c = content.str[i];
+                if (c == '>') bracket_depth++;
+                else if (c == '<') bracket_depth--;
+                else if (c == 'x' && bracket_depth == 0) { last_x_pos = i; break; }
+            }
+            if (last_x_pos > 0) {
+                string elem_type_str = str_substr(content, last_x_pos + 1, content.size - last_x_pos - 1);
+                type->data.shaped.element_type = parse_type_from_string(arena, elem_type_str);
+                string shape_str = str_substr(content, 0, last_x_pos);
+                // Count dims
+                uint32_t dims = 1;
+                for (size_t i = 0; i < shape_str.size; i++) if (shape_str.str[i] == 'x') dims++;
+                type->data.shaped.rank = dims;
+                type->data.shaped.shape = arena_alloc_array(arena, int64_t, dims);
+                // Parse each dimension token separated by 'x'
+                size_t pos = 0, dim_idx = 0;
+                while (pos <= shape_str.size && dim_idx < dims) {
+                    size_t next = pos;
+                    while (next < shape_str.size && shape_str.str[next] != 'x') next++;
+                    string tok = str_substr(shape_str, pos, next - pos);
+                    // Parse integer dim or '?' for dynamic
+                    if (tok.size == 1 && tok.str[0] == '?') {
+                        type->data.shaped.shape[dim_idx++] = -1;
+                    } else {
+                        int64_t val = 0;
+                        for (size_t j = 0; j < tok.size; j++) {
+                            if (tok.str[j] >= '0' && tok.str[j] <= '9') {
+                                val = val * 10 + (tok.str[j] - '0');
+                            }
+                        }
+                        type->data.shaped.shape[dim_idx++] = val;
+                    }
+                    pos = next + 1; // skip 'x'
+                }
+            } else {
+                // No shape dims, treat content as element type
+                type->data.shaped.element_type = parse_type_from_string(arena, content);
+                type->data.shaped.rank = 0;
+                type->data.shaped.shape = NULL;
+            }
+        }
+    }
+    // Default to integer if unrecognized
+    else {
+        type->kind = TYPE_KIND_INTEGER;
+        type->data.integer.width = 32;
+        type->data.integer.is_signed = true;
+    }
+    return type;
+}
+
+string type_to_string(Arena *arena, Type *type) {
+    if (!type) {
+        return str_lit("null");
+    }
+
+    // Debug output to help track crashes
+    // printf("type_to_string: kind=%d\n", type->kind);
+
+    switch (type->kind) {
+        case TYPE_KIND_UNKNOWN:
+            return str_lit("?");
+        case TYPE_KIND_OPAQUE:
+            return str_lit("unknown");
+        case TYPE_KIND_INTEGER:
+            if (type->data.integer.is_signed) {
+                return format(arena, str_lit("i{}"), (int64_t)type->data.integer.width);
+            } else {
+                return format(arena, str_lit("ui{}"), (int64_t)type->data.integer.width);
+            }
+        case TYPE_KIND_FLOAT:
+            if (type->data.floating.is_bfloat && type->data.floating.width == 16) {
+                return str_lit("bf16");
+            }
+            return format(arena, str_lit("f{}"), (int64_t)type->data.floating.width);
+        case TYPE_KIND_TENSOR:
+            if (type->data.shaped.element_type) {
+                string elem_str = type_to_string(arena, type->data.shaped.element_type);
+                if (type->data.shaped.rank > 0 && type->data.shaped.shape) {
+                    // Build shape string like "4x" or "4x2x"
+                    string shape_str = str_lit("");
+                    for (uint32_t i = 0; i < type->data.shaped.rank; i++) {
+                        int64_t dim = type->data.shaped.shape[i];
+                        if (dim < 0) {
+                            shape_str = str_concat(arena, shape_str, str_lit("?x"));
+                        } else {
+                            shape_str = str_concat(arena, shape_str, format(arena, str_lit("{}x"), dim));
+                        }
+                    }
+                    return format(arena, str_lit("tensor<{}{}>"), shape_str, elem_str);
+                } else {
+                    return format(arena, str_lit("tensor<{}>"), elem_str);
+                }
+            }
+            return str_lit("tensor<?>");
+        case TYPE_KIND_MEMREF:
+            if (type->data.shaped.element_type) {
+                string elem_str = type_to_string(arena, type->data.shaped.element_type);
+                if (type->data.shaped.rank > 0 && type->data.shaped.shape) {
+                    string shape_str = str_lit("");
+                    for (uint32_t i = 0; i < type->data.shaped.rank; i++) {
+                        int64_t dim = type->data.shaped.shape[i];
+                        if (dim < 0) {
+                            shape_str = str_concat(arena, shape_str, str_lit("?x"));
+                        } else {
+                            shape_str = str_concat(arena, shape_str, format(arena, str_lit("{}x"), dim));
+                        }
+                    }
+                    return format(arena, str_lit("memref<{}{}>"), shape_str, elem_str);
+                } else {
+                    return format(arena, str_lit("memref<{}>"), elem_str);
+                }
+            }
+            return str_lit("memref<?>");
+        case TYPE_KIND_POINTER:
+            if (type->data.pointer.element_type) {
+                string elem_str = type_to_string(arena, type->data.pointer.element_type);
+                if (type->data.pointer.has_address_space) {
+                    return format(arena, str_lit("!tt.ptr<{},{}>"), elem_str, (int64_t)type->data.pointer.address_space);
+                } else if (type->data.pointer.address_space == 1) {
+                    return format(arena, str_lit("!tt.ptr<{}>"), elem_str);
+                } else {
+                    return format(arena, str_lit("!tt.ptr<{},{}>"), elem_str, (int64_t)type->data.pointer.address_space);
+                }
+            }
+            return str_lit("!tt.ptr<?>");
+        case TYPE_KIND_INDEX:
+            return str_lit("index");
+        case TYPE_KIND_FUNCTION:
+            return str_lit("function");
+        default:
+            return str_lit("unknown");
+    }
 }
 
 Operation* parse_operation(Parser *parser);
@@ -486,11 +806,9 @@ Block* parse_block(Parser *parser) {
                     // Parse argument type
                     string type_name = str_lit("");
                     if (parse_type_string(parser, &type_name)) {
-                        block_arg->type->str = type_name;
-                        block_arg->type->kind = TYPE_KIND_INTEGER; // Default, could be more sophisticated
+                        block_arg->type = parse_type_from_string(parser->arena, type_name);
                     } else {
-                        block_arg->type->str = str_lit("i32");
-                        block_arg->type->kind = TYPE_KIND_INTEGER;
+                        block_arg->type = parse_type_from_string(parser->arena, str_lit("i32"));
                     }
 
                     VecValueRef_push_back(parser->arena, &block_args, block_arg);
@@ -602,8 +920,7 @@ void parse_gpu_launch(Parser *parser, Operation *op) {
                     arg->register_name = reg_str;
                     arg->result_index = launch_args.size;
                     arg->type = arena_alloc(parser->arena, Type);
-                    arg->type->str = str_lit("index");
-                    arg->type->kind = TYPE_KIND_INDEX;
+                    arg->type = parse_type_from_string(parser->arena, str_lit("index"));
 
                     VecValueRef_push_back(parser->arena, &launch_args, arg);
 
@@ -639,8 +956,7 @@ void parse_gpu_launch(Parser *parser, Operation *op) {
                     arg->register_name = reg_str;
                     arg->result_index = launch_args.size;
                     arg->type = arena_alloc(parser->arena, Type);
-                    arg->type->str = str_lit("index");
-                    arg->type->kind = TYPE_KIND_INDEX;
+                    arg->type = parse_type_from_string(parser->arena, str_lit("index"));
 
                     VecValueRef_push_back(parser->arena, &launch_args, arg);
 
@@ -743,8 +1059,7 @@ static void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
             if (parse_type_string(parser, &type_str)) {
                 op->n_result_types = 1;
                 op->result_types = arena_alloc_array(parser->arena, Type*, 1);
-                op->result_types[0] = arena_alloc(parser->arena, Type);
-                op->result_types[0]->str = type_str;
+                op->result_types[0] = parse_type_from_string(parser->arena, type_str);
             }
 
             // Optional trailing loc()
@@ -766,8 +1081,7 @@ static void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
                 if (parse_type_string(parser, &type_right)) {
                     op->n_result_types = 1;
                     op->result_types = arena_alloc_array(parser->arena, Type*, 1);
-                    op->result_types[0] = arena_alloc(parser->arena, Type);
-                    op->result_types[0]->str = type_right;
+                    op->result_types[0] = parse_type_from_string(parser->arena, type_right);
                 }
             } else if (parser_peek(parser, TK_COMMA)) {
                 // Operand type list ": type, type, ..." — consume conservatively
@@ -780,7 +1094,7 @@ static void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
                 op->n_result_types = 1;
                 op->result_types = arena_alloc_array(parser->arena, Type*, 1);
                 op->result_types[0] = arena_alloc(parser->arena, Type);
-                op->result_types[0]->str = type_left;
+                op->result_types[0] = parse_type_from_string(parser->arena, type_left);
             }
         }
     }
@@ -792,8 +1106,7 @@ static void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
         if (parse_type_string(parser, &type_str)) {
             op->n_result_types = 1;
             op->result_types = arena_alloc_array(parser->arena, Type*, 1);
-            op->result_types[0] = arena_alloc(parser->arena, Type);
-            op->result_types[0]->str = type_str;
+            op->result_types[0] = parse_type_from_string(parser->arena, type_str);
         }
     }
 
@@ -840,8 +1153,7 @@ static void parse_arith_constant(Parser *parser, Operation *op) {
             // Boolean constants have implicit i1 type
             op->n_result_types = 1;
             op->result_types = arena_alloc_array(parser->arena, Type*, 1);
-            op->result_types[0] = arena_alloc(parser->arena, Type);
-            op->result_types[0]->str = str_lit("i1");
+            op->result_types[0] = parse_type_from_string(parser->arena, str_lit("i1"));
             return;
         } else {
             // Fallback: consume attribute-like payload (e.g., dense<...>) until ':' or EOL
@@ -888,7 +1200,7 @@ static void parse_arith_binary(Parser *parser, Operation *op) {
                     operand2 = create_value_ref(parser->arena, BLOCK_ARG);
                     operand2->register_name = reg_str2;
                     operand2->type = arena_alloc(parser->arena, Type);
-                    operand2->type->str = str_lit("unknown");
+                    operand2->type = parse_type_from_string(parser->arena, str_lit("unknown"));
                 }
                 VecValueRef_push_back(parser->arena, &operands, operand2);
             }
@@ -902,9 +1214,8 @@ static void parse_arith_binary(Parser *parser, Operation *op) {
     if (op->n_result_types == 0 && op->opname.size > 0 && str_eq(op->opname, str_lit("arith.addf"))) {
         op->n_result_types = 1;
         op->result_types = arena_alloc_array(parser->arena, Type*, 1);
-        op->result_types[0] = arena_alloc(parser->arena, Type);
-        op->result_types[0]->str = str_lit("tensor<16xf32>");
-        op->result_types[0]->kind = TYPE_KIND_TENSOR;
+        op->result_types[0] = parse_type_from_string(parser->arena, str_lit("tensor<16xf32>"));
+
     }
 }
 
@@ -973,8 +1284,7 @@ static void parse_func_call(Parser *parser, Operation *op) {
             if (parse_type_string(parser, &type_str)) {
                 op->n_result_types = 1;
                 op->result_types = arena_alloc_array(parser->arena, Type*, 1);
-                op->result_types[0] = arena_alloc(parser->arena, Type);
-                op->result_types[0]->str = type_str;
+                op->result_types[0] = parse_type_from_string(parser->arena, type_str);
             }
         }
     }
@@ -1015,18 +1325,18 @@ static void parse_tt_splat(Parser *parser, Operation *op) {
         op->result_types = arena_alloc_array(parser->arena, Type*, 1);
         op->result_types[0] = arena_alloc(parser->arena, Type);
         if (op->n_operands > 0 && op->operands[0] && op->operands[0]->type) {
-            string operand_type = op->operands[0]->type->str;
+            string operand_type = type_to_string(parser->arena, op->operands[0]->type);
             if (str_eq(operand_type, str_lit("!tt.ptr<f32>"))) {
-                op->result_types[0]->str = str_lit("tensor<16x!tt.ptr<f32>>");
+                op->result_types[0] = parse_type_from_string(parser->arena, str_lit("tensor<16x!tt.ptr<f32>>"));
             } else if (str_eq(operand_type, str_lit("i32"))) {
-                op->result_types[0]->str = str_lit("tensor<16xi32>");
+                op->result_types[0] = parse_type_from_string(parser->arena, str_lit("tensor<16xi32>"));
             } else {
-                op->result_types[0]->str = str_lit("tensor<16xi32>");
+                op->result_types[0] = parse_type_from_string(parser->arena, str_lit("tensor<16xi32>"));
             }
         } else {
-            op->result_types[0]->str = str_lit("tensor<16xi32>");
+            op->result_types[0] = parse_type_from_string(parser->arena, str_lit("tensor<16xi32>"));
         }
-        op->result_types[0]->kind = TYPE_KIND_TENSOR;
+
     }
 }
 
@@ -1067,8 +1377,8 @@ static void parse_tt_make_range(Parser *parser, Operation *op) {
         op->n_result_types = 1;
         op->result_types = arena_alloc_array(parser->arena, Type*, 1);
         op->result_types[0] = arena_alloc(parser->arena, Type);
-        op->result_types[0]->str = str_lit("tensor<16xi32>");
-        op->result_types[0]->kind = TYPE_KIND_TENSOR;
+        op->result_types[0] = parse_type_from_string(parser->arena, str_lit("tensor<16xi32>"));
+
     }
 }
 
@@ -1102,7 +1412,7 @@ static void parse_tt_addptr_load_store(Parser *parser, Operation *op) {
                 op->n_result_types = 1;
                 op->result_types = arena_alloc_array(parser->arena, Type*, 1);
                 op->result_types[0] = arena_alloc(parser->arena, Type);
-                op->result_types[0]->str = type_left;
+                op->result_types[0] = parse_type_from_string(parser->arena, type_left);
             }
             // Consume remaining type list conservatively until end of list or loc
             if (parser_peek(parser, TK_COMMA)) {
@@ -1207,8 +1517,8 @@ static void parse_memref_load_or_store(Parser *parser, Operation *op) {
                 val = create_value_ref(parser->arena, BLOCK_ARG);
                 val->register_name = reg;
                 val->type = arena_alloc(parser->arena, Type);
-                val->type->str = str_lit("unknown");
-                val->type->kind = TYPE_KIND_INTEGER;
+                val->type = parse_type_from_string(parser->arena, str_lit("unknown"));
+
             }
             VecValueRef_push_back(parser->arena, &operands, val);
         }
@@ -1221,8 +1531,8 @@ static void parse_memref_load_or_store(Parser *parser, Operation *op) {
                 val = create_value_ref(parser->arena, BLOCK_ARG);
                 val->register_name = reg;
                 val->type = arena_alloc(parser->arena, Type);
-                val->type->str = str_lit("unknown");
-                val->type->kind = TYPE_KIND_INTEGER;
+                val->type = parse_type_from_string(parser->arena, str_lit("unknown"));
+
             }
             VecValueRef_push_back(parser->arena, &operands, val);
         }
@@ -1236,8 +1546,8 @@ static void parse_memref_load_or_store(Parser *parser, Operation *op) {
                 val = create_value_ref(parser->arena, BLOCK_ARG);
                 val->register_name = reg;
                 val->type = arena_alloc(parser->arena, Type);
-                val->type->str = str_lit("unknown");
-                val->type->kind = TYPE_KIND_INTEGER;
+                val->type = parse_type_from_string(parser->arena, str_lit("unknown"));
+
             }
             VecValueRef_push_back(parser->arena, &operands, val);
         }
@@ -1258,8 +1568,8 @@ static void parse_memref_load_or_store(Parser *parser, Operation *op) {
                     val = create_value_ref(parser->arena, BLOCK_ARG);
                     val->register_name = idx;
                     val->type = arena_alloc(parser->arena, Type);
-                    val->type->str = str_lit("index");
-                    val->type->kind = TYPE_KIND_INDEX;
+                    val->type = parse_type_from_string(parser->arena, str_lit("index"));
+
                 }
                 VecValueRef_push_back(parser->arena, &operands, val);
             } else {
@@ -1314,8 +1624,8 @@ static void parse_vector_print(Parser *parser, Operation *op) {
                     val = create_value_ref(parser->arena, BLOCK_ARG);
                     val->register_name = reg;
                     val->type = arena_alloc(parser->arena, Type);
-                    val->type->str = str_lit("unknown");
-                    val->type->kind = TYPE_KIND_INTEGER;
+                    val->type = parse_type_from_string(parser->arena, str_lit("unknown"));
+
                 }
                 VecValueRef_push_back(parser->arena, &operands, val);
             } else {
@@ -1333,8 +1643,8 @@ static void parse_vector_print(Parser *parser, Operation *op) {
                 val = create_value_ref(parser->arena, BLOCK_ARG);
                 val->register_name = reg;
                 val->type = arena_alloc(parser->arena, Type);
-                val->type->str = str_lit("unknown");
-                val->type->kind = TYPE_KIND_INTEGER;
+                val->type = parse_type_from_string(parser->arena, str_lit("unknown"));
+
             }
             VecValueRef_push_back(parser->arena, &operands, val);
             if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
@@ -1392,8 +1702,8 @@ static void parse_tt_reduce(Parser *parser, Operation *op) {
         op->n_result_types = 1;
         op->result_types = arena_alloc_array(parser->arena, Type*, 1);
         op->result_types[0] = arena_alloc(parser->arena, Type);
-        op->result_types[0]->str = str_lit("?");
-        op->result_types[0]->kind = TYPE_KIND_TENSOR;
+        op->result_types[0] = parse_type_from_string(parser->arena, str_lit("?"));
+
     }
 }
 
@@ -1566,8 +1876,8 @@ static void parse_affine_load(Parser *parser, Operation *op) {
                 op->n_result_types = 1;
                 op->result_types = arena_alloc_array(parser->arena, Type*, 1);
                 op->result_types[0] = arena_alloc(parser->arena, Type);
-                op->result_types[0]->str = element_type;
-                op->result_types[0]->kind = TYPE_KIND_INTEGER; // Assume integer for now
+                op->result_types[0] = parse_type_from_string(parser->arena, element_type);
+
                 parser_expect(parser, TK_RANGLE);
             }
         }
@@ -1598,8 +1908,8 @@ static void parse_index_constant(Parser *parser, Operation *op) {
     op->n_result_types = 1;
     op->result_types = arena_alloc_array(parser->arena, Type*, 1);
     op->result_types[0] = arena_alloc(parser->arena, Type);
-    op->result_types[0]->str = str_lit("index");
-    op->result_types[0]->kind = TYPE_KIND_INDEX;
+    op->result_types[0] = parse_type_from_string(parser->arena, str_lit("index"));
+
 
     // Consume any trailing loc()
     if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
@@ -1672,8 +1982,8 @@ static void parse_tensor_splat(Parser *parser, Operation *op) {
                 op->n_result_types = 1;
                 op->result_types = arena_alloc_array(parser->arena, Type*, 1);
                 op->result_types[0] = arena_alloc(parser->arena, Type);
-                op->result_types[0]->str = tensor_type;
-                op->result_types[0]->kind = TYPE_KIND_TENSOR;
+                op->result_types[0] = parse_type_from_string(parser->arena, tensor_type);
+
             }
         }
     }
@@ -1740,8 +2050,8 @@ static void parse_arith_select(Parser *parser, Operation *op) {
             op->n_result_types = 1;
             op->result_types = arena_alloc_array(parser->arena, Type*, 1);
             op->result_types[0] = arena_alloc(parser->arena, Type);
-            op->result_types[0]->str = result_type;
-            op->result_types[0]->kind = TYPE_KIND_TENSOR;
+            op->result_types[0] = parse_type_from_string(parser->arena, result_type);
+
         }
     }
 
@@ -1819,8 +2129,8 @@ static void parse_tt_call(Parser *parser, Operation *op) {
             op->n_result_types = 1;
             op->result_types = arena_alloc_array(parser->arena, Type*, 1);
             op->result_types[0] = arena_alloc(parser->arena, Type);
-            op->result_types[0]->str = result_type;
-            op->result_types[0]->kind = TYPE_KIND_TENSOR;
+            op->result_types[0] = parse_type_from_string(parser->arena, result_type);
+
         }
     }
 
@@ -1890,8 +2200,8 @@ static void parse_tensor_collapse_shape(Parser *parser, Operation *op) {
             op->n_result_types = 1;
             op->result_types = arena_alloc_array(parser->arena, Type*, 1);
             op->result_types[0] = arena_alloc(parser->arena, Type);
-            op->result_types[0]->str = result_type;
-            op->result_types[0]->kind = TYPE_KIND_TENSOR;
+            op->result_types[0] = parse_type_from_string(parser->arena, result_type);
+
         }
     }
 
@@ -2079,24 +2389,24 @@ void parse_tt_func(Parser *parser, Operation *op) {
 
                                     if (parser_peek(parser, TK_RANGLE)) {
                                         parser_expect(parser, TK_RANGLE);
-                                        arg->type->str = str_concat(parser->arena, str_lit("!tt.ptr<"), str_concat(parser->arena, type_content, str_lit(">")));
+                                        arg->type = parse_type_from_string(parser->arena, str_concat(parser->arena, str_lit("!tt.ptr<"), str_concat(parser->arena, type_content, str_lit(">"))));
                                     }
                                 } else {
-                                    arg->type->str = str_lit("!tt.ptr");
+                                    arg->type = parse_type_from_string(parser->arena, str_lit("!tt.ptr"));
                                 }
                             } else {
-                                arg->type->str = str_concat(parser->arena, str_lit("!"), type_name);
+                                arg->type = parse_type_from_string(parser->arena, str_concat(parser->arena, str_lit("!"), type_name));
                             }
                         } else {
-                            arg->type->str = str_lit("!unknown");
+                            arg->type = parse_type_from_string(parser->arena, str_lit("!unknown"));
                         }
                     } else if (parser_peek(parser, TK_NAME)) {
                         // Simple type like i32
                         string type_name = parser_token_str(parser);
                         parser_expect(parser, TK_NAME);
-                        arg->type->str = type_name;
+                        arg->type = parse_type_from_string(parser->arena, type_name);
                     } else {
-                        arg->type->str = str_lit("unknown");
+                        arg->type = parse_type_from_string(parser->arena, str_lit("unknown"));
                     }
 
                     VecValueRef_push_back(parser->arena, &func_args, arg);
@@ -2200,9 +2510,8 @@ static void parse_func_func(Parser *parser, Operation *op) {
                     parser_expect(parser, TK_COLON);
                     string t = str_lit("");
                     if (parse_type_string(parser, &t)) {
-                        ty = arena_alloc(parser->arena, Type);
-                        ty->str = t;
-                        ty->kind = TYPE_KIND_TENSOR;
+                        ty = parse_type_from_string(parser->arena, t);
+
                     }
                 }
                 ValueRef *arg = create_value_ref(parser->arena, BLOCK_ARG);
@@ -2243,7 +2552,7 @@ void parse_scf_if(Parser *parser, Operation *op) {
                         op->n_result_types = 1;
                         op->result_types = arena_alloc_array(parser->arena, Type*, 1);
                         op->result_types[0] = arena_alloc(parser->arena, Type);
-                        op->result_types[0]->str = t;
+                        op->result_types[0] = parse_type_from_string(parser->arena, t);
                     }
                     // Consume rest until ')'
                     while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
@@ -2295,8 +2604,8 @@ void parse_scf_for(Parser *parser, Operation *op) {
         loop_var = create_value_ref(parser->arena, BLOCK_ARG);
         loop_var->register_name = loop_var_name;
         loop_var->type = arena_alloc(parser->arena, Type);
-        loop_var->type->str = str_lit("index");
-        loop_var->type->kind = TYPE_KIND_INDEX;
+        loop_var->type = parse_type_from_string(parser->arena, str_lit("index"));
+
 
         // Expect =
         parser_expect(parser, TK_EQUAL);
@@ -2369,8 +2678,8 @@ void parse_scf_for(Parser *parser, Operation *op) {
                     ValueRef *iter_var = create_value_ref(parser->arena, BLOCK_ARG);
                     iter_var->register_name = iter_var_name;
                     iter_var->type = arena_alloc(parser->arena, Type);
-                    iter_var->type->str = str_lit("i16");
-                    iter_var->type->kind = TYPE_KIND_INTEGER;
+                    iter_var->type = parse_type_from_string(parser->arena, str_lit("i16"));
+
 
                     VecValueRef_push_back(parser->arena, &iter_vars, iter_var);
 
@@ -2419,7 +2728,7 @@ void parse_scf_for(Parser *parser, Operation *op) {
                     op->n_result_types = 1;
                     op->result_types = arena_alloc_array(parser->arena, Type*, 1);
                     op->result_types[0] = arena_alloc(parser->arena, Type);
-                    op->result_types[0]->str = t;
+                    op->result_types[0] = parse_type_from_string(parser->arena, t);
                 }
                 // Consume to ')'
                 while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
@@ -2453,8 +2762,8 @@ void parse_scf_for(Parser *parser, Operation *op) {
         ValueRef *loop_block_arg = create_value_ref(parser->arena, BLOCK_ARG);
         loop_block_arg->register_name = str_lit("%arg0");
         loop_block_arg->type = arena_alloc(parser->arena, Type);
-        loop_block_arg->type->str = str_lit("index");
-        loop_block_arg->type->kind = TYPE_KIND_INDEX;
+        loop_block_arg->type = parse_type_from_string(parser->arena, str_lit("index"));
+
         loop_block_arg->result_index = 0;
         loop_block_arg->def = block;
 
@@ -2484,8 +2793,8 @@ void parse_scf_for(Parser *parser, Operation *op) {
         }
         iter_block_arg->register_name = arg_name;
         iter_block_arg->type = arena_alloc(parser->arena, Type);
-        iter_block_arg->type->str = str_lit("i16");
-        iter_block_arg->type->kind = TYPE_KIND_INTEGER;
+        iter_block_arg->type = parse_type_from_string(parser->arena, str_lit("i16"));
+
         iter_block_arg->result_index = i + 1;
         iter_block_arg->def = block;
 
@@ -2555,8 +2864,8 @@ static void parse_affine_for(Parser *parser, Operation *op) {
         ind_var = create_value_ref(parser->arena, BLOCK_ARG);
         ind_var->register_name = iv_name;
         ind_var->type = arena_alloc(parser->arena, Type);
-        ind_var->type->str = str_lit("index");
-        ind_var->type->kind = TYPE_KIND_INDEX;
+        ind_var->type = parse_type_from_string(parser->arena, str_lit("index"));
+
 
         // '=' lower bound
         if (parser_peek(parser, TK_EQUAL)) {
@@ -2606,8 +2915,7 @@ static void parse_affine_for(Parser *parser, Operation *op) {
         ValueRef *iv_block_arg = create_value_ref(parser->arena, BLOCK_ARG);
         iv_block_arg->register_name = str_lit("%arg0");
         iv_block_arg->type = arena_alloc(parser->arena, Type);
-        iv_block_arg->type->str = str_lit("index");
-        iv_block_arg->type->kind = TYPE_KIND_INDEX;
+        iv_block_arg->type = parse_type_from_string(parser->arena, str_lit("index"));
         iv_block_arg->result_index = 0;
         iv_block_arg->def = block;
         VecValueRef_push_back(parser->arena, &block_args, iv_block_arg);
@@ -2674,14 +2982,6 @@ void parse_scf_while(Parser *parser, Operation *op) {
     }
     op->regions = regions;
     op->n_regions = n_regions;
-}
-
-// Helper function to extract register name for printing
-string get_register_name(string reg_str) {
-    if (reg_str.size > 1 && reg_str.str[0] == '%') {
-        return reg_str; // Return the full register name for printing
-    }
-    return str_lit("%unknown");
 }
 
 void parse_scf_yield(Parser *parser, Operation *op) {

@@ -155,18 +155,20 @@ typedef struct Region Region;
 
 // Type kinds for MLIR type system
 typedef enum {
+    TYPE_KIND_UNKNOWN,
+    TYPE_KIND_OPAQUE,
     TYPE_KIND_INTEGER,
     TYPE_KIND_FLOAT,
     TYPE_KIND_MEMREF,
     TYPE_KIND_TENSOR,
     TYPE_KIND_FUNCTION,
-    TYPE_KIND_INDEX
+    TYPE_KIND_INDEX,
+    TYPE_KIND_POINTER
 } TypeKind;
 
 // MLIR Type representation
 typedef struct Type {
     TypeKind kind;
-    string str; // TODO: remove later
     union {
         struct {
             uint32_t width;     // Bit width for integers
@@ -174,12 +176,18 @@ typedef struct Type {
         } integer;
         struct {
             uint32_t width;     // 16, 32, 64, etc.
+            bool is_bfloat;     // true for bf16
         } floating;
         struct {
             struct Type *element_type;
             int64_t *shape;     // NULL-terminated or use rank
             uint32_t rank;
         } shaped;  // For memref and tensor
+        struct {
+            struct Type *element_type;
+            uint32_t address_space;  // For !tt.ptr<type, address_space>
+            bool has_address_space;
+        } pointer;
     } data;
 } Type;
 
@@ -223,6 +231,7 @@ struct ValueRef {
     // TODO: Use an index
     void* def; // Block* or Operation* that produced it
     uint32_t result_index;   // Which result of the operation
+    // TODO: use Type by value
     Type *type;              // Type of this value
 
     // For parsed register names like %0, %c16_i32. These names are not unique
@@ -246,6 +255,7 @@ typedef struct Operation {
     // Use indices here
     ValueRef **operands;
     uint64_t n_operands;
+    // TODO: use Type by value
     Type **result_types;
     uint64_t n_result_types;
     Attribute **attributes;
@@ -295,6 +305,10 @@ Operation* parse_module(Parser *parser);
 
 string op_type_to_string(OpType type);
 OpType op_string_to_type(string name);
+
+// TODO: use Type by value
+Type* parse_type_from_string(Arena *arena, string type_str);
+string type_to_string(Arena *arena, Type *type);
 
 #ifdef __cplusplus
 }
