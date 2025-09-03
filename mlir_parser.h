@@ -166,7 +166,9 @@ typedef enum {
 // MLIR Type representation
 typedef struct Type {
     TypeKind kind;
-    string str; // TODO: remove later
+    // TODO: right now we parse the type as a string into `str`. We need
+    // to parse it into the union data structure below.
+    string str;
     union {
         struct {
             uint32_t width;     // Bit width for integers
