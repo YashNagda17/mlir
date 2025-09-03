@@ -83,6 +83,7 @@ typedef enum {
     OP_TYPE_ARITH_CONSTANT,
     OP_TYPE_ARITH_CMPI,
     OP_TYPE_ARITH_CMPF,
+    OP_TYPE_ARITH_SELECT,
 
     // Memory dialect
     OP_TYPE_MEMREF_LOAD,
@@ -114,6 +115,38 @@ typedef enum {
     OP_TYPE_TT_SPLAT,
     OP_TYPE_TT_ADDPTR,
     OP_TYPE_TT_RETURN,
+    OP_TYPE_TT_FUNC,
+    OP_TYPE_TT_CALL,
+    OP_TYPE_TT_REDUCE,
+
+    // GPU dialect
+    OP_TYPE_GPU_LAUNCH,
+
+    // Affine dialect
+    OP_TYPE_AFFINE_FOR,
+    OP_TYPE_AFFINE_LOAD,
+
+    // Vector dialect
+    OP_TYPE_VECTOR_PRINT,
+
+    // Standard dialect
+    OP_TYPE_STD_CONSTANT,
+    OP_TYPE_STD_RETURN,
+
+    // Tensor dialect
+    OP_TYPE_TENSOR_EXTRACT,
+    OP_TYPE_TENSOR_SPLAT,
+    OP_TYPE_TENSOR_COLLAPSE_SHAPE,
+
+    // Linalg dialect
+    OP_TYPE_LINALG_FILL,
+
+    // Index dialect
+    OP_TYPE_INDEX_CONSTANT,
+
+    // Return operations
+    OP_TYPE_RETURN,
+    OP_TYPE_TT_REDUCE_RETURN,
 
     OP_TYPE_COUNT  // Total number of operation types
 } OpType;

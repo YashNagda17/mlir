@@ -12,9 +12,9 @@ module() {
     func.func() {
     ^bb0:
         %result = memref.alloc() -> memref<10x20xf32>
-        "affine.for"() {
+        affine.for() {
         ^bb0(%arg0: index):
-            "affine.for"() {
+            affine.for() {
             ^bb0(%arg0: index):
                 %lhs = memref.load(%arg0: unknown, %arg0: index, %arg0: index) -> memref<10x20xf32>
                 %rhs = memref.load(%arg1: unknown, %arg0: index, %arg0: index) -> memref<10x20xf32>

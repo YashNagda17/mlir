@@ -123,6 +123,23 @@ string op_type_to_string(OpType type) {
         case OP_TYPE_TT_SPLAT: return str_lit("tt.splat");
         case OP_TYPE_TT_ADDPTR: return str_lit("tt.addptr");
         case OP_TYPE_TT_RETURN: return str_lit("tt.return");
+        case OP_TYPE_ARITH_SELECT: return str_lit("arith.select");
+        case OP_TYPE_TT_FUNC: return str_lit("tt.func");
+        case OP_TYPE_TT_CALL: return str_lit("tt.call");
+        case OP_TYPE_TT_REDUCE: return str_lit("tt.reduce");
+        case OP_TYPE_GPU_LAUNCH: return str_lit("gpu.launch");
+        case OP_TYPE_AFFINE_FOR: return str_lit("affine.for");
+        case OP_TYPE_AFFINE_LOAD: return str_lit("affine.load");
+        case OP_TYPE_VECTOR_PRINT: return str_lit("vector.print");
+        case OP_TYPE_STD_CONSTANT: return str_lit("std.constant");
+        case OP_TYPE_STD_RETURN: return str_lit("std.return");
+        case OP_TYPE_TENSOR_EXTRACT: return str_lit("tensor.extract");
+        case OP_TYPE_TENSOR_SPLAT: return str_lit("tensor.splat");
+        case OP_TYPE_TENSOR_COLLAPSE_SHAPE: return str_lit("tensor.collapse_shape");
+        case OP_TYPE_LINALG_FILL: return str_lit("linalg.fill");
+        case OP_TYPE_INDEX_CONSTANT: return str_lit("index.constant");
+        case OP_TYPE_RETURN: return str_lit("return");
+        case OP_TYPE_TT_REDUCE_RETURN: return str_lit("tt.reduce.return");
         default: return str_lit("unknown");
     }
 }
@@ -196,6 +213,40 @@ OpType op_string_to_type(string opname) {
         return OP_TYPE_TT_ADDPTR;
     } else if (str_eq(opname, str_lit("tt.return"))) {
         return OP_TYPE_TT_RETURN;
+    } else if (str_eq(opname, str_lit("arith.select"))) {
+        return OP_TYPE_ARITH_SELECT;
+    } else if (str_eq(opname, str_lit("tt.func"))) {
+        return OP_TYPE_TT_FUNC;
+    } else if (str_eq(opname, str_lit("tt.call"))) {
+        return OP_TYPE_TT_CALL;
+    } else if (str_eq(opname, str_lit("tt.reduce"))) {
+        return OP_TYPE_TT_REDUCE;
+    } else if (str_eq(opname, str_lit("gpu.launch"))) {
+        return OP_TYPE_GPU_LAUNCH;
+    } else if (str_eq(opname, str_lit("affine.for"))) {
+        return OP_TYPE_AFFINE_FOR;
+    } else if (str_eq(opname, str_lit("affine.load"))) {
+        return OP_TYPE_AFFINE_LOAD;
+    } else if (str_eq(opname, str_lit("vector.print"))) {
+        return OP_TYPE_VECTOR_PRINT;
+    } else if (str_eq(opname, str_lit("std.constant"))) {
+        return OP_TYPE_STD_CONSTANT;
+    } else if (str_eq(opname, str_lit("std.return"))) {
+        return OP_TYPE_STD_RETURN;
+    } else if (str_eq(opname, str_lit("tensor.extract"))) {
+        return OP_TYPE_TENSOR_EXTRACT;
+    } else if (str_eq(opname, str_lit("tensor.splat"))) {
+        return OP_TYPE_TENSOR_SPLAT;
+    } else if (str_eq(opname, str_lit("tensor.collapse_shape"))) {
+        return OP_TYPE_TENSOR_COLLAPSE_SHAPE;
+    } else if (str_eq(opname, str_lit("linalg.fill"))) {
+        return OP_TYPE_LINALG_FILL;
+    } else if (str_eq(opname, str_lit("index.constant"))) {
+        return OP_TYPE_INDEX_CONSTANT;
+    } else if (str_eq(opname, str_lit("return"))) {
+        return OP_TYPE_RETURN;
+    } else if (str_eq(opname, str_lit("tt.reduce.return"))) {
+        return OP_TYPE_TT_REDUCE_RETURN;
     } else {
         return OP_TYPE_UNREGISTERED;
     }
@@ -2786,10 +2837,10 @@ Operation* parse_operation(Parser *parser) {
 
 
     // First we handle specific opnames with special parsing rules
-    if (str_eq(op->opname, str_lit("tt.func"))) {
+    if (op->op_type == OP_TYPE_TT_FUNC) {
         parse_tt_func(parser, op);
         parse_generic_attrs_and_result_type(parser, op);
-    } else if (str_eq(op->opname, str_lit("gpu.launch"))) {
+    } else if (op->op_type == OP_TYPE_GPU_LAUNCH) {
         parse_gpu_launch(parser, op);
         parse_generic_attrs_and_result_type(parser, op);
     } else if (op->op_type == OP_TYPE_SCF_IF) {
@@ -2810,7 +2861,7 @@ Operation* parse_operation(Parser *parser) {
                op->op_type == OP_TYPE_ARITH_DIVI || op->op_type == OP_TYPE_ARITH_DIVF) {
         parse_arith_binary(parser, op);
         parse_generic_attrs_and_result_type(parser, op);
-    } else if (str_eq(op->opname, str_lit("arith.select"))) {
+    } else if (op->op_type == OP_TYPE_ARITH_SELECT) {
         parse_arith_select(parser, op);
     } else if (op->op_type == OP_TYPE_TT_GET_PROGRAM_ID) {
         parse_tt_get_program_id(parser, op);
@@ -2827,14 +2878,14 @@ Operation* parse_operation(Parser *parser) {
     } else if (op->op_type == OP_TYPE_TT_STORE) {
         parse_tt_store(parser, op);
         parse_generic_attrs_and_result_type(parser, op);
-    } else if (str_eq(op->opname, str_lit("tt.call"))) {
+    } else if (op->op_type == OP_TYPE_TT_CALL) {
         parse_tt_call(parser, op);
     } else if (op->op_type == OP_TYPE_FUNC_FUNC) {
         parse_func_func(parser, op);
         parse_generic_attrs_and_result_type(parser, op);
     } else if (op->op_type == OP_TYPE_FUNC_CALL) {
         parse_func_call(parser, op);
-    } else if (str_eq(op->opname, str_lit("affine.for"))) {
+    } else if (op->op_type == OP_TYPE_AFFINE_FOR) {
         parse_affine_for(parser, op);
         parse_generic_attrs_and_result_type(parser, op);
     } else if (op->op_type == OP_TYPE_MEMREF_LOAD) {
@@ -2842,33 +2893,33 @@ Operation* parse_operation(Parser *parser) {
         parse_generic_attrs_and_result_type(parser, op);
     } else if (op->op_type == OP_TYPE_MEMREF_STORE) {
         parse_memref_store(parser, op);
-    } else if (str_eq(op->opname, str_lit("vector.print"))) {
+    } else if (op->op_type == OP_TYPE_VECTOR_PRINT) {
         parse_vector_print(parser, op);
-    } else if (str_eq(op->opname, str_lit("std.constant"))) {
+    } else if (op->op_type == OP_TYPE_STD_CONSTANT) {
         parse_std_constant(parser, op);
         parse_generic_attrs_and_result_type(parser, op);
-    } else if (str_eq(op->opname, str_lit("tt.reduce"))) {
+    } else if (op->op_type == OP_TYPE_TT_REDUCE) {
         parse_tt_reduce(parser, op);
-    } else if (str_eq(op->opname, str_lit("tt.reduce.return")) ||
-               str_eq(op->opname, str_lit("tt.return")) ||
-               str_eq(op->opname, str_lit("std.return")) ||
-               str_eq(op->opname, str_lit("func.return")) ||
-               str_eq(op->opname, str_lit("return"))) {
+    } else if (op->op_type == OP_TYPE_TT_REDUCE_RETURN ||
+               op->op_type == OP_TYPE_TT_RETURN ||
+               op->op_type == OP_TYPE_STD_RETURN ||
+               op->op_type == OP_TYPE_FUNC_RETURN ||
+               op->op_type == OP_TYPE_RETURN) {
         parse_return_operation(parser, op);
-    } else if (str_eq(op->opname, str_lit("tensor.extract"))) {
+    } else if (op->op_type == OP_TYPE_TENSOR_EXTRACT) {
         parse_tensor_extract(parser, op);
         parse_generic_attrs_and_result_type(parser, op);
     } else if (op->op_type == OP_TYPE_CF_BR) {
         parse_cf_br(parser, op);
-    } else if (str_eq(op->opname, str_lit("linalg.fill"))) {
+    } else if (op->op_type == OP_TYPE_LINALG_FILL) {
         parse_linalg_fill(parser, op);
-    } else if (str_eq(op->opname, str_lit("affine.load"))) {
+    } else if (op->op_type == OP_TYPE_AFFINE_LOAD) {
         parse_affine_load(parser, op);
-    } else if (str_eq(op->opname, str_lit("index.constant"))) {
+    } else if (op->op_type == OP_TYPE_INDEX_CONSTANT) {
         parse_index_constant(parser, op);
-    } else if (str_eq(op->opname, str_lit("tensor.splat"))) {
+    } else if (op->op_type == OP_TYPE_TENSOR_SPLAT) {
         parse_tensor_splat(parser, op);
-    } else if (str_eq(op->opname, str_lit("tensor.collapse_shape"))) {
+    } else if (op->op_type == OP_TYPE_TENSOR_COLLAPSE_SHAPE) {
         parse_tensor_collapse_shape(parser, op);
     } else if (op->op_type == OP_TYPE_SCF_YIELD) {
         parse_scf_yield(parser, op);

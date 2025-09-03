@@ -30,7 +30,7 @@ module() {
         cf.cond_br(%6: i64)
     ^bb3:
         %c1_i64 = arith.constant() {value = 1} -> i64
-        "return"()
+        return()
     ^bb4:
         cf.br()
     ^bb5:
@@ -39,7 +39,7 @@ module() {
         cf.cond_br(%7: i64)
     ^bb6:
         %c2_i64 = arith.constant() {value = 2} -> i64
-        "return"()
+        return()
     ^bb7:
         cf.br()
     ^bb8:
@@ -67,14 +67,14 @@ module() {
         cf.cond_br(%17: i64)
     ^bb12:
         %c3_i64 = arith.constant() {value = 3} -> i64
-        "return"()
+        return()
     ^bb13:
         cf.br()
     ^bb14:
         cf.br()
     ^bb15:
         %c4_i64 = arith.constant() {value = 4} -> i64
-        "return"()
+        return()
     ^bb16:
         %c0_i64_13 = arith.constant() {value = 0} -> i64
         %c1_i64_14 = arith.constant() {value = 1} -> i64
@@ -98,14 +98,14 @@ module() {
         cf.cond_br(%25: i64)
     ^bb20:
         %c5_i64 = arith.constant() {value = 5} -> i64
-        "return"()
+        return()
     ^bb21:
         cf.br()
     ^bb22:
         cf.br()
     ^bb23:
         %c6_i64 = arith.constant() {value = 6} -> i64
-        "return"()
+        return()
     ^bb24:
         %c0_i64_19 = arith.constant() {value = 0} -> i64
         %c0_i64_20 = arith.constant() {value = 0} -> i64
@@ -131,22 +131,22 @@ module() {
         cf.cond_br(%35: i64)
     ^bb28:
         %c7_i64 = arith.constant() {value = 7} -> i64
-        "return"()
+        return()
     ^bb29:
         cf.br()
     ^bb30:
         cf.br()
     ^bb31:
         %c8_i64 = arith.constant() {value = 8} -> i64
-        "return"()
+        return()
     ^bb32:
         %c0_i64_26 = arith.constant() {value = 0} -> i64
-        "return"()
+        return()
     }
     func.func() {
     ^bb0:
         %c1_i64 = arith.constant() {value = 1} -> i64
-        "return"()
+        return()
     }
 }
 
