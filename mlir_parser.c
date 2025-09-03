@@ -2667,42 +2667,38 @@ void parse_scf_yield(Parser *parser, Operation *op) {
 }
 
 void parse_return_operation(Parser *parser, Operation *op) {
-    // Consume optional operands, with or without parentheses
-    if (parser_peek(parser, TK_LPAREN)) {
-        parser_expect(parser, TK_LPAREN);
-        bool first = true;
-        while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
-            if (!first && parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
-            first = false;
-            if (parser_peek(parser, TK_REGISTER)) {
-                parser_expect(parser, TK_REGISTER);
-            } else {
-                parser_next_token(parser);
-            }
+    // Parse optional operands
+    VecValueRef operands;
+    VecValueRef_reserve(parser->arena, &operands, 2);
+    while (parser_peek(parser, TK_REGISTER)) {
+        string reg_str = parser_token_str(parser);
+        parser_expect(parser, TK_REGISTER);
+        ValueRef *operand = symbol_table_lookup(&parser->symbol_table, reg_str);
+        if (!operand) {
+            parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
+            return;
         }
-        parser_expect(parser, TK_RPAREN);
-    } else {
-        while (parser_peek(parser, TK_REGISTER)) {
-            parser_expect(parser, TK_REGISTER);
-            if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
-        }
+        VecValueRef_push_back(parser->arena, &operands, operand);
+        if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
     }
-    // Consume optional ": ..." and loc()
+    // Do not keep operands for return-like ops in generic mode
+    op->operands = NULL;
+    op->n_operands = 0;
+
+    // Consume any trailing ": ..." types or loc(), without assigning result types
     if (parser_peek(parser, TK_COLON)) {
-        parser_expect(parser, TK_COLON);
-        int angle = 0, paren = 0;
-        while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
-            if (parser_peek(parser, TK_LANGLE)) angle++;
-            else if (parser_peek(parser, TK_RANGLE) && angle > 0) angle--;
-            else if (parser_peek(parser, TK_LPAREN)) paren++;
-            else if (parser_peek(parser, TK_RPAREN) && paren > 0) paren--;
-            if (angle == 0 && paren == 0 && parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
+        // Consume tokens until newline/brace
+        do {
+            if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
+                parse_loc(parser);
+                break;
+            }
             parser_next_token(parser);
-        }
-        if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) parse_loc(parser);
+        } while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE) && !parser_peek(parser, TK_EOF));
     }
-    // No results
-    op->n_result_types = 0;
+
+    // Done with this op line
+    while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
 }
 
 Operation* parse_operation(Parser *parser) {
@@ -2734,56 +2730,6 @@ Operation* parse_operation(Parser *parser) {
         } else {
             // Shouldn't happen
             abort();
-        }
-    }
-
-    // Check for operations that start with operation name instead of result assignment
-    if (parser_peek(parser, TK_NAME) || parser_peek(parser, TK_NAME_DOT_NAME)) {
-        string potential_opname = parser_token_str(parser);
-        if (str_eq(potential_opname, str_lit("return")) ||
-            str_eq(potential_opname, str_lit("func.return")) ||
-            str_eq(potential_opname, str_lit("std.return")) ||
-            str_eq(potential_opname, str_lit("tt.return")) ||
-            str_eq(potential_opname, str_lit("tt.reduce.return"))
-        ) {
-            // Handle return-like ops generically: parse operands, no result type
-            op->opname = potential_opname;
-            op->op_type = op_string_to_type(potential_opname);
-            parser_next_token(parser); // consume operation name
-
-            // Parse optional operands
-            VecValueRef operands;
-            VecValueRef_reserve(parser->arena, &operands, 2);
-            while (parser_peek(parser, TK_REGISTER)) {
-                string reg_str = parser_token_str(parser);
-                parser_expect(parser, TK_REGISTER);
-                ValueRef *operand = symbol_table_lookup(&parser->symbol_table, reg_str);
-                if (!operand) {
-                    parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
-                    return NULL;
-                }
-                VecValueRef_push_back(parser->arena, &operands, operand);
-                if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
-            }
-            // Do not keep operands for return-like ops in generic mode
-            op->operands = NULL;
-            op->n_operands = 0;
-
-            // Consume any trailing ": ..." types or loc(), without assigning result types
-            if (parser_peek(parser, TK_COLON)) {
-                // Consume tokens until newline/brace
-                do {
-                    if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
-                        parse_loc(parser);
-                        break;
-                    }
-                    parser_next_token(parser);
-                } while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE) && !parser_peek(parser, TK_EOF));
-            }
-
-            // Done with this op line
-            while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
-            return op;
         }
     }
 
