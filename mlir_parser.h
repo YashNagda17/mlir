@@ -299,9 +299,17 @@ void parse_gpu_launch(Parser *parser, Operation *op);
 
 string tokentype_to_string(TokenType tt);
 void parser_init(Arena *arena, Parser *parser, string text);
+void parser_next_token(Parser *parser);
+bool parser_peek(Parser *parser, TokenType s);
+void parser_expect(Parser *parser, TokenType s);
+string parser_token_str(Parser *parser);
 void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last);
 void parser_warning(Parser *parser, string msg, uint64_t first, uint64_t last);
 Operation* parse_module(Parser *parser);
+void parse_loc(Parser *parser);
+Operation* parse_operation(Parser *parser);
+Region* parse_region(Parser *parser);
+Block* parse_block(Parser *parser);
 
 string op_type_to_string(OpType type);
 OpType op_string_to_type(string name);
