@@ -891,9 +891,9 @@ Operation* parse_module(Parser *parser) {
     Location *loc0_def = NULL;
     while (parser_peek(parser, TK_HASH_NAME)) {
         string hash_name = parser_token_str(parser);
-        parser_next_token(parser);
+        parser_next_token(parser); // consume '#name'
         if (parser_peek(parser, TK_EQUAL)) {
-            parser_next_token(parser);
+            parser_next_token(parser); // consume '='
             if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
                 Location *loc_def = parse_loc(parser);
                 if (loc_def) {
@@ -902,8 +902,15 @@ Operation* parse_module(Parser *parser) {
                         loc0_def = loc_def;
                     }
                 }
+            } else {
+                // Not a loc() definition; skip until end of line
+                while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
             }
+        } else {
+            // No '=', skip rest of the line
+            while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
         }
+        if (parser_peek(parser, TK_NEWLINE)) parser_next_token(parser);
         while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) parser_next_token(parser);
     }
 
@@ -922,28 +929,20 @@ Operation* parse_module(Parser *parser) {
     while (parser_peek(parser, TK_HASH_NAME)) {
         string hash_name = parser_token_str(parser);
         parser_next_token(parser);
-        
         if (parser_peek(parser, TK_EQUAL)) {
             parser_next_token(parser); // consume '='
-            
             if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
                 Location *loc_def = parse_loc(parser);
                 if (loc_def) {
-                    // Store in location map for later reference
                     LocationMap_insert(parser->arena, &parser->location_map, hash_name, loc_def);
-                    // If this is the unnumbered '#loc', also ensure a canonical '#loc' key exists
-                    if (hash_name.size == 4 && strncmp(hash_name.str, "#loc", 4) == 0) {
-                        string canonical = str_lit("#loc");
-                        LocationMap_insert(parser->arena, &parser->location_map, canonical, loc_def);
-                    }
                 }
+            } else {
+                // Skip other definitions
+                while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
             }
         }
-        
-        // Skip whitespace and newlines after location definition
-        while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) {
-            parser_next_token(parser);
-        }
+        if (parser_peek(parser, TK_NEWLINE)) parser_next_token(parser);
+        while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) parser_next_token(parser);
     }
     
     // Attach unnumbered '#loc' definition captured during initial scan or in parse_operation
