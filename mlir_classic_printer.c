@@ -421,52 +421,67 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
         }
 
         case OP_TYPE_SCF_FOR: {
-            // Classic format: scf.for %arg22 = %c0_i32 to %arg12 step %c1_i32  : i32 {
+            // Classic format: %res? = scf.for %iv = %lb to %ub step %step
+            //                  [iter_args(%a = %init, ...)] [-> (types...)]  : iv_type
             result = str_concat(arena, result, str_lit("scf.for "));
-            
-            // Format: %induction = %init to %bound step %step
+
+            // Resolve body block and arguments
+            Block *body = NULL;
+            if (op->n_regions > 0 && op->regions && op->regions[0] && op->regions[0]->n_blocks > 0) {
+                body = op->regions[0]->blocks[0];
+            }
+
+            // Print induction variable name from block arg 0
+            if (body && body->n_arguments > 0 && body->arguments[0]) {
+                result = str_concat(arena, result, print_ssa_value_classic(ctx, body->arguments[0]));
+                result = str_concat(arena, result, str_lit(" = "));
+            }
+
+            // lb, ub, step operands
             if (op->n_operands >= 3) {
-                // Induction variable (result)
-                if (op->n_results > 0 && op->results[0]) {
-                    result = str_concat(arena, result, print_ssa_value_classic(ctx, op->results[0]));
-                    result = str_concat(arena, result, str_lit(" = "));
-                }
-                
-                // init, bound, step
                 result = str_concat(arena, result, print_ssa_value_classic(ctx, op->operands[0]));
                 result = str_concat(arena, result, str_lit(" to "));
                 result = str_concat(arena, result, print_ssa_value_classic(ctx, op->operands[1]));
                 result = str_concat(arena, result, str_lit(" step "));
                 result = str_concat(arena, result, print_ssa_value_classic(ctx, op->operands[2]));
-                
-                // iter_args if present
-                if (op->n_operands > 3) {
-                    result = str_concat(arena, result, str_lit(" iter_args("));
-                    for (int i = 3; i < op->n_operands; i++) {
-                        if (i > 3) result = str_concat(arena, result, str_lit(", "));
-                        // iter_arg name from result 
-                        if (op->n_results > i-2 && op->results[i-2]) {
-                            result = str_concat(arena, result, print_ssa_value_classic(ctx, op->results[i-2]));
-                            result = str_concat(arena, result, str_lit(" = "));
-                        }
-                        result = str_concat(arena, result, print_ssa_value_classic(ctx, op->operands[i]));
+            }
+
+            // iter_args section with original names from block args 1..N
+            int n_iter = op->n_operands > 3 ? (op->n_operands - 3) : 0;
+            if (n_iter > 0) {
+                result = str_concat(arena, result, str_lit(" iter_args("));
+                for (int i = 0; i < n_iter; i++) {
+                    if (i > 0) result = str_concat(arena, result, str_lit(", "));
+                    ValueRef *arg_name = NULL;
+                    if (body && body->n_arguments > (size_t)(i + 1)) arg_name = body->arguments[i + 1];
+                    if (arg_name) {
+                        result = str_concat(arena, result, print_ssa_value_classic(ctx, arg_name));
+                        result = str_concat(arena, result, str_lit(" = "));
                     }
+                    result = str_concat(arena, result, print_ssa_value_classic(ctx, op->operands[3 + i]));
+                }
+                // Arrow result types: exactly op->result_types
+                if (op->n_result_types > 0) {
                     result = str_concat(arena, result, str_lit(") -> ("));
-                    // Return types for iter_args
-                    for (int i = 1; i < op->n_result_types; i++) {
-                        if (i > 1) result = str_concat(arena, result, str_lit(", "));
+                    for (int i = 0; i < op->n_result_types; i++) {
+                        if (i > 0) result = str_concat(arena, result, str_lit(", "));
                         result = str_concat(arena, result, type_to_string(arena, op->result_types[i]));
                     }
                     result = str_concat(arena, result, str_lit(")"));
+                } else {
+                    result = str_concat(arena, result, str_lit(")"));
                 }
-                
-                // Type annotation 
-                result = str_concat(arena, result, str_lit("  : "));
-                if (op->n_result_types > 0 && op->result_types[0]) {
-                    result = str_concat(arena, result, type_to_string(arena, op->result_types[0]));
-                } else if (op->n_operands > 0 && op->operands[0] && op->operands[0]->type) {
-                    result = str_concat(arena, result, type_to_string(arena, op->operands[0]->type));
-                }
+            }
+
+            // Type annotation for induction variable after header
+            result = str_concat(arena, result, str_lit("  : "));
+            if (body && body->n_arguments > 0 && body->arguments[0] && body->arguments[0]->type) {
+                result = str_concat(arena, result, type_to_string(arena, body->arguments[0]->type));
+            } else if (op->n_operands > 0 && op->operands[0] && op->operands[0]->type) {
+                result = str_concat(arena, result, type_to_string(arena, op->operands[0]->type));
+            } else if (op->n_result_types > 0 && op->result_types[0]) {
+                // Fallback
+                result = str_concat(arena, result, type_to_string(arena, op->result_types[0]));
             }
             break;
         }
