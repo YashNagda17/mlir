@@ -56,6 +56,14 @@ typedef struct ScopedSymbolTable {
     size_t scope_capacity;
 } ScopedSymbolTable;
 
+// Forward declare Location for hashtable
+typedef struct Location Location;
+
+// Location map for named location references
+#define LocationMap_HASH string_hash
+#define LocationMap_EQUAL string_equal
+DEFINE_HASHTABLE_FOR_TYPES(string, Location*, LocationMap)
+
 typedef struct {
     Arena *arena;
     unsigned char *input;
@@ -63,6 +71,9 @@ typedef struct {
     uint64_t cur;
     uint64_t first, last;
     ScopedSymbolTable symbol_table;
+    LocationMap location_map;  // For #locN -> Location mapping
+    int next_loc_id;          // Counter for generating #locN IDs
+    Location *unnumbered_loc_def; // Optional: definition of unnumbered '#loc' at file start
 } Parser;
 
 
@@ -220,6 +231,36 @@ typedef struct NamedAttribute {
     Attribute *value;
 } NamedAttribute;
 
+// Location information for MLIR constructs
+typedef enum {
+    LOC_KIND_UNKNOWN,
+    LOC_KIND_FILE,      // loc("file.py":line:col)
+    LOC_KIND_NAME,      // loc("name")
+    LOC_KIND_CALLSITE,  // loc(callsite(...))
+    LOC_KIND_FUSED,     // loc(fused[...])
+    LOC_KIND_REF        // loc(#locN) - reference to named location
+} LocationKind;
+
+typedef struct Location {
+    LocationKind kind;
+    union {
+        struct {
+            string filename;
+            int line;
+            int column;
+        } file;
+        struct {
+            string name;
+        } name;
+        struct {
+            int ref_id;  // For #locN references
+        } ref;
+    } data;
+    
+    // For storing the original location string for printing
+    string original_text;
+} Location;
+
 
 typedef enum ValueKind {
     BLOCK_ARG,
@@ -239,6 +280,12 @@ struct ValueRef {
     // same name. If this is used for printing, then extra care must be taken
     // that the printed Value name is unique.
     string register_name;
+
+    // Optional per-argument metadata for classic printing
+    Location *location;           // e.g., arg loc("file":line:col)
+    bool has_divisibility;        // tt.divisibility attribute present
+    int64_t divisibility_value;   // value for tt.divisibility
+    Type *divisibility_type;      // type for tt.divisibility value (e.g., i32)
 
     // Maybe later:
     //Operation **users;
@@ -267,6 +314,11 @@ typedef struct Operation {
     // Result values produced by this operation
     ValueRef **results;
     uint64_t n_results;
+    
+    // Location information
+    Location *location;
+    // Optional: definition for unnumbered '#loc' header captured pre-module
+    Location *unnumbered_loc_def;
 } Operation;
 DEFINE_VECTOR_FOR_TYPE(Operation*, VecOperation)
 DEFINE_VECTOR_FOR_TYPE(ValueRef*, VecValueRef)
@@ -306,7 +358,7 @@ string parser_token_str(Parser *parser);
 void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last);
 void parser_warning(Parser *parser, string msg, uint64_t first, uint64_t last);
 Operation* parse_module(Parser *parser);
-void parse_loc(Parser *parser);
+Location* parse_loc(Parser *parser);
 Operation* parse_operation(Parser *parser);
 Region* parse_region(Parser *parser);
 Block* parse_block(Parser *parser);

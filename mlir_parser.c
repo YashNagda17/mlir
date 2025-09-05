@@ -74,6 +74,10 @@ ValueRef* create_value_ref(Arena *arena, ValueKind kind) {
     value->result_index = 0;
     value->type = NULL;
     value->register_name = str_lit("");
+    value->location = NULL;
+    value->has_divisibility = false;
+    value->divisibility_value = 0;
+    value->divisibility_type = NULL;
     return value;
 }
 
@@ -381,6 +385,9 @@ void parser_init(Arena *arena, Parser *parser, string text) {
     parser->input = (unsigned char*) text_null.str;
     parser->cur = 0;
     symbol_table_init(arena, &parser->symbol_table);
+    LocationMap_init(arena, &parser->location_map, 16);
+    parser->next_loc_id = 0;
+    parser->unnumbered_loc_def = NULL;
     parser_next_token(parser);
 }
 
@@ -880,21 +887,141 @@ Region* parse_region(Parser *parser) {
 }
 
 Operation* parse_module(Parser *parser) {
+    // Capture any top-of-file #loc definitions before the module
+    Location *loc0_def = NULL;
+    while (parser_peek(parser, TK_HASH_NAME)) {
+        string hash_name = parser_token_str(parser);
+        parser_next_token(parser); // consume '#name'
+        if (parser_peek(parser, TK_EQUAL)) {
+            parser_next_token(parser); // consume '='
+            if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
+                Location *loc_def = parse_loc(parser);
+                if (loc_def) {
+                    LocationMap_insert(parser->arena, &parser->location_map, hash_name, loc_def);
+                    if (hash_name.size == 4 && strncmp(hash_name.str, "#loc", 4) == 0) {
+                        loc0_def = loc_def;
+                    }
+                }
+            } else {
+                // Not a loc() definition; skip until end of line
+                while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
+            }
+        } else {
+            // No '=', skip rest of the line
+            while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
+        }
+        if (parser_peek(parser, TK_NEWLINE)) parser_next_token(parser);
+        while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) parser_next_token(parser);
+    }
+
     Operation *op = parse_operation(parser);
     if (!str_eq(op->opname, str_lit("module"))) {
         parser_error(parser, str_lit("The top level operation should be a module"), 0, 0);
     }
+    
+    // Skip whitespace and newlines after the module
+    while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) {
+        parser_next_token(parser);
+    }
+    
+    // Parse location definitions that appear after the module
+    // Format: #locN = loc(...)
+    while (parser_peek(parser, TK_HASH_NAME)) {
+        string hash_name = parser_token_str(parser);
+        parser_next_token(parser);
+        if (parser_peek(parser, TK_EQUAL)) {
+            parser_next_token(parser); // consume '='
+            if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
+                Location *loc_def = parse_loc(parser);
+                if (loc_def) {
+                    LocationMap_insert(parser->arena, &parser->location_map, hash_name, loc_def);
+                }
+            } else {
+                // Skip other definitions
+                while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
+            }
+        }
+        if (parser_peek(parser, TK_NEWLINE)) parser_next_token(parser);
+        while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) parser_next_token(parser);
+    }
+    
+    // Attach unnumbered '#loc' definition captured during initial scan or in parse_operation
+    if (!loc0_def) loc0_def = parser->unnumbered_loc_def;
+    op->unnumbered_loc_def = loc0_def;
     return op;
 }
 
 // parse loc()
-void parse_loc(Parser *parser) {
-    parser_expect(parser, TK_NAME);
+Location* parse_loc(Parser *parser) {
+    Arena *arena = parser->arena;
+    Location *loc = arena_alloc(arena, Location);
+    loc->kind = LOC_KIND_UNKNOWN;
+    loc->original_text = str_lit("");
+    
+    // Save starting position for original text
+    uint64_t start_pos = parser->cur;
+    
+    parser_expect(parser, TK_NAME); // 'loc'
     parser_expect(parser, TK_LPAREN);
-    while (!(parser_peek(parser, TK_RPAREN))) {
+    
+    // Check what kind of location this is
+    if (parser_peek(parser, TK_STRING)) {
+        // loc("filename":line:col) or loc("name")
+        string filename = parser_token_str(parser);
         parser_next_token(parser);
+        
+        if (parser_peek(parser, TK_COLON)) {
+            // File location: loc("filename":line:col)
+            parser_next_token(parser); // consume ':'
+            
+            if (parser_peek(parser, TK_INTEGER)) {
+                loc->kind = LOC_KIND_FILE;
+                loc->data.file.filename = filename;
+                
+                // Parse line number
+                string line_str = parser_token_str(parser);
+                loc->data.file.line = atoi(line_str.str);
+                parser_next_token(parser);
+                
+                if (parser_peek(parser, TK_COLON)) {
+                    parser_next_token(parser); // consume ':'
+                    if (parser_peek(parser, TK_INTEGER)) {
+                        // Parse column number
+                        string col_str = parser_token_str(parser);
+                        loc->data.file.column = atoi(col_str.str);
+                        parser_next_token(parser);
+                    }
+                }
+            }
+        } else {
+            // Named location: loc("name")
+            loc->kind = LOC_KIND_NAME;
+            loc->data.name.name = filename;
+        }
+    } else if (parser_peek(parser, TK_HASH_NAME)) {
+        // Reference location: loc(#locN)
+        string hash_name = parser_token_str(parser);
+        parser_next_token(parser); // consume '#locN'
+        loc->kind = LOC_KIND_REF;
+        // Extract number from "#locN" format
+        if (hash_name.size > 4 && strncmp(hash_name.str, "#loc", 4) == 0) {
+            loc->data.ref.ref_id = atoi(hash_name.str + 4);
+        } else {
+            loc->data.ref.ref_id = 0;
+        }
+    } else {
+        // Unknown location format, just consume tokens until ')'
+        while (!(parser_peek(parser, TK_RPAREN))) {
+            parser_next_token(parser);
+        }
     }
+    
     parser_expect(parser, TK_RPAREN);
+    
+    // Capture original text for printing (simplified for now)
+    loc->original_text = str_lit("loc(unknown)");
+    
+    return loc;
 }
 
 
@@ -911,6 +1038,7 @@ Operation* parse_operation(Parser *parser) {
     op->results = NULL;
     op->n_results = 0;
     op->opname = str_lit("");
+    op->unnumbered_loc_def = NULL;
 
     // Skip empty lines and attributes
     while (
@@ -918,10 +1046,24 @@ Operation* parse_operation(Parser *parser) {
         parser_peek(parser, TK_HASH_NAME)
             ) {
         if (parser_peek(parser, TK_HASH_NAME)) {
-            while (!parser_peek(parser, TK_NEWLINE)) {
-                parser_next_token(parser);
+            // Capture location definitions like "#loc = loc(...)" instead of discarding
+            string hash_name = parser_token_str(parser);
+            parser_next_token(parser); // consume '#loc...'
+            if (parser_peek(parser, TK_EQUAL)) {
+                parser_next_token(parser); // consume '='
+                if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
+                    Location *loc_def = parse_loc(parser);
+                    if (loc_def) {
+                        LocationMap_insert(parser->arena, &parser->location_map, hash_name, loc_def);
+                        if (hash_name.size == 4 && strncmp(hash_name.str, "#loc", 4) == 0) {
+                            parser->unnumbered_loc_def = loc_def;
+                        }
+                    }
+                }
             }
-            parser_expect(parser, TK_NEWLINE);
+            // Consume rest of the line
+            while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
+            if (parser_peek(parser, TK_NEWLINE)) parser_expect(parser, TK_NEWLINE);
         } else if (parser_peek(parser, TK_NEWLINE)) {
             parser_expect(parser, TK_NEWLINE);
         } else {

@@ -5,6 +5,8 @@
 #include <base/arena.h>
 #include <base/io.h>
 #include "mlir_parser.h"
+#include "mlir_generic_printer.h"
+#include "mlir_classic_printer.h"
 #include <base/hashtable.h>
 
 void tokenizer_print_all_tokens(Arena *arena, const string input_code) {
@@ -33,293 +35,6 @@ void tokenizer_print_all_tokens(Arena *arena, const string input_code) {
     }
 }
 
-// SSA numbering map for printer
-static inline size_t ptr_hash(ValueRef *p) { return ((size_t)p) >> 3; }
-static inline bool ptr_equal(ValueRef *a, ValueRef *b) { return a == b; }
-#define SsaMap_HASH ptr_hash
-#define SsaMap_EQUAL ptr_equal
-DEFINE_HASHTABLE_FOR_TYPES(ValueRef*, uint32_t, SsaMap)
-
-typedef struct {
-    Arena *arena;
-    uint32_t next_ssa;
-    SsaMap ssa_map;
-} PrintCtx;
-
-static inline void ssa_map_init(PrintCtx *ctx, Arena *arena) {
-    ctx->arena = arena;
-    ctx->next_ssa = 0;
-    SsaMap_init(arena, &ctx->ssa_map, 128);
-}
-
-static inline uint32_t get_or_assign_ssa(PrintCtx *ctx, ValueRef *v) {
-    uint32_t *found = SsaMap_get(&ctx->ssa_map, v);
-    if (found) return *found;
-    uint32_t num = ctx->next_ssa++;
-    SsaMap_insert(ctx->arena, &ctx->ssa_map, v, num);
-    return num;
-}
-
-
-string print_operation_internal(PrintCtx *ctx, int indent_level, Operation *op);
-
-static void preassign_region_ssa(PrintCtx *ctx, Region *region, int indent_level);
-static void preassign_op_ssa(PrintCtx *ctx, Operation *op, int indent_level) {
-    // First preassign nested regions so nested results get earlier numbers
-    if (op->n_regions > 0 && op->regions) {
-        for (int i = 0; i < op->n_regions; i++) {
-            preassign_region_ssa(ctx, op->regions[i], indent_level + 1);
-        }
-    }
-    // Then assign SSA for this op's results, if any
-    if (op->n_results > 0 && op->results) {
-        for (int i = 0; i < op->n_results; i++) {
-            if (op->results[i]) {
-                (void)get_or_assign_ssa(ctx, op->results[i]);
-            }
-        }
-    }
-}
-
-static void preassign_block_ssa(PrintCtx *ctx, Block *block, int indent_level) {
-    for (int i = 0; i < block->n_operations; i++) {
-        preassign_op_ssa(ctx, block->operations[i], indent_level + 1);
-    }
-}
-
-static void preassign_region_ssa(PrintCtx *ctx, Region *region, int indent_level) {
-    for (int i = 0; i < region->n_blocks; i++) {
-        preassign_block_ssa(ctx, region->blocks[i], indent_level);
-    }
-}
-
-string indent(Arena *arena, int indent_level) {
-    const int indent_spaces=4;
-    int buf_size=indent_level*indent_spaces;
-    char* buf = arena_alloc_array(arena, char, buf_size);
-    for (int64_t i = 0; i < buf_size; i++) {
-        buf[i] = ' ';
-    }
-    string str = {buf, buf_size};
-    return str;
-}
-
-string print_block_internal(PrintCtx *ctx, int bb_index, int indent_level, Block *block) {
-    Arena *arena = ctx->arena;
-    string result = format(arena, str_lit("{}^bb{}"), indent(arena, indent_level), bb_index);
-
-    // Print block arguments if any
-    if (block->n_arguments > 0 && block->arguments) {
-        result = str_concat(arena, result, str_lit("("));
-        for (int i = 0; i < block->n_arguments; i++) {
-            if (i > 0) result = str_concat(arena, result, str_lit(", "));
-            ValueRef *arg = block->arguments[i];
-            if (arg && arg->type) {
-                // For block arguments, use the original register name
-                if (arg->register_name.size > 0) {
-                    result = str_concat(arena, result, format(arena, str_lit("{}: {}"),
-                                                            arg->register_name, type_to_string(arena, arg->type)));
-                } else {
-                    result = str_concat(arena, result, format(arena, str_lit("%arg{}: {}"),
-                                                            (int64_t)arg->result_index, type_to_string(arena, arg->type)));
-                }
-            } else {
-                result = str_concat(arena, result, str_lit("null_arg"));
-            }
-        }
-        result = str_concat(arena, result, str_lit(")"));
-    }
-
-    result = str_concat(arena, result, str_lit(":\n"));
-
-    for (int i=0; i < block->n_operations; i++) {
-        result = str_concat(arena, result,
-            print_operation_internal(ctx, indent_level+1, block->operations[i])
-        );
-    }
-    return result;
-}
-
-string print_region_internal(PrintCtx *ctx, int indent_level, Region *region) {
-    Arena *arena = ctx->arena;
-    string result = str_lit("");
-    result = str_concat(arena, result, str_lit("{\n"));
-    for (int i=0; i < region->n_blocks; i++) {
-        result = str_concat(arena, result,
-            print_block_internal(ctx, i, indent_level, region->blocks[i])
-        );
-    }
-    result = str_concat(arena, result, indent(arena, indent_level));
-    result = str_concat(arena, result, str_lit("}"));
-    return result;
-}
-
-string print_operation_internal(PrintCtx *ctx, int indent_level, Operation *op) {
-    Arena *arena = ctx->arena;
-    string result = indent(arena, indent_level);
-
-    // Print results if any
-    if (op->n_result_types > 0) {
-        // Ensure nested regions get SSA numbers first to match expected ordering
-        if (op->n_regions > 0 && op->regions) {
-            for (int i = 0; i < op->n_regions; i++) {
-                preassign_region_ssa(ctx, op->regions[i], indent_level + 1);
-            }
-        }
-        for (int i = 0; i < op->n_result_types; i++) {
-            if (i > 0) result = str_concat(arena, result, str_lit(", "));
-
-            // Assign/get SSA number for the result value (after preassigning children)
-            if (op->n_results > i && op->results && op->results[i]) {
-                ValueRef *res = op->results[i];
-                if (res->register_name.size > 0) {
-                    result = str_concat(arena, result, res->register_name);
-                } else {
-                    uint32_t num = get_or_assign_ssa(ctx, res);
-                    result = str_concat(arena, result, format(arena, str_lit("%{}"), (int64_t)num));
-                }
-            } else {
-                // Should not happen; emit placeholder
-                result = str_concat(arena, result, str_lit("%_"));
-            }
-        }
-        result = str_concat(arena, result, str_lit(" = "));
-    }
-
-    // Print operation name (quotes only for unregistered operations, except tt.func)
-    bool is_tt_func = (op->opname.size > 0 && str_eq(op->opname, str_lit("tt.func")));
-    if (op->op_type == OP_TYPE_UNREGISTERED && !is_tt_func) {
-        result = str_concat(arena, result, str_lit("\""));
-        if (op->opname.size > 0) {
-            result = str_concat(arena, result, op->opname);
-        } else {
-            result = str_concat(arena, result, str_lit("unknown"));
-        }
-        result = str_concat(arena, result, str_lit("\""));
-    } else {
-        if (op->opname.size > 0) {
-            result = str_concat(arena, result, op->opname);
-        } else {
-            result = str_concat(arena, result, op_type_to_string(op->op_type));
-        }
-    }
-
-    // Print operands with types (always include parentheses)
-    result = str_concat(arena, result, str_lit("("));
-    for (int i = 0; i < op->n_operands; i++) {
-        if (i > 0) result = str_concat(arena, result, str_lit(", "));
-        ValueRef *operand = op->operands[i];
-        if (operand == NULL) {
-            result = str_concat(arena, result, str_lit("NULL_OPERAND"));
-            continue;
-        }
-        // Prefer original register name when available; otherwise compute SSA number
-        if (operand->register_name.size > 0) {
-            result = str_concat(arena, result, operand->register_name);
-        } else {
-            uint32_t num = get_or_assign_ssa(ctx, operand);
-            result = str_concat(arena, result, format(arena, str_lit("%{}"), (int64_t)num));
-        }
-        result = str_concat(arena, result, str_lit(": "));
-        result = str_concat(arena, result, type_to_string(arena, operand->type));
-    }
-    result = str_concat(arena, result, str_lit(")"));
-
-    // Print attributes if any (skip for tt.get_program_id as it's handled specially)
-    if (op->n_attributes > 0) {
-        result = str_concat(arena, result, str_lit(" {"));
-        for (int i = 0; i < op->n_attributes; i++) {
-            if (i > 0) result = str_concat(arena, result, str_lit(", "));
-            Attribute *attr = op->attributes[i];
-            result = str_concat(arena, result, format(arena, str_lit("{} = "), attr->name));
-            switch (attr->kind) {
-                case ATTR_KIND_INTEGER:
-                    // Add type annotation for tt.make_range attributes
-                    if (str_eq(op->opname, str_lit("tt.make_range"))) {
-                        result = str_concat(arena, result, format(arena, str_lit("{} : i32"), attr->data.integer_value));
-                    } else {
-                        result = str_concat(arena, result, format(arena, str_lit("{}"), attr->data.integer_value));
-                    }
-                    break;
-                case ATTR_KIND_STRING:
-                    result = str_concat(arena, result, format(arena, str_lit("\"{}\""), attr->data.string_value));
-                    break;
-                default:
-                    result = str_concat(arena, result, str_lit("..."));
-            }
-        }
-        result = str_concat(arena, result, str_lit("}"));
-    }
-
-    // Print result types if any
-    if (op->n_result_types > 0) {
-        result = str_concat(arena, result, str_lit(" -> "));
-        for (int i = 0; i < op->n_result_types; i++) {
-            if (i > 0) result = str_concat(arena, result, str_lit(", "));
-            if (op->result_types && op->result_types[i]) {
-                result = str_concat(arena, result, type_to_string(arena, op->result_types[i]));
-            } else {
-                result = str_concat(arena, result, str_lit("?"));
-            }
-        }
-    }
-
-    // Print regions if any
-    if (op->n_regions > 0) {
-        result = str_concat(arena, result, str_lit(" "));
-        for (int i = 0; i < op->n_regions; i++) {
-            result = str_concat(arena, result,
-                print_region_internal(ctx, indent_level, op->regions[i])
-            );
-        }
-    }
-
-    result = str_concat(arena, result, str_lit("\n"));
-    return result;
-}
-
-// Public entry: initialize SSA context and print
-string print_operation(Arena *arena, int indent_level, Operation *op) {
-    PrintCtx ctx;
-    ssa_map_init(&ctx, arena);
-    // Preassign SSA numbers for entire subtree to match parser's post-order numbering
-    preassign_op_ssa(&ctx, op, indent_level);
-    return print_operation_internal(&ctx, indent_level, op);
-}
-
-// Main
-Operation* construct_test_module(Arena *arena) {
-    // Create simple module operation
-    Operation *module = arena_alloc(arena, Operation);
-    module->op_type = OP_TYPE_MODULE;
-    module->operands = NULL;
-    module->n_operands = 0;
-    module->result_types = NULL;
-    module->n_result_types = 0;
-    module->attributes = NULL;
-    module->n_attributes = 0;
-    module->results = NULL;
-    module->n_results = 0;
-    module->opname = str_lit("module");
-
-    // Create module region and block (empty)
-    Region *module_region = arena_alloc(arena, Region);
-    Block *module_block = arena_alloc(arena, Block);
-    module_block->arguments = NULL;
-    module_block->n_arguments = 0;
-    module_block->operations = NULL;
-    module_block->n_operations = 0;
-
-    module_region->n_blocks = 1;
-    module_region->blocks = arena_alloc_array(arena, Block*, 1);
-    module_region->blocks[0] = module_block;
-
-    module->n_regions = 1;
-    module->regions = arena_alloc_array(arena, Region*, 1);
-    module->regions[0] = module_region;
-
-    return module;
-}
 
 Operation* construct_test_module_full(Arena *arena) {
     // Create types
@@ -527,40 +242,61 @@ Operation* construct_test_module_full(Arena *arena) {
 }
 
 int main(int argc, char *argv[]) {
-    printf("Starting main...\n");
-    Arena *arena = arena_create(50*1024*1024);  // Increase arena size
-    printf("Arena created...\n");
-
-    // Check for --construct option
+    // Check for options first
     bool use_construction = false;
+    bool use_classic_printer = false;
+    bool verbose = false;
     char *input_file = NULL;
 
-    printf("Parsing args...\n");
+    // Parse arguments first to determine verbose mode
     for (int i = 1; i < argc; i++) {
-        printf("Arg %d: %s\n", i, argv[i]);
+        if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+            verbose = true;
+            break;
+        }
+    }
+
+    if (verbose) printf("Starting main...\n");
+    Arena *arena = arena_create(50*1024*1024);  // Increase arena size
+    if (verbose) printf("Arena created...\n");
+
+    if (verbose) printf("Parsing args...\n");
+    for (int i = 1; i < argc; i++) {
+        if (verbose) printf("Arg %d: %s\n", i, argv[i]);
         if (strcmp(argv[i], "--construct") == 0) {
             use_construction = true;
-            printf("Construction mode enabled\n");
+            if (verbose) printf("Construction mode enabled\n");
+        } else if (strcmp(argv[i], "--classic") == 0 || strcmp(argv[i], "-c") == 0) {
+            use_classic_printer = true;
+            if (verbose) printf("Classic printer enabled\n");
+        } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+            verbose = true;
+            if (verbose) printf("Verbose mode enabled\n");
         } else if (argv[i][0] != '-') {
             input_file = argv[i];
         }
     }
-    printf("Done parsing args. use_construction=%d\n", use_construction);
+    if (verbose) printf("Done parsing args. use_construction=%d, use_classic_printer=%d\n", use_construction, use_classic_printer);
 
     Operation* op;
 
     int exit_code;
     if (use_construction) {
         // Use constructed test module
-        printf("Creating module...\n");
+        if (verbose) printf("Creating module...\n");
         op = construct_test_module_full(arena);
-        printf("Module created successfully.\n");
+        if (verbose) printf("Module created successfully.\n");
 
         // Test generic printing with expected output comparison
-        printf("=== Generic Printer Test ===\n");
-        printf("About to print operation...\n");
-        string result = print_operation(arena, 0, op);
-        printf("Printing result...\n");
+        if (verbose) printf("=== Generic Printer Test ===\n");
+        if (verbose) printf("About to print operation...\n");
+        string result;
+        if (use_classic_printer) {
+            result = print_operation_classic(arena, 0, op);
+        } else {
+            result = print_operation_generic(arena, 0, op);
+        }
+        if (verbose) printf("Printing result...\n");
         println(arena, str_lit("{}"), result);
 
         // Reference expected output for generic mode
@@ -578,12 +314,12 @@ int main(int argc, char *argv[]) {
 
         // Compare output
         if (str_eq(result, str_from_cstr_view((char*)expected))) {
-            printf("✅ Generic mode test PASSED\n");
+            if (verbose) printf("✅ Generic mode test PASSED\n");
             exit_code = 0;
         } else {
-            printf("❌ Generic mode test FAILED\n");
-            printf("Expected:\n%s\n", expected);
-            printf("Actual:\n");
+            if (verbose) printf("❌ Generic mode test FAILED\n");
+            if (verbose) printf("Expected:\n%s\n", expected);
+            if (verbose) printf("Actual:\n");
             println(arena, str_lit("{}"), result);
             exit_code = 1;
         }
@@ -603,8 +339,12 @@ int main(int argc, char *argv[]) {
         Parser parser;
         parser_init(arena, &parser, mlir_code);
         op = parse_module(&parser);
-        println(arena, str_lit("MLIR:"));
-        println(arena, str_lit("{}"), print_operation(arena, 0, op));
+        if (verbose) println(arena, str_lit("MLIR:"));
+        if (use_classic_printer) {
+            println(arena, str_lit("{}"), print_module_classic(arena, op, &parser.location_map));
+        } else {
+            println(arena, str_lit("{}"), print_operation_generic(arena, 0, op));
+        }
         exit_code = 0;
     }
 
