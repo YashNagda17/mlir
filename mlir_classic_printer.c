@@ -792,7 +792,8 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
     if (op->n_regions > 0) {
         result = str_concat(arena, result, str_lit(" "));
         for (int i = 0; i < op->n_regions; i++) {
-            if (op->op_type == OP_TYPE_TT_FUNC || op->op_type == OP_TYPE_MODULE) {
+            if (op->op_type == OP_TYPE_TT_FUNC || op->op_type == OP_TYPE_MODULE ||
+                op->op_type == OP_TYPE_SCF_FOR || op->op_type == OP_TYPE_SCF_IF || op->op_type == OP_TYPE_SCF_WHILE) {
                 result = str_concat(arena, result,
                     print_function_region_classic(ctx, indent_level, op->regions[i])
                 );

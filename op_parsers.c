@@ -1953,6 +1953,15 @@ void parse_scf_for(Parser *parser, Operation *op) {
     // Set operands for the scf.for operation
     op->operands = operands.data;
     op->n_operands = operands.size;
+    
+    // Set loop variable as a result for classic format printing
+    if (loop_var) {
+        op->n_results = 1;
+        op->results = arena_alloc_array(parser->arena, ValueRef*, 1);
+        op->results[0] = loop_var;
+        // Also fix the type to match original (i32 instead of index)
+        loop_var->type = parse_type_from_string(parser->arena, str_lit("i32"));
+    }
 
     // Parse optional result types '-> (type, ...)' before region
     while (!parser_peek(parser, TK_LBRACE_END) && !parser_peek(parser, TK_EOF)) {
