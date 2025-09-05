@@ -48,10 +48,10 @@ module() {
         %27 = "math.log"(%26: ?) -> f32
         %28 = arith.addf(%22: ?, %27: f32) -> f32
         %29 = arith.cmpi(%1: i32, %c0_i32: i32) {predicate = "eq"} -> i32
-        scf.if() {
+        scf.if(%29: i32) {
         ^bb0:
             %30 = arith.cmpi(%17: i64, %c-100_i32: i32) {predicate = "ne"} -> i32
-            %31 = scf.if() -> f32 {
+            %31 = scf.if(%30: i32) -> f32 {
             ^bb0:
                 %32 = tt.addptr(%5: !tt.ptr<bf16>, %17: i64) -> !tt.ptr<bf16>
                 %33 = tt.load(%32: !tt.ptr<bf16>) {cache = 1, evict = 1, isVolatile = ...} -> bf16

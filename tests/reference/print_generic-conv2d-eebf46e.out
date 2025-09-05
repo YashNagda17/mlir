@@ -28,7 +28,7 @@ module() {
                     %20 = arith.cmpi(%19: i32, %c0_i32: i32) {predicate = "slt"} -> i32
                     %21 = arith.cmpi(%19: i32, %arg4: i32) {predicate = "sge"} -> i32
                     %22 = "arith.ori"(%20: i32, %21: i32) -> i1
-                    %23 = scf.if() -> f32 {
+                    %23 = scf.if(%22: i1) -> f32 {
                     ^bb0:
                         scf.yield(%arg1: i16)
                     }{
@@ -39,7 +39,7 @@ module() {
                             %26 = arith.cmpi(%25: i32, %c0_i32: i32) {predicate = "slt"} -> i32
                             %27 = arith.cmpi(%25: i32, %arg5: i32) {predicate = "sge"} -> i32
                             %28 = "arith.ori"(%26: i32, %27: i32) -> i1
-                            %29 = scf.if() -> f32 {
+                            %29 = scf.if(%28: i1) -> f32 {
                             ^bb0:
                                 scf.yield(%arg1: i16)
                             }{

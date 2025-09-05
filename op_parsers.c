@@ -1777,6 +1777,23 @@ void parse_func_func(Parser *parser, Operation *op) {
 }
 
 void parse_scf_if(Parser *parser, Operation *op) {
+    // Parse condition operand: scf.if %condition -> ...
+    VecValueRef operands;
+    VecValueRef_reserve(parser->arena, &operands, 1);
+    
+    if (parser_peek(parser, TK_REGISTER)) {
+        string cond_str = parser_token_str(parser);
+        parser_expect(parser, TK_REGISTER);
+        ValueRef *condition = symbol_table_lookup(&parser->symbol_table, cond_str);
+        if (condition) {
+            VecValueRef_push_back(parser->arena, &operands, condition);
+        }
+    }
+    
+    // Set operands
+    op->operands = operands.data;
+    op->n_operands = operands.size;
+    
     // Capture optional result types: '-> (type, ... )'
     while (!parser_peek(parser, TK_LBRACE_END) && !parser_peek(parser, TK_EOF)) {
         if (parser_peek(parser, TK_ARROW)) {

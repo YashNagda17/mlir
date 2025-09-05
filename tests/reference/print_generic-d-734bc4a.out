@@ -18,7 +18,7 @@ module() {
         linalg.fill()
         %49 = affine.load(%alloc_76: memref<24xi16>, %idx0: index) -> i16
         %from_elements_117 = "tensor.from_elements"(%49: i16, %49: i16, %49: i16, %49: i16, %49: i16, %49: i16, %49: i16, %49: i16, %49: i16, %49: i16) -> tensor<5x2xi16>
-        %171 = scf.if() -> tensor<5x2xi16> {
+        %171 = scf.if(%true: i1) -> tensor<5x2xi16> {
         ^bb0:
             scf.yield(%from_elements_117: tensor<5x2xi16>)
         }{
