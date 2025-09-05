@@ -51,6 +51,7 @@ print_generic = true
 [[test]]
 filename = "conv2d.ttir"
 print_generic = true
+check_classic = true
 
 [[test]]
 filename = "matmul1.ttir"

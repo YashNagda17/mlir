@@ -1915,12 +1915,13 @@ void parse_scf_if(Parser *parser, Operation *op) {
 }
 
 void parse_scf_for(Parser *parser, Operation *op) {
-    // Parse scf.for %loop_var = %start to %end step %step iter_args(%iter_var = %init) -> (type)
+    // Parse scf.for %iv = %lb to %ub step %step
+    //        [iter_args(%arg = %init, ...)] [-> (types...)]  : iv_type { ... }
 
     VecValueRef operands;
     VecValueRef_reserve(parser->arena, &operands, 4);
 
-    // Parse loop variable: %loop_var
+    // Parse loop variable: %iv
     ValueRef *loop_var = NULL;
     if (parser_peek(parser, TK_REGISTER)) {
         string loop_var_name = parser_token_str(parser);
@@ -1928,8 +1929,8 @@ void parse_scf_for(Parser *parser, Operation *op) {
 
         loop_var = create_value_ref(parser->arena, BLOCK_ARG);
         loop_var->register_name = loop_var_name;
-        loop_var->type = arena_alloc(parser->arena, Type);
-        loop_var->type = parse_type_from_string(parser->arena, str_lit("index"));
+        // Type assigned from trailing ": <type>" if present; default later
+        loop_var->type = NULL;
 
 
         // Expect =
@@ -2001,9 +2002,9 @@ void parse_scf_for(Parser *parser, Operation *op) {
                     parser_expect(parser, TK_REGISTER);
 
                     ValueRef *iter_var = create_value_ref(parser->arena, BLOCK_ARG);
+                    // Keep the original SSA name for printing and symbol mapping
                     iter_var->register_name = iter_var_name;
-                    iter_var->type = arena_alloc(parser->arena, Type);
-                    iter_var->type = parse_type_from_string(parser->arena, str_lit("i16"));
+                    iter_var->type = NULL; // Determined from init operand
 
 
                     VecValueRef_push_back(parser->arena, &iter_vars, iter_var);
@@ -2042,34 +2043,42 @@ void parse_scf_for(Parser *parser, Operation *op) {
     op->operands = operands.data;
     op->n_operands = operands.size;
     
-    // Set loop variable as a result for classic format printing
-    if (loop_var) {
-        op->n_results = 1;
-        op->results = arena_alloc_array(parser->arena, ValueRef*, 1);
-        op->results[0] = loop_var;
-        // Also fix the type to match original (i32 instead of index)
-        loop_var->type = parse_type_from_string(parser->arena, str_lit("i32"));
+    // Parse optional result types list '-> (type, ...)' before region
+    Type **iter_result_types = NULL;
+    size_t n_iter_results = 0;
+    if (parser_peek(parser, TK_ARROW)) {
+        parser_expect(parser, TK_ARROW);
+        if (parser_peek(parser, TK_LPAREN)) {
+            parser_expect(parser, TK_LPAREN);
+            // Parse one or more types separated by commas
+            // Minimal manual growth: collect types with manual growth
+            size_t cap = 4; size_t sz = 0;
+            Type **tmp = arena_alloc_array(parser->arena, Type*, cap);
+            while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
+                string t = str_lit("");
+                if (!parse_type_string(parser, &t)) break;
+                if (sz >= cap) {
+                    size_t ncap = cap * 2;
+                    Type **nt = arena_alloc_array(parser->arena, Type*, ncap);
+                    for (size_t i = 0; i < sz; i++) nt[i] = tmp[i];
+                    tmp = nt; cap = ncap;
+                }
+                tmp[sz++] = parse_type_from_string(parser->arena, t);
+                if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
+            }
+            parser_expect(parser, TK_RPAREN);
+            iter_result_types = tmp;
+            n_iter_results = sz;
+        }
     }
 
-    // Parse optional result types '-> (type, ...)' before region
-    while (!parser_peek(parser, TK_LBRACE_END) && !parser_peek(parser, TK_EOF)) {
-        if (parser_peek(parser, TK_ARROW)) {
-            parser_expect(parser, TK_ARROW);
-            if (parser_peek(parser, TK_LPAREN)) {
-                parser_expect(parser, TK_LPAREN);
-                string t = str_lit("");
-                if (parse_type_string(parser, &t)) {
-                    op->n_result_types = 1;
-                    op->result_types = arena_alloc_array(parser->arena, Type*, 1);
-                    op->result_types[0] = arena_alloc(parser->arena, Type);
-                    op->result_types[0] = parse_type_from_string(parser->arena, t);
-                }
-                // Consume to ')'
-                while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
-                if (parser_peek(parser, TK_RPAREN)) parser_expect(parser, TK_RPAREN);
-            }
-        } else {
-            parser_next_token(parser);
+    // Optional trailing ": <iv_type>" before region
+    Type *iv_type = NULL;
+    if (parser_peek(parser, TK_COLON)) {
+        parser_expect(parser, TK_COLON);
+        string t = str_lit("");
+        if (parse_type_string(parser, &t)) {
+            iv_type = parse_type_from_string(parser->arena, t);
         }
     }
 
@@ -2095,8 +2104,14 @@ void parse_scf_for(Parser *parser, Operation *op) {
         // Create a new ValueRef for the block argument using the original loop variable name
         ValueRef *loop_block_arg = create_value_ref(parser->arena, BLOCK_ARG);
         loop_block_arg->register_name = loop_var->register_name;
-        loop_block_arg->type = arena_alloc(parser->arena, Type);
-        loop_block_arg->type = parse_type_from_string(parser->arena, str_lit("i32"));
+        // Use parsed iv type if available; otherwise default to the lb type or i32
+        if (iv_type) {
+            loop_block_arg->type = iv_type;
+        } else if (operands.size > 0 && operands.data[0] && operands.data[0]->type) {
+            loop_block_arg->type = operands.data[0]->type;
+        } else {
+            loop_block_arg->type = parse_type_from_string(parser->arena, str_lit("i32"));
+        }
 
         loop_block_arg->result_index = 0;
         loop_block_arg->def = block;
@@ -2110,24 +2125,15 @@ void parse_scf_for(Parser *parser, Operation *op) {
     // Create block arguments for all iter_args
     for (size_t i = 0; i < iter_vars.size; i++) {
         ValueRef *iter_var = iter_vars.data[i];
-
-        // Create a new ValueRef for the block argument %arg{i+1}
+        // Create a new ValueRef for the block argument using original name
         ValueRef *iter_block_arg = create_value_ref(parser->arena, BLOCK_ARG);
-
-        // Generate argument name like %arg1, %arg2, %arg3, etc.
-        string arg_name;
-        if (i == 0) {
-            arg_name = str_lit("%arg1");
-        } else if (i == 1) {
-            arg_name = str_lit("%arg2");
-        } else if (i == 2) {
-            arg_name = str_lit("%arg3");
+        iter_block_arg->register_name = iter_var->register_name;
+        // Type of iter arg is the type of its init operand (operands[3+i])
+        if (op->n_operands >= 4 + (int)i && operands.data[3 + i] && operands.data[3 + i]->type) {
+            iter_block_arg->type = operands.data[3 + i]->type;
         } else {
-            arg_name = str_lit("%arg4"); // Support up to 4 iter_args for now
+            iter_block_arg->type = parse_type_from_string(parser->arena, str_lit("unknown"));
         }
-        iter_block_arg->register_name = arg_name;
-        iter_block_arg->type = arena_alloc(parser->arena, Type);
-        iter_block_arg->type = parse_type_from_string(parser->arena, str_lit("i16"));
 
         iter_block_arg->result_index = i + 1;
         iter_block_arg->def = block;
@@ -2175,9 +2181,12 @@ void parse_scf_for(Parser *parser, Operation *op) {
     op->regions[0] = region;
     op->n_regions = 1;
 
-    // Set operands
-    op->operands = operands.data;
-    op->n_operands = operands.size;
+    // Assign parsed iter result types to operation
+    if (n_iter_results > 0) {
+        op->n_result_types = (int)n_iter_results;
+        op->result_types = arena_alloc_array(parser->arena, Type*, n_iter_results);
+        for (size_t i = 0; i < n_iter_results; i++) op->result_types[i] = iter_result_types[i];
+    }
 
     // Handle optional location attribute after }
 }
