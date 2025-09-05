@@ -3,7 +3,7 @@ module() {
     tt.func(%arg0: !tt.ptr<bf16>, %arg1: i32, %arg2: !tt.ptr<f32>, %arg3: !tt.ptr<f32>, %arg4: !tt.ptr<i64>) {sym_name = "_chunked_cross_entropy_forward_0d1d2d3d4d"} {
     ^bb0:
         %cst = arith.constant() -> tensor<65536xbf16>
-        %cst_0 = arith.constant() -> f32
+        %cst_0 = arith.constant() {value = ...} -> f32
         %cst_1 = arith.constant() -> f32
         %c-100_i32 = arith.constant() -> i32
         %c0_i32 = arith.constant() {value = 0} -> i32

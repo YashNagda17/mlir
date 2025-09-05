@@ -615,11 +615,17 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
         for (int i = 0; i < op->n_attributes; i++) {
             Attribute *attr = op->attributes[i];
             // Skip internal attributes that shouldn't be shown in classic format
-            if (str_eq(attr->name, str_lit("value")) ||
-                str_eq(attr->name, str_lit("axis")) ||
+            if (str_eq(attr->name, str_lit("sym_name"))) {
+                continue;
+            }
+            // Skip 'value' attribute only for arith.constant operations
+            if (str_eq(attr->name, str_lit("value")) && op->op_type == OP_TYPE_ARITH_CONSTANT) {
+                continue;
+            }
+            // Skip internal parser attributes 
+            if (str_eq(attr->name, str_lit("axis")) ||
                 str_eq(attr->name, str_lit("start")) ||
-                str_eq(attr->name, str_lit("end")) ||
-                str_eq(attr->name, str_lit("sym_name"))) {
+                str_eq(attr->name, str_lit("end"))) {
                 continue;
             }
             if (!has_visible_attrs) {

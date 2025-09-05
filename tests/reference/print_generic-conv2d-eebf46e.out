@@ -4,7 +4,7 @@ module() {
     ^bb0:
         %c1_i32 = arith.constant() {value = 1} -> i32
         %c0_i32 = arith.constant() {value = 0} -> i32
-        %cst = arith.constant() -> f32
+        %cst = arith.constant() {value = ...} -> f32
         %0 = tt.get_program_id() {axis = "x"} -> i32
         %1 = arith.muli(%arg18: i32, %arg19: i32) -> i32
         %2 = arith.muli(%0: i32, %arg1: i32) -> i32

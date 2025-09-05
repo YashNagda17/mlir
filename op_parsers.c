@@ -162,6 +162,23 @@ void parse_arith_constant(Parser *parser, Operation *op) {
         }
         op->attributes[0]->data.integer_value = parsed_value;
         op->attributes[0]->name = str_lit("value");
+    } else if (parser_peek(parser, TK_REAL)) {
+        // Handle floating point constants like 0.000000e+00
+        string value_str = parser_token_str(parser);
+        parser_expect(parser, TK_REAL);
+
+        op->n_attributes = 1;
+        op->attributes = arena_alloc_array(parser->arena, Attribute*, 1);
+        op->attributes[0] = arena_alloc(parser->arena, Attribute);
+        op->attributes[0]->kind = ATTR_KIND_FLOAT;
+
+        // Parse floating point value using strtod
+        char *str_copy = arena_alloc_array(parser->arena, char, value_str.size + 1);
+        memcpy(str_copy, value_str.str, value_str.size);
+        str_copy[value_str.size] = '\0';
+        double parsed_value = strtod(str_copy, NULL);
+        op->attributes[0]->data.float_value = parsed_value;
+        op->attributes[0]->name = str_lit("value");
     } else if (parser_peek(parser, TK_NAME)) {
         string name_str = parser_token_str(parser);
         // Handle boolean constants: true or false

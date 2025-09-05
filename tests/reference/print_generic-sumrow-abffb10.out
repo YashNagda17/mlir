@@ -15,7 +15,7 @@ module() {
         %6 = arith.cmpi(%5: tensor<2x1xi32>, %cst: tensor<2x1xi32>) -> tensor<2x1xi32>
         %7 = tt.make_range() {end = 16 : i32, start = 0 : i32} -> tensor<256xi32>
         %8 = "tt.expand_dims"(%7: tensor<256xi32>) -> tensor<1x256xi32>
-        %cst_0 = arith.constant() -> f32
+        %cst_0 = arith.constant() {value = ...} -> f32
         %cst_1 = arith.constant() -> tensor<2x256xf32>
         %c0_i32 = arith.constant() {value = 0} -> i32
         %c256_i32 = arith.constant() {value = 256} -> i32
