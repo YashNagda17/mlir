@@ -18,7 +18,7 @@ module() {
         linalg.fill()
         %49 = affine.load(%alloc_76: memref<24xi16>, %idx0: index) -> i16
         %from_elements_117 = "tensor.from_elements"(%49: i16, %49: i16, %49: i16, %49: i16, %49: i16, %49: i16, %49: i16, %49: i16, %49: i16, %49: i16) -> tensor<5x2xi16>
-        %171 = scf.if() -> tensor<5x2xi16> {
+        %171 = scf.if(%true: i1) -> tensor<5x2xi16> {
         ^bb0:
             scf.yield(%from_elements_117: tensor<5x2xi16>)
         }{
@@ -30,8 +30,8 @@ module() {
         %collapsed_217 = tensor.collapse_shape(%171: tensor<5x2xi16>) -> tensor<10xi16>
         %dim = index.constant() -> index
         %0 = scf.for(%idx0: index, %dim: index, %idx1: index, %c0_i16: i16) -> i16 {
-        ^bb0(%arg0: index, %arg1: i16):
-            %extracted = tensor.extract(%collapsed_217: tensor<10xi16>, %arg0: index) -> tensor<10xi16>
+        ^bb0(%arg1: i32, %arg1: i16):
+            %extracted = tensor.extract(%collapsed_217: tensor<10xi16>, %arg1: i32) -> tensor<10xi16>
             %1 = arith.addi(%arg1: i16, %extracted: tensor<10xi16>) -> i16
             vector.print(%extracted: tensor<10xi16>)
             scf.yield(%1: i16)

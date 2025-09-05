@@ -78,6 +78,9 @@ ValueRef* create_value_ref(Arena *arena, ValueKind kind) {
     value->has_divisibility = false;
     value->divisibility_value = 0;
     value->divisibility_type = NULL;
+    value->has_max_divisibility = false;
+    value->max_divisibility_value = 0;
+    value->max_divisibility_type = NULL;
     return value;
 }
 
@@ -764,12 +767,11 @@ string type_to_string(Arena *arena, Type *type) {
         case TYPE_KIND_POINTER:
             if (type->data.pointer.element_type) {
                 string elem_str = type_to_string(arena, type->data.pointer.element_type);
-                if (type->data.pointer.has_address_space) {
-                    return format(arena, str_lit("!tt.ptr<{},{}>"), elem_str, (int64_t)type->data.pointer.address_space);
-                } else if (type->data.pointer.address_space == 1) {
-                    return format(arena, str_lit("!tt.ptr<{}>"), elem_str);
+                // Only show address space if it's explicitly set and not the default (0)
+                if (type->data.pointer.has_address_space && type->data.pointer.address_space != 0) {
+                    return format(arena, str_lit("!tt.ptr<{}, {}>"), elem_str, (int64_t)type->data.pointer.address_space);
                 } else {
-                    return format(arena, str_lit("!tt.ptr<{},{}>"), elem_str, (int64_t)type->data.pointer.address_space);
+                    return format(arena, str_lit("!tt.ptr<{}>"), elem_str);
                 }
             }
             return str_lit("!tt.ptr<?>");
@@ -958,8 +960,6 @@ Location* parse_loc(Parser *parser) {
     loc->kind = LOC_KIND_UNKNOWN;
     loc->original_text = str_lit("");
     
-    // Save starting position for original text
-    uint64_t start_pos = parser->cur;
     
     parser_expect(parser, TK_NAME); // 'loc'
     parser_expect(parser, TK_LPAREN);
@@ -1148,6 +1148,10 @@ Operation* parse_operation(Parser *parser) {
             break;
         case OP_TYPE_ARITH_CONSTANT:
             parse_arith_constant(parser, op);
+            parse_generic_attrs_and_result_type(parser, op);
+            break;
+        case OP_TYPE_ARITH_CMPI:
+            parse_arith_cmpi(parser, op);
             parse_generic_attrs_and_result_type(parser, op);
             break;
         case OP_TYPE_ARITH_ADDI:
