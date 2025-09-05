@@ -6,6 +6,7 @@
 #include <base/io.h>
 #include "mlir_parser.h"
 #include "mlir_generic_printer.h"
+#include "mlir_classic_printer.h"
 #include <base/hashtable.h>
 
 void tokenizer_print_all_tokens(Arena *arena, const string input_code) {
@@ -245,8 +246,9 @@ int main(int argc, char *argv[]) {
     Arena *arena = arena_create(50*1024*1024);  // Increase arena size
     printf("Arena created...\n");
 
-    // Check for --construct option
+    // Check for options
     bool use_construction = false;
+    bool use_classic_printer = false;
     char *input_file = NULL;
 
     printf("Parsing args...\n");
@@ -255,11 +257,14 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--construct") == 0) {
             use_construction = true;
             printf("Construction mode enabled\n");
+        } else if (strcmp(argv[i], "--classic") == 0 || strcmp(argv[i], "-c") == 0) {
+            use_classic_printer = true;
+            printf("Classic printer enabled\n");
         } else if (argv[i][0] != '-') {
             input_file = argv[i];
         }
     }
-    printf("Done parsing args. use_construction=%d\n", use_construction);
+    printf("Done parsing args. use_construction=%d, use_classic_printer=%d\n", use_construction, use_classic_printer);
 
     Operation* op;
 
@@ -273,7 +278,12 @@ int main(int argc, char *argv[]) {
         // Test generic printing with expected output comparison
         printf("=== Generic Printer Test ===\n");
         printf("About to print operation...\n");
-        string result = print_operation_generic(arena, 0, op);
+        string result;
+        if (use_classic_printer) {
+            result = print_operation_classic(arena, 0, op);
+        } else {
+            result = print_operation_generic(arena, 0, op);
+        }
         printf("Printing result...\n");
         println(arena, str_lit("{}"), result);
 
@@ -318,7 +328,11 @@ int main(int argc, char *argv[]) {
         parser_init(arena, &parser, mlir_code);
         op = parse_module(&parser);
         println(arena, str_lit("MLIR:"));
-        println(arena, str_lit("{}"), print_operation_generic(arena, 0, op));
+        if (use_classic_printer) {
+            println(arena, str_lit("{}"), print_operation_classic(arena, 0, op));
+        } else {
+            println(arena, str_lit("{}"), print_operation_generic(arena, 0, op));
+        }
         exit_code = 0;
     }
 
