@@ -62,9 +62,9 @@ module() {
             ^bb0:
                 scf.yield(%cst_0: f32)
             }
-            tt.store(%6: !tt.ptr<f32>, %31: f32)
+            tt.store(%6: !tt.ptr<f32>, %31: f32) {cache = 1, evict = 1}
         }
-        tt.store(%9: !tt.ptr<f32>, %28: f32)
+        tt.store(%9: !tt.ptr<f32>, %28: f32) {cache = 1, evict = 1}
         tt.return()
     }
 }

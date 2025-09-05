@@ -97,7 +97,7 @@ module() {
         %63 = "tt.broadcast"(%60: tensor<32x1xi32>) -> tensor<32x64xi1>
         %64 = "tt.broadcast"(%62: tensor<1x64xi32>) -> tensor<32x64xi1>
         %65 = "arith.andi"(%63: tensor<32x64xi1>, %64: tensor<32x64xi1>) -> tensor<32x64xi1>
-        tt.store(%58: tensor<32x64x!tt.ptr<f32, 1>>, %49: tensor<32x64xf32>, %65: tensor<32x64xi1>)
+        tt.store(%58: tensor<32x64x!tt.ptr<f32, 1>>, %49: tensor<32x64xf32>, %65: tensor<32x64xi1>) {cache = 1, evict = 1}
         tt.return()
     }
 }

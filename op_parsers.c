@@ -559,15 +559,86 @@ void parse_tt_store(Parser *parser, Operation *op) {
     // Reuse common operand parsing for tt.addptr/load/store
     parse_tt_addptr_load_store(parser, op);
 
-    // Optional attribute dict after operands
+    // Parse attributes manually since tt.store doesn't produce results
+    // Look for optional attribute dict: {key = value, ...}
     if (parser_peek(parser, TK_LBRACE)) {
         parser_expect(parser, TK_LBRACE);
-        int brace_depth = 1;
-        while (brace_depth > 0 && !parser_peek(parser, TK_EOF)) {
-            if (parser_peek(parser, TK_LBRACE)) brace_depth++;
-            else if (parser_peek(parser, TK_RBRACE)) brace_depth--;
-            parser_next_token(parser);
+        
+        Attribute **attrs = NULL;
+        size_t n_attrs = 0;
+        size_t attrs_capacity = 4;
+        attrs = arena_alloc_array(parser->arena, Attribute*, attrs_capacity);
+        
+        while (!parser_peek(parser, TK_RBRACE) && !parser_peek(parser, TK_EOF)) {
+            // Parse attribute name
+            if (parser_peek(parser, TK_NAME) || parser_peek(parser, TK_NAME_DOT_NAME)) {
+                string attr_name = parser_token_str(parser);
+                parser_next_token(parser);
+                
+                // Expect '='
+                if (parser_peek(parser, TK_EQUAL)) {
+                    parser_expect(parser, TK_EQUAL);
+                    
+                    // Grow array if needed
+                    if (n_attrs >= attrs_capacity) {
+                        attrs_capacity *= 2;
+                        Attribute **new_attrs = arena_alloc_array(parser->arena, Attribute*, attrs_capacity);
+                        for (size_t i = 0; i < n_attrs; i++) {
+                            new_attrs[i] = attrs[i];
+                        }
+                        attrs = new_attrs;
+                    }
+                    
+                    // Create and parse attribute
+                    Attribute *attr = arena_alloc(parser->arena, Attribute);
+                    attr->name = attr_name;
+                    
+                    // Parse attribute value
+                    if (parser_peek(parser, TK_INTEGER)) {
+                        string value_str = parser_token_str(parser);
+                        parser_expect(parser, TK_INTEGER);
+                        attr->kind = ATTR_KIND_INTEGER;
+                        attr->data.integer_value = atoll(value_str.str);
+                    } else if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("false"))) {
+                        parser_expect(parser, TK_NAME);
+                        attr->kind = ATTR_KIND_BOOL;
+                        attr->data.bool_value = false;
+                    } else if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("true"))) {
+                        parser_expect(parser, TK_NAME);
+                        attr->kind = ATTR_KIND_BOOL;
+                        attr->data.bool_value = true;
+                    } else {
+                        // Skip unknown attribute values
+                        parser_next_token(parser);
+                        attr->kind = ATTR_KIND_INTEGER;
+                        attr->data.integer_value = 0;
+                    }
+                    
+                    // Skip optional type annotation (: i32)
+                    if (parser_peek(parser, TK_COLON)) {
+                        parser_expect(parser, TK_COLON);
+                        if (parser_peek(parser, TK_NAME)) {
+                            parser_next_token(parser);
+                        }
+                    }
+                    
+                    attrs[n_attrs++] = attr;
+                }
+                
+                // Skip optional comma
+                if (parser_peek(parser, TK_COMMA)) {
+                    parser_expect(parser, TK_COMMA);
+                }
+            } else {
+                break;
+            }
         }
+        
+        parser_expect(parser, TK_RBRACE);
+        
+        // Store attributes in operation
+        op->attributes = attrs;
+        op->n_attributes = n_attrs;
     }
 
     // Trailing operand type list ": ..." (consume conservatively)

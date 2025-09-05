@@ -26,7 +26,7 @@ module() {
         %17 = tt.splat(%arg1: !tt.ptr<f16, 1>) -> tensor<128x!tt.ptr<f16, 1>>
         %18 = tt.addptr(%17: tensor<128x!tt.ptr<f16, 1>>, %1: tensor<128xi32>) -> tensor<128x!tt.ptr<f16, 1>>
         %19 = "arith.truncf"(%16: ?) -> tensor<128xf32>
-        tt.store(%18: tensor<128x!tt.ptr<f16, 1>>, %19: tensor<128xf32>)
+        tt.store(%18: tensor<128x!tt.ptr<f16, 1>>, %19: tensor<128xf32>) {cache = 1, evict = 1}
         tt.return()
     }
 }

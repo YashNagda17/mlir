@@ -641,8 +641,13 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 }
             }
             
-            // Print result type (for tt.store, it's the pointer operand type)
-            if (op->n_operands > 0 && op->operands[0] && op->operands[0]->type) {
+            // Print result type (for tt.store with attributes, use value type; otherwise use pointer type)
+            if (op->n_attributes > 0 && op->n_operands > 1 && op->operands[1] && op->operands[1]->type) {
+                // With attributes: use value operand type
+                result = str_concat(arena, result, str_lit(" : "));
+                result = str_concat(arena, result, type_to_string(arena, op->operands[1]->type));
+            } else if (op->n_operands > 0 && op->operands[0] && op->operands[0]->type) {
+                // Without attributes: use pointer operand type
                 result = str_concat(arena, result, str_lit(" : "));
                 result = str_concat(arena, result, type_to_string(arena, op->operands[0]->type));
             }
