@@ -35,40 +35,6 @@ void tokenizer_print_all_tokens(Arena *arena, const string input_code) {
 }
 
 
-// Main
-Operation* construct_test_module(Arena *arena) {
-    // Create simple module operation
-    Operation *module = arena_alloc(arena, Operation);
-    module->op_type = OP_TYPE_MODULE;
-    module->operands = NULL;
-    module->n_operands = 0;
-    module->result_types = NULL;
-    module->n_result_types = 0;
-    module->attributes = NULL;
-    module->n_attributes = 0;
-    module->results = NULL;
-    module->n_results = 0;
-    module->opname = str_lit("module");
-
-    // Create module region and block (empty)
-    Region *module_region = arena_alloc(arena, Region);
-    Block *module_block = arena_alloc(arena, Block);
-    module_block->arguments = NULL;
-    module_block->n_arguments = 0;
-    module_block->operations = NULL;
-    module_block->n_operations = 0;
-
-    module_region->n_blocks = 1;
-    module_region->blocks = arena_alloc_array(arena, Block*, 1);
-    module_region->blocks[0] = module_block;
-
-    module->n_regions = 1;
-    module->regions = arena_alloc_array(arena, Region*, 1);
-    module->regions[0] = module_region;
-
-    return module;
-}
-
 Operation* construct_test_module_full(Arena *arena) {
     // Create types
     Type *i32_type = arena_alloc(arena, Type);
