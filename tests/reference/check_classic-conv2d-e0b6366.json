@@ -1,0 +1,13 @@
+{
+    "basename": "check_classic-conv2d-e0b6366",
+    "cmd": "./parser {infile} --classic > {infile}2 && diff {infile} {infile}2",
+    "infile": "tests/conv2d.ttir",
+    "infile_hash": "1b581f633b123f049906803f4967ad63a1604f1f47aaf176e44a2a04",
+    "outfile": null,
+    "outfile_hash": null,
+    "stdout": null,
+    "stdout_hash": null,
+    "stderr": null,
+    "stderr_hash": null,
+    "returncode": 0
+}
