@@ -391,6 +391,7 @@ void parser_init(Arena *arena, Parser *parser, string text) {
     LocationMap_init(arena, &parser->location_map, 16);
     parser->next_loc_id = 0;
     parser->unnumbered_loc_def = NULL;
+    parser->capture_trailing_comments = false;
     parser_next_token(parser);
 }
 
@@ -844,6 +845,32 @@ Block* parse_block(Parser *parser) {
     VecOperation_reserve(parser->arena, &operations, 16);
     while (! (parser_peek(parser, TK_RBRACE) || parser_peek(parser, TK_CARET_NAME))) {
         Operation *op = parse_operation(parser);
+        // Capture trailing inline comment based on the original line where the op started
+        // This avoids mis-associating comments if tokenization peeks into the next line.
+        if (op && op->source_line_start >= 0) {
+            int64_t line_start = op->source_line_start;
+            // Find end of this line
+            int64_t line_end = line_start;
+            while (parser->input[line_end] != '\0' && parser->input[line_end] != '\n' && parser->input[line_end] != '\r') {
+                line_end++;
+            }
+            if (line_end > line_start) {
+                // Search for // within this line
+                int64_t comment_pos = -1;
+                for (int64_t i = line_start; i + 1 < line_end; i++) {
+                    if (parser->input[i] == '/' && parser->input[i + 1] == '/') { comment_pos = i; break; }
+                }
+                if (comment_pos >= 0) {
+                    int64_t begin = comment_pos;
+                    // include preceding spaces to keep formatting
+                    while (begin > line_start && parser->input[begin - 1] == ' ') begin--;
+                    int64_t len = line_end - begin;
+                    if (len > 0) {
+                        op->trailing_comment = str_from_cstr_len_view((char*)parser->input + begin, len);
+                    }
+                }
+            }
+        }
         VecOperation_push_back(parser->arena, &operations, op);
         parser_expect(parser, TK_NEWLINE);
 
@@ -1077,6 +1104,8 @@ Operation* parse_operation(Parser *parser) {
     op->n_results = 0;
     op->opname = str_lit("");
     op->unnumbered_loc_def = NULL;
+    op->trailing_comment = str_lit("");
+    op->source_line_start = -1;
 
     // Skip empty lines and attributes
     while (
@@ -1108,6 +1137,17 @@ Operation* parse_operation(Parser *parser) {
             // Shouldn't happen
             abort();
         }
+    }
+
+    // Record source line start for this operation
+    {
+        int64_t pos = (int64_t)parser->first;
+        while (pos > 0) {
+            unsigned char c = parser->input[pos - 1];
+            if (c == '\n' || c == '\r') break;
+            pos--;
+        }
+        op->source_line_start = pos;
     }
 
     // Parse return registers if any
@@ -1320,6 +1360,52 @@ Operation* parse_operation(Parser *parser) {
     } else {
         if (op->n_result_types > 0) {
             parser_error(parser, str_lit("Result Type parsed on RHS but no result Value on LHS"), parser->first, parser->last);
+        }
+    }
+
+    // Only capture comments for operations that definitely should have them
+    // This conservative approach avoids the comment duplication issue
+    bool should_capture = false;
+    
+    if (should_capture && op->trailing_comment.size == 0) {
+        // Only capture comments if we can find "//" in the rest of the current line
+        // after some whitespace (to ensure it belongs to this operation)
+        string text = str_from_cstr_view((char*)parser->input);
+        int64_t scan_start = (int64_t)parser->last + 1;
+        if (scan_start < (int64_t)text.size) {
+            int64_t line_end = scan_start - 1; // Default: no text to scan
+            // Find the end of the current line (stop at first newline)
+            for (int64_t i = scan_start; i < (int64_t)text.size; i++) {
+                char ch = text.str[i];
+                if (ch == '\n' || ch == '\r') { 
+                    line_end = i - 1; 
+                    break; 
+                }
+                line_end = i; // Keep extending until we hit newline
+            }
+            
+            
+            // Look for "//" in the remaining part of this line
+            bool found_comment = false;
+            int64_t comment_start = -1;
+            for (int64_t i = scan_start; i <= line_end - 1; i++) {
+                if (text.str[i] == '/' && i + 1 <= line_end && text.str[i+1] == '/') {
+                    // Found comment - include preceding whitespace
+                    comment_start = i;
+                    while (comment_start > scan_start && text.str[comment_start - 1] == ' ') {
+                        comment_start--;
+                    }
+                    found_comment = true;
+                    break;
+                }
+            }
+            
+            if (found_comment && comment_start >= 0) {
+                int64_t len = line_end - comment_start + 1;
+                if (len > 0) {
+                    op->trailing_comment = str_from_cstr_len_view(text.str + comment_start, len);
+                }
+            }
         }
     }
 

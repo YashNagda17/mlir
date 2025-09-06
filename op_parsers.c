@@ -53,6 +53,35 @@ void consume_optional_hash_selector(Parser *parser) {
 // Include the extracted functions
 void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
     // Attributes block
+    // Handle generic attributes in angle-bracket form: <{ ... }>
+    if (parser_peek(parser, TK_LANGLE)) {
+        // Lookahead for '<{' sequence
+        uint64_t save_first = parser->first, save_last = parser->last, save_cur = parser->cur; TokenType save_sym = parser->sym;
+        parser_expect(parser, TK_LANGLE);
+        bool had_attrs=false;
+        if (parser_peek(parser, TK_LBRACE)) {
+            parser_expect(parser, TK_LBRACE);
+            Attribute **attrs = NULL; size_t n_attrs=0; size_t cap=4; attrs = arena_alloc_array(parser->arena, Attribute*, cap);
+            while (!parser_peek(parser, TK_RBRACE) && !parser_peek(parser, TK_EOF)) {
+                if (parser_peek(parser, TK_NAME) || parser_peek(parser, TK_NAME_DOT_NAME)) {
+                    string attr_name = parser_token_str(parser); parser_next_token(parser);
+                    if (parser_peek(parser, TK_EQUAL)) { parser_expect(parser, TK_EQUAL);
+                        if (n_attrs>=cap){ cap*=2; Attribute**na = arena_alloc_array(parser->arena, Attribute*, cap); for(size_t i=0;i<n_attrs;i++) na[i]=attrs[i]; attrs=na; }
+                        Attribute *attr = arena_alloc(parser->arena, Attribute); attr->name=attr_name;
+                        string payload = str_lit(""); int angle=0; while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_COMMA) && !parser_peek(parser, TK_RBRACE)) { string tok=parser_token_str(parser); if (parser_peek(parser, TK_LANGLE)) angle++; else if (parser_peek(parser, TK_RANGLE) && angle>0) angle--; payload = payload.size ? str_concat(parser->arena, payload, tok) : tok; parser_next_token(parser); if (angle==0 && (parser_peek(parser, TK_COMMA) || parser_peek(parser, TK_RBRACE))) break; }
+                        attr->kind = ATTR_KIND_STRING; attr->data.string_value = payload; attrs[n_attrs++] = attr; had_attrs=true;
+                    }
+                    if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
+                } else { parser_next_token(parser); }
+            }
+            if (parser_peek(parser, TK_RBRACE)) parser_expect(parser, TK_RBRACE);
+            if (had_attrs) { op->attributes = attrs; op->n_attributes = n_attrs; }
+            if (parser_peek(parser, TK_RANGLE)) parser_expect(parser, TK_RANGLE);
+        } else {
+            // Not actually an attribute block; rewind
+            parser->first = save_first; parser->last = save_last; parser->cur = save_cur; parser->sym = save_sym;
+        }
+    }
     if (parser_peek(parser, TK_LBRACE)) {
         parser_expect(parser, TK_LBRACE);
         
@@ -225,8 +254,8 @@ void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
                     new_attrs[n] = srca; n = n+1; attrs = new_attrs;
                 }
                 op->attributes = attrs; op->n_attributes = n;
-            } else if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("to")) && op->opname.size>0 && str_eq(op->opname, str_lit("arith.extui"))) {
-                // arith.extui: ": src_ty to dst_ty"; set result to dst_ty
+            } else if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("to"))) {
+                // Casts like ": src_ty to dst_ty"; set result to dst_ty
                 parser_expect(parser, TK_NAME);
                 string type_dst = str_lit("");
                 if (parse_type_string(parser, &type_dst)) {
@@ -997,15 +1026,134 @@ void parse_std_constant(Parser *parser, Operation *op) {
 }
 
 void parse_tt_reduce(Parser *parser, Operation *op) {
-    // Reuse the generic operation parser to handle operands, attrs, and region
-    parse_generic_operation(parser, op);
-    // Ensure a result type exists for SSA linking; fall back to a placeholder string
-    if (op->n_result_types == 0) {
-        op->n_result_types = 1;
-        op->result_types = arena_alloc_array(parser->arena, Type*, 1);
-        op->result_types[0] = arena_alloc(parser->arena, Type);
-        op->result_types[0] = parse_type_from_string(parser->arena, str_lit("?"));
+    // Record source line start for this op
+    {
+        int64_t pos = (int64_t)parser->first;
+        while (pos > 0) { unsigned char c = parser->input[pos-1]; if (c=='\n'||c=='\r') break; pos--; }
+        op->source_line_start = pos;
+    }
+    // Parse "tt.reduce"(%operand) <{attributes}> ({region}) : (input_type) -> output_type
+    
+    // Parse operands: "tt.reduce"(%arg0)
+    VecValueRef operands;
+    VecValueRef_reserve(parser->arena, &operands, 1);
+    if (parser_peek(parser, TK_LPAREN)) {
+        parser_expect(parser, TK_LPAREN);
+        while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
+            if (parser_peek(parser, TK_REGISTER)) {
+                string reg_str = parser_token_str(parser);
+                parser_expect(parser, TK_REGISTER);
+                ValueRef *operand = symbol_table_lookup(&parser->symbol_table, reg_str);
+                if (!operand) {
+                    parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
+                    return;
+                }
+                VecValueRef_push_back(parser->arena, &operands, operand);
+                if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
+            } else {
+                parser_next_token(parser);
+            }
+        }
+        parser_expect(parser, TK_RPAREN);
+    }
+    op->operands = operands.data;
+    op->n_operands = operands.size;
 
+    // Parse attributes: <{axis = 1 : i32}>
+    if (parser_peek(parser, TK_LANGLE)) {
+        parser_expect(parser, TK_LANGLE);
+        if (parser_peek(parser, TK_LBRACE)) {
+            parser_expect(parser, TK_LBRACE);
+            // Parse axis attribute
+            while (!parser_peek(parser, TK_RBRACE) && !parser_peek(parser, TK_EOF)) {
+                if (parser_peek(parser, TK_NAME)) {
+                    string attr_name = parser_token_str(parser);
+                    parser_expect(parser, TK_NAME);
+                    if (parser_peek(parser, TK_EQUAL)) {
+                        parser_expect(parser, TK_EQUAL);
+                        if (parser_peek(parser, TK_INTEGER)) {
+                            string int_val = parser_token_str(parser);
+                            parser_expect(parser, TK_INTEGER);
+                            
+                            // Store axis attribute
+                            op->n_attributes = 1;
+                            op->attributes = arena_alloc_array(parser->arena, Attribute*, 1);
+                            op->attributes[0] = arena_alloc(parser->arena, Attribute);
+                            op->attributes[0]->name = attr_name;
+                            op->attributes[0]->kind = ATTR_KIND_INTEGER;
+                            
+                            // Convert string to integer
+                            int64_t val = 0;
+                            for (size_t i = 0; i < int_val.size; i++) {
+                                char c = int_val.str[i];
+                                if (c >= '0' && c <= '9') val = val * 10 + (c - '0');
+                            }
+                            op->attributes[0]->data.integer_value = val;
+                            
+                            // Skip optional ': i32'
+                            if (parser_peek(parser, TK_COLON)) {
+                                parser_expect(parser, TK_COLON);
+                                if (parser_peek(parser, TK_NAME)) parser_expect(parser, TK_NAME);
+                            }
+                        }
+                    }
+                } else {
+                    parser_next_token(parser);
+                }
+                if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
+            }
+            parser_expect(parser, TK_RBRACE);
+        }
+        parser_expect(parser, TK_RANGLE);
+    }
+    
+    // Parse region: ({^bb0(%arg1: f32, %arg2: f32): ... })
+    if (parser_peek(parser, TK_LPAREN_BRACE) || parser_peek(parser, TK_LPAREN)) {
+        if (parser_peek(parser, TK_LPAREN_BRACE)) {
+            parser_expect(parser, TK_LPAREN_BRACE);
+        } else {
+            parser_expect(parser, TK_LPAREN);
+        }
+        if (parser_peek(parser, TK_LBRACE_END)) {
+            Region *region = parse_region(parser);
+            op->n_regions = 1;
+            op->regions = arena_alloc_array(parser->arena, Region*, 1);
+            op->regions[0] = region;
+        }
+        parser_expect(parser, TK_RPAREN);
+    }
+    
+    // Parse type signature: : (tensor<2x256xf32>) -> tensor<2xf32>
+    if (parser_peek(parser, TK_COLON)) {
+        parser_expect(parser, TK_COLON);
+        
+        // Parse input type in parens
+        if (parser_peek(parser, TK_LPAREN)) {
+            parser_expect(parser, TK_LPAREN);
+            // Skip input type for now
+            int paren_depth = 0;
+            while (!parser_peek(parser, TK_EOF)) {
+                if (parser_peek(parser, TK_LPAREN)) paren_depth++;
+                else if (parser_peek(parser, TK_RPAREN)) {
+                    if (paren_depth == 0) break;
+                    paren_depth--;
+                }
+                parser_next_token(parser);
+            }
+            parser_expect(parser, TK_RPAREN);
+        }
+        
+        // Parse arrow and result type
+        if (parser_peek(parser, TK_ARROW)) {
+            parser_expect(parser, TK_ARROW);
+            string type_str = str_lit("");
+            // Use helper to capture a full type token (handles nested <> correctly)
+            if (parse_type_string(parser, &type_str)) {
+                op->n_result_types = 1;
+                op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+                op->result_types[0] = parse_type_from_string(parser->arena, type_str);
+            }
+        }
     }
 }
 
@@ -1477,7 +1625,19 @@ void parse_tt_call(Parser *parser, Operation *op) {
 
     // Parse function name (@name is tokenized as TK_FUNCTION_NAME)
     if (parser_peek(parser, TK_FUNCTION_NAME)) {
+        // Capture callee name including '@'
+        string fname = parser_token_str(parser);
         parser_expect(parser, TK_FUNCTION_NAME);
+        // Store as attribute 'callee'
+        size_t n = op->n_attributes; Attribute **attrs = op->attributes;
+        if (!attrs) { attrs = arena_alloc_array(parser->arena, Attribute*, 1); n = 0; }
+        else {
+            Attribute **new_attrs = arena_alloc_array(parser->arena, Attribute*, n+1);
+            for (size_t i=0;i<n;i++) new_attrs[i]=attrs[i]; attrs = new_attrs;
+        }
+        attrs[n] = arena_alloc(parser->arena, Attribute);
+        attrs[n]->name = str_lit("callee"); attrs[n]->kind = ATTR_KIND_STRING; attrs[n]->data.string_value = fname;
+        op->attributes = attrs; op->n_attributes = n+1;
     }
 
     // Parse arguments in parentheses
@@ -1623,6 +1783,16 @@ void parse_tensor_collapse_shape(Parser *parser, Operation *op) {
 }
 
 void parse_generic_operation(Parser *parser, Operation *op) {
+    // Remember the start of this operation's source line for accurate comment capture
+    {
+        int64_t pos = (int64_t)parser->first;
+        while (pos > 0) {
+            unsigned char c = parser->input[pos - 1];
+            if (c == '\n' || c == '\r') break;
+            pos--;
+        }
+        op->source_line_start = pos;
+    }
     // Skip non-structural tokens (e.g., cmp predicates) until operands/attrs/types
     while (!parser_peek(parser, TK_EOF) &&
            !(parser_peek(parser, TK_REGISTER) || parser_peek(parser, TK_LBRACKET) ||
@@ -1706,6 +1876,8 @@ void parse_generic_operation(Parser *parser, Operation *op) {
         regions[0] = region;
         op->regions = regions;
         op->n_regions = 1;
+        // After region, there can be another signature/attrs like ": (tys) -> ty"
+        parse_generic_attrs_and_result_type(parser, op);
     }
     if (lparen_brace) {
         parser_expect(parser, TK_RPAREN);
@@ -1721,12 +1893,28 @@ void parse_generic_operation(Parser *parser, Operation *op) {
 }
 
 void parse_tt_func(Parser *parser, Operation *op) {
+    // Record source line start
+    {
+        int64_t pos = (int64_t)parser->first;
+        while (pos > 0) { unsigned char c = parser->input[pos-1]; if (c=='\n'||c=='\r') break; pos--; }
+        op->source_line_start = pos;
+    }
     // Parse tt.func public @function_name(%arg0: type, %arg1: type, ...)
 
-    // Skip "public" if present
-    if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("public"))) {
+    // Capture visibility keyword if present
+    string visibility = str_lit("private");  // default
+    if (parser_peek(parser, TK_NAME) && (str_eq(parser_token_str(parser), str_lit("public")) || str_eq(parser_token_str(parser), str_lit("private")))) {
+        visibility = parser_token_str(parser);
         parser_expect(parser, TK_NAME);
     }
+    
+    // Store visibility as attribute
+    op->n_attributes = 1;
+    op->attributes = arena_alloc_array(parser->arena, Attribute*, 1);
+    op->attributes[0] = arena_alloc(parser->arena, Attribute);
+    op->attributes[0]->kind = ATTR_KIND_STRING;
+    op->attributes[0]->data.string_value = visibility;
+    op->attributes[0]->name = str_lit("visibility");
 
     // Parse @function_name
     if (parser_peek(parser, TK_FUNCTION_NAME)) {
@@ -1739,19 +1927,13 @@ void parse_tt_func(Parser *parser, Operation *op) {
         
         // Store as string attribute 'sym_name'
         size_t n = op->n_attributes;
-        Attribute **attrs = op->attributes;
-        if (attrs == NULL) {
-            attrs = arena_alloc_array(parser->arena, Attribute*, 1);
-        } else {
-            Attribute **new_attrs = arena_alloc_array(parser->arena, Attribute*, n+1);
-            for (size_t i = 0; i < n; i++) new_attrs[i] = attrs[i];
-            attrs = new_attrs;
-        }
-        attrs[n] = arena_alloc(parser->arena, Attribute);
-        attrs[n]->kind = ATTR_KIND_STRING;
-        attrs[n]->data.string_value = fname;
-        attrs[n]->name = str_lit("sym_name");
-        op->attributes = attrs;
+        Attribute **new_attrs = arena_alloc_array(parser->arena, Attribute*, n+1);
+        for (size_t i = 0; i < n; i++) new_attrs[i] = op->attributes[i];
+        new_attrs[n] = arena_alloc(parser->arena, Attribute);
+        new_attrs[n]->kind = ATTR_KIND_STRING;
+        new_attrs[n]->data.string_value = fname;
+        new_attrs[n]->name = str_lit("sym_name");
+        op->attributes = new_attrs;
         op->n_attributes = n+1;
     } else {
         // Try to skip tokens until we find a parenthesis
@@ -1833,10 +2015,35 @@ void parse_tt_func(Parser *parser, Operation *op) {
                             arg->type = parse_type_from_string(parser->arena, str_lit("!unknown"));
                         }
                     } else if (parser_peek(parser, TK_NAME)) {
-                        // Simple type like i32
+                        // Simple type like i32 or complex type like tensor<2x256xf32>
                         string type_name = parser_token_str(parser);
                         parser_expect(parser, TK_NAME);
-                        arg->type = parse_type_from_string(parser->arena, type_name);
+                        
+                        // Handle complex types with angle brackets (e.g., tensor<2x256xf32>)
+                        if (parser_peek(parser, TK_LANGLE)) {
+                            parser_expect(parser, TK_LANGLE);
+                            string angle_content = str_lit("");
+                            int bracket_depth = 1;
+                            while (bracket_depth > 0 && !parser_peek(parser, TK_EOF)) {
+                                if (parser_peek(parser, TK_LANGLE)) {
+                                    bracket_depth++;
+                                } else if (parser_peek(parser, TK_RANGLE)) {
+                                    bracket_depth--;
+                                    if (bracket_depth == 0) {
+                                        parser_expect(parser, TK_RANGLE);
+                                        break;
+                                    }
+                                }
+                                string token_str = parser_token_str(parser);
+                                angle_content = str_concat(parser->arena, angle_content, token_str);
+                                parser_next_token(parser);
+                            }
+                            // Reconstruct the full type string
+                            string full_type = str_concat(parser->arena, type_name, str_concat(parser->arena, str_lit("<"), str_concat(parser->arena, angle_content, str_lit(">"))));
+                            arg->type = parse_type_from_string(parser->arena, full_type);
+                        } else {
+                            arg->type = parse_type_from_string(parser->arena, type_name);
+                        }
                     } else {
                         arg->type = parse_type_from_string(parser->arena, str_lit("unknown"));
                     }
@@ -1946,6 +2153,20 @@ void parse_tt_func(Parser *parser, Operation *op) {
         if (parser_peek(parser, TK_RPAREN)) {
             parser_expect(parser, TK_RPAREN);
         } else {
+        }
+    }
+
+    // Optional return signature after '->' (capture conservatively until 'attributes' or body)
+    string ret_sig = str_lit("");
+    if (parser_peek(parser, TK_ARROW)) {
+        parser_expect(parser, TK_ARROW);
+        while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_LBRACE_END)) {
+            if (parser_peek(parser, TK_NAME)) {
+                string nm = parser_token_str(parser);
+                if (str_eq(nm, str_lit("attributes")) || str_eq(nm, str_lit("loc"))) break;
+            }
+            ret_sig = str_concat(parser->arena, ret_sig, parser_token_str(parser));
+            parser_next_token(parser);
         }
     }
 
@@ -2078,6 +2299,7 @@ void parse_func_func(Parser *parser, Operation *op) {
             ret_sig = str_concat(parser->arena, ret_sig, parser_token_str(parser));
             parser_next_token(parser);
         }
+        
     }
     // Parse body region with caret block labels and arguments
     Region *region = parse_region(parser);
@@ -2402,8 +2624,30 @@ void parse_scf_for(Parser *parser, Operation *op) {
     VecOperation operations;
     VecOperation_reserve(parser->arena, &operations, 16);
     while (!parser_peek(parser, TK_RBRACE)) {
-        Operation *op = parse_operation(parser);
-        VecOperation_push_back(parser->arena, &operations, op);
+        Operation *inner_op = parse_operation(parser);
+        // Capture trailing comment for inner operations based on their source line
+        if (inner_op && inner_op->source_line_start >= 0) {
+            int64_t line_start = inner_op->source_line_start;
+            int64_t line_end = line_start;
+            while (parser->input[line_end] != '\0' && parser->input[line_end] != '\n' && parser->input[line_end] != '\r') {
+                line_end++;
+            }
+            if (line_end > line_start) {
+                int64_t comment_pos = -1;
+                for (int64_t i = line_start; i + 1 < line_end; i++) {
+                    if (parser->input[i] == '/' && parser->input[i + 1] == '/') { comment_pos = i; break; }
+                }
+                if (comment_pos >= 0) {
+                    int64_t begin = comment_pos;
+                    while (begin > line_start && parser->input[begin - 1] == ' ') begin--;
+                    int64_t len = line_end - begin;
+                    if (len > 0) {
+                        inner_op->trailing_comment = str_from_cstr_len_view((char*)parser->input + begin, len);
+                    }
+                }
+            }
+        }
+        VecOperation_push_back(parser->arena, &operations, inner_op);
         parser_expect(parser, TK_NEWLINE);
 
         // Skip empty lines
@@ -2627,14 +2871,65 @@ void parse_affine_for(Parser *parser, Operation *op) {
     block->n_arguments = block_args.size;
 
     // Parse body operations
+    bool prev_flag = parser->capture_trailing_comments;
+    parser->capture_trailing_comments = true;
     VecOperation operations; VecOperation_reserve(parser->arena, &operations, 16);
     while (!parser_peek(parser, TK_RBRACE)) {
         Operation *inner = parse_operation(parser);
+        // Capture trailing inline comment before consuming the newline
+        if (parser_peek(parser, TK_NEWLINE)) {
+            int64_t nl_pos = (int64_t)parser->first;
+            if (nl_pos > 0) {
+                int64_t line_end = nl_pos - 1;
+                int64_t line_start = line_end;
+                while (line_start > 0) {
+                    unsigned char c = parser->input[line_start - 1];
+                    if (c == '\n' || c == '\r') break;
+                    line_start--;
+                }
+                int64_t comment_pos = -1;
+                for (int64_t i = line_end - 1; i >= line_start; i--) {
+                    if (parser->input[i] == '/' && parser->input[i + 1] == '/') { comment_pos = i; break; }
+                }
+                if (comment_pos >= 0) {
+                    int64_t begin = comment_pos;
+                    while (begin > line_start && parser->input[begin - 1] == ' ') begin--;
+                    int64_t len = line_end - begin + 1;
+                    if (len > 0) {
+                        inner->trailing_comment = str_from_cstr_len_view((char*)parser->input + begin, len);
+                    }
+                }
+            }
+        } else {
+            // Fallback: scan from end of op tokens to the end of this line
+            string text = str_from_cstr_view((char*)parser->input);
+            int64_t start = (int64_t)parser->last + 1;
+            if (start < (int64_t)text.size) {
+                int64_t end = (int64_t)text.size - 1;
+                for (int64_t i = start; i < (int64_t)text.size; i++) {
+                    char ch = text.str[i];
+                    if (ch == '\n' || ch == '\r') { end = i - 1; break; }
+                }
+                if (end >= start) {
+                    int64_t cpos = -1;
+                    for (int64_t i = end - 1; i >= start; i--) {
+                        if (text.str[i] == '/' && text.str[i+1] == '/') { cpos = i; break; }
+                    }
+                    if (cpos >= 0) {
+                        int64_t begin = cpos;
+                        while (begin > start && text.str[begin - 1] == ' ') begin--;
+                        int64_t len = end - begin + 1;
+                        if (len > 0) inner->trailing_comment = str_from_cstr_len_view(text.str + begin, len);
+                    }
+                }
+            }
+        }
         VecOperation_push_back(parser->arena, &operations, inner);
         parser_expect(parser, TK_NEWLINE);
         while (parser_peek(parser, TK_NEWLINE)) parser_expect(parser, TK_NEWLINE);
     }
     parser_expect(parser, TK_RBRACE);
+    parser->capture_trailing_comments = prev_flag;
 
     // Optional trailing loc()
     if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {

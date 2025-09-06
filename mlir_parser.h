@@ -74,6 +74,8 @@ typedef struct {
     LocationMap location_map;  // For #locN -> Location mapping
     int next_loc_id;          // Counter for generating #locN IDs
     Location *unnumbered_loc_def; // Optional: definition of unnumbered '#loc' at file start
+    // Parsing mode flag to enable robust trailing comment capture in special contexts
+    bool capture_trailing_comments;
 } Parser;
 
 
@@ -323,6 +325,14 @@ typedef struct Operation {
     Location *location;
     // Optional: definition for unnumbered '#loc' header captured pre-module
     Location *unnumbered_loc_def;
+
+    // Optional trailing comment captured from source line (e.g., " // note")
+    string trailing_comment;
+
+    // Source line tracking (for accurate trailing comment capture)
+    // Byte offset in the original buffer of the first character of the line
+    // on which this operation starts.
+    int64_t source_line_start;
 } Operation;
 DEFINE_VECTOR_FOR_TYPE(Operation*, VecOperation)
 DEFINE_VECTOR_FOR_TYPE(ValueRef*, VecValueRef)
