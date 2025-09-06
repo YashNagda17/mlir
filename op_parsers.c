@@ -225,6 +225,15 @@ void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
                     new_attrs[n] = srca; n = n+1; attrs = new_attrs;
                 }
                 op->attributes = attrs; op->n_attributes = n;
+            } else if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("to")) && op->opname.size>0 && str_eq(op->opname, str_lit("arith.extui"))) {
+                // arith.extui: ": src_ty to dst_ty"; set result to dst_ty
+                parser_expect(parser, TK_NAME);
+                string type_dst = str_lit("");
+                if (parse_type_string(parser, &type_dst)) {
+                    op->n_result_types = 1;
+                    op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+                    op->result_types[0] = parse_type_from_string(parser->arena, type_dst);
+                }
             } else if (parser_peek(parser, TK_COMMA)) {
                 // Operand type list ": type, type, ..." — consume conservatively
                 while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
@@ -232,11 +241,15 @@ void parse_generic_attrs_and_result_type(Parser *parser, Operation *op) {
                     parser_next_token(parser);
                 }
             } else {
-                // Treat as single result type ": type"
-                op->n_result_types = 1;
-                op->result_types = arena_alloc_array(parser->arena, Type*, 1);
-                op->result_types[0] = arena_alloc(parser->arena, Type);
-                op->result_types[0] = parse_type_from_string(parser->arena, type_left);
+                // Treat as single result type ": type" for most ops,
+                // but do NOT override for compare ops like arith.cmpi where
+                // the colon type is the operand type, not the result.
+                if (!(op->opname.size > 0 && str_eq(op->opname, str_lit("arith.cmpi")))) {
+                    op->n_result_types = 1;
+                    op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+                    op->result_types[0] = arena_alloc(parser->arena, Type);
+                    op->result_types[0] = parse_type_from_string(parser->arena, type_left);
+                }
             }
         }
     }
@@ -391,7 +404,16 @@ void parse_func_call(Parser *parser, Operation *op) {
     // Parse call @function(%args) : (arg_types) -> result_type
     // Function name (@name is tokenized as TK_FUNCTION_NAME)
     if (parser_peek(parser, TK_FUNCTION_NAME)) {
+        // Capture callee
+        string fname = parser_token_str(parser);
         parser_expect(parser, TK_FUNCTION_NAME);
+        // Store as attribute 'callee'
+        op->n_attributes = 1;
+        op->attributes = arena_alloc_array(parser->arena, Attribute*, 1);
+        op->attributes[0] = arena_alloc(parser->arena, Attribute);
+        op->attributes[0]->name = str_lit("callee");
+        op->attributes[0]->kind = ATTR_KIND_STRING;
+        op->attributes[0]->data.string_value = fname;
     }
 
     // Parse operands in parentheses
@@ -988,41 +1010,40 @@ void parse_tt_reduce(Parser *parser, Operation *op) {
 }
 
 void parse_cf_br(Parser *parser, Operation *op) {
-    // Parse cf.br ^bb1(%arg : type, ...)
-    parser_expect(parser, TK_CARET_NAME);  // ^bb1
+    // Parse cf.br ^bbX(%args : types)
+    string target = str_lit("^bb1");
+    if (parser_peek(parser, TK_CARET_NAME)) { target = parser_token_str(parser); parser_expect(parser, TK_CARET_NAME); }
 
+    VecValueRef branch_args; VecValueRef_reserve(parser->arena, &branch_args, 4);
     if (parser_peek(parser, TK_LPAREN)) {
         parser_expect(parser, TK_LPAREN);
-        // Consume operands with type annotations
         while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
             if (parser_peek(parser, TK_REGISTER)) {
+                string vr = parser_token_str(parser);
                 parser_expect(parser, TK_REGISTER);
-                if (parser_peek(parser, TK_COLON)) {
-                    parser_expect(parser, TK_COLON);
-                    // Consume type
-                    while (!parser_peek(parser, TK_COMMA) && !parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
-                        parser_next_token(parser);
-                    }
-                }
+                ValueRef *v = symbol_table_lookup(&parser->symbol_table, vr);
+                if (v) VecValueRef_push_back(parser->arena, &branch_args, v);
                 if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
-            } else {
-                parser_next_token(parser);
-            }
+            } else if (parser_peek(parser, TK_COLON)) {
+                parser_expect(parser, TK_COLON);
+                // Skip types list
+                int angle=0;
+                while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) { if (parser_peek(parser, TK_LANGLE)) angle++; else if (parser_peek(parser, TK_RANGLE) && angle>0) angle--; parser_next_token(parser);}                
+            } else { parser_next_token(parser); }
         }
         parser_expect(parser, TK_RPAREN);
     }
-
-    // cf.br has no result types
-    op->n_result_types = 0;
-
-    // Consume any trailing loc()
-    if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
-        op->location = parse_loc(parser);
-    }
+    op->operands = branch_args.data; op->n_operands = branch_args.size;
+    // Store target as private attribute
+    op->n_attributes = 1; op->attributes = arena_alloc_array(parser->arena, Attribute*, 1);
+    op->attributes[0] = arena_alloc(parser->arena, Attribute);
+    op->attributes[0]->name = str_lit("_target"); op->attributes[0]->kind = ATTR_KIND_STRING; op->attributes[0]->data.string_value = target;
+    // trailing loc
+    if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) op->location = parse_loc(parser);
 }
 
 void parse_cf_cond_br(Parser *parser, Operation *op) {
-    // Parse: cf.cond_br %cond, ^bbX, ^bbY [loc]
+    // Parse: cf.cond_br %cond, ^bbX[(args : types)], ^bbY[(args : types)] [loc]
     VecValueRef operands; VecValueRef_reserve(parser->arena, &operands, 1);
     // condition
     if (parser_peek(parser, TK_REGISTER)) {
@@ -1040,9 +1061,14 @@ void parse_cf_cond_br(Parser *parser, Operation *op) {
         // Optional argument list for true target: (^bbX(%v1, %v2 : ty1, ty2))
         if (parser_peek(parser, TK_LPAREN)) {
             parser_expect(parser, TK_LPAREN);
+            int64_t ntrue = 0;
             while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
                 if (parser_peek(parser, TK_REGISTER)) {
+                    string vr = parser_token_str(parser);
                     parser_expect(parser, TK_REGISTER);
+                    ValueRef *v = symbol_table_lookup(&parser->symbol_table, vr);
+                    if (v) VecValueRef_push_back(parser->arena, &operands, v);
+                    ntrue++;
                     if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
                 } else if (parser_peek(parser, TK_COLON)) {
                     parser_expect(parser, TK_COLON);
@@ -1058,6 +1084,15 @@ void parse_cf_cond_br(Parser *parser, Operation *op) {
                 }
             }
             parser_expect(parser, TK_RPAREN);
+            // store count for true branch
+            // append attribute _ntrue (accumulate, don't overwrite later)
+            size_t n = op->n_attributes; Attribute **attrs = op->attributes;
+            Attribute *an = arena_alloc(parser->arena, Attribute);
+            an->name = str_lit("_ntrue"); an->kind = ATTR_KIND_INTEGER; an->data.integer_value = ntrue;
+            Attribute **na = arena_alloc_array(parser->arena, Attribute*, n+1);
+            for (size_t i=0;i<n;i++) na[i]=attrs[i];
+            na[n]=an;
+            op->attributes=na; op->n_attributes=(int)(n+1);
         }
     }
     if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
@@ -1066,9 +1101,14 @@ void parse_cf_cond_br(Parser *parser, Operation *op) {
         // Optional argument list for false target
         if (parser_peek(parser, TK_LPAREN)) {
             parser_expect(parser, TK_LPAREN);
+            int64_t nfalse = 0;
             while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
                 if (parser_peek(parser, TK_REGISTER)) {
+                    string vr = parser_token_str(parser);
                     parser_expect(parser, TK_REGISTER);
+                    ValueRef *v = symbol_table_lookup(&parser->symbol_table, vr);
+                    if (v) VecValueRef_push_back(parser->arena, &operands, v);
+                    nfalse++;
                     if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
                 } else if (parser_peek(parser, TK_COLON)) {
                     parser_expect(parser, TK_COLON);
@@ -1083,20 +1123,29 @@ void parse_cf_cond_br(Parser *parser, Operation *op) {
                 }
             }
             parser_expect(parser, TK_RPAREN);
+            size_t n = op->n_attributes; Attribute **attrs = op->attributes;
+            Attribute *an = arena_alloc(parser->arena, Attribute);
+            an->name = str_lit("_nfalse"); an->kind = ATTR_KIND_INTEGER; an->data.integer_value = nfalse;
+            Attribute **na = arena_alloc_array(parser->arena, Attribute*, n+1);
+            for (size_t i=0;i<n;i++) na[i]=attrs[i];
+            na[n]=an;
+            op->attributes=na; op->n_attributes=(int)(n+1);
         }
     }
     op->operands = operands.data; op->n_operands = operands.size;
-    // Store private attributes for classic printing
-    op->n_attributes = 2;
-    op->attributes = arena_alloc_array(parser->arena, Attribute*, 2);
-    op->attributes[0] = arena_alloc(parser->arena, Attribute);
-    op->attributes[0]->name = str_lit("_true");
-    op->attributes[0]->kind = ATTR_KIND_STRING;
-    op->attributes[0]->data.string_value = ttrue;
-    op->attributes[1] = arena_alloc(parser->arena, Attribute);
-    op->attributes[1]->name = str_lit("_false");
-    op->attributes[1]->kind = ATTR_KIND_STRING;
-    op->attributes[1]->data.string_value = tfalse;
+    // Store private attributes for classic printing; append _true/_false without dropping existing counts
+    size_t n0 = op->n_attributes; Attribute **attrs0 = op->attributes;
+    Attribute **na0 = arena_alloc_array(parser->arena, Attribute*, n0 + 2);
+    for (size_t i=0;i<n0;i++) na0[i]=attrs0[i];
+    na0[n0] = arena_alloc(parser->arena, Attribute);
+    na0[n0]->name = str_lit("_true");
+    na0[n0]->kind = ATTR_KIND_STRING;
+    na0[n0]->data.string_value = ttrue;
+    na0[n0+1] = arena_alloc(parser->arena, Attribute);
+    na0[n0+1]->name = str_lit("_false");
+    na0[n0+1]->kind = ATTR_KIND_STRING;
+    na0[n0+1]->data.string_value = tfalse;
+    op->attributes = na0; op->n_attributes = (int)(n0 + 2);
     // Optional loc
     if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
         op->location = parse_loc(parser);
@@ -1973,8 +2022,19 @@ void parse_tt_func(Parser *parser, Operation *op) {
 }
 
 void parse_func_func(Parser *parser, Operation *op) {
-    // Skip optional visibility and function name until argument list
+    // Capture optional visibility and function name
+    string visibility = str_lit("");
+    string fname = str_lit("");
     while (!parser_peek(parser, TK_LPAREN) && !parser_peek(parser, TK_EOF)) {
+        if (parser_peek(parser, TK_NAME)) {
+            string nm = parser_token_str(parser);
+            if (str_eq(nm, str_lit("private")) || str_eq(nm, str_lit("public"))) {
+                visibility = nm; parser_expect(parser, TK_NAME); continue;
+            }
+        }
+        if (parser_peek(parser, TK_FUNCTION_NAME)) {
+            fname = parser_token_str(parser); parser_expect(parser, TK_FUNCTION_NAME); continue;
+        }
         parser_next_token(parser);
     }
     // Parse argument list
@@ -2008,11 +2068,14 @@ void parse_func_func(Parser *parser, Operation *op) {
         }
         parser_expect(parser, TK_RPAREN);
     }
-    // Optional return type sequence after '->' (skip conservatively)
+    // Optional return type sequence after '->' (capture text conservatively)
+    string ret_sig = str_lit("");
     if (parser_peek(parser, TK_ARROW)) {
         parser_expect(parser, TK_ARROW);
+        // Capture until '{' or loc
         while (!(parser_peek(parser, TK_LBRACE_END) || parser_peek(parser, TK_EOF))) {
             if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
+            ret_sig = str_concat(parser->arena, ret_sig, parser_token_str(parser));
             parser_next_token(parser);
         }
     }
@@ -2021,6 +2084,18 @@ void parse_func_func(Parser *parser, Operation *op) {
     op->regions = arena_alloc_array(parser->arena, Region*, 1);
     op->regions[0] = region;
     op->n_regions = 1;
+
+    // Store attributes for classic printing
+    size_t n = op->n_attributes; Attribute **attrs = op->attributes;
+    size_t add = 0; if (visibility.size>0) add++; if (fname.size>0) add++; if (ret_sig.size>0) add++;
+    if (add > 0) {
+        Attribute **new_attrs = arena_alloc_array(parser->arena, Attribute*, n+add);
+        for (size_t i=0;i<n;i++) new_attrs[i]=attrs[i]; size_t idx=n;
+        if (visibility.size>0){ new_attrs[idx]=arena_alloc(parser->arena, Attribute); new_attrs[idx]->name=str_lit("visibility"); new_attrs[idx]->kind=ATTR_KIND_STRING; new_attrs[idx]->data.string_value=visibility; idx++; }
+        if (fname.size>0){ new_attrs[idx]=arena_alloc(parser->arena, Attribute); new_attrs[idx]->name=str_lit("sym_name"); new_attrs[idx]->kind=ATTR_KIND_STRING; new_attrs[idx]->data.string_value=fname; idx++; }
+        if (ret_sig.size>0){ new_attrs[idx]=arena_alloc(parser->arena, Attribute); new_attrs[idx]->name=str_lit("ret"); new_attrs[idx]->kind=ATTR_KIND_STRING; new_attrs[idx]->data.string_value=ret_sig; idx++; }
+        op->attributes = new_attrs; op->n_attributes = idx;
+    }
 }
 
 void parse_scf_if(Parser *parser, Operation *op) {
@@ -2455,9 +2530,9 @@ void parse_return_operation(Parser *parser, Operation *op) {
         VecValueRef_push_back(parser->arena, &operands, operand);
         if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
     }
-    // Do not keep operands for return-like ops in generic mode
-    op->operands = NULL;
-    op->n_operands = 0;
+    // Keep operands for classic and better generic fidelity
+    op->operands = operands.data;
+    op->n_operands = operands.size;
 
     // Consume any trailing ": ..." types or loc(), without assigning result types
     if (parser_peek(parser, TK_COLON)) {
@@ -2749,4 +2824,8 @@ void parse_arith_cmpi(Parser *parser, Operation *op) {
     // Set operands
     op->operands = operands.data;
     op->n_operands = operands.size;
+    // Result type is i1 for arith.cmpi
+    op->n_result_types = 1;
+    op->result_types = arena_alloc_array(parser->arena, Type*, 1);
+    op->result_types[0] = parse_type_from_string(parser->arena, str_lit("i1"));
 }
