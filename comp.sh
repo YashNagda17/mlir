@@ -25,7 +25,10 @@ TEST=conv2d
 ./parser --classic tests/${TEST}.ttir > ${TEST}2.ttir
 diff -Naur tests/${TEST}.ttir ${TEST}2.ttir
 
-#chunked_cross_entropy_forward.ttir
+TEST=chunked_cross_entropy_forward
+./parser --classic tests/${TEST}.ttir > ${TEST}2.ttir
+diff -Naur tests/${TEST}.ttir ${TEST}2.ttir
+
 #b.mlir
 #c.mlir
 
