@@ -130,9 +130,20 @@ string op_type_to_string(OpType type) {
         case OP_TYPE_TT_ADDPTR: return str_lit("tt.addptr");
         case OP_TYPE_TT_RETURN: return str_lit("tt.return");
         case OP_TYPE_ARITH_SELECT: return str_lit("arith.select");
+        case OP_TYPE_ARITH_BITCAST: return str_lit("arith.bitcast");
+        case OP_TYPE_ARITH_SITOFP: return str_lit("arith.sitofp");
+        case OP_TYPE_ARITH_EXTSI: return str_lit("arith.extsi");
+        case OP_TYPE_ARITH_TRUNCI: return str_lit("arith.trunci");
+        case OP_TYPE_ARITH_EXTF: return str_lit("arith.extf");
+        case OP_TYPE_ARITH_TRUNCF: return str_lit("arith.truncf");
+        case OP_TYPE_ARITH_EXTUI: return str_lit("arith.extui");
         case OP_TYPE_TT_FUNC: return str_lit("tt.func");
         case OP_TYPE_TT_CALL: return str_lit("tt.call");
         case OP_TYPE_TT_REDUCE: return str_lit("tt.reduce");
+        case OP_TYPE_TT_BROADCAST: return str_lit("tt.broadcast");
+        case OP_TYPE_TT_EXPAND_DIMS: return str_lit("tt.expand_dims");
+        case OP_TYPE_TT_DOT: return str_lit("tt.dot");
+        case OP_TYPE_TT_PURE_EXTERN_ELEMENTWISE: return str_lit("tt.pure_extern_elementwise");
         case OP_TYPE_GPU_LAUNCH: return str_lit("gpu.launch");
         case OP_TYPE_AFFINE_FOR: return str_lit("affine.for");
         case OP_TYPE_AFFINE_LOAD: return str_lit("affine.load");
@@ -175,6 +186,20 @@ OpType op_string_to_type(string opname) {
         return OP_TYPE_ARITH_CMPI;
     } else if (str_eq(opname, str_lit("arith.cmpf"))) {
         return OP_TYPE_ARITH_CMPF;
+    } else if (str_eq(opname, str_lit("arith.bitcast"))) {
+        return OP_TYPE_ARITH_BITCAST;
+    } else if (str_eq(opname, str_lit("arith.sitofp"))) {
+        return OP_TYPE_ARITH_SITOFP;
+    } else if (str_eq(opname, str_lit("arith.extsi"))) {
+        return OP_TYPE_ARITH_EXTSI;
+    } else if (str_eq(opname, str_lit("arith.trunci"))) {
+        return OP_TYPE_ARITH_TRUNCI;
+    } else if (str_eq(opname, str_lit("arith.extf"))) {
+        return OP_TYPE_ARITH_EXTF;
+    } else if (str_eq(opname, str_lit("arith.truncf"))) {
+        return OP_TYPE_ARITH_TRUNCF;
+    } else if (str_eq(opname, str_lit("arith.extui"))) {
+        return OP_TYPE_ARITH_EXTUI;
     } else if (str_eq(opname, str_lit("memref.load"))) {
         return OP_TYPE_MEMREF_LOAD;
     } else if (str_eq(opname, str_lit("memref.store"))) {
@@ -227,6 +252,14 @@ OpType op_string_to_type(string opname) {
         return OP_TYPE_TT_CALL;
     } else if (str_eq(opname, str_lit("tt.reduce"))) {
         return OP_TYPE_TT_REDUCE;
+    } else if (str_eq(opname, str_lit("tt.broadcast"))) {
+        return OP_TYPE_TT_BROADCAST;
+    } else if (str_eq(opname, str_lit("tt.expand_dims"))) {
+        return OP_TYPE_TT_EXPAND_DIMS;
+    } else if (str_eq(opname, str_lit("tt.dot"))) {
+        return OP_TYPE_TT_DOT;
+    } else if (str_eq(opname, str_lit("tt.pure_extern_elementwise"))) {
+        return OP_TYPE_TT_PURE_EXTERN_ELEMENTWISE;
     } else if (str_eq(opname, str_lit("gpu.launch"))) {
         return OP_TYPE_GPU_LAUNCH;
     } else if (str_eq(opname, str_lit("affine.for"))) {
