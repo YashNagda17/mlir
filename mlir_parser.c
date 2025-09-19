@@ -9,6 +9,7 @@
 #include <base/vector.h>
 
 #include "mlir_parser.h"
+#include "mlir_api.h"
 #include "op_parsers.h"
 
 // Forward decls for helper scanners (moved to op_parsers.h)
@@ -48,7 +49,7 @@ void symbol_table_pop_scope(ScopedSymbolTable *st) {
     }
 }
 
-void symbol_table_add_value(Arena *arena, ScopedSymbolTable *st, string name, ValueRef *value) {
+void symbol_table_add_value(Arena *arena, ScopedSymbolTable *st, string name, MlirValue *value) {
     if (st->num_scopes == 0) {
         // Create a default scope if none exists
         symbol_table_push_scope(arena, st);
@@ -56,32 +57,15 @@ void symbol_table_add_value(Arena *arena, ScopedSymbolTable *st, string name, Va
     SymbolTable_insert(arena, &st->scopes[st->num_scopes - 1], name, value);
 }
 
-ValueRef* symbol_table_lookup(ScopedSymbolTable *st, string name) {
+MlirValue* symbol_table_lookup(ScopedSymbolTable *st, string name) {
     // Search from innermost to outermost scope
     for (size_t i = st->num_scopes; i > 0; i--) {
-        ValueRef **found = SymbolTable_get(&st->scopes[i - 1], name);
+        MlirValue **found = SymbolTable_get(&st->scopes[i - 1], name);
         if (found && *found) {
             return *found;
         }
     }
     return NULL;
-}
-
-ValueRef* create_value_ref(Arena *arena, ValueKind kind) {
-    ValueRef *value = arena_alloc(arena, ValueRef);
-    value->kind = kind;
-    value->def = NULL;
-    value->result_index = 0;
-    value->type = NULL;
-    value->register_name = str_lit("");
-    value->location = NULL;
-    value->has_divisibility = false;
-    value->divisibility_value = 0;
-    value->divisibility_type = NULL;
-    value->has_max_divisibility = false;
-    value->max_divisibility_value = 0;
-    value->max_divisibility_type = NULL;
-    return value;
 }
 
 string tokentype_to_string(TokenType tt) {
@@ -511,345 +495,14 @@ static bool parse_type_string(Parser *parser, string *out) {
     return true;
 }
 
-Type* parse_type_from_string(Arena *arena, string type_str) {
-    Type *type = arena_alloc(arena, Type);
 
-    // Unknown type (printed as '?')
-    if (str_eq(type_str, str_lit("?"))) {
-        type->kind = TYPE_KIND_UNKNOWN;
-    }
-    // Opaque/unspecified type (printed as 'unknown')
-    else if (str_eq(type_str, str_lit("unknown")) || str_eq(type_str, str_lit("!unknown"))) {
-        type->kind = TYPE_KIND_OPAQUE;
-    }
-    // Parse index type first (before integer check below)
-    else if (str_eq(type_str, str_lit("index"))) {
-        type->kind = TYPE_KIND_INDEX;
-    }
-    // Parse integer types like "i32", "i64", etc.
-    else if (type_str.size >= 2 && type_str.str[0] == 'i') {
-        // Require that all remaining characters are digits
-        bool all_digits = true;
-        for (size_t i = 1; i < type_str.size; i++) {
-            char c = type_str.str[i];
-            if (c < '0' || c > '9') { all_digits = false; break; }
-        }
-        if (!all_digits) {
-            // Fallback to default unknown integer width
-            type->kind = TYPE_KIND_INTEGER;
-            type->data.integer.is_signed = true;
-            type->data.integer.width = 32;
-            return type;
-        }
-        type->kind = TYPE_KIND_INTEGER;
-        type->data.integer.is_signed = true;
 
-        // Extract width
-        string width_str = str_substr(type_str, 1, type_str.size - 1);
-        if (str_eq(width_str, str_lit("1"))) type->data.integer.width = 1;
-        else if (str_eq(width_str, str_lit("8"))) type->data.integer.width = 8;
-        else if (str_eq(width_str, str_lit("16"))) type->data.integer.width = 16;
-        else if (str_eq(width_str, str_lit("32"))) type->data.integer.width = 32;
-        else if (str_eq(width_str, str_lit("64"))) type->data.integer.width = 64;
-        else type->data.integer.width = 32; // Default
-    }
-    // Parse floating point types like "f32", "f64", etc.
-    else if (type_str.size >= 2 && type_str.str[0] == 'f') {
-        type->kind = TYPE_KIND_FLOAT;
-        type->data.floating.is_bfloat = false;
-        // Extract width
-        string width_str = str_substr(type_str, 1, type_str.size - 1);
-        if (str_eq(width_str, str_lit("16"))) type->data.floating.width = 16;
-        else if (str_eq(width_str, str_lit("32"))) type->data.floating.width = 32;
-        else if (str_eq(width_str, str_lit("64"))) type->data.floating.width = 64;
-        else type->data.floating.width = 32; // Default
-    }
-    // bfloat16
-    else if (str_eq(type_str, str_lit("bf16"))) {
-        type->kind = TYPE_KIND_FLOAT;
-        type->data.floating.width = 16;
-        type->data.floating.is_bfloat = true;
-    }
-    // Parse pointer types like "!tt.ptr<f32, 1>"
-    else if (type_str.size >= 7 && str_eq(str_substr(type_str, 0, 7), str_lit("!tt.ptr"))) {
-        type->kind = TYPE_KIND_POINTER;
-        type->data.pointer.address_space = 1; // Default
-        type->data.pointer.has_address_space = false;
-        type->data.pointer.element_type = arena_alloc(arena, Type);
 
-        // Find the content inside < >
-        size_t start = 8; // After "!tt.ptr<"
-        size_t end = type_str.size - 1; // Before ">"
-        if (start < end && type_str.str[7] == '<' && type_str.str[end] == '>') {
-            string content = str_substr(type_str, start, end - start);
-            // Find comma to separate element type from address space
-            size_t comma_pos = content.size;
-            for (size_t i = 0; i < content.size; i++) {
-                if (content.str[i] == ',') {
-                    comma_pos = i;
-                    break;
-                }
-            }
+MlirOperation* parse_operation(Parser *parser);
 
-            if (comma_pos < content.size) {
-                // Parse element type on the left of comma
-                string elem_type_str = str_substr(content, 0, comma_pos);
-                // Trim whitespace
-                while (elem_type_str.size > 0 && elem_type_str.str[0] == ' ') {
-                    elem_type_str = str_substr(elem_type_str, 1, elem_type_str.size - 1);
-                }
-                while (elem_type_str.size > 0 && elem_type_str.str[elem_type_str.size - 1] == ' ') {
-                    elem_type_str = str_substr(elem_type_str, 0, elem_type_str.size - 1);
-                }
-                type->data.pointer.element_type = parse_type_from_string(arena, elem_type_str);
-
-                // Parse address space from right of comma (trim spaces)
-                string addr_str = str_substr(content, comma_pos + 1, content.size - comma_pos - 1);
-                while (addr_str.size > 0 && addr_str.str[0] == ' ') {
-                    addr_str = str_substr(addr_str, 1, addr_str.size - 1);
-                }
-                while (addr_str.size > 0 && addr_str.str[addr_str.size - 1] == ' ') {
-                    addr_str = str_substr(addr_str, 0, addr_str.size - 1);
-                }
-                uint32_t as = 0;
-                for (size_t i = 0; i < addr_str.size; i++) {
-                    if (addr_str.str[i] >= '0' && addr_str.str[i] <= '9') {
-                        as = as * 10 + (uint32_t)(addr_str.str[i] - '0');
-                    }
-                }
-                type->data.pointer.address_space = as;
-                type->data.pointer.has_address_space = true;
-            } else {
-                // No comma, assume f32 and address space 1
-                type->data.pointer.element_type = parse_type_from_string(arena, content);
-                type->data.pointer.address_space = 1;
-                type->data.pointer.has_address_space = false;
-            }
-        } else {
-            // Malformed, default to f32 pointer
-            type->data.pointer.element_type = parse_type_from_string(arena, str_lit("f32"));
-            type->data.pointer.address_space = 1;
-            type->data.pointer.has_address_space = false;
-        }
-    }
-    // Parse tensor types like "tensor<4xi32>" or "tensor<4x!tt.ptr<f32,1>>"
-    else if (type_str.size >= 6 && str_eq(str_substr(type_str, 0, 6), str_lit("tensor"))) {
-        type->kind = TYPE_KIND_TENSOR;
-
-        // Find the content inside < >
-        size_t start = 7; // After "tensor<"
-        size_t end = type_str.size - 1; // Before ">"
-        if (start < end && type_str.str[6] == '<' && type_str.str[end] == '>') {
-            string content = str_substr(type_str, start, end - start);
-
-            // Parse dimensions and element type (e.g., "4xi32" or "4x!tt.ptr<f32,1>")
-            // Find the last 'x' to separate dimensions from element type
-            int last_x_pos = -1;
-            int bracket_depth = 0;
-            for (int i = content.size - 1; i >= 0; i--) {
-                if (content.str[i] == '>') bracket_depth++;
-                else if (content.str[i] == '<') bracket_depth--;
-                else if (content.str[i] == 'x' && bracket_depth == 0) {
-                    last_x_pos = i;
-                    break;
-                }
-            }
-
-            if (last_x_pos > 0) {
-                string elem_type_str = str_substr(content, last_x_pos + 1, content.size - last_x_pos - 1);
-                type->data.shaped.element_type = parse_type_from_string(arena, elem_type_str);
-
-                // Parse shape dims from tokens separated by 'x'
-                string shape_str = str_substr(content, 0, last_x_pos);
-                uint32_t dims = 1;
-                for (size_t i = 0; i < shape_str.size; i++) if (shape_str.str[i] == 'x') dims++;
-                type->data.shaped.rank = dims;
-                type->data.shaped.shape = arena_alloc_array(arena, int64_t, dims);
-                size_t pos = 0; uint32_t dim_idx = 0;
-                while (pos <= shape_str.size && dim_idx < dims) {
-                    size_t next = pos;
-                    while (next < shape_str.size && shape_str.str[next] != 'x') next++;
-                    string tok = str_substr(shape_str, pos, next - pos);
-                    if (tok.size == 1 && tok.str[0] == '?') {
-                        type->data.shaped.shape[dim_idx++] = -1;
-                    } else {
-                        int64_t val = 0;
-                        for (size_t j = 0; j < tok.size; j++) {
-                            if (tok.str[j] >= '0' && tok.str[j] <= '9') {
-                                val = val * 10 + (tok.str[j] - '0');
-                            }
-                        }
-                        type->data.shaped.shape[dim_idx++] = val;
-                    }
-                    pos = next + 1;
-                }
-            } else {
-                // No 'x' found, assume it's just the element type
-                type->data.shaped.element_type = parse_type_from_string(arena, content);
-                type->data.shaped.rank = 0;
-                type->data.shaped.shape = NULL;
-            }
-        } else {
-            // Malformed tensor, default to f32
-            type->data.shaped.element_type = parse_type_from_string(arena, str_lit("f32"));
-            type->data.shaped.rank = 0;
-            type->data.shaped.shape = NULL;
-        }
-    }
-    // Parse memref types like "memref<2x3xf32>"
-    else if (type_str.size >= 6 && str_eq(str_substr(type_str, 0, 6), str_lit("memref"))) {
-        type->kind = TYPE_KIND_MEMREF;
-        type->data.shaped.element_type = NULL;
-        type->data.shaped.shape = NULL;
-        type->data.shaped.rank = 0;
-        // Extract inside of angle brackets
-        size_t start = 7; // after "memref<"
-        size_t end = type_str.size - 1; // before '>'
-        if (start < end && type_str.str[6] == '<' && type_str.str[end] == '>') {
-            string content = str_substr(type_str, start, end - start);
-            // Find last 'x' not inside nested '<>' to split shape and element type
-            int last_x_pos = -1;
-            int bracket_depth = 0;
-            for (int i = (int)content.size - 1; i >= 0; i--) {
-                char c = content.str[i];
-                if (c == '>') bracket_depth++;
-                else if (c == '<') bracket_depth--;
-                else if (c == 'x' && bracket_depth == 0) { last_x_pos = i; break; }
-            }
-            if (last_x_pos > 0) {
-                string elem_type_str = str_substr(content, last_x_pos + 1, content.size - last_x_pos - 1);
-                type->data.shaped.element_type = parse_type_from_string(arena, elem_type_str);
-                string shape_str = str_substr(content, 0, last_x_pos);
-                // Count dims
-                uint32_t dims = 1;
-                for (size_t i = 0; i < shape_str.size; i++) if (shape_str.str[i] == 'x') dims++;
-                type->data.shaped.rank = dims;
-                type->data.shaped.shape = arena_alloc_array(arena, int64_t, dims);
-                // Parse each dimension token separated by 'x'
-                size_t pos = 0, dim_idx = 0;
-                while (pos <= shape_str.size && dim_idx < dims) {
-                    size_t next = pos;
-                    while (next < shape_str.size && shape_str.str[next] != 'x') next++;
-                    string tok = str_substr(shape_str, pos, next - pos);
-                    // Parse integer dim or '?' for dynamic
-                    if (tok.size == 1 && tok.str[0] == '?') {
-                        type->data.shaped.shape[dim_idx++] = -1;
-                    } else {
-                        int64_t val = 0;
-                        for (size_t j = 0; j < tok.size; j++) {
-                            if (tok.str[j] >= '0' && tok.str[j] <= '9') {
-                                val = val * 10 + (tok.str[j] - '0');
-                            }
-                        }
-                        type->data.shaped.shape[dim_idx++] = val;
-                    }
-                    pos = next + 1; // skip 'x'
-                }
-            } else {
-                // No shape dims, treat content as element type
-                type->data.shaped.element_type = parse_type_from_string(arena, content);
-                type->data.shaped.rank = 0;
-                type->data.shaped.shape = NULL;
-            }
-        }
-    }
-    // Default to integer if unrecognized
-    else {
-        type->kind = TYPE_KIND_INTEGER;
-        type->data.integer.width = 32;
-        type->data.integer.is_signed = true;
-    }
-    return type;
-}
-
-string type_to_string(Arena *arena, Type *type) {
-    if (!type) {
-        return str_lit("null");
-    }
-
-    // Debug output to help track crashes
-    // printf("type_to_string: kind=%d\n", type->kind);
-
-    switch (type->kind) {
-        case TYPE_KIND_UNKNOWN:
-            return str_lit("?");
-        case TYPE_KIND_OPAQUE:
-            return str_lit("unknown");
-        case TYPE_KIND_INTEGER:
-            if (type->data.integer.is_signed) {
-                return format(arena, str_lit("i{}"), (int64_t)type->data.integer.width);
-            } else {
-                return format(arena, str_lit("ui{}"), (int64_t)type->data.integer.width);
-            }
-        case TYPE_KIND_FLOAT:
-            if (type->data.floating.is_bfloat && type->data.floating.width == 16) {
-                return str_lit("bf16");
-            }
-            return format(arena, str_lit("f{}"), (int64_t)type->data.floating.width);
-        case TYPE_KIND_TENSOR:
-            if (type->data.shaped.element_type) {
-                string elem_str = type_to_string(arena, type->data.shaped.element_type);
-                if (type->data.shaped.rank > 0 && type->data.shaped.shape) {
-                    // Build shape string like "4x" or "4x2x"
-                    string shape_str = str_lit("");
-                    for (uint32_t i = 0; i < type->data.shaped.rank; i++) {
-                        int64_t dim = type->data.shaped.shape[i];
-                        if (dim < 0) {
-                            shape_str = str_concat(arena, shape_str, str_lit("?x"));
-                        } else {
-                            shape_str = str_concat(arena, shape_str, format(arena, str_lit("{}x"), dim));
-                        }
-                    }
-                    return format(arena, str_lit("tensor<{}{}>"), shape_str, elem_str);
-                } else {
-                    return format(arena, str_lit("tensor<{}>"), elem_str);
-                }
-            }
-            return str_lit("tensor<?>");
-        case TYPE_KIND_MEMREF:
-            if (type->data.shaped.element_type) {
-                string elem_str = type_to_string(arena, type->data.shaped.element_type);
-                if (type->data.shaped.rank > 0 && type->data.shaped.shape) {
-                    string shape_str = str_lit("");
-                    for (uint32_t i = 0; i < type->data.shaped.rank; i++) {
-                        int64_t dim = type->data.shaped.shape[i];
-                        if (dim < 0) {
-                            shape_str = str_concat(arena, shape_str, str_lit("?x"));
-                        } else {
-                            shape_str = str_concat(arena, shape_str, format(arena, str_lit("{}x"), dim));
-                        }
-                    }
-                    return format(arena, str_lit("memref<{}{}>"), shape_str, elem_str);
-                } else {
-                    return format(arena, str_lit("memref<{}>"), elem_str);
-                }
-            }
-            return str_lit("memref<?>");
-        case TYPE_KIND_POINTER:
-            if (type->data.pointer.element_type) {
-                string elem_str = type_to_string(arena, type->data.pointer.element_type);
-                // Only show address space if it's explicitly set and not the default (0)
-                if (type->data.pointer.has_address_space && type->data.pointer.address_space != 0) {
-                    return format(arena, str_lit("!tt.ptr<{}, {}>"), elem_str, (int64_t)type->data.pointer.address_space);
-                } else {
-                    return format(arena, str_lit("!tt.ptr<{}>"), elem_str);
-                }
-            }
-            return str_lit("!tt.ptr<?>");
-        case TYPE_KIND_INDEX:
-            return str_lit("index");
-        case TYPE_KIND_FUNCTION:
-            return str_lit("function");
-        default:
-            return str_lit("unknown");
-    }
-}
-
-Operation* parse_operation(Parser *parser);
-
-Block* parse_block(Parser *parser) {
-    VecValueRef block_args;
-    VecValueRef_reserve(parser->arena, &block_args, 4);
+MlirBlock* parse_block(Parser *parser) {
+    VecValue block_args;
+    VecValue_reserve(parser->arena, &block_args, 4);
 
     if (parser_peek(parser, TK_CARET_NAME)) {
         parser_expect(parser, TK_CARET_NAME);
@@ -865,22 +518,21 @@ Block* parse_block(Parser *parser) {
                     parser_expect(parser, TK_COLON);
 
                     // Create block argument value
-                    ValueRef *block_arg = arena_alloc(parser->arena, ValueRef);
-                    block_arg->kind = BLOCK_ARG;
-                    block_arg->register_name = arg_name;
-                    block_arg->result_index = block_args.size;
-                    block_arg->def = NULL; // Block arguments don't have a defining operation
-                    block_arg->type = arena_alloc(parser->arena, Type);
-
+                    MlirValue *block_arg = mlir_value_create(parser->arena, BLOCK_ARG);
+                    mlir_value_set_register_name(block_arg, arg_name.str, arg_name.size);
+                    mlir_value_set_result_index(block_arg, (uint32_t)block_args.size);
+                    mlir_value_set_def(block_arg, NULL);
                     // Parse argument type
                     string type_name = str_lit("");
+                    MlirType *arg_type = NULL;
                     if (parse_type_string(parser, &type_name)) {
-                        block_arg->type = parse_type_from_string(parser->arena, type_name);
+                        arg_type = mlir_type_create_from_string(parser->arena, type_name);
                     } else {
-                        block_arg->type = parse_type_from_string(parser->arena, str_lit("i32"));
+                        arg_type = mlir_type_create_from_string(parser->arena, str_lit("i32"));
                     }
+                    mlir_value_set_type(block_arg, arg_type);
 
-                    VecValueRef_push_back(parser->arena, &block_args, block_arg);
+                    VecValue_push_back(parser->arena, &block_args, block_arg);
 
                     // Register block argument in symbol table
                     symbol_table_add_value(parser->arena, &parser->symbol_table, arg_name, block_arg);
@@ -904,11 +556,11 @@ Block* parse_block(Parser *parser) {
     VecOperation operations;
     VecOperation_reserve(parser->arena, &operations, 16);
     while (! (parser_peek(parser, TK_RBRACE) || parser_peek(parser, TK_CARET_NAME))) {
-        Operation *op = parse_operation(parser);
+        MlirOperation *op = parse_operation(parser);
         // Capture trailing inline comment based on the original line where the op started
         // This avoids mis-associating comments if tokenization peeks into the next line.
-        if (op && op->source_line_start >= 0) {
-            int64_t line_start = op->source_line_start;
+        if (op && mlir_operation_get_source_line_start(op) >= 0) {
+            int64_t line_start = mlir_operation_get_source_line_start(op);
             // Find end of this line
             int64_t line_end = line_start;
             while (parser->input[line_end] != '\0' && parser->input[line_end] != '\n' && parser->input[line_end] != '\r') {
@@ -926,7 +578,8 @@ Block* parse_block(Parser *parser) {
                     while (begin > line_start && parser->input[begin - 1] == ' ') begin--;
                     int64_t len = line_end - begin;
                     if (len > 0) {
-                        op->trailing_comment = str_from_cstr_len_view((char*)parser->input + begin, len);
+                        string comment = str_from_cstr_len_view((char*)parser->input + begin, len);
+                        mlir_operation_set_trailing_comment(op, comment.str, comment.size);
                     }
                 }
             }
@@ -940,17 +593,19 @@ Block* parse_block(Parser *parser) {
         }
     }
 
-    Block *block = arena_alloc(parser->arena, Block);
-    block->operations = operations.data;
-    block->n_operations = operations.size;
-    block->arguments = block_args.data;
-    block->n_arguments = block_args.size;
+    MlirBlock *block = mlir_block_create(parser->arena);
+    for (size_t i = 0; i < block_args.size; i++) {
+        mlir_block_add_argument(parser->arena, block, block_args.data[i]);
+    }
+    for (size_t i = 0; i < operations.size; i++) {
+        mlir_block_add_operation(parser->arena, block, operations.data[i]);
+    }
 
     return block;
 }
 
 // Parses a region from { to } inclusive
-Region* parse_region(Parser *parser) {
+MlirRegion* parse_region(Parser *parser) {
     parser_expect(parser, TK_LBRACE_END);
     parser_expect(parser, TK_NEWLINE);
 
@@ -960,7 +615,7 @@ Region* parse_region(Parser *parser) {
     VecBlock blocks;
     VecBlock_reserve(parser->arena, &blocks, 8);
     while (!parser_peek(parser, TK_RBRACE)) {
-        Block *block = parse_block(parser);
+        MlirBlock *block = parse_block(parser);
         VecBlock_push_back(parser->arena, &blocks, block);
     }
     parser_expect(parser, TK_RBRACE);
@@ -968,23 +623,24 @@ Region* parse_region(Parser *parser) {
     // Pop scope when leaving region
     symbol_table_pop_scope(&parser->symbol_table);
 
-    Region *region = arena_alloc(parser->arena, Region);
-    region->blocks = blocks.data;
-    region->n_blocks = blocks.size;
+    MlirRegion *region = mlir_region_create(parser->arena);
+    for (size_t i = 0; i < blocks.size; i++) {
+        mlir_region_add_block(parser->arena, region, blocks.data[i]);
+    }
 
     return region;
 }
 
-Operation* parse_module(Parser *parser) {
+MlirOperation* parse_module(Parser *parser) {
     // Capture any top-of-file #loc definitions before the module
-    Location *loc0_def = NULL;
+    MlirLocation *loc0_def = NULL;
     while (parser_peek(parser, TK_HASH_NAME)) {
         string hash_name = parser_token_str(parser);
         parser_next_token(parser); // consume '#name'
         if (parser_peek(parser, TK_EQUAL)) {
             parser_next_token(parser); // consume '='
             if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
-                Location *loc_def = parse_loc(parser);
+                MlirLocation *loc_def = parse_loc(parser);
                 if (loc_def) {
                     LocationMap_insert(parser->arena, &parser->location_map, hash_name, loc_def);
                     if (hash_name.size == 4 && strncmp(hash_name.str, "#loc", 4) == 0) {
@@ -1003,16 +659,16 @@ Operation* parse_module(Parser *parser) {
         while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) parser_next_token(parser);
     }
 
-    Operation *op = parse_operation(parser);
-    if (op->op_type != OP_TYPE_MODULE) {
+    MlirOperation *op = parse_operation(parser);
+    if (mlir_operation_get_type(op) != OP_TYPE_MODULE) {
         parser_error(parser, str_lit("The top level operation should be a module"), 0, 0);
     }
-    
+
     // Skip whitespace and newlines after the module
     while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) {
         parser_next_token(parser);
     }
-    
+
     // Parse location definitions that appear after the module
     // Format: #locN = loc(...)
     while (parser_peek(parser, TK_HASH_NAME)) {
@@ -1021,7 +677,7 @@ Operation* parse_module(Parser *parser) {
         if (parser_peek(parser, TK_EQUAL)) {
             parser_next_token(parser); // consume '='
             if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
-                Location *loc_def = parse_loc(parser);
+                MlirLocation *loc_def = parse_loc(parser);
                 if (loc_def) {
                     LocationMap_insert(parser->arena, &parser->location_map, hash_name, loc_def);
                 }
@@ -1033,24 +689,66 @@ Operation* parse_module(Parser *parser) {
         if (parser_peek(parser, TK_NEWLINE)) parser_next_token(parser);
         while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) parser_next_token(parser);
     }
-    
+
     // Attach unnumbered '#loc' definition captured during initial scan or in parse_operation
     if (!loc0_def) loc0_def = parser->unnumbered_loc_def;
-    op->unnumbered_loc_def = loc0_def;
+    mlir_operation_set_unnumbered_loc_def(op, loc0_def);
     return op;
 }
 
+MlirOperation *mlir_parse_module(Arena *arena, const char *input, size_t input_len, MlirLocationMap **out_location_map) {
+    Parser *parser = arena_alloc(arena, Parser);
+    string input_string = {
+        .str = (char*)input,
+        .size = input_len
+    };
+    parser_init(arena, parser, input_string);
+    MlirOperation *module = parse_module(parser);
+    if (out_location_map) {
+        MlirLocationMap *map_wrapper = arena_alloc(arena, MlirLocationMap);
+        map_wrapper->impl = &parser->location_map;
+        *out_location_map = map_wrapper;
+    }
+    return module;
+}
+
+const char *mlir_tokentype_to_string(int token_type) {
+    string s = tokentype_to_string((TokenType)token_type);
+    return s.str;
+}
+
+size_t mlir_location_map_size(const MlirLocationMap *location_map) {
+    if (!location_map) return 0;
+    const LocationMap *lm = (const LocationMap*)location_map->impl;
+    if (!lm) return 0;
+    return lm->size;
+}
+
+size_t mlir_location_map_collect(const MlirLocationMap *location_map, string *out_keys, MlirLocation **out_locs, size_t max) {
+    if (!location_map) return 0;
+    const LocationMap *lm = (const LocationMap*)location_map->impl;
+    if (!lm) return 0;
+    size_t written = 0;
+    for (size_t i = 0; i < lm->num_buckets && written < max; i++) {
+        if (!lm->buckets[i].occupied) continue;
+        out_keys[written] = lm->buckets[i].key;
+        out_locs[written] = lm->buckets[i].value;
+        written++;
+    }
+    return written;
+}
+
 // parse loc()
-Location* parse_loc(Parser *parser) {
+MlirLocation* parse_loc(Parser *parser) {
     Arena *arena = parser->arena;
-    Location *loc = arena_alloc(arena, Location);
-    loc->kind = LOC_KIND_UNKNOWN;
-    loc->original_text = str_lit("");
-    
-    
+    MlirLocation *loc = mlir_location_create(arena);
+    mlir_location_set_kind(loc, MLIR_LOC_UNKNOWN);
+    mlir_location_set_original_text(loc, str_lit(""));
+
+
     parser_expect(parser, TK_NAME); // 'loc'
     parser_expect(parser, TK_LPAREN);
-    
+
     // Check what kind of location this is
     if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("callsite"))) {
         // Capture loc(callsite(...)) verbatim as original_text
@@ -1078,95 +776,87 @@ Location* parse_loc(Parser *parser) {
         }
         parser_expect(parser, TK_RPAREN);
         text = str_concat(parser->arena, text, str_lit(")"));
-        loc->kind = LOC_KIND_UNKNOWN;
-        loc->original_text = text;
+        mlir_location_set_kind(loc, MLIR_LOC_UNKNOWN);
+        mlir_location_set_original_text(loc, text);
         return loc;
     } else if (parser_peek(parser, TK_STRING)) {
         // loc("filename":line:col) or loc("name")
         string filename = parser_token_str(parser);
         parser_next_token(parser);
-        
+
         if (parser_peek(parser, TK_COLON)) {
             // File location: loc("filename":line:col)
             parser_next_token(parser); // consume ':'
-            
+
+            int line = 0;
+            int column = 0;
+
             if (parser_peek(parser, TK_INTEGER)) {
-                loc->kind = LOC_KIND_FILE;
-                loc->data.file.filename = filename;
-                
-                // Parse line number
                 string line_str = parser_token_str(parser);
-                loc->data.file.line = atoi(line_str.str);
+                line = atoi(line_str.str);
                 parser_next_token(parser);
-                
+
                 if (parser_peek(parser, TK_COLON)) {
                     parser_next_token(parser); // consume ':'
                     if (parser_peek(parser, TK_INTEGER)) {
-                        // Parse column number
                         string col_str = parser_token_str(parser);
-                        loc->data.file.column = atoi(col_str.str);
+                        column = atoi(col_str.str);
                         parser_next_token(parser);
                     }
                 }
+
+                mlir_location_set_file_data(loc, filename, line, column);
             }
         } else {
             // Named location: loc("name")
-            loc->kind = LOC_KIND_NAME;
-            loc->data.name.name = filename;
+            mlir_location_set_name_data(loc, filename);
         }
     } else if (parser_peek(parser, TK_HASH_NAME)) {
         // Reference location: loc(#locN)
         string hash_name = parser_token_str(parser);
         parser_next_token(parser); // consume '#locN'
-        loc->kind = LOC_KIND_REF;
-        // Extract number from "#locN" format
+        int ref_id = 0;
         if (hash_name.size > 4 && strncmp(hash_name.str, "#loc", 4) == 0) {
-            loc->data.ref.ref_id = atoi(hash_name.str + 4);
-        } else {
-            loc->data.ref.ref_id = 0;
+            ref_id = atoi(hash_name.str + 4);
         }
+        mlir_location_set_ref_id(loc, ref_id);
     } else {
         // Unknown location format, just consume tokens until ')'
         while (!(parser_peek(parser, TK_RPAREN))) {
             parser_next_token(parser);
         }
     }
-    
+
     parser_expect(parser, TK_RPAREN);
-    
+
     // Capture original text for printing (simple reconstruction)
-    if (loc->kind == LOC_KIND_FILE) {
-        loc->original_text = format(parser->arena, str_lit("loc({}:{}:{})"),
-            loc->data.file.filename, (int64_t)loc->data.file.line, (int64_t)loc->data.file.column);
-    } else if (loc->kind == LOC_KIND_NAME) {
-        loc->original_text = format(parser->arena, str_lit("loc(\"{}\")"), loc->data.name.name);
-    } else if (loc->kind == LOC_KIND_REF) {
-        loc->original_text = format(parser->arena, str_lit("loc(#loc{})"), (int64_t)loc->data.ref.ref_id);
+    MlirLocationKind stored_kind = mlir_location_get_kind(loc);
+    if (stored_kind == MLIR_LOC_FILE) {
+        mlir_location_set_original_text(loc,
+            format(parser->arena, str_lit("loc({}:{}:{})"),
+                   mlir_location_get_file_filename(loc),
+                   (int64_t)mlir_location_get_file_line(loc),
+                   (int64_t)mlir_location_get_file_column(loc)));
+    } else if (stored_kind == MLIR_LOC_NAME) {
+        mlir_location_set_original_text(loc,
+            format(parser->arena, str_lit("loc(\"{}\")"), mlir_location_get_name(loc)));
+    } else if (stored_kind == MLIR_LOC_REF) {
+        mlir_location_set_original_text(loc,
+            format(parser->arena, str_lit("loc(#loc{})"), (int64_t)mlir_location_get_ref_id(loc)));
     } else {
-        loc->original_text = str_lit("loc(unknown)");
+        mlir_location_set_original_text(loc, str_lit("loc(unknown)"));
     }
-    
+
     return loc;
 }
 
 
-Operation* parse_operation(Parser *parser) {
-    Operation *op = arena_alloc(parser->arena, Operation);
-    op->regions = NULL;
-    op->n_regions = 0;
-    op->n_result_types = 0;
-    op->operands = NULL;
-    op->n_operands = 0;
-    op->attributes = NULL;
-    op->n_attributes = 0;
-    op->result_types = NULL;
-    op->results = NULL;
-    op->n_results = 0;
-    op->opname = str_lit("");
-    op->unnumbered_loc_def = NULL;
-    op->location = NULL;
-    op->trailing_comment = str_lit("");
-    op->source_line_start = -1;
+MlirOperation* parse_operation(Parser *parser) {
+    MlirOperation *op = mlir_op_create(parser->arena, OP_TYPE_UNREGISTERED);
+    mlir_operation_set_trailing_comment(op, "", 0);
+    mlir_operation_set_source_line_start(op, -1);
+    mlir_operation_set_location(op, NULL);
+    mlir_operation_set_unnumbered_loc_def(op, NULL);
 
     // Skip empty lines and attributes
     while (
@@ -1180,7 +870,7 @@ Operation* parse_operation(Parser *parser) {
             if (parser_peek(parser, TK_EQUAL)) {
                 parser_next_token(parser); // consume '='
                 if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
-                    Location *loc_def = parse_loc(parser);
+                    MlirLocation *loc_def = parse_loc(parser);
                     if (loc_def) {
                         LocationMap_insert(parser->arena, &parser->location_map, hash_name, loc_def);
                         if (hash_name.size == 4 && strncmp(hash_name.str, "#loc", 4) == 0) {
@@ -1208,11 +898,11 @@ Operation* parse_operation(Parser *parser) {
             if (c == '\n' || c == '\r') break;
             pos--;
         }
-        op->source_line_start = pos;
+        mlir_operation_set_source_line_start(op, pos);
     }
 
     // Parse return registers if any
-    ValueRef *result_value = NULL;
+    MlirValue *result_value = NULL;
     if (parser_peek(parser, TK_REGISTER)) {
         string reg_name = parser_token_str(parser);
         parser_expect(parser, TK_REGISTER);
@@ -1222,13 +912,11 @@ Operation* parse_operation(Parser *parser) {
         }
         parser_expect(parser, TK_EQUAL);
 
-        // Create ValueRef for the result and add to symbol table
-        result_value = arena_alloc(parser->arena, ValueRef);
-        result_value->kind = OP_RESULT;
-        result_value->def = op;
-        result_value->result_index = 0;
-        result_value->register_name = reg_name;
-        result_value->type = NULL; // Will be set later when we parse the result type
+        // Create MlirValue for the result and add to symbol table
+        result_value = mlir_value_create(parser->arena, OP_RESULT);
+        mlir_value_set_def(result_value, op);
+        mlir_value_set_result_index(result_value, 0);
+        mlir_value_set_register_name(result_value, reg_name.str, reg_name.size);
     }
 
     // Parse operation name
@@ -1261,14 +949,17 @@ Operation* parse_operation(Parser *parser) {
 
 
     // Set op_type based on operation name
-    op->op_type = op_string_to_type(opname);
-    if (op->op_type == OP_TYPE_UNREGISTERED) {
-        op->opname = opname;
+    OpType op_type = op_string_to_type(opname);
+    mlir_operation_set_type(op, op_type);
+    if (op_type == OP_TYPE_UNREGISTERED) {
+        mlir_operation_set_name(op, opname.str, opname.size);
     }
+    
+    // Debug: Print all operation names
 
 
     // First we handle specific opnames with special parsing rules
-    switch (op->op_type) {
+    switch (op_type) {
         case OP_TYPE_TT_FUNC:
             parse_tt_func(parser, op);
             parse_generic_attrs_and_result_type(parser, op);
@@ -1404,26 +1095,25 @@ Operation* parse_operation(Parser *parser) {
             break;
     }
 
+
     // Handle return value(s) for all operations
     if (result_value) {
-        if (op->n_result_types > 0) {
-            // If op->n_result_types > 0, then op->result_types must be set:
-            assert(op->result_types != NULL);
-            assert(op->result_types[0] != NULL);
-            // Set the type
-            result_value->type = op->result_types[0];
-            result_value->def = op;
-            symbol_table_add_value(parser->arena, &parser->symbol_table, result_value->register_name, result_value);
+        if (mlir_operation_num_result_types(op) > 0) {
+            MlirType *res_type = mlir_operation_get_result_type(op, 0);
+            assert(res_type != NULL);
+            mlir_value_set_type(result_value, res_type);
+            mlir_value_set_def(result_value, op);
+            symbol_table_add_value(parser->arena, &parser->symbol_table, mlir_value_get_register_name(result_value), result_value);
 
             // Link result to operation
-            op->n_results = 1;
-            op->results = arena_alloc_array(parser->arena, ValueRef*, 1);
-            op->results[0] = result_value;
+            MlirValue **results = arena_alloc_array(parser->arena, MlirValue*, 1);
+            results[0] = result_value;
+            mlir_operation_set_results(op, results, 1);
         } else {
             parser_error(parser, str_lit("Result Value parsed on LHS but no Type present on RHS"), parser->first, parser->last);
         }
     } else {
-        if (op->n_result_types > 0) {
+        if (mlir_operation_num_result_types(op) > 0) {
             parser_error(parser, str_lit("Result Type parsed on RHS but no result Value on LHS"), parser->first, parser->last);
         }
     }
@@ -1431,8 +1121,8 @@ Operation* parse_operation(Parser *parser) {
     // Only capture comments for operations that definitely should have them
     // This conservative approach avoids the comment duplication issue
     bool should_capture = false;
-    
-    if (should_capture && op->trailing_comment.size == 0) {
+
+    if (should_capture && mlir_operation_get_trailing_comment(op).size == 0) {
         // Only capture comments if we can find "//" in the rest of the current line
         // after some whitespace (to ensure it belongs to this operation)
         string text = str_from_cstr_view((char*)parser->input);
@@ -1442,14 +1132,14 @@ Operation* parse_operation(Parser *parser) {
             // Find the end of the current line (stop at first newline)
             for (int64_t i = scan_start; i < (int64_t)text.size; i++) {
                 char ch = text.str[i];
-                if (ch == '\n' || ch == '\r') { 
-                    line_end = i - 1; 
-                    break; 
+                if (ch == '\n' || ch == '\r') {
+                    line_end = i - 1;
+                    break;
                 }
                 line_end = i; // Keep extending until we hit newline
             }
-            
-            
+
+
             // Look for "//" in the remaining part of this line
             bool found_comment = false;
             int64_t comment_start = -1;
@@ -1464,11 +1154,12 @@ Operation* parse_operation(Parser *parser) {
                     break;
                 }
             }
-            
+
             if (found_comment && comment_start >= 0) {
                 int64_t len = line_end - comment_start + 1;
                 if (len > 0) {
-                    op->trailing_comment = str_from_cstr_len_view(text.str + comment_start, len);
+                    string comment = str_from_cstr_len_view(text.str + comment_start, len);
+                    mlir_operation_set_trailing_comment(op, comment.str, comment.size);
                 }
             }
         }
