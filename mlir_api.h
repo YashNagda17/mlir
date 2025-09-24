@@ -163,7 +163,19 @@ void mlir_api_init(MlirOperation *root);
 // -----------------------------------------------------------------------------
 
 // Creation & structural mutation
-MlirOperation *mlir_op_create(Arena *arena, OpType type);
+MlirOperation *mlir_op_create(
+    Arena *arena,
+    OpType type,
+    string opname,
+    MlirAttribute **attributes, size_t n_attributes,
+    MlirType **result_types, size_t n_result_types,
+    MlirValue **results, size_t n_results,
+    MlirValue **operands, size_t n_operands,
+    MlirRegion **regions, size_t n_regions,
+    MlirLocation *location,
+    MlirLocation *unnumbered_loc_def,
+    string trailing_comment,
+    int64_t source_line_start);
 void mlir_op_add_region(Arena *arena, MlirOperation *op, MlirRegion *region);
 void mlir_op_add_operand(Arena *arena, MlirOperation *op, MlirValue *operand);
 void mlir_op_add_result(Arena *arena, MlirOperation *op, MlirValue *result);

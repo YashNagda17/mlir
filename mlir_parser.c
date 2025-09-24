@@ -1043,11 +1043,30 @@ MlirLocation* parse_loc(Parser *parser) {
 
 
 MlirOperation* parse_operation(Parser *parser) {
-    MlirOperation *op = mlir_op_create(parser->arena, OP_TYPE_UNREGISTERED);
+    MlirOperation *op = mlir_op_create(
+        parser->arena,
+        OP_TYPE_UNREGISTERED,
+        str_lit(""),
+        NULL, 0,
+        NULL, 0,
+        NULL, 0,
+        NULL, 0,
+        NULL, 0,
+        NULL,
+        NULL,
+        str_lit(""),
+        -1);
     mlir_operation_set_trailing_comment(op, "", 0);
     mlir_operation_set_source_line_start(op, -1);
     mlir_operation_set_location(op, NULL);
     mlir_operation_set_unnumbered_loc_def(op, NULL);
+
+    MlirLocation *recorded_location = NULL;
+    MlirLocation *recorded_unnumbered_loc = NULL;
+    int64_t recorded_source_line = -1;
+    MlirValue **lhs_results = NULL;
+    size_t n_lhs_results = 0;
+    size_t n_new_results_from_parser = 0;
 
     // Skip empty lines and attributes
     while (
@@ -1090,6 +1109,7 @@ MlirOperation* parse_operation(Parser *parser) {
             pos--;
         }
         mlir_operation_set_source_line_start(op, pos);
+        recorded_source_line = pos;
     }
 
     // Parse return registers if any
@@ -1103,11 +1123,12 @@ MlirOperation* parse_operation(Parser *parser) {
         }
         parser_expect(parser, TK_EQUAL);
 
-        // Create MlirValue for the result and add to symbol table
         result_value = mlir_value_create(parser->arena, OP_RESULT);
-        mlir_value_set_def(result_value, op);
         mlir_value_set_result_index(result_value, 0);
         mlir_value_set_register_name(result_value, reg_name.str, reg_name.size);
+        lhs_results = arena_alloc_array(parser->arena, MlirValue*, 1);
+        lhs_results[0] = result_value;
+        n_lhs_results = 1;
     }
 
     // Parse operation name
@@ -1145,7 +1166,17 @@ MlirOperation* parse_operation(Parser *parser) {
     if (op_type == OP_TYPE_UNREGISTERED) {
         mlir_operation_set_name(op, opname.str, opname.size);
     }
-    
+    OperationParserParams params = {
+        .arena = parser->arena,
+        .op_type = op_type,
+        .opname = opname,
+        .lhs_results = lhs_results,
+        .n_lhs_results = n_lhs_results,
+        .unnumbered_loc_def = parser->unnumbered_loc_def,
+        .source_line_start = recorded_source_line
+    };
+    OperationParserResult parsed = {0};
+
     // Debug: Print all operation names
 
 
@@ -1172,8 +1203,7 @@ MlirOperation* parse_operation(Parser *parser) {
             parse_generic_attrs_and_result_type(parser, op);
             break;
         case OP_TYPE_ARITH_CONSTANT:
-            parse_arith_constant(parser, op);
-            parse_generic_attrs_and_result_type(parser, op);
+            parsed = parse_arith_constant_op(parser, &params);
             break;
         case OP_TYPE_ARITH_CMPI:
             parse_arith_cmpi(parser, op);
@@ -1229,11 +1259,10 @@ MlirOperation* parse_operation(Parser *parser) {
             parse_generic_attrs_and_result_type(parser, op);
             break;
         case OP_TYPE_MEMREF_LOAD:
-            parse_memref_load_or_store(parser, op);
-            parse_generic_attrs_and_result_type(parser, op);
+            parsed = parse_memref_load_op(parser, &params);
             break;
         case OP_TYPE_MEMREF_STORE:
-            parse_memref_store(parser, op);
+            parsed = parse_memref_store_op(parser, &params);
             break;
         case OP_TYPE_VECTOR_PRINT:
             parse_vector_print(parser, op);
@@ -1285,27 +1314,52 @@ MlirOperation* parse_operation(Parser *parser) {
             parse_generic_operation(parser, op);
             break;
     }
-
+    if (parsed.operation != NULL) {
+        op = parsed.operation;
+        n_new_results_from_parser = parsed.n_results;
+        if (parsed.location) {
+            recorded_location = parsed.location;
+        }
+        mlir_operation_set_source_line_start(op, recorded_source_line);
+        recorded_unnumbered_loc = parser->unnumbered_loc_def;
+        mlir_operation_set_unnumbered_loc_def(op, recorded_unnumbered_loc);
+        if (recorded_location) {
+            mlir_operation_set_location(op, recorded_location);
+        }
+    }
 
     // Handle return value(s) for all operations
-    if (result_value) {
-        if (mlir_operation_num_result_types(op) > 0) {
-            MlirType *res_type = mlir_operation_get_result_type(op, 0);
-            assert(res_type != NULL);
-            mlir_value_set_type(result_value, res_type);
-            mlir_value_set_def(result_value, op);
-            symbol_table_add_value(parser->arena, &parser->symbol_table, mlir_value_get_register_name(result_value), result_value);
+    if (parsed.operation == NULL) {
+        if (result_value) {
+            if (mlir_operation_num_result_types(op) > 0) {
+                MlirType *res_type = mlir_operation_get_result_type(op, 0);
+                assert(res_type != NULL);
+                mlir_value_set_type(result_value, res_type);
+                mlir_value_set_def(result_value, op);
+                symbol_table_add_value(parser->arena, &parser->symbol_table, mlir_value_get_register_name(result_value), result_value);
 
-            // Link result to operation
-            MlirValue **results = arena_alloc_array(parser->arena, MlirValue*, 1);
-            results[0] = result_value;
-            mlir_operation_set_results(op, results, 1);
+                MlirValue **results = arena_alloc_array(parser->arena, MlirValue*, 1);
+                results[0] = result_value;
+                mlir_operation_set_results(op, results, 1);
+            } else {
+                parser_error(parser, str_lit("Result Value parsed on LHS but no Type present on RHS"), parser->first, parser->last);
+            }
         } else {
-            parser_error(parser, str_lit("Result Value parsed on LHS but no Type present on RHS"), parser->first, parser->last);
+            if (mlir_operation_num_result_types(op) > 0) {
+                parser_error(parser, str_lit("Result Type parsed on RHS but no result Value on LHS"), parser->first, parser->last);
+            }
         }
     } else {
-        if (mlir_operation_num_result_types(op) > 0) {
-            parser_error(parser, str_lit("Result Type parsed on RHS but no result Value on LHS"), parser->first, parser->last);
+        if (result_value && n_new_results_from_parser > 0) {
+            MlirType *res_type = mlir_operation_get_result_type(op, 0);
+            if (res_type) {
+                mlir_value_set_type(result_value, res_type);
+            }
+            mlir_value_set_def(result_value, op);
+            symbol_table_add_value(parser->arena, &parser->symbol_table, mlir_value_get_register_name(result_value), result_value);
+        } else if (!result_value && n_new_results_from_parser > 0) {
+            // Operation produces results but no SSA name was provided - this is invalid MLIR
+            parser_error(parser, str_lit("Operation produces results but no SSA name provided on left-hand side"), parser->first, parser->last);
         }
     }
 

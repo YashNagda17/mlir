@@ -172,10 +172,37 @@ void mlir_api_init(MlirOperation *root) {
     // No initialization required for the native C implementation.
 }
 
-MlirOperation *mlir_op_create(Arena *arena, OpType type) {
+MlirOperation *mlir_op_create(
+    Arena *arena,
+    OpType type,
+    string opname,
+    MlirAttribute **attributes, size_t n_attributes,
+    MlirType **result_types, size_t n_result_types,
+    MlirValue **results, size_t n_results,
+    MlirValue **operands, size_t n_operands,
+    MlirRegion **regions, size_t n_regions,
+    MlirLocation *location,
+    MlirLocation *unnumbered_loc_def,
+    string trailing_comment,
+    int64_t source_line_start) {
     MlirOperation *op = arena_alloc(arena, MlirOperation);
     *op = (MlirOperation){0};
     op->op_type = type;
+    op->opname = opname;
+    op->attributes = attributes;
+    op->n_attributes = n_attributes;
+    op->result_types = result_types;
+    op->n_result_types = n_result_types;
+    op->results = results;
+    op->n_results = n_results;
+    op->operands = operands;
+    op->n_operands = n_operands;
+    op->regions = regions;
+    op->n_regions = n_regions;
+    op->location = location;
+    op->unnumbered_loc_def = unnumbered_loc_def;
+    op->trailing_comment = trailing_comment;
+    op->source_line_start = source_line_start;
     return op;
 }
 
