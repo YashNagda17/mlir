@@ -3333,43 +3333,6 @@ void parse_scf_yield(Parser *parser, MlirOperation *op) {
     while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
 }
 
-void parse_return_operation(Parser *parser, MlirOperation *op) {
-    // Parse optional operands
-    VecValue operands;
-    VecValue_reserve(parser->arena, &operands, 2);
-    while (parser_peek(parser, TK_REGISTER)) {
-        string reg_str = parser_token_str(parser);
-        parser_expect(parser, TK_REGISTER);
-        MlirValue *operand = symbol_table_lookup(&parser->symbol_table, reg_str);
-        if (!operand) {
-            parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
-            return;
-        }
-        VecValue_push_back(parser->arena, &operands, operand);
-        if (parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA); else break;
-    }
-    // Keep operands for classic and better generic fidelity
-    set_op_operands(op, operands.data, operands.size);
-
-    // Consume any trailing ": ..." types or loc(), without assigning result types
-    if (parser_peek(parser, TK_COLON)) {
-        do {
-            if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
-                mlir_operation_set_location(op, parse_loc(parser));
-                break;
-            }
-            parser_next_token(parser);
-        } while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE) && !parser_peek(parser, TK_EOF));
-    }
-    // Or a trailing loc() without preceding ':'
-    if (!mlir_operation_get_location(op) && parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) {
-        mlir_operation_set_location(op, parse_loc(parser));
-    }
-
-    // Done with this op line
-    while (!parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_EOF)) parser_next_token(parser);
-}
-
 void parse_affine_for(Parser *parser, MlirOperation *op) {
     // Expect induction variable
     MlirValue *ind_var = NULL;

@@ -40,8 +40,6 @@ OperationParserResult parse_linalg_fill_op(Parser *parser, const OperationParser
 OperationParserResult parse_memref_load_op(Parser *parser, const OperationParserParams *params);
 OperationParserResult parse_memref_store_op(Parser *parser, const OperationParserParams *params);
 
-void parse_return_operation(Parser *parser, MlirOperation *op);
-
 OperationParserResult parse_scf_if_op(Parser *parser, const OperationParserParams *params);
 OperationParserResult parse_scf_for_op(Parser *parser, const OperationParserParams *params);
 OperationParserResult parse_scf_while_op(Parser *parser, const OperationParserParams *params);
