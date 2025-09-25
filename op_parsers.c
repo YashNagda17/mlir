@@ -66,6 +66,43 @@ static inline const char *string_data_or_null(string s) {
     return s.size > 0 ? s.str : NULL;
 }
 
+static MlirValue **finalize_results(const OperationParserParams *params,
+                                    MlirOperation *op,
+                                    MlirType **result_types,
+                                    size_t n_result_types,
+                                    size_t *out_n_results) {
+    MlirValue **results = NULL;
+    size_t n_results = 0;
+
+    if (result_types == NULL) {
+        n_result_types = mlir_operation_num_result_types(op);
+    }
+
+    if (n_result_types > 0) {
+        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
+        for (size_t i = 0; i < n_result_types; i++) {
+            MlirValue *res = mlir_value_create(params->arena, OP_RESULT);
+            mlir_value_set_def(res, op);
+            mlir_value_set_result_index(res, (uint32_t)i);
+            MlirType *ty = result_types ? result_types[i] : mlir_operation_get_result_type(op, i);
+            if (ty) {
+                mlir_value_set_type(res, ty);
+            }
+            if (params->lhs_results && i < params->n_lhs_results) {
+                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
+                mlir_value_set_register_name(res, string_data_or_null(reg_name), reg_name.size);
+            } else {
+                mlir_value_set_register_name(res, NULL, 0);
+            }
+            results[i] = res;
+        }
+        mlir_operation_set_results(op, results, n_results = n_result_types);
+    }
+
+    if (out_n_results) *out_n_results = n_results;
+    return results;
+}
+
 static MlirAttribute *create_string_attr(Parser *parser, string name, string value) {
     MlirAttribute *attr = mlir_attribute_create_string(parser->arena, string_data_or_null(value), value.size);
     if (name.size > 0) mlir_attribute_set_name(attr, string_data_or_null(name), name.size);
@@ -670,25 +707,8 @@ OperationParserResult parse_arith_binary_op(Parser *parser, const OperationParse
                                       str_lit(""), params->source_line_start);
 
     // Create results from the operation's result types
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -803,26 +823,8 @@ OperationParserResult parse_func_call_op(Parser *parser, const OperationParserPa
                                       op_location, params->unnumbered_loc_def, 
                                       str_lit(""), params->source_line_start);
 
-    // Create results from the operation's result types
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -877,24 +879,8 @@ OperationParserResult parse_tt_get_program_id_op(Parser *parser, const Operation
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -973,26 +959,8 @@ OperationParserResult parse_tt_splat_op(Parser *parser, const OperationParserPar
                                       op_location, params->unnumbered_loc_def, 
                                       str_lit(""), params->source_line_start);
 
-    // Create results from the operation's result types
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -1097,24 +1065,8 @@ OperationParserResult parse_tt_make_range_op(Parser *parser, const OperationPars
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -1211,22 +1163,7 @@ OperationParserResult parse_tt_addptr_op(Parser *parser, const OperationParserPa
 
     MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -1320,24 +1257,8 @@ OperationParserResult parse_tensor_extract_op(Parser *parser, const OperationPar
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -1638,24 +1559,8 @@ OperationParserResult parse_std_constant_op(Parser *parser, const OperationParse
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -1813,24 +1718,8 @@ OperationParserResult parse_tt_reduce_op(Parser *parser, const OperationParserPa
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -2225,24 +2114,8 @@ OperationParserResult parse_affine_load_op(Parser *parser, const OperationParser
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -2307,24 +2180,8 @@ OperationParserResult parse_index_constant_op(Parser *parser, const OperationPar
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -2427,24 +2284,8 @@ OperationParserResult parse_tensor_splat_op(Parser *parser, const OperationParse
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -2547,26 +2388,8 @@ OperationParserResult parse_arith_select_op(Parser *parser, const OperationParse
                                       op_location, params->unnumbered_loc_def, 
                                       str_lit(""), params->source_line_start);
 
-    // Create results from the operation's result types
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -2673,24 +2496,8 @@ OperationParserResult parse_tt_call_op(Parser *parser, const OperationParserPara
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -2793,24 +2600,8 @@ OperationParserResult parse_tensor_collapse_shape_op(Parser *parser, const Opera
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -2950,26 +2741,8 @@ OperationParserResult parse_generic_op(Parser *parser, const OperationParserPara
     if (op_location) mlir_operation_set_location(op, op_location);
 
     size_t n_result_types = mlir_operation_num_result_types(op);
-    MlirValue **results = NULL;
     size_t n_results = 0;
-
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            MlirValue *res = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(res, op);
-            mlir_value_set_result_index(res, (uint32_t)i);
-            mlir_value_set_type(res, mlir_operation_get_result_type(op, i));
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(res, string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(res, NULL, 0);
-            }
-            results[i] = res;
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, NULL, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -3364,26 +3137,8 @@ OperationParserResult parse_tt_func_op(Parser *parser, const OperationParserPara
         mlir_op_add_region(params->arena, op, func_region);
     }
 
-    // Create results from the operation's result types
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -3582,24 +3337,8 @@ OperationParserResult parse_scf_if_op(Parser *parser, const OperationParserParam
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -3890,11 +3629,10 @@ OperationParserResult parse_scf_for_op(Parser *parser, const OperationParserPara
 
     MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_iter_results > 0) {
-        // Only create result values for LHS results that have names
-        // This matches the old behavior where unnamed results weren't created
-        results = arena_alloc_array(params->arena, MlirValue*, params->n_lhs_results);
-        for (size_t i = 0; i < params->n_lhs_results && i < n_iter_results; i++) {
+    if (n_iter_results > 0 && params->n_lhs_results > 0) {
+        size_t count = params->n_lhs_results < n_iter_results ? params->n_lhs_results : n_iter_results;
+        results = arena_alloc_array(params->arena, MlirValue*, count);
+        for (size_t i = 0; i < count; i++) {
             results[i] = mlir_value_create(params->arena, OP_RESULT);
             mlir_value_set_def(results[i], op);
             mlir_value_set_result_index(results[i], (uint32_t)i);
@@ -3902,7 +3640,7 @@ OperationParserResult parse_scf_for_op(Parser *parser, const OperationParserPara
             string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
             mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
         }
-        n_results = params->n_lhs_results;
+        n_results = count;
         mlir_operation_set_results(op, results, n_results);
         mlir_operation_set_result_types(op, iter_result_types, n_iter_results);
     }
@@ -4041,24 +3779,8 @@ OperationParserResult parse_scf_while_op(Parser *parser, const OperationParserPa
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -4428,22 +4150,7 @@ OperationParserResult parse_gpu_launch_op(Parser *parser, const OperationParserP
     MlirValue **results = NULL;
     size_t n_results = 0;
     
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -4535,22 +4242,7 @@ OperationParserResult parse_arith_cmpi_op(Parser *parser, const OperationParserP
     MlirValue **results = NULL;
     size_t n_results = 0;
     
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
@@ -4814,24 +4506,8 @@ OperationParserResult parse_tt_load_op(Parser *parser, const OperationParserPara
         str_lit(""),
         params->source_line_start);
 
-    MlirValue **results = NULL;
     size_t n_results = 0;
-    if (n_result_types > 0) {
-        results = arena_alloc_array(params->arena, MlirValue*, n_result_types);
-        for (size_t i = 0; i < n_result_types; i++) {
-            results[i] = mlir_value_create(params->arena, OP_RESULT);
-            mlir_value_set_def(results[i], op);
-            mlir_value_set_result_index(results[i], (uint32_t)i);
-            mlir_value_set_type(results[i], result_types[i]);
-            if (params->lhs_results && i < params->n_lhs_results) {
-                string reg_name = mlir_value_get_register_name(params->lhs_results[i]);
-                mlir_value_set_register_name(results[i], string_data_or_null(reg_name), reg_name.size);
-            } else {
-                mlir_value_set_register_name(results[i], NULL, 0);
-            }
-        }
-        mlir_operation_set_results(op, results, n_results = n_result_types);
-    }
+    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
 
     OperationParserResult out = {
         .operation = op,
