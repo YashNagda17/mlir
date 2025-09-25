@@ -18,7 +18,6 @@ extern "C" {
 // Specific operation parsers
 
 OperationParserResult parse_affine_load_op(Parser *parser, const OperationParserParams *params);
-void parse_affine_for(Parser *parser, MlirOperation *op);
 
 OperationParserResult parse_arith_binary_op(Parser *parser, const OperationParserParams *params);
 OperationParserResult parse_arith_cmpi_op(Parser *parser, const OperationParserParams *params);
@@ -29,7 +28,6 @@ OperationParserResult parse_cf_br_op(Parser *parser, const OperationParserParams
 OperationParserResult parse_cf_cond_br_op(Parser *parser, const OperationParserParams *params);
 
 OperationParserResult parse_func_call_op(Parser *parser, const OperationParserParams *params);
-void parse_func_func(Parser *parser, MlirOperation *op);
 
 OperationParserResult parse_gpu_launch_op(Parser *parser, const OperationParserParams *params);
 
