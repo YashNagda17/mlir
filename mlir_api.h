@@ -179,12 +179,7 @@ MlirOperation *mlir_op_create(
 void mlir_op_add_region(Arena *arena, MlirOperation *op, MlirRegion *region);
 void mlir_op_add_operand(Arena *arena, MlirOperation *op, MlirValue *operand);
 void mlir_op_add_result(Arena *arena, MlirOperation *op, MlirValue *result);
-
-// Property setters
-
-// Consolidated setter for results and their types
 void mlir_operation_set_results_with_types(MlirOperation *op, MlirValue **results, MlirType **result_types, size_t count);
-
 void mlir_operation_set_attributes(MlirOperation *op, MlirAttribute **attrs, size_t count);
 void mlir_operation_append_attribute(Arena *arena, MlirOperation *op, MlirAttribute *attr);
 
