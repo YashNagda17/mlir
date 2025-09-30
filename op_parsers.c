@@ -211,19 +211,26 @@ OperationParserResult parse_arith_binary_op(Parser *parser, const OperationParse
         op_location = params->unnumbered_loc_def;
     }
 
+    // Create results from the operation's result types
+    size_t n_results = 0;
+    MlirValue **results = finalize_results(params, NULL, result_types, n_result_types, &n_results);
+
     // Create the operation at the end
     MlirOperation *op = mlir_operation_create(params->arena, params->op_type, str_lit(""),
                                       attributes, n_attributes,
                                       result_types, n_result_types,
-                                      params->lhs_results, params->n_lhs_results,
+                                      results, n_results,
                                       operands.data, operands.size,
                                       NULL, 0,
                                       op_location, params->unnumbered_loc_def,
                                       params->trailing_comment, params->source_line_start);
 
-    // Create results from the operation's result types
-    size_t n_results = 0;
-    MlirValue **results = finalize_results(params, op, result_types, n_result_types, &n_results);
+    // Set result definitions
+    for (size_t i = 0; i < n_results; i++) {
+        if (results[i]) {
+            mlir_value_set_def(results[i], op);
+        }
+    }
 
     OperationParserResult out = {
         .operation = op,
@@ -3030,7 +3037,6 @@ OperationParserResult parse_scf_for_op(Parser *parser, const OperationParserPara
         }
 
         // Use consolidated API now that counts match
-        mlir_operation_set_results_with_types(op, results, iter_result_types, n_results);
     }
 
     OperationParserResult out = {

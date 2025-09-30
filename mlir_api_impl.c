@@ -597,14 +597,6 @@ MlirRegion *mlir_region_create(Arena *arena) {
     return region;
 }
 
-// Consolidated setter for results and their types
-void mlir_operation_set_results_with_types(MlirOperation *op, MlirValue **results, MlirType **result_types, size_t count) {
-    op->results = results;
-    op->n_results = count;
-    op->result_types = result_types;
-    op->n_result_types = count;
-}
-
 void mlir_operation_append_attribute(Arena *arena, MlirOperation *op, MlirAttribute *attr) {
     size_t new_count = op->n_attributes + 1;
     struct MlirAttribute **new_attrs = arena_alloc_array(arena, struct MlirAttribute*, new_count);

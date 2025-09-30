@@ -176,7 +176,6 @@ MlirOperation *mlir_operation_create(
     MlirLocation *unnumbered_loc_def,
     string trailing_comment,
     int64_t source_line_start);
-void mlir_operation_set_results_with_types(MlirOperation *op, MlirValue **results, MlirType **result_types, size_t count);
 void mlir_operation_append_attribute(Arena *arena, MlirOperation *op, MlirAttribute *attr);
 
 // Accessors
