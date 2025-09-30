@@ -207,11 +207,6 @@ MlirRegion *mlir_operation_get_region(const MlirOperation *op, size_t idx) {
     return reinterpret_cast<MlirRegion *>(&cppOp->getRegion(idx));
 }
 
-void mlir_operation_set_unnumbered_loc_def(MlirOperation *op, MlirLocation *loc) {
-    (void)op;
-    (void)loc;
-}
-
 MlirLocation *mlir_location_create(Arena *arena) {
     (void)arena;
     return nullptr;

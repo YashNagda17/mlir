@@ -634,10 +634,6 @@ void mlir_operation_set_attributes(MlirOperation *op, MlirAttribute **attrs, siz
     op->n_attributes = count;
 }
 
-void mlir_operation_set_unnumbered_loc_def(MlirOperation *op, MlirLocation *loc) {
-    op->unnumbered_loc_def = loc;
-}
-
 void mlir_operation_append_attribute(Arena *arena, MlirOperation *op, MlirAttribute *attr) {
     size_t new_count = op->n_attributes + 1;
     struct MlirAttribute **new_attrs = arena_alloc_array(arena, struct MlirAttribute*, new_count);

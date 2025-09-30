@@ -824,6 +824,11 @@ MlirOperation* parse_module(Parser *parser) {
         while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) parser_next_token(parser);
     }
 
+    // Use the top-of-file #loc definition if available
+    if (loc0_def) {
+        parser->unnumbered_loc_def = loc0_def;
+    }
+
     MlirOperation *op = parse_operation(parser);
     if (mlir_operation_get_type(op) != OP_TYPE_MODULE) {
         parser_error(parser, str_lit("The top level operation should be a module"), 0, 0);
@@ -855,9 +860,6 @@ MlirOperation* parse_module(Parser *parser) {
         while (parser_peek(parser, TK_NEWLINE) || parser_peek(parser, TK_WHITESPACE)) parser_next_token(parser);
     }
 
-    // Attach unnumbered '#loc' definition captured during initial scan or in parse_operation
-    if (!loc0_def) loc0_def = parser->unnumbered_loc_def;
-    mlir_operation_set_unnumbered_loc_def(op, loc0_def);
     return op;
 }
 
@@ -1483,7 +1485,6 @@ void parse_generic_attrs_and_result_type(Parser *parser,
 
 MlirOperation* parse_operation(Parser *parser) {
 
-    MlirLocation *recorded_unnumbered_loc = NULL;
     int64_t recorded_source_line = -1;
     MlirValue **lhs_results = NULL;
     size_t n_lhs_results = 0;
@@ -1766,8 +1767,6 @@ MlirOperation* parse_operation(Parser *parser) {
     assert(parsed.operation != NULL);
     MlirOperation *op = parsed.operation;
     n_new_results_from_parser = parsed.n_results;
-    recorded_unnumbered_loc = parser->unnumbered_loc_def;
-    mlir_operation_set_unnumbered_loc_def(op, recorded_unnumbered_loc);
 
     // Handle return value(s) for all operations
     assert(parsed.operation != NULL);
