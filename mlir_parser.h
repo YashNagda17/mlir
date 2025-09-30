@@ -30,7 +30,6 @@ typedef struct OperationParserResult {
     MlirOperation *operation;
     MlirValue    **results;
     size_t         n_results;
-    MlirLocation  *location; /* may be NULL */
 } OperationParserResult;
 
 // Hash function for strings
@@ -138,7 +137,6 @@ void parse_generic_attrs_and_result_type(Parser *parser,
                                           size_t *attributes_capacity,
                                           MlirType ***result_types,
                                           size_t *n_result_types,
-                                          MlirLocation **location,
                                           OpType op_type);
 
 void consume_optional_hash_selector(Parser *parser);

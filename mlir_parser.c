@@ -1498,7 +1498,6 @@ void parse_generic_attrs_and_result_type(Parser *parser,
                                           size_t *attributes_capacity,
                                           MlirType ***result_types,
                                           size_t *n_result_types,
-                                          MlirLocation **location,
                                           OpType op_type) {
     // Parse attributes from both <{...}> and {...} blocks
     // These functions will append to existing arrays if provided
@@ -1507,18 +1506,11 @@ void parse_generic_attrs_and_result_type(Parser *parser,
 
     // Parse result types using output parameters
     parse_result_types(parser, result_types, n_result_types, attributes, n_attributes, attributes_capacity, op_type, NULL);
-
-    // Parse optional location
-    MlirLocation *parsed_location = parse_optional_location(parser);
-    if (parsed_location && location) {
-        *location = parsed_location;
-    }
 }
 
 
 MlirOperation* parse_operation(Parser *parser) {
 
-    MlirLocation *recorded_location = NULL;
     MlirLocation *recorded_unnumbered_loc = NULL;
     int64_t recorded_source_line = -1;
     MlirValue **lhs_results = NULL;
@@ -1773,15 +1765,9 @@ MlirOperation* parse_operation(Parser *parser) {
     assert(parsed.operation != NULL);
     MlirOperation *op = parsed.operation;
     n_new_results_from_parser = parsed.n_results;
-    if (parsed.location) {
-        recorded_location = parsed.location;
-    }
     mlir_operation_set_source_line_start(op, recorded_source_line);
     recorded_unnumbered_loc = parser->unnumbered_loc_def;
     mlir_operation_set_unnumbered_loc_def(op, recorded_unnumbered_loc);
-    if (recorded_location) {
-        mlir_operation_set_location(op, recorded_location);
-    }
 
     // Handle return value(s) for all operations
     assert(parsed.operation != NULL);

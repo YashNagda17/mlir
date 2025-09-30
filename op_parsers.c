@@ -120,13 +120,9 @@ OperationParserResult parse_arith_constant_op(Parser *parser, OperationParserPar
         n_results = 1;
     }
 
-    // Parse additional attributes, result types, and location
-    MlirLocation *parsed_location = NULL;
+    // Parse additional attributes and result types
     parse_generic_attrs_and_result_type(parser, &attributes, &n_attributes, &attributes_capacity,
-                                         &result_types, &n_result_types, &parsed_location, params->op_type);
-    if (parsed_location) {
-        op_location = parsed_location;
-    }
+                                         &result_types, &n_result_types, params->op_type);
 
     // Fallback location if none was parsed
     if (!op_location) {
@@ -157,8 +153,7 @@ OperationParserResult parse_arith_constant_op(Parser *parser, OperationParserPar
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -233,8 +228,7 @@ OperationParserResult parse_arith_binary_op(Parser *parser, const OperationParse
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -349,8 +343,7 @@ OperationParserResult parse_func_call_op(Parser *parser, const OperationParserPa
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -405,8 +398,7 @@ OperationParserResult parse_tt_get_program_id_op(Parser *parser, const Operation
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -485,8 +477,7 @@ OperationParserResult parse_tt_splat_op(Parser *parser, const OperationParserPar
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -591,8 +582,7 @@ OperationParserResult parse_tt_make_range_op(Parser *parser, const OperationPars
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -682,8 +672,7 @@ OperationParserResult parse_tt_addptr_op(Parser *parser, const OperationParserPa
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -777,8 +766,7 @@ OperationParserResult parse_tensor_extract_op(Parser *parser, const OperationPar
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -848,8 +836,7 @@ OperationParserResult parse_memref_load_op(Parser *parser, const OperationParser
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -937,8 +924,7 @@ OperationParserResult parse_memref_store_op(Parser *parser, const OperationParse
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -1013,7 +999,6 @@ OperationParserResult parse_vector_print_op(Parser *parser, const OperationParse
         .operation = op,
         .results = NULL,
         .n_results = 0,
-        .location = op_location
     };
     return out;
 }
@@ -1079,8 +1064,7 @@ OperationParserResult parse_std_constant_op(Parser *parser, const OperationParse
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -1238,8 +1222,7 @@ OperationParserResult parse_tt_reduce_op(Parser *parser, const OperationParserPa
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -1312,7 +1295,6 @@ OperationParserResult parse_cf_br_op(Parser *parser, const OperationParserParams
         .operation = op,
         .results = NULL,
         .n_results = 0,
-        .location = op_location
     };
     return out;
 }
@@ -1436,7 +1418,6 @@ OperationParserResult parse_cf_cond_br_op(Parser *parser, const OperationParserP
         .operation = op,
         .results = NULL,
         .n_results = 0,
-        .location = op_location
     };
     return out;
 }
@@ -1510,7 +1491,6 @@ OperationParserResult parse_linalg_fill_op(Parser *parser, const OperationParser
         .operation = op,
         .results = NULL,
         .n_results = 0,
-        .location = op_location
     };
     return out;
 }
@@ -1634,8 +1614,7 @@ OperationParserResult parse_affine_load_op(Parser *parser, const OperationParser
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -1700,8 +1679,7 @@ OperationParserResult parse_index_constant_op(Parser *parser, const OperationPar
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -1804,8 +1782,7 @@ OperationParserResult parse_tensor_splat_op(Parser *parser, const OperationParse
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -1908,8 +1885,7 @@ OperationParserResult parse_arith_select_op(Parser *parser, const OperationParse
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -2016,8 +1992,7 @@ OperationParserResult parse_tt_call_op(Parser *parser, const OperationParserPara
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -2120,8 +2095,7 @@ OperationParserResult parse_tensor_collapse_shape_op(Parser *parser, const Opera
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -2167,7 +2141,7 @@ OperationParserResult parse_generic_op(Parser *parser, const OperationParserPara
             MlirValue *operand = symbol_table_lookup(&parser->symbol_table, reg_str);
             if (!operand) {
                 parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
-                OperationParserResult empty = {NULL, NULL, 0, NULL};
+                OperationParserResult empty = {NULL, NULL, 0};
                 return empty;
             }
             VecValue_push_back(parser->arena, &operands, operand);
@@ -2180,7 +2154,7 @@ OperationParserResult parse_generic_op(Parser *parser, const OperationParserPara
                     MlirValue *operand2 = symbol_table_lookup(&parser->symbol_table, reg_str2);
                     if (!operand2) {
                         parser_error(parser, str_lit("Use of undefined SSA value"), parser->first, parser->last);
-                        OperationParserResult empty = {NULL, NULL, 0, NULL};
+                        OperationParserResult empty = {NULL, NULL, 0};
                         return empty;
                     }
                     VecValue_push_back(parser->arena, &operands, operand2);
@@ -2290,8 +2264,7 @@ OperationParserResult parse_generic_op(Parser *parser, const OperationParserPara
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -2686,8 +2659,7 @@ OperationParserResult parse_tt_func_op(Parser *parser, const OperationParserPara
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -2799,8 +2771,7 @@ OperationParserResult parse_scf_if_op(Parser *parser, const OperationParserParam
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -3111,8 +3082,7 @@ OperationParserResult parse_scf_for_op(Parser *parser, const OperationParserPara
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -3248,8 +3218,7 @@ OperationParserResult parse_scf_while_op(Parser *parser, const OperationParserPa
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -3399,8 +3368,7 @@ OperationParserResult parse_gpu_launch_op(Parser *parser, const OperationParserP
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -3491,8 +3459,7 @@ OperationParserResult parse_arith_cmpi_op(Parser *parser, const OperationParserP
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -3551,7 +3518,6 @@ OperationParserResult parse_scf_yield_op(Parser *parser, const OperationParserPa
         .operation = op,
         .results = NULL,
         .n_results = 0,
-        .location = op_location
     };
     return out;
 }
@@ -3619,7 +3585,6 @@ OperationParserResult parse_return_op(Parser *parser, const OperationParserParam
         .operation = op,
         .results = NULL,
         .n_results = 0,
-        .location = op_location
     };
     return out;
 }
@@ -3750,8 +3715,7 @@ OperationParserResult parse_tt_load_op(Parser *parser, const OperationParserPara
     OperationParserResult out = {
         .operation = op,
         .results = results,
-        .n_results = n_results,
-        .location = op_location
+        .n_results = n_results
     };
     return out;
 }
@@ -3857,7 +3821,6 @@ OperationParserResult parse_tt_store_op(Parser *parser, const OperationParserPar
         .operation = op,
         .results = NULL,
         .n_results = 0,
-        .location = op_location
     };
     return out;
 }
@@ -3966,7 +3929,7 @@ OperationParserResult parse_func_func_op(Parser *parser, const OperationParserPa
     size_t n_result_types = 0;
     MlirLocation *op_location = NULL;
     parse_generic_attrs_and_result_type(parser, &attrs, &n_attrs, &cap_attrs,
-                                         &result_types, &n_result_types, &op_location, params->op_type);
+                                         &result_types, &n_result_types, params->op_type);
 
     // Fallback location if none was parsed
     if (!op_location) {
@@ -3993,7 +3956,6 @@ OperationParserResult parse_func_func_op(Parser *parser, const OperationParserPa
         .operation = op,
         .results = NULL,
         .n_results = 0,
-        .location = op_location
     };
     return out;
 }
@@ -4181,7 +4143,6 @@ OperationParserResult parse_affine_for_op(Parser *parser, const OperationParserP
         .operation = op,
         .results = NULL,
         .n_results = 0,
-        .location = op_location
     };
     return out;
 }
