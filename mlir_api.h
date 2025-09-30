@@ -163,7 +163,7 @@ void mlir_api_init(MlirOperation *root);
 // -----------------------------------------------------------------------------
 
 // Creation & structural mutation
-MlirOperation *mlir_op_create(
+MlirOperation *mlir_operation_create(
     Arena *arena,
     OpType type,
     string opname,

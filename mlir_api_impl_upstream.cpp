@@ -115,7 +115,7 @@ void mlir_api_init(MlirOperation *root) {
     }
 }
 
-MlirOperation *mlir_op_create(Arena *arena, OpType type) {
+MlirOperation *mlir_operation_create(Arena *arena, OpType type) {
     (void)arena;
     OperationState state(gBuilder->getUnknownLoc(), opTypeToName(type));
     Operation *op = Operation::create(state);

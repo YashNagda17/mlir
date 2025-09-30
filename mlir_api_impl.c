@@ -172,7 +172,7 @@ void mlir_api_init(MlirOperation *root) {
     // No initialization required for the native C implementation.
 }
 
-MlirOperation *mlir_op_create(
+MlirOperation *mlir_operation_create(
     Arena *arena,
     OpType type,
     string opname,
