@@ -751,7 +751,7 @@ OperationParserResult parse_tensor_extract_op(Parser *parser, const OperationPar
     MlirOperation *op = mlir_operation_create(
         params->arena,
         params->op_type,
-        params->trailing_comment,
+        str_lit(""),
         attributes,
         n_attributes,
         result_types,
@@ -986,7 +986,7 @@ OperationParserResult parse_vector_print_op(Parser *parser, const OperationParse
     MlirOperation *op = mlir_operation_create(
         params->arena,
         params->op_type,
-        params->trailing_comment,
+        str_lit(""),
         NULL,
         0,
         NULL,
@@ -1599,7 +1599,7 @@ OperationParserResult parse_affine_load_op(Parser *parser, const OperationParser
     MlirOperation *op = mlir_operation_create(
         params->arena,
         params->op_type,
-        params->trailing_comment,
+        str_lit(""),
         attributes,
         n_attributes,
         result_types,
@@ -1767,7 +1767,7 @@ OperationParserResult parse_tensor_splat_op(Parser *parser, const OperationParse
     MlirOperation *op = mlir_operation_create(
         params->arena,
         params->op_type,
-        params->trailing_comment,
+        str_lit(""),
         attributes,
         n_attributes,
         result_types,
@@ -1977,7 +1977,7 @@ OperationParserResult parse_tt_call_op(Parser *parser, const OperationParserPara
     MlirOperation *op = mlir_operation_create(
         params->arena,
         params->op_type,
-        params->trailing_comment,
+        str_lit(""),
         attributes,
         n_attributes,
         result_types,
@@ -2080,7 +2080,7 @@ OperationParserResult parse_tensor_collapse_shape_op(Parser *parser, const Opera
     MlirOperation *op = mlir_operation_create(
         params->arena,
         params->op_type,
-        params->trailing_comment,
+        str_lit(""),
         attributes,
         n_attributes,
         result_types,
@@ -2999,7 +2999,7 @@ OperationParserResult parse_scf_for_op(Parser *parser, const OperationParserPara
     MlirOperation *op = mlir_operation_create(
         params->arena,
         params->op_type,
-        params->trailing_comment,
+        str_lit(""),
         NULL,
         0,
         iter_result_types,
@@ -3766,7 +3766,7 @@ OperationParserResult parse_tt_store_op(Parser *parser, const OperationParserPar
     MlirOperation *op = mlir_operation_create(
         params->arena,
         params->op_type,
-        params->trailing_comment,
+        str_lit(""),
         attributes,
         n_attributes,
         NULL, 0,
@@ -3903,7 +3903,7 @@ OperationParserResult parse_func_func_op(Parser *parser, const OperationParserPa
     MlirOperation *op = mlir_operation_create(
         params->arena,
         params->op_type,
-        params->trailing_comment,
+        str_lit(""),
         attrs, n_attrs,
         result_types, n_result_types,
         params->lhs_results,
@@ -4039,7 +4039,7 @@ OperationParserResult parse_affine_for_op(Parser *parser, const OperationParserP
     MlirOperation *op = mlir_operation_create(
         params->arena,
         params->op_type,
-        params->trailing_comment,
+        str_lit(""),
         attributes, n_attributes,
         result_types, n_result_types,
         params->lhs_results,
