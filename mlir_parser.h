@@ -108,7 +108,7 @@ MlirBlock* parse_block(Parser *parser);
 
 bool parse_type_string(Parser *parser, string *out);
 void consume_optional_hash_selector(Parser *parser);
-void set_op_attributes(MlirOperation *op, MlirAttribute **attrs, size_t count);
+
 
 const char *string_data_or_null(string s);
 

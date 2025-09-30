@@ -1025,9 +1025,7 @@ void consume_optional_hash_selector(Parser *parser) {
     }
 }
 
-void set_op_attributes(MlirOperation *op, MlirAttribute **attrs, size_t count) {
-    mlir_operation_set_attributes(op, attrs, count);
-}
+
 
 
 
