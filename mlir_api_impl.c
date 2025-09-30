@@ -639,10 +639,6 @@ void mlir_operation_set_operands(MlirOperation *op, MlirValue **operands, size_t
     op->n_operands = count;
 }
 
-void mlir_operation_set_location(MlirOperation *op, MlirLocation *loc) {
-    op->location = loc;
-}
-
 void mlir_operation_set_trailing_comment(MlirOperation *op, const char *comment, size_t comment_len) {
     op->trailing_comment = (string){(char*)comment, comment_len};
 }
