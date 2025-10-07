@@ -12,6 +12,8 @@
 #include "tokenizer.h"
 #include "op_parsers.h"
 
+// Define vector type for storing strings (used for argument attributes in tt.func)
+DEFINE_VECTOR_FOR_TYPE(string, VecString)
 
 OperationParserResult parse_arith_constant_op(Parser *parser, OperationParserParams *params) {
     MlirAttribute **attributes = NULL;
@@ -2278,15 +2280,8 @@ OperationParserResult parse_tt_func_op(Parser *parser, const OperationParserPara
 
     // Vector to collect per-argument attributes (parallel to func_args)
     // Each element is a string like "tt.divisibility = 16 : i32" or empty if no attrs
-    typedef struct {
-        string *data;
-        size_t size;
-        size_t capacity;
-    } VecString;
-    VecString arg_attr_strings = {0};
-    arg_attr_strings.capacity = 8;
-    arg_attr_strings.data = arena_alloc_array(parser->arena, string, arg_attr_strings.capacity);
-    arg_attr_strings.size = 0;
+    VecString arg_attr_strings;
+    VecString_reserve(parser->arena, &arg_attr_strings, 8);
 
     // Capture visibility keyword if present
     string visibility = str_lit("private");  // default
@@ -2539,16 +2534,7 @@ OperationParserResult parse_tt_func_op(Parser *parser, const OperationParserPara
                     }
 
                     VecValue_push_back(parser->arena, &func_args, arg);
-
-                    // Grow arg_attr_strings if needed
-                    if (arg_attr_strings.size >= arg_attr_strings.capacity) {
-                        size_t new_cap = arg_attr_strings.capacity * 2;
-                        string *new_data = arena_alloc_array(parser->arena, string, new_cap);
-                        for (size_t k = 0; k < arg_attr_strings.size; k++) new_data[k] = arg_attr_strings.data[k];
-                        arg_attr_strings.data = new_data;
-                        arg_attr_strings.capacity = new_cap;
-                    }
-                    arg_attr_strings.data[arg_attr_strings.size++] = arg_attrs_str;
+                    VecString_push_back(parser->arena, &arg_attr_strings, arg_attrs_str);
                 }
             } else if (parser_peek(parser, TK_NAME) || parser_peek(parser, TK_NAME_DOT_NAME) || parser_peek(parser, TK_EXCLAMATION)) {
                 // Type-only param (no SSA name); accumulate its textual form
