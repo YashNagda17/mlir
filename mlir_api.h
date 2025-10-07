@@ -228,12 +228,14 @@ typedef enum ValueKind {
     OP_RESULT
 } ValueKind;
 
-// Creation & mutation
-MlirValue *mlir_value_create(Arena *arena, ValueKind value_kind);
-void mlir_value_set_def(MlirValue *value, void *def);
+// Creation
+MlirValue *mlir_value_create_block_arg(Arena *arena, string register_name, uint32_t result_index, MlirType *type);
+MlirValue *mlir_value_create_op_result(Arena *arena, void *def, uint32_t result_index, MlirType *type, string register_name);
+
+// Optional mutation (for cases where type is determined after creation)
 void mlir_value_set_type(MlirValue *value, MlirType *type);
-void mlir_value_set_register_name(MlirValue *value, string name);
-void mlir_value_set_result_index(MlirValue *value, uint32_t index);
+
+// Optional mutation (for Triton-specific attributes)
 void mlir_value_set_location(MlirValue *value, MlirLocation *loc);
 void mlir_value_set_divisibility(MlirValue *value, bool has_value, int64_t div_value, MlirType *type);
 void mlir_value_set_max_divisibility(MlirValue *value, bool has_value, int64_t div_value, MlirType *type);

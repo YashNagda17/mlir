@@ -65,26 +65,17 @@ MlirOperation* construct_test_module_full(Arena *arena) {
     MlirBlock *func_block = mlir_block_create(arena);
 
     // Function block arguments (%arg0, %arg1)
-    MlirValue *arg0 = mlir_value_create(arena, BLOCK_ARG);
-    mlir_value_set_result_index(arg0, 0);
-    mlir_value_set_type(arg0, i32_type);
-    mlir_value_set_register_name(arg0, str_lit("%arg0"));
+    MlirValue *arg0 = mlir_value_create_block_arg(arena, str_lit("%arg0"), 0, i32_type);
     mlir_block_add_argument(arena, func_block, arg0);
 
-    MlirValue *arg1 = mlir_value_create(arena, BLOCK_ARG);
-    mlir_value_set_result_index(arg1, 1);
-    mlir_value_set_type(arg1, i32_type);
-    mlir_value_set_register_name(arg1, str_lit("%arg1"));
+    MlirValue *arg1 = mlir_value_create_block_arg(arena, str_lit("%arg1"), 1, i32_type);
     mlir_block_add_argument(arena, func_block, arg1);
 
     // Create operations in function block
     // %0 = arith.constant 5 : i32
 
-    // Create const_result first
-    MlirValue *const_result = mlir_value_create(arena, OP_RESULT);
-    mlir_value_set_result_index(const_result, 0);
-    mlir_value_set_type(const_result, i32_type);
-    mlir_value_set_register_name(const_result, str_lit("%0"));
+    // Create const_result first (def will be set after operation creation)
+    MlirValue *const_result = mlir_value_create_op_result(arena, NULL, 0, i32_type, str_lit("%0"));
 
     // Set result types
     MlirType **const_result_types = arena_alloc_array(arena, MlirType*, 1);
@@ -101,16 +92,10 @@ MlirOperation* construct_test_module_full(Arena *arena) {
 
     MlirOperation *const_op = mlir_operation_create(arena, OP_TYPE_ARITH_CONSTANT, str_lit("arith.constant"), const_attrs, 1, const_result_types, 1, const_results, 1, NULL, 0, NULL, 0, NULL, NULL, str_lit(""), -1);
 
-    // Set result definition
-    mlir_value_set_def(const_result, const_op);
-
     // %1 = arith.addi %arg0, %arg1 : i32
 
-    // Create add_result first
-    MlirValue *add_result = mlir_value_create(arena, OP_RESULT);
-    mlir_value_set_result_index(add_result, 1);
-    mlir_value_set_type(add_result, i32_type);
-    mlir_value_set_register_name(add_result, str_lit("%1"));
+    // Create add_result first (def will be set after operation creation)
+    MlirValue *add_result = mlir_value_create_op_result(arena, NULL, 1, i32_type, str_lit("%1"));
 
     // Set operands
     MlirValue **add_operands = arena_alloc_array(arena, MlirValue*, 2);
@@ -127,16 +112,10 @@ MlirOperation* construct_test_module_full(Arena *arena) {
 
     MlirOperation *add_op = mlir_operation_create(arena, OP_TYPE_ARITH_ADDI, str_lit(""), NULL, 0, add_result_types, 1, add_results, 1, add_operands, 2, NULL, 0, NULL, NULL, str_lit(""), -1);
 
-    // Set result definition
-    mlir_value_set_def(add_result, add_op);
-
     // %2 = arith.muli %1, %0 : i32 (add_result and const_result already created above)
 
-    // Create mul_result first
-    MlirValue *mul_result = mlir_value_create(arena, OP_RESULT);
-    mlir_value_set_result_index(mul_result, 2);
-    mlir_value_set_type(mul_result, i32_type);
-    mlir_value_set_register_name(mul_result, str_lit("%2"));
+    // Create mul_result first (def will be set after operation creation)
+    MlirValue *mul_result = mlir_value_create_op_result(arena, NULL, 2, i32_type, str_lit("%2"));
 
     // Set operands
     MlirValue **mul_operands = arena_alloc_array(arena, MlirValue*, 2);
@@ -152,9 +131,6 @@ MlirOperation* construct_test_module_full(Arena *arena) {
     mul_results[0] = mul_result;
 
     MlirOperation *mul_op = mlir_operation_create(arena, OP_TYPE_ARITH_MULI, str_lit(""), NULL, 0, mul_result_types, 1, mul_results, 1, mul_operands, 2, NULL, 0, NULL, NULL, str_lit(""), -1);
-
-    // Set result definition
-    mlir_value_set_def(mul_result, mul_op);
 
     // func.return %2 : i32
     MlirValue **ret_operands = arena_alloc_array(arena, MlirValue*, 1);

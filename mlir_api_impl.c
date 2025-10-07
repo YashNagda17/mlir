@@ -203,6 +203,14 @@ MlirOperation *mlir_operation_create(
     op->unnumbered_loc_def = unnumbered_loc_def;
     op->trailing_comment = trailing_comment;
     op->source_line_start = source_line_start;
+
+    // Automatically set the def field on all result values
+    for (size_t i = 0; i < n_results; i++) {
+        if (results[i]) {
+            results[i]->def = op;
+        }
+    }
+
     return op;
 }
 
@@ -220,6 +228,11 @@ void mlir_block_add_argument(Arena *arena, MlirBlock *block, MlirValue *arg) {
     new_args[block->n_arguments] = arg;
     block->arguments = new_args;
     block->n_arguments++;
+
+    // Automatically set the def field to point to the block for block arguments
+    if (arg) {
+        arg->def = block;
+    }
 }
 
 void mlir_region_add_block(Arena *arena, MlirRegion *region, MlirBlock *block) {
@@ -549,27 +562,26 @@ MlirAttribute *mlir_attribute_create_bool(Arena *arena, string name, bool value)
 }
 
 // Value creation and manipulation
-MlirValue *mlir_value_create(Arena *arena, ValueKind value_kind) {
+MlirValue *mlir_value_create_block_arg(Arena *arena, string register_name, uint32_t result_index, MlirType *type) {
     struct MlirValue *value = arena_alloc(arena, struct MlirValue);
     *value = (struct MlirValue){0};
-    value->kind = value_kind;
+    value->kind = BLOCK_ARG;
+    value->register_name = register_name;
+    value->result_index = result_index;
+    value->type = type;
+    value->def = NULL;
     return value;
 }
 
-void mlir_value_set_type(MlirValue *value, MlirType *type) {
-    value->type = type;
-}
-
-void mlir_value_set_register_name(MlirValue *value, string name) {
-    value->register_name = name;
-}
-
-void mlir_value_set_result_index(MlirValue *value, uint32_t index) {
-    value->result_index = index;
-}
-
-void mlir_value_set_def(MlirValue *value, void *def) {
+MlirValue *mlir_value_create_op_result(Arena *arena, void *def, uint32_t result_index, MlirType *type, string register_name) {
+    struct MlirValue *value = arena_alloc(arena, struct MlirValue);
+    *value = (struct MlirValue){0};
+    value->kind = OP_RESULT;
     value->def = def;
+    value->result_index = result_index;
+    value->type = type;
+    value->register_name = register_name;
+    return value;
 }
 
 void mlir_value_set_divisibility(MlirValue *value, bool has_value, int64_t div_value, MlirType *type) {
@@ -745,6 +757,10 @@ MlirLocation *mlir_location_create_ref(Arena *arena, int ref_id) {
     loc->data.ref.ref_id = ref_id;
     loc->original_text = format(arena, str_lit("loc(#loc{})"), (int64_t)ref_id);
     return loc;
+}
+
+void mlir_value_set_type(MlirValue *value, MlirType *type) {
+    value->type = type;
 }
 
 void mlir_value_set_location(MlirValue *value, MlirLocation *loc) {
