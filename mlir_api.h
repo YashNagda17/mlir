@@ -163,7 +163,7 @@ void mlir_api_init(MlirOperation *root);
 // -----------------------------------------------------------------------------
 
 // Creation & structural mutation
-MlirOperation *mlir_op_create(
+MlirOperation *mlir_operation_create(
     Arena *arena,
     OpType type,
     string opname,
@@ -176,22 +176,7 @@ MlirOperation *mlir_op_create(
     MlirLocation *unnumbered_loc_def,
     string trailing_comment,
     int64_t source_line_start);
-void mlir_op_add_region(Arena *arena, MlirOperation *op, MlirRegion *region);
-void mlir_op_add_operand(Arena *arena, MlirOperation *op, MlirValue *operand);
-void mlir_op_add_result(Arena *arena, MlirOperation *op, MlirValue *result);
-
-// Property setters
-void mlir_operation_set_operands(MlirOperation *op, MlirValue **operands, size_t count);
-
-// Consolidated setter for results and their types
-void mlir_operation_set_results_with_types(MlirOperation *op, MlirValue **results, MlirType **result_types, size_t count);
-
-void mlir_operation_set_attributes(MlirOperation *op, MlirAttribute **attrs, size_t count);
 void mlir_operation_append_attribute(Arena *arena, MlirOperation *op, MlirAttribute *attr);
-void mlir_operation_set_location(MlirOperation *op, MlirLocation *loc);
-void mlir_operation_set_trailing_comment(MlirOperation *op, const char *comment, size_t comment_len);
-void mlir_operation_set_source_line_start(MlirOperation *op, int64_t line_start);
-void mlir_operation_set_unnumbered_loc_def(MlirOperation *op, MlirLocation *loc);
 
 // Accessors
 OpType mlir_operation_get_type(const MlirOperation *op);

@@ -24,13 +24,13 @@ typedef struct OperationParserParams {
 
     MlirLocation *unnumbered_loc_def;
     int64_t       source_line_start;
+    string        trailing_comment;
 } OperationParserParams;
 
 typedef struct OperationParserResult {
     MlirOperation *operation;
     MlirValue    **results;
     size_t         n_results;
-    MlirLocation  *location; /* may be NULL */
 } OperationParserResult;
 
 // Hash function for strings
@@ -108,8 +108,8 @@ MlirBlock* parse_block(Parser *parser);
 
 bool parse_type_string(Parser *parser, string *out);
 void consume_optional_hash_selector(Parser *parser);
-void set_op_attributes(MlirOperation *op, MlirAttribute **attrs, size_t count);
-void set_op_operands(MlirOperation *op, MlirValue **operands, size_t count);
+
+
 const char *string_data_or_null(string s);
 
 bool parse_register_operand(Parser *parser, VecValue *operands, bool allow_hash_selector);
@@ -138,7 +138,6 @@ void parse_generic_attrs_and_result_type(Parser *parser,
                                           size_t *attributes_capacity,
                                           MlirType ***result_types,
                                           size_t *n_result_types,
-                                          MlirLocation **location,
                                           OpType op_type);
 
 void consume_optional_hash_selector(Parser *parser);

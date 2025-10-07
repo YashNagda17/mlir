@@ -172,7 +172,7 @@ void mlir_api_init(MlirOperation *root) {
     // No initialization required for the native C implementation.
 }
 
-MlirOperation *mlir_op_create(
+MlirOperation *mlir_operation_create(
     Arena *arena,
     OpType type,
     string opname,
@@ -204,30 +204,6 @@ MlirOperation *mlir_op_create(
     op->trailing_comment = trailing_comment;
     op->source_line_start = source_line_start;
     return op;
-}
-
-void mlir_op_add_region(Arena *arena, MlirOperation *op, MlirRegion *region) {
-    MlirRegion **new_regions = arena_alloc_array(arena, MlirRegion*, op->n_regions + 1);
-    if (op->regions) memcpy(new_regions, op->regions, op->n_regions * sizeof(MlirRegion*));
-    new_regions[op->n_regions] = region;
-    op->regions = new_regions;
-    op->n_regions++;
-}
-
-void mlir_op_add_operand(Arena *arena, MlirOperation *op, MlirValue *operand) {
-    struct MlirValue **new_operands = arena_alloc_array(arena, struct MlirValue*, op->n_operands + 1);
-    if (op->operands) memcpy(new_operands, op->operands, op->n_operands * sizeof(struct MlirValue*));
-    new_operands[op->n_operands] = operand;
-    op->operands = new_operands;
-    op->n_operands++;
-}
-
-void mlir_op_add_result(Arena *arena, MlirOperation *op, MlirValue *result) {
-    struct MlirValue **new_results = arena_alloc_array(arena, struct MlirValue*, op->n_results + 1);
-    if (op->results) memcpy(new_results, op->results, op->n_results * sizeof(struct MlirValue*));
-    new_results[op->n_results] = result;
-    op->results = new_results;
-    op->n_results++;
 }
 
 void mlir_block_add_operation(Arena *arena, MlirBlock *block, MlirOperation *op) {
@@ -619,40 +595,6 @@ MlirRegion *mlir_region_create(Arena *arena) {
     struct MlirRegion *region = arena_alloc(arena, struct MlirRegion);
     *region = (struct MlirRegion){0};
     return region;
-}
-
-// Consolidated setter for results and their types
-void mlir_operation_set_results_with_types(MlirOperation *op, MlirValue **results, MlirType **result_types, size_t count) {
-    op->results = results;
-    op->n_results = count;
-    op->result_types = result_types;
-    op->n_result_types = count;
-}
-
-void mlir_operation_set_attributes(MlirOperation *op, MlirAttribute **attrs, size_t count) {
-    op->attributes = attrs;
-    op->n_attributes = count;
-}
-
-void mlir_operation_set_operands(MlirOperation *op, MlirValue **operands, size_t count) {
-    op->operands = operands;
-    op->n_operands = count;
-}
-
-void mlir_operation_set_location(MlirOperation *op, MlirLocation *loc) {
-    op->location = loc;
-}
-
-void mlir_operation_set_trailing_comment(MlirOperation *op, const char *comment, size_t comment_len) {
-    op->trailing_comment = (string){(char*)comment, comment_len};
-}
-
-void mlir_operation_set_source_line_start(MlirOperation *op, int64_t line_start) {
-    op->source_line_start = line_start;
-}
-
-void mlir_operation_set_unnumbered_loc_def(MlirOperation *op, MlirLocation *loc) {
-    op->unnumbered_loc_def = loc;
 }
 
 void mlir_operation_append_attribute(Arena *arena, MlirOperation *op, MlirAttribute *attr) {

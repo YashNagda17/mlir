@@ -115,33 +115,12 @@ void mlir_api_init(MlirOperation *root) {
     }
 }
 
-MlirOperation *mlir_op_create(Arena *arena, OpType type) {
+MlirOperation *mlir_operation_create(Arena *arena, OpType type) {
     (void)arena;
     OperationState state(gBuilder->getUnknownLoc(), opTypeToName(type));
     Operation *op = Operation::create(state);
     gOpTypeMap[op] = type;
     return reinterpret_cast<MlirOperation *>(op);
-}
-
-void mlir_op_add_region(Arena *arena, MlirOperation *op, MlirRegion *region) {
-    (void)arena;
-    Operation *cppOp = reinterpret_cast<Operation *>(op);
-    Region *cppRegion = reinterpret_cast<Region *>(region);
-    cppOp->getRegions().push_back(cppRegion);
-}
-
-void mlir_op_add_operand(Arena *arena, MlirOperation *op, MlirValue *operand) {
-    (void)arena;
-    Operation *cppOp = reinterpret_cast<Operation *>(op);
-    Value cppVal = *reinterpret_cast<Value *>(operand);
-    cppOp->insertOperands(cppOp->getNumOperands(), cppVal);
-}
-
-void mlir_op_add_result(Arena *arena, MlirOperation *op, MlirValue *result) {
-    (void)arena;
-    Operation *cppOp = reinterpret_cast<Operation *>(op);
-    Value cppVal = *reinterpret_cast<Value *>(result);
-    cppOp->insertResults(cppOp->getNumResults(), cppVal.getType());
 }
 
 void mlir_block_add_operation(Arena *arena, MlirBlock *block, MlirOperation *op) {
@@ -205,28 +184,6 @@ size_t mlir_operation_num_regions(const MlirOperation *op) {
 MlirRegion *mlir_operation_get_region(const MlirOperation *op, size_t idx) {
     Operation *cppOp = const_cast<Operation *>(reinterpret_cast<const Operation *>(op));
     return reinterpret_cast<MlirRegion *>(&cppOp->getRegion(idx));
-}
-
-void mlir_operation_set_location(MlirOperation *op, MlirLocation *loc) {
-    (void)op;
-    (void)loc;
-    // Upstream bridge has no location support yet.
-}
-
-void mlir_operation_set_trailing_comment(MlirOperation *op, const char *comment, size_t comment_len) {
-    (void)op;
-    (void)comment;
-    (void)comment_len;
-}
-
-void mlir_operation_set_source_line_start(MlirOperation *op, int64_t line_start) {
-    (void)op;
-    (void)line_start;
-}
-
-void mlir_operation_set_unnumbered_loc_def(MlirOperation *op, MlirLocation *loc) {
-    (void)op;
-    (void)loc;
 }
 
 MlirLocation *mlir_location_create(Arena *arena) {
