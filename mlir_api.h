@@ -17,26 +17,26 @@ extern "C" {
 // Opaque forward declarations
 // -----------------------------------------------------------------------------
 
-typedef struct MlirOperation MlirOperation;
-typedef struct MlirRegion MlirRegion;
-typedef struct MlirBlock MlirBlock;
-typedef struct MlirValue MlirValue;
-typedef struct MlirType MlirType;
-typedef struct MlirAttribute MlirAttribute;
-typedef struct MlirLocation MlirLocation;
+typedef struct MLIR_Op MLIR_Op;
+typedef struct MLIR_Region MLIR_Region;
+typedef struct MLIR_Block MLIR_Block;
+typedef struct MLIR_Value MLIR_Value;
+typedef struct MLIR_Type MLIR_Type;
+typedef struct MLIR_Attribute MLIR_Attribute;
+typedef struct MLIR_Location MLIR_Location;
 
-typedef struct MlirLocationMap {
+typedef struct MLIR_LocationMap {
     void *impl;
-} MlirLocationMap;
+} MLIR_LocationMap;
 
-size_t mlir_location_map_size(const MlirLocationMap *location_map);
-size_t mlir_location_map_collect(const MlirLocationMap *location_map, string *out_keys, MlirLocation **out_locs, size_t max);
+size_t MLIR_GetLocationMapSize(const MLIR_LocationMap *location_map);
+size_t MLIR_CollectLocationMap(const MLIR_LocationMap *location_map, string *out_keys, MLIR_Location **out_locs, size_t max);
 
 // Vector helpers used by the parser implementation
-DEFINE_VECTOR_FOR_TYPE(MlirOperation*, VecOperation)
-DEFINE_VECTOR_FOR_TYPE(MlirValue*, VecValue)
-DEFINE_VECTOR_FOR_TYPE(MlirBlock*, VecBlock)
-DEFINE_VECTOR_FOR_TYPE(MlirAttribute*, VecAttribute)
+DEFINE_VECTOR_FOR_TYPE(MLIR_Op*, VecOp)
+DEFINE_VECTOR_FOR_TYPE(MLIR_Value*, VecValue)
+DEFINE_VECTOR_FOR_TYPE(MLIR_Block*, VecBlock)
+DEFINE_VECTOR_FOR_TYPE(MLIR_Attribute*, VecAttribute)
 
 // -----------------------------------------------------------------------------
 // Operation kinds
@@ -149,141 +149,141 @@ typedef enum {
     OP_TYPE_TT_REDUCE_RETURN,
 
     OP_TYPE_COUNT
-} OpType;
+} MLIR_OpType;
 
-string mlir_op_type_to_string(OpType type);
+string MLIR_MLIR_OpTypeToString(MLIR_OpType type);
 
 // -----------------------------------------------------------------------------
 // API lifecycle
 // -----------------------------------------------------------------------------
 
-void mlir_api_init(MlirOperation *root);
+void MLIR_InitApi(MLIR_Op *root);
 
 // -----------------------------------------------------------------------------
 // Operation API
 // -----------------------------------------------------------------------------
 
 // Creation & structural mutation
-MlirOperation *mlir_op_create(
+MLIR_Op *MLIR_CreateOp(
     Arena *arena,
-    OpType type,
+    MLIR_OpType type,
     string opname,
-    MlirAttribute **attributes, size_t n_attributes,
-    MlirType **result_types, size_t n_result_types,
-    MlirValue **results, size_t n_results,
-    MlirValue **operands, size_t n_operands,
-    MlirRegion **regions, size_t n_regions,
-    MlirLocation *location,
-    MlirLocation *unnumbered_loc_def,
+    MLIR_Attribute **attributes, size_t n_attributes,
+    MLIR_Type **result_types, size_t n_result_types,
+    MLIR_Value **results, size_t n_results,
+    MLIR_Value **operands, size_t n_operands,
+    MLIR_Region **regions, size_t n_regions,
+    MLIR_Location *location,
+    MLIR_Location *unnumbered_loc_def,
     string trailing_comment,
     int64_t source_line_start);
-void mlir_op_append_attribute(Arena *arena, MlirOperation *op, MlirAttribute *attr);
+void MLIR_AppendOpAttribute(Arena *arena, MLIR_Op *op, MLIR_Attribute *attr);
 
 // Accessors
-OpType mlir_op_get_type(const MlirOperation *op);
-string mlir_op_get_name(const MlirOperation *op);
-string mlir_op_get_name_string(const MlirOperation *op);
-MlirLocation *mlir_op_get_location(const MlirOperation *op);
-string mlir_op_get_trailing_comment(const MlirOperation *op);
-int64_t mlir_op_get_source_line_start(const MlirOperation *op);
-MlirLocation *mlir_op_get_unnumbered_loc_def(const MlirOperation *op);
-size_t mlir_op_num_operands(const MlirOperation *op);
-MlirValue *mlir_op_get_operand(const MlirOperation *op, size_t idx);
-size_t mlir_op_num_results(const MlirOperation *op);
-MlirValue *mlir_op_get_result(const MlirOperation *op, size_t idx);
-size_t mlir_op_num_result_types(const MlirOperation *op);
-MlirType *mlir_op_get_result_type(const MlirOperation *op, size_t idx);
-size_t mlir_op_num_attributes(const MlirOperation *op);
-MlirAttribute *mlir_op_get_attribute(const MlirOperation *op, size_t idx);
-size_t mlir_op_num_regions(const MlirOperation *op);
-MlirRegion *mlir_op_get_region(const MlirOperation *op, size_t idx);
+MLIR_OpType MLIR_GetOpType(const MLIR_Op *op);
+string MLIR_GetOpName(const MLIR_Op *op);
+string MLIR_GetOpName_string(const MLIR_Op *op);
+MLIR_Location *MLIR_GetOpLocation(const MLIR_Op *op);
+string MLIR_GetOpTrailingComment(const MLIR_Op *op);
+int64_t MLIR_GetOpSourceLineStart(const MLIR_Op *op);
+MLIR_Location *MLIR_GetOpUnnumberedLocationDef(const MLIR_Op *op);
+size_t MLIR_GetOpNumOperands(const MLIR_Op *op);
+MLIR_Value *MLIR_GetOpOperand(const MLIR_Op *op, size_t idx);
+size_t MLIR_GetOpNumResults(const MLIR_Op *op);
+MLIR_Value *MLIR_GetOpResult(const MLIR_Op *op, size_t idx);
+size_t MLIR_GetOpNumResultTypes(const MLIR_Op *op);
+MLIR_Type *MLIR_GetOpResult_type(const MLIR_Op *op, size_t idx);
+size_t MLIR_GetOpNumAttributes(const MLIR_Op *op);
+MLIR_Attribute *MLIR_GetOpAttribute(const MLIR_Op *op, size_t idx);
+size_t MLIR_GetOpNumRegions(const MLIR_Op *op);
+MLIR_Region *MLIR_GetOpRegion(const MLIR_Op *op, size_t idx);
 
 // -----------------------------------------------------------------------------
 // Region API
 // -----------------------------------------------------------------------------
 
-MlirRegion *mlir_region_create(Arena *arena);
-void mlir_region_add_block(Arena *arena, MlirRegion *region, MlirBlock *block);
-size_t mlir_region_num_blocks(const MlirRegion *region);
-MlirBlock *mlir_region_get_block(const MlirRegion *region, size_t idx);
+MLIR_Region *MLIR_CreateRegion(Arena *arena);
+void MLIR_AppendRegionBlock(Arena *arena, MLIR_Region *region, MLIR_Block *block);
+size_t MLIR_GetRegionNumBlocks(const MLIR_Region *region);
+MLIR_Block *MLIR_GetRegionBlock(const MLIR_Region *region, size_t idx);
 
 // -----------------------------------------------------------------------------
 // Block API
 // -----------------------------------------------------------------------------
 
-MlirBlock *mlir_block_create(Arena *arena);
-void mlir_block_add_operation(Arena *arena, MlirBlock *block, MlirOperation *op);
-void mlir_block_add_argument(Arena *arena, MlirBlock *block, MlirValue *arg);
-size_t mlir_block_num_operations(const MlirBlock *block);
-MlirOperation *mlir_block_get_operation(const MlirBlock *block, size_t idx);
-size_t mlir_block_num_arguments(const MlirBlock *block);
-MlirValue *mlir_block_get_argument(const MlirBlock *block, size_t idx);
+MLIR_Block *MLIR_CreateBlock(Arena *arena);
+void MLIR_AppendBlockOp(Arena *arena, MLIR_Block *block, MLIR_Op *op);
+void MLIR_AppendBlockArg(Arena *arena, MLIR_Block *block, MLIR_Value *arg);
+size_t MLIR_GetBlockNumOps(const MLIR_Block *block);
+MLIR_Op *MLIR_GetBlockOp(const MLIR_Block *block, size_t idx);
+size_t MLIR_GetBlockNumArgs(const MLIR_Block *block);
+MLIR_Value *MLIR_GetBlockArg(const MLIR_Block *block, size_t idx);
 
 // -----------------------------------------------------------------------------
 // Value API
 // -----------------------------------------------------------------------------
 
 // Value kind used for SSA values
-typedef enum ValueKind {
+typedef enum MLIR_ValueKind {
     BLOCK_ARG,
     OP_RESULT
-} ValueKind;
+} MLIR_ValueKind;
 
 // Creation
-MlirValue *mlir_value_create_block_arg(Arena *arena, string register_name, uint32_t result_index, MlirType *type, MlirLocation *location);
-MlirValue *mlir_value_create_op_result(Arena *arena, void *def, uint32_t result_index, MlirType *type, string register_name, MlirLocation *location);
+MLIR_Value *MLIR_CreateValueBlockArg(Arena *arena, string register_name, uint32_t result_index, MLIR_Type *type, MLIR_Location *location);
+MLIR_Value *MLIR_CreateValueOpResult(Arena *arena, void *def, uint32_t result_index, MLIR_Type *type, string register_name, MLIR_Location *location);
 
 // Accessors
-ValueKind mlir_value_get_kind(const MlirValue *value);
-MlirType *mlir_value_get_type(const MlirValue *value);
-string mlir_value_get_register_name(const MlirValue *value);
-uint32_t mlir_value_get_result_index(const MlirValue *value);
-MlirOperation *mlir_value_get_def_op(const MlirValue *value);
-MlirLocation *mlir_value_get_location(const MlirValue *value);
+MLIR_ValueKind MLIR_GetValueKind(const MLIR_Value *value);
+MLIR_Type *MLIR_GetValueType(const MLIR_Value *value);
+string MLIR_GetValueRegisterName(const MLIR_Value *value);
+uint32_t MLIR_GetValueResultIndex(const MLIR_Value *value);
+MLIR_Op *MLIR_GetValueDefiningOp(const MLIR_Value *value);
+MLIR_Location *MLIR_GetValueLocation(const MLIR_Value *value);
 
 // -----------------------------------------------------------------------------
 // Type API
 // -----------------------------------------------------------------------------
 
 // Creation
-MlirType *mlir_type_create_integer(Arena *arena, uint32_t width, bool is_signed);
-MlirType *mlir_type_create_float(Arena *arena, uint32_t width, bool is_bfloat);
-MlirType *mlir_type_create_index(Arena *arena);
-MlirType *mlir_type_create_unknown(Arena *arena);
-MlirType *mlir_type_create_tensor(Arena *arena, const int64_t *shape, size_t rank, MlirType *element_type);
-MlirType *mlir_type_create_memref(Arena *arena, const int64_t *shape, size_t rank, MlirType *element_type);
-MlirType *mlir_type_create_pointer(Arena *arena, MlirType *element_type, bool has_address_space, uint32_t address_space);
-MlirType *mlir_type_create_opaque(Arena *arena, string name);
+MLIR_Type *MLIR_CreateTypeInteger(Arena *arena, uint32_t width, bool is_signed);
+MLIR_Type *MLIR_CreateTypeFloat(Arena *arena, uint32_t width, bool is_bfloat);
+MLIR_Type *MLIR_CreateTypeIndex(Arena *arena);
+MLIR_Type *MLIR_CreateTypeUnknown(Arena *arena);
+MLIR_Type *MLIR_CreateTypeTensor(Arena *arena, const int64_t *shape, size_t rank, MLIR_Type *element_type);
+MLIR_Type *MLIR_CreateTypeMemref(Arena *arena, const int64_t *shape, size_t rank, MLIR_Type *element_type);
+MLIR_Type *MLIR_CreateTypePointer(Arena *arena, MLIR_Type *element_type, bool has_address_space, uint32_t address_space);
+MLIR_Type *MLIR_CreateTypeOpaque(Arena *arena, string name);
 
 // Mutation
-void mlir_type_set_integer_properties(MlirType *type, uint32_t width, bool is_signed);
-void mlir_type_set_float_properties(MlirType *type, uint32_t width, bool is_bfloat);
-void mlir_type_set_tensor_properties(MlirType *type, const int64_t *shape, size_t rank, MlirType *element_type);
-void mlir_type_set_memref_properties(MlirType *type, const int64_t *shape, size_t rank, MlirType *element_type);
-void mlir_type_set_pointer_properties(MlirType *type, MlirType *element_type, bool has_address_space, uint32_t address_space);
+void MLIR_SetTypeIntegerProperties(MLIR_Type *type, uint32_t width, bool is_signed);
+void MLIR_SetTypeFloatProperties(MLIR_Type *type, uint32_t width, bool is_bfloat);
+void MLIR_SetTypeTensorProperties(MLIR_Type *type, const int64_t *shape, size_t rank, MLIR_Type *element_type);
+void MLIR_SetTypeMemrefProperties(MLIR_Type *type, const int64_t *shape, size_t rank, MLIR_Type *element_type);
+void MLIR_SetTypePointerProperties(MLIR_Type *type, MLIR_Type *element_type, bool has_address_space, uint32_t address_space);
 
 // Introspection & formatting
-bool mlir_type_is_integer(const MlirType *type);
-bool mlir_type_is_float(const MlirType *type);
-bool mlir_type_is_tensor(const MlirType *type);
-bool mlir_type_is_memref(const MlirType *type);
-bool mlir_type_is_pointer(const MlirType *type);
-bool mlir_type_is_index(const MlirType *type);
-bool mlir_type_is_unknown(const MlirType *type);
-bool mlir_type_is_opaque(const MlirType *type);
-string mlir_type_to_string(Arena *arena, MlirType *type);
+bool MLIR_IsTypeInteger(const MLIR_Type *type);
+bool MLIR_IsTypeFloat(const MLIR_Type *type);
+bool MLIR_IsTypeTensor(const MLIR_Type *type);
+bool MLIR_IsTypeMemref(const MLIR_Type *type);
+bool MLIR_IsTypePointer(const MLIR_Type *type);
+bool MLIR_IsTypeIndex(const MLIR_Type *type);
+bool MLIR_IsTypeUnknown(const MLIR_Type *type);
+bool MLIR_IsTypeOpaque(const MLIR_Type *type);
+string MLIR_GetTypeString(Arena *arena, MLIR_Type *type);
 
 // -----------------------------------------------------------------------------
 // Attribute API
 // -----------------------------------------------------------------------------
 
 // Creation & mutation
-MlirAttribute *mlir_attribute_create_integer(Arena *arena, string name, int64_t value);
-MlirAttribute *mlir_attribute_create_float(Arena *arena, string name, double value);
-MlirAttribute *mlir_attribute_create_bool(Arena *arena, string name, bool value);
-MlirAttribute *mlir_attribute_create_string(Arena *arena, string name, string value);
-MlirAttribute *mlir_attribute_create_array(Arena *arena, string name, MlirAttribute **elements, size_t count);
-MlirAttribute *mlir_attribute_create_dict(Arena *arena, string name, MlirAttribute **elements, size_t count);
+MLIR_Attribute *MLIR_CreateAttributeInteger(Arena *arena, string name, int64_t value);
+MLIR_Attribute *MLIR_CreateAttributeFloat(Arena *arena, string name, double value);
+MLIR_Attribute *MLIR_CreateAttributeBool(Arena *arena, string name, bool value);
+MLIR_Attribute *MLIR_CreateAttributeString(Arena *arena, string name, string value);
+MLIR_Attribute *MLIR_CreateAttributeArray(Arena *arena, string name, MLIR_Attribute **elements, size_t count);
+MLIR_Attribute *MLIR_CreateAttributeDict(Arena *arena, string name, MLIR_Attribute **elements, size_t count);
 
 // Introspection
 typedef enum {
@@ -293,18 +293,18 @@ typedef enum {
     MLIR_ATTR_KIND_BOOL,
     MLIR_ATTR_KIND_ARRAY,
     MLIR_ATTR_KIND_DICT
-} MlirAttrKind;
+} MLIR_AttrKind;
 
-MlirAttrKind mlir_attribute_get_kind(const MlirAttribute *attr);
-string mlir_attribute_get_name(const MlirAttribute *attr);
-int64_t mlir_attribute_get_integer(const MlirAttribute *attr);
-double mlir_attribute_get_float(const MlirAttribute *attr);
-bool mlir_attribute_get_bool(const MlirAttribute *attr);
-string mlir_attribute_get_string(const MlirAttribute *attr);
-size_t mlir_attribute_get_array_size(const MlirAttribute *attr);
-MlirAttribute *mlir_attribute_get_array_element(const MlirAttribute *attr, size_t idx);
-size_t mlir_attribute_get_dict_size(const MlirAttribute *attr);
-MlirAttribute *mlir_attribute_get_dict_element(const MlirAttribute *attr, size_t idx);
+MLIR_AttrKind MLIR_GetAttributeKind(const MLIR_Attribute *attr);
+string MLIR_GetAttributeName(const MLIR_Attribute *attr);
+int64_t MLIR_GetAttributeInteger(const MLIR_Attribute *attr);
+double MLIR_GetAttributeFloat(const MLIR_Attribute *attr);
+bool MLIR_GetAttributeBool(const MLIR_Attribute *attr);
+string MLIR_GetAttributeString(const MLIR_Attribute *attr);
+size_t MLIR_GetAttributeArraySize(const MLIR_Attribute *attr);
+MLIR_Attribute *MLIR_GetAttributeArrayElement(const MLIR_Attribute *attr, size_t idx);
+size_t MLIR_GetAttributeDictSize(const MLIR_Attribute *attr);
+MLIR_Attribute *MLIR_GetAttributeDictElement(const MLIR_Attribute *attr, size_t idx);
 
 // -----------------------------------------------------------------------------
 // Location API
@@ -317,22 +317,22 @@ typedef enum {
     MLIR_LOC_CALLSITE,
     MLIR_LOC_FUSED,
     MLIR_LOC_REF
-} MlirLocationKind;
+} MLIR_LocationKind;
 
 // Creation
-MlirLocation *mlir_location_create_unknown(Arena *arena, string original_text);
-MlirLocation *mlir_location_create_file(Arena *arena, string filename, int line, int column);
-MlirLocation *mlir_location_create_name(Arena *arena, string name);
-MlirLocation *mlir_location_create_ref(Arena *arena, int ref_id);
+MLIR_Location *MLIR_CreateLocationUnknown(Arena *arena, string original_text);
+MLIR_Location *MLIR_CreateLocationFile(Arena *arena, string filename, int line, int column);
+MLIR_Location *MLIR_CreateLocationName(Arena *arena, string name);
+MLIR_Location *MLIR_CreateLocationRef(Arena *arena, int ref_id);
 
 // Accessors
-MlirLocationKind mlir_location_get_kind(const MlirLocation *loc);
-string mlir_location_get_original_text(const MlirLocation *loc);
-string mlir_location_get_file_filename(const MlirLocation *loc);
-int mlir_location_get_file_line(const MlirLocation *loc);
-int mlir_location_get_file_column(const MlirLocation *loc);
-string mlir_location_get_name(const MlirLocation *loc);
-int mlir_location_get_ref_id(const MlirLocation *loc);
+MLIR_LocationKind MLIR_GetLocationKind(const MLIR_Location *loc);
+string MLIR_GetLocationOriginalText(const MLIR_Location *loc);
+string MLIR_GetLocationFileFilename(const MLIR_Location *loc);
+int MLIR_GetLocationFileLine(const MLIR_Location *loc);
+int MLIR_GetLocationFileColumn(const MLIR_Location *loc);
+string MLIR_GetLocationName(const MLIR_Location *loc);
+int MLIR_GetLocationRefId(const MLIR_Location *loc);
 
 #ifdef __cplusplus
 }
