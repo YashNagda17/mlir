@@ -1,0 +1,26 @@
+[workspace]
+name = "mlir"
+version = "0.1.0"
+description = "Faster and simpler MLIR infrastructure"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[dependencies]
+clang = ">=17"
+clangxx = ">=17"
+re2c = ">=3"
+python = ">=3.11"
+toml = ">=0.10.2"
+
+[tasks]
+tokenizer = { cmd = "re2c --no-generation-date -b tokenizer.re -o tokenizer.c", description = "Generate tokenizer.c from tokenizer.re via re2c" }
+build-tests = { cmd = "clang -g -Wall -ferror-limit=1 -I. -o run_tests tests/run_tests.c base/arena.c base/string.c base/format.c base/io.c", description = "Compile the unit test binary" }
+build-parser = { cmd = "clang -g -Wall -ferror-limit=1 -I. -o parser parser.c tokenizer.c mlir_parser.c mlir_generic_printer.c mlir_classic_printer.c op_parsers.c mlir_api_impl.c base/arena.c base/string.c base/format.c base/io.c", depends-on = ["tokenizer"], description = "Compile the parser binary" }
+build = { depends-on = ["build-tests", "build-parser"], description = "Build everything (tests + parser)" }
+unit-tests = { cmd = "./run_tests", depends-on = ["build-tests"], description = "Run C unit tests for base utilities" }
+run-parser = { cmd = "./parser", depends-on = ["build-parser"], description = "Smoke-test parser in default mode" }
+run-construct = { cmd = "./parser --construct", depends-on = ["build-parser"], description = "Test parser in AST construction mode" }
+test = { cmd = "python run_tests.py -s", depends-on = ["build"], description = "Run the Python-based diff test suite" }
+roundtrip = { cmd = "bash comp.sh", depends-on = ["build-parser"], description = "Run classic-printer roundtrip checks" }
+update-refs = { cmd = "python run_tests.py -u", depends-on = ["build"], description = "Update reference test results" }
+ci = { depends-on = ["unit-tests", "run-parser", "run-construct", "test"], description = "Full CI: build + all tests" }
