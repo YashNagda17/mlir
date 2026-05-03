@@ -164,49 +164,49 @@ static inline IR_Location *resolve_loc(MLIR_LocationHandle h) {
 
 static inline MLIR_OpHandle alloc_op(MLIR_Context *ctx, IR_Op op) {
     if (!ctx || !ctx->arena) return MLIR_INVALID_HANDLE;
-    IR_Op *slot = arena_alloc_array(ctx->arena, IR_Op, 1);
+    IR_Op *slot = arena_alloc(ctx->arena, IR_Op);
     *slot = op;
     return (MLIR_OpHandle)(uintptr_t)slot;
 }
 
 static inline MLIR_RegionHandle alloc_region(MLIR_Context *ctx, IR_Region r) {
     if (!ctx || !ctx->arena) return MLIR_INVALID_HANDLE;
-    IR_Region *slot = arena_alloc_array(ctx->arena, IR_Region, 1);
+    IR_Region *slot = arena_alloc(ctx->arena, IR_Region);
     *slot = r;
     return (MLIR_RegionHandle)(uintptr_t)slot;
 }
 
 static inline MLIR_BlockHandle alloc_block(MLIR_Context *ctx, IR_Block b) {
     if (!ctx || !ctx->arena) return MLIR_INVALID_HANDLE;
-    IR_Block *slot = arena_alloc_array(ctx->arena, IR_Block, 1);
+    IR_Block *slot = arena_alloc(ctx->arena, IR_Block);
     *slot = b;
     return (MLIR_BlockHandle)(uintptr_t)slot;
 }
 
 static inline MLIR_ValueHandle alloc_value(MLIR_Context *ctx, IR_Value v) {
     if (!ctx || !ctx->arena) return MLIR_INVALID_HANDLE;
-    IR_Value *slot = arena_alloc_array(ctx->arena, IR_Value, 1);
+    IR_Value *slot = arena_alloc(ctx->arena, IR_Value);
     *slot = v;
     return (MLIR_ValueHandle)(uintptr_t)slot;
 }
 
 static inline MLIR_TypeHandle alloc_type(MLIR_Context *ctx, IR_Type t) {
     if (!ctx || !ctx->arena) return MLIR_INVALID_HANDLE;
-    IR_Type *slot = arena_alloc_array(ctx->arena, IR_Type, 1);
+    IR_Type *slot = arena_alloc(ctx->arena, IR_Type);
     *slot = t;
     return (MLIR_TypeHandle)(uintptr_t)slot;
 }
 
 static inline MLIR_AttributeHandle alloc_attr_obj(MLIR_Context *ctx, IR_Attribute a) {
     if (!ctx || !ctx->arena) return MLIR_INVALID_HANDLE;
-    IR_Attribute *slot = arena_alloc_array(ctx->arena, IR_Attribute, 1);
+    IR_Attribute *slot = arena_alloc(ctx->arena, IR_Attribute);
     *slot = a;
     return (MLIR_AttributeHandle)(uintptr_t)slot;
 }
 
 static inline MLIR_LocationHandle alloc_loc(MLIR_Context *ctx, IR_Location l) {
     if (!ctx || !ctx->arena) return MLIR_INVALID_HANDLE;
-    IR_Location *slot = arena_alloc_array(ctx->arena, IR_Location, 1);
+    IR_Location *slot = arena_alloc(ctx->arena, IR_Location);
     *slot = l;
     return (MLIR_LocationHandle)(uintptr_t)slot;
 }

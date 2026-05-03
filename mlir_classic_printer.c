@@ -89,7 +89,7 @@ static int parse_bb_index(string lab) {
 
 static PredComments* build_pred_comments(MLIR_Context *mlir_ctx, Arena *arena, MLIR_RegionHandle region) {
     if (!region) return NULL;
-    PredComments *pc = arena_alloc_array(arena, PredComments, 1);
+    PredComments *pc = arena_alloc(arena, PredComments);
     (void)mlir_ctx;
     pc->region = region;
     size_t nb = MLIR_GetRegionNumBlocks(region);
