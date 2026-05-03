@@ -10,6 +10,10 @@
 #include <base/string.h>
 #include <base/vector.h>
 
+// TODO: move this into corec.
+#define arena_alloc_array(arena, type, count) \
+    ((type *)arena_alloc((arena), sizeof(type) * (size_t)(count)))
+
 #ifdef __cplusplus
 extern "C" {
 #endif
