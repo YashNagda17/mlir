@@ -542,9 +542,8 @@ void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last) {
 
     bool debug = false;
     if (debug) {
-        println(parser->arena, str_lit("{}"), newlines);
-        println(parser->arena,
-                str_lit("first: {}, last: {}, line_first: {}, column_first: {}, start_of_line: {}, end_of_line: {}"),
+        println(str_lit("{}"), newlines);
+        println(str_lit("first: {}, last: {}, line_first: {}, column_first: {}, start_of_line: {}, end_of_line: {}"),
                 first, last, line_first, column_first, start_of_line, end_of_line);
     }
 
@@ -564,10 +563,10 @@ void parser_error(Parser *parser, string msg, uint64_t first, uint64_t last) {
     string caret_str = { .str = caret_buf, .size = first - start_of_line + token_length };
 
     // Print the error message, line, and caret string
-    println(parser->arena, str_lit("Syntax error ({}:{}): {}"),
+    println(str_lit("Syntax error ({}:{}): {}"),
             line_first, column_first, msg);
-    println(parser->arena, str_lit("{}"), line);
-    println(parser->arena, caret_str);
+    println(str_lit("{}"), line);
+    println(caret_str);
 
     exit(1);
 }
@@ -585,9 +584,8 @@ void parser_warning(Parser *parser, string msg, uint64_t first, uint64_t last) {
 
     bool debug = false;
     if (debug) {
-        println(parser->arena, str_lit("{}"), newlines);
-        println(parser->arena,
-                str_lit("first: {}, last: {}, line_first: {}, column_first: {}, start_of_line: {}, end_of_line: {}"),
+        println(str_lit("{}"), newlines);
+        println(str_lit("first: {}, last: {}, line_first: {}, column_first: {}, start_of_line: {}, end_of_line: {}"),
                 first, last, line_first, column_first, start_of_line, end_of_line);
     }
 
@@ -607,10 +605,10 @@ void parser_warning(Parser *parser, string msg, uint64_t first, uint64_t last) {
     string caret_str = { .str = caret_buf, .size = first - start_of_line + token_length };
 
     // Print the warning message, line, and caret string
-    println(parser->arena, str_lit("Warning ({}:{}): {}"),
+    println(str_lit("Warning ({}:{}): {}"),
             line_first, column_first, msg);
-    println(parser->arena, str_lit("{}"), line);
-    println(parser->arena, caret_str);
+    println(str_lit("{}"), line);
+    println(caret_str);
 }
 
 void parser_next_token(Parser *parser) {
@@ -867,7 +865,7 @@ MLIR_OpHandle parse_module(Parser *parser) {
 
 MLIR_OpHandle mlir_parse_module(MLIR_Context *ctx, const char *input, size_t input_len, MLIR_LocationMap **out_location_map) {
     Arena *arena = MLIR_GetArenaAllocator(ctx);
-    Parser *parser = arena_alloc(arena, Parser);
+    Parser *parser = arena_alloc_array(arena, Parser, 1);
     string input_string = {
         .str = (char*)input,
         .size = input_len
@@ -875,7 +873,7 @@ MLIR_OpHandle mlir_parse_module(MLIR_Context *ctx, const char *input, size_t inp
     parser_init(ctx, parser, input_string);
     MLIR_OpHandle module = parse_module(parser);
     if (out_location_map) {
-        MLIR_LocationMap *map_wrapper = arena_alloc(arena, MLIR_LocationMap);
+        MLIR_LocationMap *map_wrapper = arena_alloc_array(arena, MLIR_LocationMap, 1);
         map_wrapper->impl = &parser->location_map;
         *out_location_map = map_wrapper;
     }
