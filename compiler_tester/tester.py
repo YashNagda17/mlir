@@ -181,9 +181,18 @@ def run(basename: str, cmd: Union[pathlib.Path, str],
     cmd2 = cmd.format(infile=infile, outfile=outfile)
     if extra_args:
         cmd2 += " " + extra_args
-    r = subprocess.run(cmd2, shell=True,
-                       stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE)
+    # On Windows, subprocess(shell=True) launches cmd.exe which doesn't
+    # understand `./parser ...` style command lines. Use sh.exe (provided
+    # by the conda `shell` package, available in our pixi env) so the
+    # same cmd string runs on every platform.
+    if sys.platform == "win32":
+        r = subprocess.run(["sh", "-c", cmd2],
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+    else:
+        r = subprocess.run(cmd2, shell=True,
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
     if not os.path.exists(outfile):
         outfile = None
     if len(r.stdout):
