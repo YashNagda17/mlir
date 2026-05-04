@@ -22,7 +22,7 @@ if errorlevel 1 exit /b 1
 link /nologo /out:cross_upstream.exe ^
     upstream_main.obj driver.obj mlir_generic_printer.obj mlir_op_names.obj mlir_api_impl_upstream.obj ^
     io.obj buddy.obj arena.obj scratch.obj format.obj math.obj string.obj mem.obj numconv.obj assert.obj exit.obj platform_windows.obj ^
-    /LIBPATH:"%CONDA_PREFIX%\Library\lib" %MLIR_LIBS% %LLVM_LIBS%
+    /LIBPATH:"%CONDA_PREFIX%\Library\lib" %MLIR_LIBS% %LLVM_LIBS% ntdll.lib
 if errorlevel 1 exit /b 1
 
 endlocal
