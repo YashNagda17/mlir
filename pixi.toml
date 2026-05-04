@@ -37,7 +37,6 @@ clang \
     -Os \
     -nostdlib \
     -nostdinc \
-    -DCOREC_FREESTANDING \
     -fno-builtin \
     -I corec \
     -I corec-stdlib/stdlib \
@@ -98,7 +97,6 @@ build_linux = { cmd = """
 clang \
     -nostdlib \
     -nostdinc \
-    -DCOREC_FREESTANDING \
     -fno-builtin \
     -I corec \
     -I corec-stdlib/stdlib \
@@ -144,7 +142,6 @@ clang \
     -g \
     -nostdlib \
     -nostdinc \
-    -DCOREC_FREESTANDING \
     -fno-builtin \
     -I corec \
     -I corec-stdlib/stdlib \
@@ -185,7 +182,6 @@ clang \
     -g \
     -nostdlib \
     -nostdinc \
-    -DCOREC_FREESTANDING \
     -fno-builtin \
     -I corec \
     -I corec-stdlib/stdlib \
@@ -225,7 +221,6 @@ build_windows = { cmd = """
 cl \
     /nologo \
     /X \
-    /D"COREC_FREESTANDING" \
     /std:c11 \
     /Zc:preprocessor \
     /I"corec" \
