@@ -452,7 +452,6 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             line = str_concat(arena, line, str_lit(" "));
             line = str_concat(arena, line, print_function_region_classic(ctx, indent_level, region));
         }
-        else { line = str_concat(arena, line, str_lit(" { }")); }
         MLIR_LocationHandle loc = MLIR_GetOpLocation(op);
         if (loc) line = str_concat(arena, line, print_location_classic(arena, loc));
         line = str_concat(arena, line, str_lit("\n"));
@@ -825,8 +824,6 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             if (MLIR_GetOpNumRegions(op)>0) {
                 line = str_concat(arena, line, str_lit(" "));
                 line = str_concat(arena, line, print_function_region_classic(ctx, indent_level, MLIR_GetOpRegion(op, 0)));
-            } else {
-                line = str_concat(arena, line, str_lit(" { }"));
             }
             MLIR_LocationHandle loc = MLIR_GetOpLocation(op);
             if (loc) {
