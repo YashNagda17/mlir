@@ -1,0 +1,4 @@
+module() {
+^bb0:
+    "custom.empty"()
+}

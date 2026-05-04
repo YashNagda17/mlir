@@ -1,242 +1,329 @@
-#include "mlir_api.h"
+// Upstream LLVM/MLIR-backed implementation of the public API in mlir_api.h.
+//
+// This is a minimal implementation sufficient for the cross-implementation
+// smoke test in tests/cross/. It exercises:
+//   * Module + unregistered op construction.
+//   * The read-side surface used by mlir_generic_printer.c when there are
+//     no operands, results, attributes, types, or values.
+//
+// Functions outside that minimal set are stubbed with UNIMPLEMENTED and
+// will abort if called. Expanding coverage requires arena-allocated
+// wrapper records for value types (mlir::Value/Type/Attribute) since
+// those are value-semantics handles, not stable pointers.
+//
+// This file is compiled in "hosted" mode: corec headers are included
+// without -DCOREC_FREESTANDING, so they fall through to system libc
+// declarations. Linkage is against system libc/libc++ + libMLIR*.
 
-// This file provides an example implementation of the public C API on top of
-// the upstream MLIR C++ library.  It is not compiled as part of this project
-// but demonstrates how the API can be bridged to the official MLIR data
-// structures.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/Region.h"
-#include "mlir/IR/Value.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/StringRef.h"
-#include <cassert>
 
-using namespace mlir;
+extern "C" {
+#include "mlir_api.h"
+#include "mlir_op_names.h"
+}
 
-// Global context/builder used to create operations.  A real implementation
-// would likely provide a more sophisticated ownership model.
-static MLIRContext *gContext = nullptr;
-static OpBuilder *gBuilder = nullptr;
+#define UNIMPLEMENTED()                                                   \
+    do {                                                                  \
+        std::fprintf(stderr, "%s unimplemented (upstream)\n", __func__);  \
+        std::abort();                                                     \
+    } while (0)
 
-// Mapping from MLIR operation pointers back to our MLIR_OpType enumeration.
-static llvm::DenseMap<const Operation *, MLIR_OpType> gMLIR_OpTypeMap;
+namespace {
 
-// Mapping from MLIR_OpType to the canonical MLIR operation name.  The order matches
-// the MLIR_OpType enumeration defined in mlir_api.h.
-static const char *const kOpNames[OP_TYPE_COUNT] = {
-    "",                     // OP_TYPE_UNREGISTERED
-    "builtin.module",       // OP_TYPE_MODULE
-    "arith.addi",           // OP_TYPE_ARITH_ADDI
-    "arith.subi",           // OP_TYPE_ARITH_SUBI
-    "arith.muli",           // OP_TYPE_ARITH_MULI
-    "arith.divi",           // OP_TYPE_ARITH_DIVI
-    "arith.addf",           // OP_TYPE_ARITH_ADDF
-    "arith.subf",           // OP_TYPE_ARITH_SUBF
-    "arith.mulf",           // OP_TYPE_ARITH_MULF
-    "arith.divf",           // OP_TYPE_ARITH_DIVF
-    "arith.constant",       // OP_TYPE_ARITH_CONSTANT
-    "arith.cmpi",           // OP_TYPE_ARITH_CMPI
-    "arith.cmpf",           // OP_TYPE_ARITH_CMPF
-    "arith.select",         // OP_TYPE_ARITH_SELECT
-    "memref.load",          // OP_TYPE_MEMREF_LOAD
-    "memref.store",         // OP_TYPE_MEMREF_STORE
-    "memref.alloc",         // OP_TYPE_MEMREF_ALLOC
-    "memref.dealloc",       // OP_TYPE_MEMREF_DEALLOC
-    "cf.br",                // OP_TYPE_CF_BR
-    "cf.cond_br",           // OP_TYPE_CF_COND_BR
-    "cf.switch",            // OP_TYPE_CF_SWITCH
-    "func.func",            // OP_TYPE_FUNC_FUNC
-    "func.return",          // OP_TYPE_FUNC_RETURN
-    "func.call",            // OP_TYPE_FUNC_CALL
-    "scf.for",              // OP_TYPE_SCF_FOR
-    "scf.while",            // OP_TYPE_SCF_WHILE
-    "scf.if",               // OP_TYPE_SCF_IF
-    "scf.yield",            // OP_TYPE_SCF_YIELD
-    "tt.get_program_id",    // OP_TYPE_TT_GET_PROGRAM_ID
-    "tt.load",              // OP_TYPE_TT_LOAD
-    "tt.store",             // OP_TYPE_TT_STORE
-    "tt.make_range",        // OP_TYPE_TT_MAKE_RANGE
-    "tt.splat",             // OP_TYPE_TT_SPLAT
-    "tt.addptr",            // OP_TYPE_TT_ADDPTR
-    "tt.return",            // OP_TYPE_TT_RETURN
-    "tt.func",              // OP_TYPE_TT_FUNC
-    "tt.call",              // OP_TYPE_TT_CALL
-    "tt.reduce",            // OP_TYPE_TT_REDUCE
-    "gpu.launch",           // OP_TYPE_GPU_LAUNCH
-    "affine.for",           // OP_TYPE_AFFINE_FOR
-    "affine.load",          // OP_TYPE_AFFINE_LOAD
-    "vector.print",         // OP_TYPE_VECTOR_PRINT
-    "std.constant",         // OP_TYPE_STD_CONSTANT
-    "std.return",           // OP_TYPE_STD_RETURN
-    "tensor.extract",       // OP_TYPE_TENSOR_EXTRACT
-    "tensor.splat",         // OP_TYPE_TENSOR_SPLAT
-    "tensor.collapse_shape",// OP_TYPE_TENSOR_COLLAPSE_SHAPE
-    "linalg.fill",          // OP_TYPE_LINALG_FILL
-    "index.constant",       // OP_TYPE_INDEX_CONSTANT
-    "return",               // OP_TYPE_RETURN
-    "tt.reduce_return"      // OP_TYPE_TT_REDUCE_RETURN
+// Global context owns all upstream MLIR objects we create.
+struct UpstreamCtx {
+    mlir::MLIRContext mctx;
+    UpstreamCtx() {
+        mctx.allowUnregisteredDialects(true);
+    }
 };
 
-static inline StringRef opTypeToName(MLIR_OpType type) {
-    assert(type < OP_TYPE_COUNT);
-    return kOpNames[type];
+UpstreamCtx &globalCtx() {
+    static UpstreamCtx g;
+    return g;
 }
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+// Convert between opaque integer handles and upstream pointers.
+template <class T>
+static inline uintptr_t toHandle(T *p) { return reinterpret_cast<uintptr_t>(p); }
+template <class T>
+static inline T *fromHandle(uintptr_t h) { return reinterpret_cast<T *>(h); }
 
-static MLIR_OpType lookupMLIR_OpTypeByName(StringRef name) {
-    for (int i = 1; i < OP_TYPE_COUNT; ++i) {
-        if (name == opTypeToName(static_cast<MLIR_OpType>(i)))
-            return static_cast<MLIR_OpType>(i);
-    }
+// Map upstream op name → our enum (only entries the cross-test exercises).
+static MLIR_OpType opTypeFromName(llvm::StringRef name) {
+    if (name == "builtin.module") return OP_TYPE_MODULE;
     return OP_TYPE_UNREGISTERED;
 }
 
-void MLIR_InitApi(MLIR_Op *root) {
-    if (!gContext) {
-        gContext = new MLIRContext();
-        gContext->loadAllAvailableDialects();
-        gBuilder = new OpBuilder(gContext);
+} // namespace
+
+// -----------------------------------------------------------------------------
+// Lifecycle
+// -----------------------------------------------------------------------------
+
+extern "C" void MLIR_InitApi(MLIR_Context *ctx, MLIR_OpHandle root) {
+    (void)ctx;
+    (void)root;
+}
+
+extern "C" void MLIR_SetArenaAllocator(MLIR_Context *ctx, Arena *arena) {
+    ctx->arena = arena;
+}
+
+extern "C" Arena *MLIR_GetArenaAllocator(MLIR_Context *ctx) {
+    return ctx->arena;
+}
+
+// -----------------------------------------------------------------------------
+// Region / Block construction
+// -----------------------------------------------------------------------------
+
+extern "C" MLIR_RegionHandle MLIR_CreateRegion(MLIR_Context *) {
+    return toHandle(new mlir::Region());
+}
+
+extern "C" MLIR_BlockHandle MLIR_CreateBlock(MLIR_Context *) {
+    return toHandle(new mlir::Block());
+}
+
+extern "C" void MLIR_AppendRegionBlock(MLIR_Context *, MLIR_RegionHandle r,
+                                        MLIR_BlockHandle b) {
+    auto *region = fromHandle<mlir::Region>(r);
+    auto *block = fromHandle<mlir::Block>(b);
+    region->push_back(block);
+}
+
+extern "C" void MLIR_AppendBlockOp(MLIR_Context *, MLIR_BlockHandle b,
+                                    MLIR_OpHandle op) {
+    auto *block = fromHandle<mlir::Block>(b);
+    auto *operation = fromHandle<mlir::Operation>(op);
+    block->push_back(operation);
+}
+
+extern "C" void MLIR_AppendBlockArg(MLIR_Context *, MLIR_BlockHandle,
+                                     MLIR_ValueHandle) {
+    UNIMPLEMENTED();
+}
+
+// -----------------------------------------------------------------------------
+// Op construction
+// -----------------------------------------------------------------------------
+
+extern "C" MLIR_OpHandle MLIR_CreateOp(
+    MLIR_Context *, MLIR_OpType type, string opname,
+    MLIR_AttributeHandle * /*attrs*/, size_t n_attrs,
+    MLIR_TypeHandle * /*result_types*/, size_t n_result_types,
+    MLIR_ValueHandle * /*results*/, size_t n_results,
+    MLIR_ValueHandle * /*operands*/, size_t n_operands,
+    MLIR_RegionHandle *regions, size_t n_regions,
+    MLIR_LocationHandle, MLIR_LocationHandle, string, int64_t) {
+    auto &ctx = globalCtx().mctx;
+
+    if (n_attrs != 0 || n_result_types != 0 || n_results != 0 ||
+        n_operands != 0) {
+        std::fprintf(stderr,
+                     "MLIR_CreateOp: upstream impl only supports the minimal "
+                     "no-operands/results/attrs path\n");
+        std::abort();
     }
 
-    gMLIR_OpTypeMap.clear();
-
-    if (root) {
-        Operation *cppRoot = reinterpret_cast<Operation *>(root);
-        cppRoot->walk([](Operation *op) {
-            gMLIR_OpTypeMap[op] = lookupMLIR_OpTypeByName(op->getName().getStringRef());
-        });
+    // Resolve op name. For OP_TYPE_MODULE the C side uses "module" but
+    // upstream's canonical name is "builtin.module".
+    std::string name(opname.str, opname.size);
+    if (type == OP_TYPE_MODULE && name == "module") {
+        name = "builtin.module";
     }
+
+    mlir::OperationState state(mlir::UnknownLoc::get(&ctx),
+                               llvm::StringRef(name));
+    for (size_t i = 0; i < n_regions; i++) {
+        auto *region = fromHandle<mlir::Region>(regions[i]);
+        state.addRegion(std::unique_ptr<mlir::Region>(region));
+    }
+    mlir::Operation *op = mlir::Operation::create(state);
+    return toHandle(op);
 }
 
-MLIR_Op *mlir_operation_create(Arena *arena, MLIR_OpType type) {
-    (void)arena;
-    OperationState state(gBuilder->getUnknownLoc(), opTypeToName(type));
-    Operation *op = Operation::create(state);
-    gMLIR_OpTypeMap[op] = type;
-    return reinterpret_cast<MLIR_Op *>(op);
+extern "C" void MLIR_AppendOpAttribute(MLIR_Context *, MLIR_OpHandle,
+                                        MLIR_AttributeHandle) {
+    UNIMPLEMENTED();
 }
 
-void MLIR_AppendBlockOp(Arena *arena, MLIR_Block *block, MLIR_Op *op) {
-    (void)arena;
-    Block *cppBlock = reinterpret_cast<Block *>(block);
-    Operation *cppOp = reinterpret_cast<Operation *>(op);
-    cppBlock->push_back(cppOp);
+// -----------------------------------------------------------------------------
+// Op accessors
+// -----------------------------------------------------------------------------
+
+extern "C" MLIR_OpType MLIR_GetOpType(MLIR_OpHandle h) {
+    auto *op = fromHandle<mlir::Operation>(h);
+    return opTypeFromName(op->getName().getStringRef());
 }
 
-void MLIR_AppendBlockArg(Arena *arena, MLIR_Block *block, MLIR_Value *arg) {
-    (void)arena;
-    Block *cppBlock = reinterpret_cast<Block *>(block);
-    Value cppVal = *reinterpret_cast<Value *>(arg);
-    cppBlock->addArgument(cppVal.getType(), cppVal.getLoc());
+extern "C" string MLIR_GetOpName(MLIR_OpHandle h) {
+    auto *op = fromHandle<mlir::Operation>(h);
+    auto sr = op->getName().getStringRef();
+    string s;
+    s.str = const_cast<char *>(sr.data());
+    s.size = sr.size();
+    return s;
 }
 
-void MLIR_AppendRegionBlock(Arena *arena, MLIR_Region *region, MLIR_Block *block) {
-    (void)arena;
-    Region *cppRegion = reinterpret_cast<Region *>(region);
-    Block *cppBlock = reinterpret_cast<Block *>(block);
-    cppRegion->push_back(cppBlock);
+extern "C" string MLIR_GetOpName_string(MLIR_OpHandle h) {
+    auto *op = fromHandle<mlir::Operation>(h);
+    auto sr = op->getName().getStringRef();
+    // For OP_TYPE_MODULE the C side prints "module"; strip "builtin." prefix.
+    if (sr == "builtin.module") {
+        string s;
+        s.str = const_cast<char *>("module");
+        s.size = 6;
+        return s;
+    }
+    string s;
+    s.str = const_cast<char *>(sr.data());
+    s.size = sr.size();
+    return s;
 }
 
-size_t MLIR_GetRegionNumBlocks(const MLIR_Region *region) {
-    const Region *cppRegion = reinterpret_cast<const Region *>(region);
-    return cppRegion->getBlocks().size();
+extern "C" MLIR_LocationHandle MLIR_GetOpLocation(MLIR_OpHandle) {
+    return MLIR_INVALID_HANDLE;
+}
+extern "C" string MLIR_GetOpTrailingComment(MLIR_OpHandle) {
+    string s; s.str = nullptr; s.size = 0; return s;
+}
+extern "C" int64_t MLIR_GetOpSourceLineStart(MLIR_OpHandle) { return -1; }
+extern "C" MLIR_LocationHandle MLIR_GetOpUnnumberedLocationDef(MLIR_OpHandle) {
+    return MLIR_INVALID_HANDLE;
 }
 
-MLIR_Block *MLIR_GetRegionBlock(const MLIR_Region *region, size_t idx) {
-    Region *cppRegion = const_cast<Region *>(reinterpret_cast<const Region *>(region));
-    auto it = cppRegion->begin();
-    std::advance(it, idx);
-    return reinterpret_cast<MLIR_Block *>(&*it);
+extern "C" size_t MLIR_GetOpNumOperands(MLIR_OpHandle h) {
+    return fromHandle<mlir::Operation>(h)->getNumOperands();
+}
+extern "C" MLIR_ValueHandle MLIR_GetOpOperand(MLIR_OpHandle, size_t) {
+    UNIMPLEMENTED();
+}
+extern "C" size_t MLIR_GetOpNumResults(MLIR_OpHandle h) {
+    return fromHandle<mlir::Operation>(h)->getNumResults();
+}
+extern "C" MLIR_ValueHandle MLIR_GetOpResult(MLIR_OpHandle, size_t) {
+    UNIMPLEMENTED();
+}
+extern "C" size_t MLIR_GetOpNumResultTypes(MLIR_OpHandle h) {
+    return fromHandle<mlir::Operation>(h)->getNumResults();
+}
+extern "C" MLIR_TypeHandle MLIR_GetOpResult_type(MLIR_OpHandle, size_t) {
+    UNIMPLEMENTED();
+}
+extern "C" size_t MLIR_GetOpNumAttributes(MLIR_OpHandle h) {
+    return fromHandle<mlir::Operation>(h)->getAttrs().size();
+}
+extern "C" MLIR_AttributeHandle MLIR_GetOpAttribute(MLIR_OpHandle, size_t) {
+    UNIMPLEMENTED();
+}
+extern "C" size_t MLIR_GetOpNumRegions(MLIR_OpHandle h) {
+    return fromHandle<mlir::Operation>(h)->getNumRegions();
+}
+extern "C" MLIR_RegionHandle MLIR_GetOpRegion(MLIR_OpHandle h, size_t i) {
+    return toHandle(&fromHandle<mlir::Operation>(h)->getRegion(i));
 }
 
-size_t MLIR_GetBlockNumOps(const MLIR_Block *block) {
-    const Block *cppBlock = reinterpret_cast<const Block *>(block);
-    return cppBlock->getOperations().size();
+// -----------------------------------------------------------------------------
+// Region accessors
+// -----------------------------------------------------------------------------
+
+extern "C" size_t MLIR_GetRegionNumBlocks(MLIR_RegionHandle h) {
+    auto *region = fromHandle<mlir::Region>(h);
+    size_t n = 0;
+    for (auto it = region->begin(); it != region->end(); ++it) ++n;
+    return n;
+}
+extern "C" MLIR_BlockHandle MLIR_GetRegionBlock(MLIR_RegionHandle h, size_t i) {
+    auto *region = fromHandle<mlir::Region>(h);
+    auto it = region->begin();
+    for (size_t k = 0; k < i; k++) ++it;
+    return toHandle(&*it);
 }
 
-MLIR_Op *MLIR_GetBlockOp(const MLIR_Block *block, size_t idx) {
-    Block *cppBlock = const_cast<Block *>(reinterpret_cast<const Block *>(block));
-    auto it = cppBlock->begin();
-    std::advance(it, idx);
-    return reinterpret_cast<MLIR_Op *>(&*it);
+// -----------------------------------------------------------------------------
+// Block accessors
+// -----------------------------------------------------------------------------
+
+extern "C" size_t MLIR_GetBlockNumOps(MLIR_BlockHandle h) {
+    auto *block = fromHandle<mlir::Block>(h);
+    size_t n = 0;
+    for (auto &op : *block) { (void)op; ++n; }
+    return n;
+}
+extern "C" MLIR_OpHandle MLIR_GetBlockOp(MLIR_BlockHandle h, size_t i) {
+    auto *block = fromHandle<mlir::Block>(h);
+    auto it = block->begin();
+    for (size_t k = 0; k < i; k++) ++it;
+    return toHandle(&*it);
+}
+extern "C" size_t MLIR_GetBlockNumArgs(MLIR_BlockHandle h) {
+    return fromHandle<mlir::Block>(h)->getNumArguments();
+}
+extern "C" MLIR_ValueHandle MLIR_GetBlockArg(MLIR_BlockHandle, size_t) {
+    UNIMPLEMENTED();
 }
 
-MLIR_OpType mlir_operation_get_type(const MLIR_Op *op) {
-    const Operation *cppOp = reinterpret_cast<const Operation *>(op);
-    auto it = gMLIR_OpTypeMap.find(cppOp);
-    if (it != gMLIR_OpTypeMap.end())
-        return it->second;
-    return OP_TYPE_UNREGISTERED;
+// -----------------------------------------------------------------------------
+// Stubs — value/type/attribute surfaces are not exercised by the minimal driver
+// -----------------------------------------------------------------------------
+
+extern "C" MLIR_ValueHandle MLIR_CreateValueBlockArg(MLIR_Context *, string,
+                                                     uint32_t, MLIR_TypeHandle,
+                                                     MLIR_LocationHandle) {
+    UNIMPLEMENTED();
+}
+extern "C" MLIR_ValueHandle MLIR_CreateValueOpResult(MLIR_Context *, MLIR_OpHandle,
+                                                     uint32_t, MLIR_TypeHandle,
+                                                     string, MLIR_LocationHandle) {
+    UNIMPLEMENTED();
+}
+extern "C" MLIR_ValueKind MLIR_GetValueKind(MLIR_ValueHandle) { UNIMPLEMENTED(); }
+extern "C" MLIR_TypeHandle MLIR_GetValueType(MLIR_ValueHandle) { UNIMPLEMENTED(); }
+extern "C" string MLIR_GetValueRegisterName(MLIR_ValueHandle) { UNIMPLEMENTED(); }
+extern "C" uint32_t MLIR_GetValueResultIndex(MLIR_ValueHandle) { UNIMPLEMENTED(); }
+extern "C" MLIR_OpHandle MLIR_GetValueDefiningOp(MLIR_ValueHandle) { UNIMPLEMENTED(); }
+
+extern "C" string MLIR_GetTypeString(MLIR_Context *, MLIR_TypeHandle) { UNIMPLEMENTED(); }
+
+// MLIR_OpTypeToString is provided by mlir_op_names.c and shared with the
+// native impl, so we don't redefine it here. (Linked via mlir_op_names.c.)
+extern "C" string MLIR_MLIR_OpTypeToString(MLIR_OpType type) {
+    return op_type_to_string(type);
 }
 
-size_t mlir_operation_num_regions(const MLIR_Op *op) {
-    const Operation *cppOp = reinterpret_cast<const Operation *>(op);
-    return cppOp->getNumRegions();
+extern "C" size_t MLIR_GetAttributeArraySize(MLIR_AttributeHandle) { UNIMPLEMENTED(); }
+extern "C" MLIR_AttributeHandle MLIR_GetAttributeArrayElement(MLIR_AttributeHandle, size_t) { UNIMPLEMENTED(); }
+extern "C" size_t MLIR_GetAttributeDictSize(MLIR_AttributeHandle) { UNIMPLEMENTED(); }
+extern "C" MLIR_AttributeHandle MLIR_GetAttributeDictElement(MLIR_AttributeHandle, size_t) { UNIMPLEMENTED(); }
+extern "C" int64_t MLIR_GetAttributeInteger(MLIR_AttributeHandle) { UNIMPLEMENTED(); }
+extern "C" MLIR_AttrKind MLIR_GetAttributeKind(MLIR_AttributeHandle) { UNIMPLEMENTED(); }
+extern "C" string MLIR_GetAttributeName(MLIR_AttributeHandle) { UNIMPLEMENTED(); }
+extern "C" string MLIR_GetAttributeString(MLIR_AttributeHandle) { UNIMPLEMENTED(); }
+
+// Location-map helpers — printer doesn't use them in the minimal path.
+extern "C" size_t MLIR_GetLocationMapSize(const MLIR_LocationMap *) { return 0; }
+extern "C" size_t MLIR_CollectLocationMap(const MLIR_LocationMap *, string *,
+                                           MLIR_LocationHandle *, size_t) {
+    return 0;
 }
 
-MLIR_Region *mlir_operation_get_region(const MLIR_Op *op, size_t idx) {
-    Operation *cppOp = const_cast<Operation *>(reinterpret_cast<const Operation *>(op));
-    return reinterpret_cast<MLIR_Region *>(&cppOp->getRegion(idx));
+// Hosted entry point: defer to app_main() defined in driver.c.
+extern "C" int app_main(void);
+extern "C" void platform_init(int argc, char **argv);
+int main(int /*argc*/, char ** /*argv*/) {
+    platform_init(0, nullptr);
+    return app_main();
 }
-
-MLIR_Location *mlir_location_create(Arena *arena) {
-    (void)arena;
-    return nullptr;
-}
-
-void mlir_location_set_kind(MLIR_Location *loc, MLIR_LocationKind kind) {
-    (void)loc;
-    (void)kind;
-}
-
-void mlir_location_set_original_text(MLIR_Location *loc, string text) {
-    (void)loc;
-    (void)text;
-}
-
-void mlir_location_set_file_data(MLIR_Location *loc, string filename, int line, int column) {
-    (void)loc;
-    (void)filename;
-    (void)line;
-    (void)column;
-}
-
-void mlir_location_set_name_data(MLIR_Location *loc, string name) {
-    (void)loc;
-    (void)name;
-}
-
-void mlir_location_set_ref_id(MLIR_Location *loc, int ref_id) {
-    (void)loc;
-    (void)ref_id;
-}
-
-void mlir_value_set_location(MLIR_Value *value, MLIR_Location *loc) {
-    (void)value;
-    (void)loc;
-}
-
-void mlir_value_set_divisibility(MLIR_Value *value, bool has_value, int64_t div_value, MLIR_Type *type) {
-    (void)value;
-    (void)has_value;
-    (void)div_value;
-    (void)type;
-}
-
-void mlir_value_set_max_divisibility(MLIR_Value *value, bool has_value, int64_t div_value, MLIR_Type *type) {
-    (void)value;
-    (void)has_value;
-    (void)div_value;
-    (void)type;
-}
-
-#ifdef __cplusplus
-} // extern "C"
-#endif

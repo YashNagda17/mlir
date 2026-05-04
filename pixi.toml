@@ -37,6 +37,7 @@ clang \
     -Os \
     -nostdlib \
     -nostdinc \
+    -DCOREC_FREESTANDING \
     -fno-builtin \
     -I corec \
     -I corec-stdlib/stdlib \
@@ -53,6 +54,7 @@ clang \
     mlir_generic_printer.c \
     op_parsers.c \
     mlir_api_impl.c \
+    mlir_op_names.c \
     corec-stdlib/stdlib/stdio.c \
     corec-stdlib/stdlib/stdlib.c \
     corec-stdlib/stdlib/printf.c \
@@ -75,7 +77,7 @@ clang \
     "mlir_classic_printer.c", "mlir_classic_printer.h",
     "mlir_generic_printer.c", "mlir_generic_printer.h",
     "op_parsers.c", "op_parsers.h",
-    "mlir_api_impl.c", "mlir_api.h",
+    "mlir_api_impl.c", "mlir_op_names.c", "mlir_op_names.h", "mlir_api.h",
     "corec-stdlib/stdlib/**/*.c", "corec-stdlib/stdlib/**/*.h",
     "corec/base/**/*.c", "corec/base/**/*.h",
     "corec/platform/platform_wasm.c", "corec/platform/platform.h",
@@ -96,6 +98,7 @@ build_linux = { cmd = """
 clang \
     -nostdlib \
     -nostdinc \
+    -DCOREC_FREESTANDING \
     -fno-builtin \
     -I corec \
     -I corec-stdlib/stdlib \
@@ -108,6 +111,7 @@ clang \
     mlir_generic_printer.c \
     op_parsers.c \
     mlir_api_impl.c \
+    mlir_op_names.c \
     corec-stdlib/stdlib/stdio.c \
     corec-stdlib/stdlib/stdlib.c \
     corec-stdlib/stdlib/printf.c \
@@ -140,6 +144,7 @@ clang \
     -g \
     -nostdlib \
     -nostdinc \
+    -DCOREC_FREESTANDING \
     -fno-builtin \
     -I corec \
     -I corec-stdlib/stdlib \
@@ -152,6 +157,7 @@ clang \
     mlir_generic_printer.c \
     op_parsers.c \
     mlir_api_impl.c \
+    mlir_op_names.c \
     corec-stdlib/stdlib/stdio.c \
     corec-stdlib/stdlib/stdlib.c \
     corec-stdlib/stdlib/printf.c \
@@ -174,6 +180,43 @@ clang \
 
 test_macos = { cmd = "./parser --construct && python run_tests.py -s", depends-on = ["build_macos"], description = "Run mlir test suite (macOS)" }
 
+build_cross_native_macos = { cmd = """
+clang \
+    -g \
+    -nostdlib \
+    -nostdinc \
+    -DCOREC_FREESTANDING \
+    -fno-builtin \
+    -I corec \
+    -I corec-stdlib/stdlib \
+    -I . \
+    -o cross_native \
+    tests/cross/driver.c \
+    mlir_generic_printer.c \
+    mlir_api_impl.c \
+    mlir_op_names.c \
+    corec-stdlib/stdlib/stdio.c \
+    corec-stdlib/stdlib/stdlib.c \
+    corec-stdlib/stdlib/printf.c \
+    corec-stdlib/stdlib/string_impl.c \
+    corec/base/io.c \
+    corec/base/buddy.c \
+    corec/base/arena.c \
+    corec/base/scratch.c \
+    corec/base/format.c \
+    corec/base/math.c \
+    corec/base/string.c \
+    corec/base/mem.c \
+    corec/base/numconv.c \
+    corec/base/assert.c \
+    corec/base/exit.c \
+    corec/platform/platform_macos.c \
+    -lSystem \
+    -Wl,-e,__start
+""", description = "Build cross-impl test driver (native, macOS)" }
+
+test_cross_native_macos = { cmd = "./cross_native > tests/cross/out_native.txt && diff tests/cross/expected.txt tests/cross/out_native.txt", depends-on = ["build_cross_native_macos"], description = "Run native cross-impl test driver and diff against reference" }
+
 #=============================================================================
 # Windows (MSVC)
 #=============================================================================
@@ -182,6 +225,7 @@ build_windows = { cmd = """
 cl \
     /nologo \
     /X \
+    /D"COREC_FREESTANDING" \
     /std:c11 \
     /Zc:preprocessor \
     /I"corec" \
@@ -198,6 +242,7 @@ cl \
     mlir_generic_printer.c \
     op_parsers.c \
     mlir_api_impl.c \
+    mlir_op_names.c \
     corec-stdlib/stdlib/stdio.c \
     corec-stdlib/stdlib/stdlib.c \
     corec-stdlib/stdlib/printf.c \
@@ -271,17 +316,20 @@ mlir = "*"
 cxx-compiler = "*"
 
 [feature.upstream.tasks]
-build_upstream = { cmd = """
-$CXX -c -std=c++17 -fno-rtti \
-    -I corec \
-    -I corec-stdlib/stdlib \
-    -I . \
-    -I "$CONDA_PREFIX/include" \
-    -o mlir_api_impl_upstream.o \
-    mlir_api_impl_upstream.cpp
-""", depends-on = ["tokenizer"], description = "Compile mlir_api_impl_upstream.cpp against upstream MLIR (compile-only)" }
+build_cross_upstream = { cmd = """
+COREC_C_FILES="corec/base/io.c corec/base/buddy.c corec/base/arena.c corec/base/scratch.c corec/base/format.c corec/base/math.c corec/base/string.c corec/base/mem.c corec/base/numconv.c corec/base/assert.c corec/base/exit.c corec/platform/platform_macos.c" && \
+PROJ_C_FILES="tests/cross/driver.c mlir_generic_printer.c mlir_op_names.c" && \
+$CC -c -g -I corec -I . $COREC_C_FILES $PROJ_C_FILES && \
+$CXX -c -std=c++17 -fno-rtti -g -I corec -I . -I "$CONDA_PREFIX/include" mlir_api_impl_upstream.cpp && \
+$CXX -g -o cross_upstream \
+    driver.o mlir_generic_printer.o mlir_op_names.o mlir_api_impl_upstream.o \
+    io.o buddy.o arena.o scratch.o format.o math.o string.o mem.o numconv.o assert.o exit.o platform_macos.o \
+    -L "$CONDA_PREFIX/lib" "$CONDA_PREFIX/lib/libMLIR.19.1.dylib" -lLLVM \
+    -Wl,-rpath,"$CONDA_PREFIX/lib"
+""", description = "Build cross-impl driver against upstream LLVM/MLIR" }
 
-test_upstream = { cmd = "echo upstream build OK", depends-on = ["build_upstream"], description = "Build the upstream MLIR bridge as a smoke test" }
+
+test_cross = { cmd = "./cross_upstream > tests/cross/out_upstream.txt && diff tests/cross/expected.txt tests/cross/out_upstream.txt", depends-on = ["build_cross_upstream"], description = "Run upstream cross-impl driver and diff against reference" }
 
 
 [environments]
