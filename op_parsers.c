@@ -3854,59 +3854,91 @@ OperationParserResult parse_func_func_op(Parser *parser, const OperationParserPa
         parser_next_token(parser);
     }
 
-    // Parse argument list
+    // Parse argument list (and collect arg types for the function_type)
     VecValue args;
     VecValue_reserve(parser->arena, &args, 8);
+    MLIR_TypeHandle *arg_types = arena_new_array(parser->arena, MLIR_TypeHandle, 16);
+    size_t n_arg_types = 0;
+    size_t cap_arg_types = 16;
     if (parser_peek(parser, TK_LPAREN)) {
         parser_expect(parser, TK_LPAREN);
         bool first = true;
-        string params_sig = str_lit("");
         while (!parser_peek(parser, TK_RPAREN) && !parser_peek(parser, TK_EOF)) {
             if (!first && parser_peek(parser, TK_COMMA)) parser_expect(parser, TK_COMMA);
             first = false;
+            MLIR_TypeHandle this_arg_ty = MLIR_INVALID_HANDLE;
             if (parser_peek(parser, TK_REGISTER)) {
                 string reg = parser_token_str(parser);
                 parser_expect(parser, TK_REGISTER);
                 // Optional type annotation
-                MLIR_TypeHandle ty = MLIR_INVALID_HANDLE;
                 if (parser_peek(parser, TK_COLON)) {
                     parser_expect(parser, TK_COLON);
                     string t = str_lit("");
                     if (parse_type_string(parser, &t)) {
-                        ty = mlir_type_create_from_string(parser->ctx, t);
+                        this_arg_ty = mlir_type_create_from_string(parser->ctx, t);
                     }
                 }
-                MLIR_ValueHandle arg = MLIR_CreateValueBlockArg(parser->ctx, reg, 0, ty, MLIR_INVALID_HANDLE);
+                MLIR_ValueHandle arg = MLIR_CreateValueBlockArg(parser->ctx, reg, 0, this_arg_ty, MLIR_INVALID_HANDLE);
                 VecValue_push_back(parser->arena, &args, arg);
             } else if (parser_peek(parser, TK_NAME) || parser_peek(parser, TK_NAME_DOT_NAME) || parser_peek(parser, TK_EXCLAMATION)) {
                 // Type-only argument in declaration form
                 string t = str_lit("");
                 if (parse_type_string(parser, &t)) {
-                    if (params_sig.size > 0) params_sig = str_concat(parser->arena, params_sig, str_lit(", "));
-                    params_sig = str_concat(parser->arena, params_sig, t);
+                    this_arg_ty = mlir_type_create_from_string(parser->ctx, t);
                 } else {
                     parser_next_token(parser);
                 }
             } else {
                 parser_next_token(parser);
             }
+            if (this_arg_ty != MLIR_INVALID_HANDLE) {
+                if (n_arg_types == cap_arg_types) {
+                    size_t new_cap = cap_arg_types * 2;
+                    MLIR_TypeHandle *new_arr = arena_new_array(parser->arena, MLIR_TypeHandle, new_cap);
+                    for (size_t i = 0; i < n_arg_types; i++) new_arr[i] = arg_types[i];
+                    arg_types = new_arr;
+                    cap_arg_types = new_cap;
+                }
+                arg_types[n_arg_types++] = this_arg_ty;
+            }
         }
         parser_expect(parser, TK_RPAREN);
-        if (params_sig.size > 0) {
-            append_attr(parser, &attrs, &n_attrs, &cap_attrs, create_string_attr(parser, str_lit("params_sig"), params_sig));
-        }
     }
 
-    // Optional return type sequence after '->' (capture text conservatively)
-    string ret_sig = str_lit("");
+    // Optional return type sequence after '->': either a single type or a
+    // parenthesized comma-separated list of types.
+    MLIR_TypeHandle *ret_types = arena_new_array(parser->arena, MLIR_TypeHandle, 4);
+    size_t n_ret_types = 0;
+    size_t cap_ret_types = 4;
     if (parser_peek(parser, TK_ARROW)) {
         parser_expect(parser, TK_ARROW);
-        // Capture until '{' or loc
-        while (!(parser_peek(parser, TK_LBRACE_END) || parser_peek(parser, TK_EOF))) {
+        bool parens = parser_peek(parser, TK_LPAREN);
+        if (parens) parser_expect(parser, TK_LPAREN);
+        bool first_ret = true;
+        while (!(parser_peek(parser, TK_LBRACE_END) || parser_peek(parser, TK_EOF))
+                && !(parens && parser_peek(parser, TK_RPAREN))) {
             if (parser_peek(parser, TK_NAME) && str_eq(parser_token_str(parser), str_lit("loc"))) break;
-            ret_sig = str_concat(parser->arena, ret_sig, parser_token_str(parser));
-            parser_next_token(parser);
+            if (!first_ret && parser_peek(parser, TK_COMMA)) {
+                parser_expect(parser, TK_COMMA);
+            }
+            first_ret = false;
+            string t = str_lit("");
+            if (parse_type_string(parser, &t)) {
+                MLIR_TypeHandle th = mlir_type_create_from_string(parser->ctx, t);
+                if (n_ret_types == cap_ret_types) {
+                    size_t new_cap = cap_ret_types * 2;
+                    MLIR_TypeHandle *new_arr = arena_new_array(parser->arena, MLIR_TypeHandle, new_cap);
+                    for (size_t i = 0; i < n_ret_types; i++) new_arr[i] = ret_types[i];
+                    ret_types = new_arr;
+                    cap_ret_types = new_cap;
+                }
+                ret_types[n_ret_types++] = th;
+            } else {
+                // Unrecognized token; bail out to avoid an infinite loop.
+                break;
+            }
         }
+        if (parens && parser_peek(parser, TK_RPAREN)) parser_expect(parser, TK_RPAREN);
     }
 
     // Parse optional body region (definition) or leave as declaration
@@ -3917,12 +3949,28 @@ OperationParserResult parse_func_func_op(Parser *parser, const OperationParserPa
         regions = arena_new_array(parser->arena, MLIR_RegionHandle, 1);
         regions[0] = region;
         n_regions = 1;
+        // Attach the function header's arguments to the entry block, unless
+        // the body already declared its own (^bb0(...) form).
+        if (region && MLIR_GetRegionNumBlocks(region) > 0 && args.size > 0) {
+            MLIR_BlockHandle entry = MLIR_GetRegionBlock(region, 0);
+            if (entry && MLIR_GetBlockNumArgs(entry) == 0) {
+                for (size_t i = 0; i < args.size; i++) {
+                    MLIR_AppendBlockArg(parser->ctx, entry, args.data[i]);
+                }
+            }
+        }
     }
 
     // Store attributes for classic printing
     if (visibility.size > 0) append_attr(parser, &attrs, &n_attrs, &cap_attrs, create_string_attr(parser, str_lit("visibility"), visibility));
     if (fname.size > 0) append_attr(parser, &attrs, &n_attrs, &cap_attrs, create_string_attr(parser, str_lit("sym_name"), fname));
-    if (ret_sig.size > 0) append_attr(parser, &attrs, &n_attrs, &cap_attrs, create_string_attr(parser, str_lit("ret"), ret_sig));
+    {
+        MLIR_TypeHandle func_type = MLIR_CreateTypeFunction(parser->ctx,
+                                                              arg_types, n_arg_types,
+                                                              ret_types, n_ret_types);
+        append_attr(parser, &attrs, &n_attrs, &cap_attrs,
+                    MLIR_CreateAttributeType(parser->ctx, str_lit("function_type"), func_type));
+    }
 
     // Parse additional attributes, result types, and location
     MLIR_TypeHandle *result_types = MLIR_INVALID_HANDLE;

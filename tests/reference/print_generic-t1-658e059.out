@@ -1,7 +1,7 @@
 module() {
 ^bb0:
-    func.func() {sym_name = "@matrix_add", ret = "memref<10x20xf32>"} {
-    ^bb0:
+    func.func() {sym_name = "@matrix_add", function_type = (memref<10x20xf32>, memref<10x20xf32>) -> memref<10x20xf32>} {
+    ^bb0(%arg0: memref<10x20xf32>, %arg1: memref<10x20xf32>):
         %result = memref.alloc() -> memref<10x20xf32>
         affine.for() {
         ^bb0(%arg0: index):

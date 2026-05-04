@@ -241,6 +241,15 @@ static string print_operation_internal(PrintCtx *ctx, int indent_level, MLIR_OpH
                         result = str_concat(arena, result, str_lit("}"));
                         break;
                     }
+                    case MLIR_ATTR_KIND_TYPE: {
+                        MLIR_TypeHandle wrapped = MLIR_GetAttributeTypeValue(attr);
+                        if (wrapped) {
+                            result = str_concat(arena, result, MLIR_GetTypeString(ctx->mlir_ctx, wrapped));
+                        } else {
+                            result = str_concat(arena, result, str_lit("..."));
+                        }
+                        break;
+                    }
                     default:
                         result = str_concat(arena, result, str_lit("..."));
                 }

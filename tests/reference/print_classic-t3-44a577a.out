@@ -1,5 +1,5 @@
 module {
-  func.func @avg() -> memref<10x20xf32> {
+  func.func @avg(%arg0: memref<10x20xf32>, %arg1: memref<10x20xf32>) -> memref<10x20xf32> {
     %alloc = memref.alloc : memref<10x20xf32>
     %c0 = arith.constant 0 : index
     %c10 = arith.constant 10 : index

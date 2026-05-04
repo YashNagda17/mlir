@@ -60,6 +60,12 @@ typedef struct IR_Type {
             uint32_t address_space;
             bool has_address_space;
         } pointer;
+        struct {
+            MLIR_TypeHandle *inputs;
+            size_t n_inputs;
+            MLIR_TypeHandle *results;
+            size_t n_results;
+        } function;
     } data;
 } IR_Type;
 
@@ -70,7 +76,8 @@ typedef struct IR_Attribute {
         ATTR_KIND_STRING,
         ATTR_KIND_BOOL,
         ATTR_KIND_ARRAY,
-        ATTR_KIND_DICT
+        ATTR_KIND_DICT,
+        ATTR_KIND_TYPE
     } kind;
     union {
         int64_t integer_value;
@@ -81,6 +88,7 @@ typedef struct IR_Attribute {
             MLIR_AttributeHandle *elements;
             size_t count;
         } array;
+        MLIR_TypeHandle type_value;
     } data;
     string name;
     // MLIR type of the attribute's value. Required for ATTR_KIND_INTEGER
@@ -522,8 +530,28 @@ string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle th) {
         }
         case TYPE_KIND_INDEX:
             return str_lit("index");
-        case TYPE_KIND_FUNCTION:
-            return str_lit("function");
+        case TYPE_KIND_FUNCTION: {
+            string in_str = str_lit("");
+            for (size_t i = 0; i < type->data.function.n_inputs; i++) {
+                if (i > 0) in_str = str_concat(arena, in_str, str_lit(", "));
+                in_str = str_concat(arena, in_str,
+                                    MLIR_GetTypeString(ctx, type->data.function.inputs[i]));
+            }
+            string out_str = str_lit("");
+            size_t nr = type->data.function.n_results;
+            if (nr == 1) {
+                out_str = MLIR_GetTypeString(ctx, type->data.function.results[0]);
+            } else {
+                string body = str_lit("");
+                for (size_t i = 0; i < nr; i++) {
+                    if (i > 0) body = str_concat(arena, body, str_lit(", "));
+                    body = str_concat(arena, body,
+                                      MLIR_GetTypeString(ctx, type->data.function.results[i]));
+                }
+                out_str = format(arena, str_lit("({})"), body);
+            }
+            return format(arena, str_lit("({}) -> {}"), in_str, out_str);
+        }
         default:
             return str_lit("unknown");
     }
@@ -600,6 +628,57 @@ MLIR_TypeHandle MLIR_CreateTypePointer(MLIR_Context *ctx, MLIR_TypeHandle elemen
     return alloc_type(ctx, t);
 }
 
+MLIR_TypeHandle MLIR_CreateTypeFunction(MLIR_Context *ctx,
+                                         const MLIR_TypeHandle *inputs, size_t n_inputs,
+                                         const MLIR_TypeHandle *results, size_t n_results) {
+    IR_Type t = {0};
+    t.kind = TYPE_KIND_FUNCTION;
+    if (ctx && ctx->arena) {
+        if (n_inputs > 0 && inputs) {
+            t.data.function.inputs = arena_new_array(ctx->arena, MLIR_TypeHandle, n_inputs);
+            for (size_t i = 0; i < n_inputs; i++) t.data.function.inputs[i] = inputs[i];
+            t.data.function.n_inputs = n_inputs;
+        }
+        if (n_results > 0 && results) {
+            t.data.function.results = arena_new_array(ctx->arena, MLIR_TypeHandle, n_results);
+            for (size_t i = 0; i < n_results; i++) t.data.function.results[i] = results[i];
+            t.data.function.n_results = n_results;
+        }
+    }
+    return alloc_type(ctx, t);
+}
+
+bool MLIR_IsTypeFunction(MLIR_TypeHandle th) {
+    IR_Type *t = resolve_type(th);
+    return t && t->kind == TYPE_KIND_FUNCTION;
+}
+
+size_t MLIR_GetTypeFunctionNumInputs(MLIR_TypeHandle th) {
+    IR_Type *t = resolve_type(th);
+    if (!t || t->kind != TYPE_KIND_FUNCTION) return 0;
+    return t->data.function.n_inputs;
+}
+
+MLIR_TypeHandle MLIR_GetTypeFunctionInput(MLIR_TypeHandle th, size_t idx) {
+    IR_Type *t = resolve_type(th);
+    if (!t || t->kind != TYPE_KIND_FUNCTION) return MLIR_INVALID_HANDLE;
+    if (idx >= t->data.function.n_inputs || !t->data.function.inputs) return MLIR_INVALID_HANDLE;
+    return t->data.function.inputs[idx];
+}
+
+size_t MLIR_GetTypeFunctionNumResults(MLIR_TypeHandle th) {
+    IR_Type *t = resolve_type(th);
+    if (!t || t->kind != TYPE_KIND_FUNCTION) return 0;
+    return t->data.function.n_results;
+}
+
+MLIR_TypeHandle MLIR_GetTypeFunctionResult(MLIR_TypeHandle th, size_t idx) {
+    IR_Type *t = resolve_type(th);
+    if (!t || t->kind != TYPE_KIND_FUNCTION) return MLIR_INVALID_HANDLE;
+    if (idx >= t->data.function.n_results || !t->data.function.results) return MLIR_INVALID_HANDLE;
+    return t->data.function.results[idx];
+}
+
 void MLIR_SetTypeIntegerProperties(MLIR_TypeHandle th, uint32_t width, bool is_signed) {
     IR_Type *t = resolve_type(th);
     if (!t) return;
@@ -666,6 +745,14 @@ MLIR_AttributeHandle MLIR_CreateAttributeDict(MLIR_Context *ctx, string name, ML
     a.name = name;
     a.data.array.elements = elements;
     a.data.array.count = count;
+    return alloc_attr_obj(ctx, a);
+}
+
+MLIR_AttributeHandle MLIR_CreateAttributeType(MLIR_Context *ctx, string name, MLIR_TypeHandle type) {
+    IR_Attribute a = {0};
+    a.kind = ATTR_KIND_TYPE;
+    a.name = name;
+    a.data.type_value = type;
     return alloc_attr_obj(ctx, a);
 }
 
@@ -738,6 +825,7 @@ MLIR_AttrKind MLIR_GetAttributeKind(MLIR_AttributeHandle ah) {
         case ATTR_KIND_BOOL:    return MLIR_ATTR_KIND_BOOL;
         case ATTR_KIND_ARRAY:   return MLIR_ATTR_KIND_ARRAY;
         case ATTR_KIND_DICT:    return MLIR_ATTR_KIND_DICT;
+        case ATTR_KIND_TYPE:    return MLIR_ATTR_KIND_TYPE;
         default:                return MLIR_ATTR_KIND_DICT;
     }
 }
@@ -795,6 +883,12 @@ MLIR_AttributeHandle MLIR_GetAttributeDictElement(MLIR_AttributeHandle ah, size_
     IR_Attribute *attr = resolve_attr(ah);
     if (!attr || idx >= attr->data.array.count) return MLIR_INVALID_HANDLE;
     return attr->data.array.elements[idx];
+}
+
+MLIR_TypeHandle MLIR_GetAttributeTypeValue(MLIR_AttributeHandle ah) {
+    IR_Attribute *attr = resolve_attr(ah);
+    if (!attr || attr->kind != ATTR_KIND_TYPE) return MLIR_INVALID_HANDLE;
+    return attr->data.type_value;
 }
 
 // Value accessors
