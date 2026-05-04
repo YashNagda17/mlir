@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Run the MLIR test suite using parser_upstream in place of parser.
-# parser is restored on exit. Many tests are expected to fail because the
-# upstream MLIR backend can't fully represent everything our native impl
-# does (comments, register names, ref locations, ...).
+# Run the full MLIR test suite using parser_upstream in place of parser.
+# Tests marked `upstream_strict = true` in tests/tests.toml are diffed
+# against the native reference (must match exactly). All other tests
+# are smoke-tested: parser_upstream must parse them without error, but
+# output is not compared (since the upstream backend cannot represent
+# everything our native impl does — comments, register names, etc.).
 
 set -u
 cd "$(dirname "$0")/.."
@@ -22,5 +24,4 @@ if [ -e parser ]; then
 fi
 cp parser_upstream parser
 
-set +e
-python run_tests.py -s
+python run_tests.py -s --upstream

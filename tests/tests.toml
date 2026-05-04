@@ -2,6 +2,7 @@
 filename = "a.mlir"
 print_generic = true
 print_classic = true
+upstream_strict = true
 
 [[test]]
 filename = "b.mlir"

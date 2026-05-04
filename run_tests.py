@@ -17,10 +17,22 @@ def run_cmd(cmd, cwd=None):
         print("Command failed.")
         exit(1)
 
+def run_smoke(filename, mode, cmd):
+    """Run parser as a smoke test: succeed iff exit code is 0; output is discarded."""
+    infile = os.path.join("tests", filename)
+    full = cmd.replace("{infile}", infile).replace("{outfile}", os.devnull)
+    log.debug(f"+ {full}")
+    rc = sp.run(full, shell=True, stdout=sp.DEVNULL, stderr=sp.PIPE).returncode
+    if rc != 0:
+        log.error(f"{color(fg.red)}SMOKE FAIL{color(fg.reset)} {mode} {filename} (exit {rc})")
+        sys.exit(1)
+    log.debug(f"{color(fg.green)}smoke ok{color(fg.reset)} {mode} {filename}")
+
+
 def single_test(test: Dict, verbose: bool, no_llvm: bool, skip_run_with_dbg: bool,
                 update_reference: bool, verify_hash: bool,
                 no_color: bool, specific_backends=None,
-                excluded_backends=None) -> None:
+                excluded_backends=None, is_upstream: bool = False) -> None:
     def is_included(backend):
         return test.get(backend, False) \
             and (specific_backends is None or backend in specific_backends) \
@@ -125,35 +137,56 @@ def single_test(test: Dict, verbose: bool, no_llvm: bool, skip_run_with_dbg: boo
 
     extra_args = ""
 
+    # Upstream-MLIR mode (idea 5+6): tests not marked `upstream_strict = true`
+    # are smoke-tested only — we just verify parser_upstream parses the file
+    # without errors. Tests with `upstream_strict = true` are expected to
+    # produce output identical to the native parser and are diffed against
+    # the native reference exactly like in native mode.
+    smoke_only = is_upstream and not test.get("upstream_strict", False)
+
     if print_generic:
-        run_test(
-            filename,
-            "print_generic",
-            "./parser {infile} > {outfile}",
-            filename,
-            update_reference,
-            verify_hash,
-            extra_args)
+        if smoke_only:
+            run_smoke(filename, "print_generic", "./parser {infile} > {outfile}")
+        else:
+            run_test(
+                filename,
+                "print_generic",
+                "./parser {infile} > {outfile}",
+                filename,
+                update_reference,
+                verify_hash,
+                extra_args)
 
     if print_classic:
-        run_test(
-            filename,
-            "print_classic",
-            "./parser {infile} --classic > {outfile}",
-            filename,
-            update_reference,
-            verify_hash,
-            extra_args)
+        if smoke_only:
+            run_smoke(filename, "print_classic",
+                      "./parser {infile} --classic > {outfile}")
+        else:
+            run_test(
+                filename,
+                "print_classic",
+                "./parser {infile} --classic > {outfile}",
+                filename,
+                update_reference,
+                verify_hash,
+                extra_args)
 
     if check_classic:
-        run_test(
-            filename,
-            "check_classic",
-            "./parser {infile} --classic > {infile}2 && diff {infile} {infile}2",
-            filename,
-            update_reference,
-            verify_hash,
-            extra_args)
+        if smoke_only:
+            # In smoke mode skip the diff-against-input step (upstream's
+            # classic printer is not byte-identical to the input). Just
+            # verify --classic exits 0.
+            run_smoke(filename, "check_classic",
+                      "./parser {infile} --classic > {outfile}")
+        else:
+            run_test(
+                filename,
+                "check_classic",
+                "./parser {infile} --classic > {infile}2 && diff {infile} {infile}2",
+                filename,
+                update_reference,
+                verify_hash,
+                extra_args)
 
 if __name__ == "__main__":
     tester_main("MLIR", single_test)
