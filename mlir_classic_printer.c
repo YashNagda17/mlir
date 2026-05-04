@@ -439,7 +439,7 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
         }
         func_signature_from_op(ctx->mlir_ctx, op, &params, &ret);
         if (vis.size>0) { header = str_concat(arena, header, vis); header = str_concat(arena, header, str_lit(" ")); }
-        if (name.size>0) { header = str_concat(arena, header, name); }
+        if (name.size>0) { header = str_concat(arena, header, str_lit("@")); header = str_concat(arena, header, name); }
         header = str_concat(arena, header, str_lit("(")); if (params.size>0) header = str_concat(arena, header, params); header = str_concat(arena, header, str_lit(")"));
         if (ret.size>0) { header = str_concat(arena, header, str_lit(" -> ")); header = str_concat(arena, header, ret); }
 
@@ -810,7 +810,7 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             }
             func_signature_from_op(ctx->mlir_ctx, op, &params, &ret);
             if (vis.size>0) { header = str_concat(arena, header, vis); header = str_concat(arena, header, str_lit(" ")); }
-            if (name.size>0) { header = str_concat(arena, header, name); }
+            if (name.size>0) { header = str_concat(arena, header, str_lit("@")); header = str_concat(arena, header, name); }
             // Params
             header = str_concat(arena, header, str_lit("("));
             if (params.size>0) header = str_concat(arena, header, params);
@@ -1437,7 +1437,7 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 }
                 func_signature_from_op(ctx->mlir_ctx, op, &params, &ret);
                 if (vis.size>0) { header = str_concat(arena, header, str_lit(" ")); header = str_concat(arena, header, vis); }
-                if (name.size>0) { header = str_concat(arena, header, str_lit(" ")); header = str_concat(arena, header, name); }
+                if (name.size>0) { header = str_concat(arena, header, str_lit(" @")); header = str_concat(arena, header, name); }
                 header = str_concat(arena, header, str_lit("(")); if (params.size>0) header = str_concat(arena, header, params); header = str_concat(arena, header, str_lit(")"));
                 if (ret.size>0) { header = str_concat(arena, header, str_lit(" -> ")); header = str_concat(arena, header, ret); }
                 // Replace current line with indent + header

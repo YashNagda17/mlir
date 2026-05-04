@@ -834,6 +834,24 @@ OperationParserResult parse_memref_load_op(Parser *parser, const OperationParser
     // Parse result types (memref.load operations can have result types)
     parse_result_types(parser, &result_types, &n_result_types, &attributes, &n_attributes, &attributes_capacity, params->op_type, MLIR_INVALID_HANDLE);
 
+    // The trailing `: memref<NxMxELEM>` describes the source memref, not the
+    // result type. memref.load returns the element type. Extract ELEM from the
+    // memref type string.
+    if (n_result_types == 1) {
+        string ts = MLIR_GetTypeString(parser->ctx, result_types[0]);
+        if (ts.size > 7 && strncmp(ts.str, "memref<", 7) == 0 && ts.str[ts.size - 1] == '>') {
+            size_t end = ts.size - 1;
+            size_t last_x = 0;
+            for (size_t i = 7; i < end; i++) {
+                if (ts.str[i] == 'x') last_x = i;
+            }
+            if (last_x > 0) {
+                string elem = (string){ .str = ts.str + last_x + 1, .size = end - last_x - 1 };
+                result_types[0] = mlir_type_create_from_string(parser->ctx, elem);
+            }
+        }
+    }
+
     // Parse optional location
     MLIR_LocationHandle op_location = parse_optional_location(parser);
 
@@ -3848,6 +3866,11 @@ OperationParserResult parse_func_func_op(Parser *parser, const OperationParserPa
         }
         if (parser_peek(parser, TK_FUNCTION_NAME)) {
             fname = parser_token_str(parser);
+            // Strip leading '@' (token text is "@name")
+            if (fname.size > 0 && fname.str[0] == '@') {
+                fname.str += 1;
+                fname.size -= 1;
+            }
             parser_expect(parser, TK_FUNCTION_NAME);
             continue;
         }
