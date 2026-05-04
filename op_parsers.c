@@ -933,9 +933,16 @@ OperationParserResult parse_memref_store_op(Parser *parser, const OperationParse
     parse_angle_brace_attributes(parser, &attributes, &n_attributes, &attributes_capacity);
     parse_brace_attributes(parser, &attributes, &n_attributes, &attributes_capacity);
 
-    // Parse type information and location after colon (memref.store doesn't have result types)
+    // Parse type information and location after colon (memref.store doesn't have result types).
+    // Capture the first type as `_source_type` so the classic printer can roundtrip
+    // `memref.store %v, %m[i,j] : memref<...>`. The remaining tokens are skipped.
     if (parser_peek(parser, TK_COLON)) {
         parser_expect(parser, TK_COLON);
+        string source_type = (string){0};
+        if (parse_type_string(parser, &source_type) && source_type.size > 0) {
+            append_attr(parser, &attributes, &n_attributes, &attributes_capacity,
+                        create_string_attr(parser, str_lit("_source_type"), source_type));
+        }
         int angle = 0;
         while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) && !parser_peek(parser, TK_RBRACE)) {
             if (parser_peek(parser, TK_LANGLE)) angle++;

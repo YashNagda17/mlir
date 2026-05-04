@@ -1756,10 +1756,13 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 }
             }
             // Print type suffix in classic format
-            if (MLIR_GetOpType(op) == OP_TYPE_MEMREF_LOAD) {
-                // memref.load prints the source memref type, not the (element)
-                // result type. Look up the `_source_type` hidden attr stashed
-                // by the parser; fall back to operand 0's type if unavailable.
+            if (MLIR_GetOpType(op) == OP_TYPE_MEMREF_LOAD ||
+                MLIR_GetOpType(op) == OP_TYPE_MEMREF_STORE) {
+                // memref.load/store print only the source memref type (the
+                // canonical MLIR form), not all operand types. Look up the
+                // `_source_type` hidden attr stashed by the parser; fall back
+                // to the memref operand's type if unavailable. (memref operand
+                // is operand 0 for load, operand 1 for store.)
                 string src_type_str = (string){0};
                 for (size_t i = 0, n = MLIR_GetOpNumAttributes(op); i < n; i++) {
                     MLIR_AttributeHandle a = MLIR_GetOpAttribute(op, i);
@@ -1772,10 +1775,13 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 if (src_type_str.size > 0) {
                     result = str_concat(arena, result, str_lit(" : "));
                     result = str_concat(arena, result, src_type_str);
-                } else if (MLIR_GetOpNumOperands(op) > 0 && MLIR_GetOpOperand(op, 0) &&
-                           MLIR_GetValueType(MLIR_GetOpOperand(op, 0))) {
-                    result = str_concat(arena, result, str_lit(" : "));
-                    result = str_concat(arena, result, MLIR_GetTypeString(ctx->mlir_ctx, MLIR_GetValueType(MLIR_GetOpOperand(op, 0))));
+                } else {
+                    size_t memref_idx = (MLIR_GetOpType(op) == OP_TYPE_MEMREF_STORE) ? 1 : 0;
+                    if (MLIR_GetOpNumOperands(op) > memref_idx && MLIR_GetOpOperand(op, memref_idx) &&
+                        MLIR_GetValueType(MLIR_GetOpOperand(op, memref_idx))) {
+                        result = str_concat(arena, result, str_lit(" : "));
+                        result = str_concat(arena, result, MLIR_GetTypeString(ctx->mlir_ctx, MLIR_GetValueType(MLIR_GetOpOperand(op, memref_idx))));
+                    }
                 }
             } else if (MLIR_GetOpNumResultTypes(op) > 0 && MLIR_GetOpResult_type(op, 0)) {
                 result = str_concat(arena, result, str_lit(" : "));
