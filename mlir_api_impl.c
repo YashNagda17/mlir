@@ -83,8 +83,10 @@ typedef struct IR_Attribute {
         } array;
     } data;
     string name;
-    // Only meaningful for ATTR_KIND_INTEGER and ATTR_KIND_FLOAT (for now;
-    // will also apply to ATTR_KIND_DENSE_ELEMENTS when added).
+    // MLIR type of the attribute's value. Required for ATTR_KIND_INTEGER
+    // and ATTR_KIND_FLOAT (and will apply to ATTR_KIND_DENSE_ELEMENTS
+    // when added). For other kinds it is unused and must be
+    // MLIR_INVALID_HANDLE (the zero value, set by `IR_Attribute a = {0}`).
     MLIR_TypeHandle type;
 } IR_Attribute;
 
