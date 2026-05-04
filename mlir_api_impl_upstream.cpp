@@ -203,13 +203,6 @@ extern "C" void MLIR_AppendBlockArg(MLIR_Context *, MLIR_BlockHandle bh,
 // Op construction
 // -----------------------------------------------------------------------------
 
-// Per-op-name fixups that retype attributes and rebuild structural attributes
-// so that the resulting Operation parses, verifies and prints in pretty form.
-// Our parser stores attributes in a generic, untyped form (e.g. `value = 0 :
-// i64` for arith.constant, `ret = "memref<...>"` for func.func). Upstream's
-// pretty-form printers reject those, so we rewrite them here into what the
-// dialect actually expects (IntegerAttr typed to the result type, FunctionType
-// TypeAttr, etc.).
 extern "C" MLIR_OpHandle MLIR_CreateOp(
     MLIR_Context *, MLIR_OpType type, string opname,
     MLIR_AttributeHandle *attrs, size_t n_attrs,
