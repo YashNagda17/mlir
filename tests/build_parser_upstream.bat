@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 for /f "delims=" %%i in ('"%CONDA_PREFIX%\Library\bin\llvm-config.exe" --link-static --libs support core') do set LLVM_LIBS=%%i
 if errorlevel 1 exit /b 1
 
-set MLIR_LIBS=MLIRIR.lib MLIRSupport.lib
+set MLIR_LIBS=MLIRIR.lib MLIRSupport.lib MLIRArithDialect.lib MLIRFuncDialect.lib MLIRSCFDialect.lib MLIRControlFlowDialect.lib MLIRMemRefDialect.lib
 
 set COREC_C=corec\base\io.c corec\base\buddy.c corec\base\arena.c corec\base\scratch.c corec\base\format.c corec\base\math.c corec\base\string.c corec\base\mem.c corec\base\numconv.c corec\base\assert.c corec\base\exit.c
 set PROJ_C=parser.c tokenizer.c mlir_parser.c mlir_classic_printer.c mlir_generic_printer.c op_parsers.c mlir_op_names.c
