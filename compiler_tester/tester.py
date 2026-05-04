@@ -18,7 +18,25 @@ from typing import Any, Mapping, List, Union
 
 level = logging.DEBUG
 log = logging.getLogger(__name__)
-handler = logging.StreamHandler(sys.stdout)
+
+# On Windows the default stdout encoding is cp1252, which cannot encode the
+# Unicode characters we use for status (e.g. '\u2713'). Force UTF-8 so the
+# logging StreamHandler doesn't silently fail on these.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+# By default `logging` swallows exceptions raised by handlers (such as a
+# UnicodeEncodeError on Windows): it just prints "--- Logging error ---" to
+# stderr and continues. That means tests would appear to pass even when log
+# output is broken. Make logging exceptions fatal so CI catches such bugs.
+logging.raiseExceptions = True
+class _StrictStreamHandler(logging.StreamHandler):
+    def handleError(self, record):
+        raise
+
+handler = _StrictStreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter('%(message)s'))
 handler.setLevel(level)
 log.addHandler(handler)
