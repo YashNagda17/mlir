@@ -1,5 +1,5 @@
 module {
-  func.func @matrix_add() -> memref<10x20xf32> {
+  func.func @matrix_add(%arg0: memref<10x20xf32>, %arg1: memref<10x20xf32>) -> memref<10x20xf32> {
     %result = memref.alloc : memref<10x20xf32>
     affine.for {
     ^bb0(%arg0: index):

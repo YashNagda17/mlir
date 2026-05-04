@@ -453,6 +453,18 @@ extern "C" MLIR_TypeHandle MLIR_CreateTypeOpaque(MLIR_Context *, string name) {
     return typeH(mlir::OpaqueType::get(mlir::StringAttr::get(&ctx, "?"),
                                         llvm::StringRef(name.str, name.size)));
 }
+extern "C" MLIR_TypeHandle MLIR_CreateTypeFunction(MLIR_Context *,
+                                                    const MLIR_TypeHandle *inputs, size_t n_inputs,
+                                                    const MLIR_TypeHandle *results, size_t n_results) {
+    auto &ctx = globalCtx().mctx;
+    llvm::SmallVector<mlir::Type, 4> in;
+    in.reserve(n_inputs);
+    for (size_t i = 0; i < n_inputs; i++) in.push_back(typeF(inputs[i]));
+    llvm::SmallVector<mlir::Type, 4> out;
+    out.reserve(n_results);
+    for (size_t i = 0; i < n_results; i++) out.push_back(typeF(results[i]));
+    return typeH(mlir::FunctionType::get(&ctx, in, out));
+}
 extern "C" void MLIR_SetTypeIntegerProperties(MLIR_TypeHandle, uint32_t, bool) {}
 extern "C" void MLIR_SetTypeFloatProperties(MLIR_TypeHandle, uint32_t, bool) {}
 extern "C" void MLIR_SetTypeTensorProperties(MLIR_TypeHandle, const int64_t *, size_t, MLIR_TypeHandle) {}
@@ -472,6 +484,25 @@ extern "C" bool MLIR_IsTypeUnknown(MLIR_TypeHandle h) { return llvm::isa<mlir::N
 extern "C" bool MLIR_IsTypeOpaque(MLIR_TypeHandle h)  {
     auto opaq = llvm::dyn_cast<mlir::OpaqueType>(typeF(h));
     return opaq && opaq.getDialectNamespace() != "tt";
+}
+extern "C" bool MLIR_IsTypeFunction(MLIR_TypeHandle h) { return llvm::isa<mlir::FunctionType>(typeF(h)); }
+extern "C" size_t MLIR_GetTypeFunctionNumInputs(MLIR_TypeHandle h) {
+    auto ft = llvm::dyn_cast<mlir::FunctionType>(typeF(h));
+    return ft ? ft.getNumInputs() : 0;
+}
+extern "C" MLIR_TypeHandle MLIR_GetTypeFunctionInput(MLIR_TypeHandle h, size_t idx) {
+    auto ft = llvm::dyn_cast<mlir::FunctionType>(typeF(h));
+    if (!ft || idx >= ft.getNumInputs()) return MLIR_INVALID_HANDLE;
+    return typeH(ft.getInput(idx));
+}
+extern "C" size_t MLIR_GetTypeFunctionNumResults(MLIR_TypeHandle h) {
+    auto ft = llvm::dyn_cast<mlir::FunctionType>(typeF(h));
+    return ft ? ft.getNumResults() : 0;
+}
+extern "C" MLIR_TypeHandle MLIR_GetTypeFunctionResult(MLIR_TypeHandle h, size_t idx) {
+    auto ft = llvm::dyn_cast<mlir::FunctionType>(typeF(h));
+    if (!ft || idx >= ft.getNumResults()) return MLIR_INVALID_HANDLE;
+    return typeH(ft.getResult(idx));
 }
 
 extern "C" string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle h) {
@@ -544,6 +575,10 @@ extern "C" MLIR_AttributeHandle MLIR_CreateAttributeDict(MLIR_Context *, string 
     return makeNamedAttr(llvm::StringRef(name.str, name.size),
                          mlir::DictionaryAttr::get(&ctx, entries));
 }
+extern "C" MLIR_AttributeHandle MLIR_CreateAttributeType(MLIR_Context *, string name, MLIR_TypeHandle type) {
+    return makeNamedAttr(llvm::StringRef(name.str, name.size),
+                         mlir::TypeAttr::get(typeF(type)));
+}
 
 extern "C" MLIR_AttrKind MLIR_GetAttributeKind(MLIR_AttributeHandle h) {
     auto value = F<mlir::NamedAttribute>(h)->getValue();
@@ -553,6 +588,7 @@ extern "C" MLIR_AttrKind MLIR_GetAttributeKind(MLIR_AttributeHandle h) {
     if (llvm::isa<mlir::FloatAttr>(value))   return MLIR_ATTR_KIND_FLOAT;
     if (llvm::isa<mlir::ArrayAttr>(value))   return MLIR_ATTR_KIND_ARRAY;
     if (llvm::isa<mlir::DictionaryAttr>(value)) return MLIR_ATTR_KIND_DICT;
+    if (llvm::isa<mlir::TypeAttr>(value))    return MLIR_ATTR_KIND_TYPE;
     return MLIR_ATTR_KIND_STRING;
 }
 extern "C" string MLIR_GetAttributeName(MLIR_AttributeHandle h) {
@@ -568,6 +604,11 @@ extern "C" MLIR_TypeHandle MLIR_GetAttributeType(MLIR_AttributeHandle h) {
     auto attr = F<mlir::NamedAttribute>(h)->getValue();
     if (auto ia = llvm::dyn_cast<mlir::IntegerAttr>(attr)) return typeH(ia.getType());
     if (auto fa = llvm::dyn_cast<mlir::FloatAttr>(attr))   return typeH(fa.getType());
+    return MLIR_INVALID_HANDLE;
+}
+extern "C" MLIR_TypeHandle MLIR_GetAttributeTypeValue(MLIR_AttributeHandle h) {
+    auto attr = F<mlir::NamedAttribute>(h)->getValue();
+    if (auto ta = llvm::dyn_cast<mlir::TypeAttr>(attr)) return typeH(ta.getValue());
     return MLIR_INVALID_HANDLE;
 }
 extern "C" bool MLIR_GetAttributeBool(MLIR_AttributeHandle h) {

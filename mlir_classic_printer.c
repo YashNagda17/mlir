@@ -35,6 +35,74 @@ static int parse_bb_index(string lab) {
     return v;
 }
 
+// Extract (params, ret) text from an op's `function_type` TypeAttr, in the
+// form expected by the classic func.func header. If the op has a body, the
+// entry block's args are used (so the signature includes %arg names);
+// otherwise the function_type's input types are used directly.
+//   params = "%arg0: memref<...>, %arg1: memref<...>"  (or "memref<...>, ..." for decls)
+//   ret    = "i32" or "(i32, i32)" (single type or parenthesized list)
+static void func_signature_from_op(MLIR_Context *ctx, MLIR_OpHandle op,
+                                    string *params, string *ret) {
+    *params = str_lit("");
+    *ret = str_lit("");
+    Arena *arena = ctx->arena;
+
+    MLIR_TypeHandle ft = MLIR_INVALID_HANDLE;
+    size_t nattrs = MLIR_GetOpNumAttributes(op);
+    for (size_t i = 0; i < nattrs; i++) {
+        MLIR_AttributeHandle a = MLIR_GetOpAttribute(op, i);
+        if (str_eq(MLIR_GetAttributeName(a), str_lit("function_type")) &&
+            MLIR_GetAttributeKind(a) == MLIR_ATTR_KIND_TYPE) {
+            ft = MLIR_GetAttributeTypeValue(a);
+            break;
+        }
+    }
+    if (ft == MLIR_INVALID_HANDLE) return;
+
+    // Prefer entry-block args for params (so we print %argN: type).
+    bool used_block_args = false;
+    if (MLIR_GetOpNumRegions(op) > 0) {
+        MLIR_RegionHandle region = MLIR_GetOpRegion(op, 0);
+        if (region && MLIR_GetRegionNumBlocks(region) > 0) {
+            MLIR_BlockHandle entry = MLIR_GetRegionBlock(region, 0);
+            size_t na = MLIR_GetBlockNumArgs(entry);
+            if (na > 0) {
+                for (size_t k = 0; k < na; k++) {
+                    if (k > 0) *params = str_concat(arena, *params, str_lit(", "));
+                    MLIR_ValueHandle v = MLIR_GetBlockArg(entry, k);
+                    string nm = MLIR_GetValueRegisterName(v);
+                    MLIR_TypeHandle t = MLIR_GetValueType(v);
+                    *params = str_concat(arena, *params, nm);
+                    *params = str_concat(arena, *params, str_lit(": "));
+                    *params = str_concat(arena, *params, MLIR_GetTypeString(ctx, t));
+                }
+                used_block_args = true;
+            }
+        }
+    }
+    if (!used_block_args) {
+        size_t ni = MLIR_GetTypeFunctionNumInputs(ft);
+        for (size_t k = 0; k < ni; k++) {
+            if (k > 0) *params = str_concat(arena, *params, str_lit(", "));
+            *params = str_concat(arena, *params,
+                                  MLIR_GetTypeString(ctx, MLIR_GetTypeFunctionInput(ft, k)));
+        }
+    }
+
+    size_t nr = MLIR_GetTypeFunctionNumResults(ft);
+    if (nr == 1) {
+        *ret = MLIR_GetTypeString(ctx, MLIR_GetTypeFunctionResult(ft, 0));
+    } else if (nr > 1) {
+        string body = str_lit("");
+        for (size_t k = 0; k < nr; k++) {
+            if (k > 0) body = str_concat(arena, body, str_lit(", "));
+            body = str_concat(arena, body,
+                               MLIR_GetTypeString(ctx, MLIR_GetTypeFunctionResult(ft, k)));
+        }
+        *ret = format(arena, str_lit("({})"), body);
+    }
+}
+
 static PredComments* build_pred_comments(MLIR_Context *mlir_ctx, Arena *arena, MLIR_RegionHandle region) {
     if (!region) return NULL;
     PredComments *pc = arena_new(arena, PredComments);
@@ -368,9 +436,8 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             string an = MLIR_GetAttributeName(a);
             if (str_eq(an, str_lit("visibility")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) vis = MLIR_GetAttributeString(a);
             else if (str_eq(an, str_lit("sym_name")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) name = MLIR_GetAttributeString(a);
-            else if (str_eq(an, str_lit("ret")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) ret = MLIR_GetAttributeString(a);
-            else if (str_eq(an, str_lit("params_sig")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) params = MLIR_GetAttributeString(a);
         }
+        func_signature_from_op(ctx->mlir_ctx, op, &params, &ret);
         if (vis.size>0) { header = str_concat(arena, header, vis); header = str_concat(arena, header, str_lit(" ")); }
         if (name.size>0) { header = str_concat(arena, header, name); }
         header = str_concat(arena, header, str_lit("(")); if (params.size>0) header = str_concat(arena, header, params); header = str_concat(arena, header, str_lit(")"));
@@ -385,7 +452,6 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             line = str_concat(arena, line, str_lit(" "));
             line = str_concat(arena, line, print_function_region_classic(ctx, indent_level, region));
         }
-        else { line = str_concat(arena, line, str_lit(" { }")); }
         MLIR_LocationHandle loc = MLIR_GetOpLocation(op);
         if (loc) line = str_concat(arena, line, print_location_classic(arena, loc));
         line = str_concat(arena, line, str_lit("\n"));
@@ -741,9 +807,8 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 string an = MLIR_GetAttributeName(a);
                 if (str_eq(an, str_lit("visibility")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) vis = MLIR_GetAttributeString(a);
                 else if (str_eq(an, str_lit("sym_name")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) name = MLIR_GetAttributeString(a);
-                else if (str_eq(an, str_lit("ret")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) ret = MLIR_GetAttributeString(a);
-                else if (str_eq(an, str_lit("params_sig")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) params = MLIR_GetAttributeString(a);
             }
+            func_signature_from_op(ctx->mlir_ctx, op, &params, &ret);
             if (vis.size>0) { header = str_concat(arena, header, vis); header = str_concat(arena, header, str_lit(" ")); }
             if (name.size>0) { header = str_concat(arena, header, name); }
             // Params
@@ -759,8 +824,6 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             if (MLIR_GetOpNumRegions(op)>0) {
                 line = str_concat(arena, line, str_lit(" "));
                 line = str_concat(arena, line, print_function_region_classic(ctx, indent_level, MLIR_GetOpRegion(op, 0)));
-            } else {
-                line = str_concat(arena, line, str_lit(" { }"));
             }
             MLIR_LocationHandle loc = MLIR_GetOpLocation(op);
             if (loc) {
@@ -843,15 +906,17 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 }
             }
             result = str_concat(arena, result, str_lit(")"));
-            // Optional return signature captured in attribute 'ret'; if absent, infer from last tt.return
+            // Optional return signature captured in attribute 'function_type';
+            // if absent, infer from last tt.return.
             bool printed_ret = false;
-            size_t nattrs4 = MLIR_GetOpNumAttributes(op);
-            for (size_t i=0;i<nattrs4;i++) {
-                MLIR_AttributeHandle a = MLIR_GetOpAttribute(op, i);
-                if (a && str_eq(MLIR_GetAttributeName(a), str_lit("ret")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) {
-                    string r = MLIR_GetAttributeString(a);
-                    if (r.size>0) { result = str_concat(arena, result, str_lit(" -> ")); result = str_concat(arena, result, r); printed_ret = true; }
-                    break;
+            {
+                string params_unused = str_lit("");
+                string r = str_lit("");
+                func_signature_from_op(ctx->mlir_ctx, op, &params_unused, &r);
+                if (r.size > 0) {
+                    result = str_concat(arena, result, str_lit(" -> "));
+                    result = str_concat(arena, result, r);
+                    printed_ret = true;
                 }
             }
             if (!printed_ret && MLIR_GetOpNumRegions(op)>0) {
@@ -1369,9 +1434,8 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 for (int i=0;i<MLIR_GetOpNumAttributes(op);i++) {
                     if (str_eq(MLIR_GetAttributeName(MLIR_GetOpAttribute(op, i)), str_lit("visibility")) && MLIR_GetAttributeKind(MLIR_GetOpAttribute(op, i))==MLIR_ATTR_KIND_STRING) vis = MLIR_GetAttributeString(MLIR_GetOpAttribute(op, i));
                     else if (str_eq(MLIR_GetAttributeName(MLIR_GetOpAttribute(op, i)), str_lit("sym_name")) && MLIR_GetAttributeKind(MLIR_GetOpAttribute(op, i))==MLIR_ATTR_KIND_STRING) name = MLIR_GetAttributeString(MLIR_GetOpAttribute(op, i));
-                    else if (str_eq(MLIR_GetAttributeName(MLIR_GetOpAttribute(op, i)), str_lit("ret")) && MLIR_GetAttributeKind(MLIR_GetOpAttribute(op, i))==MLIR_ATTR_KIND_STRING) ret = MLIR_GetAttributeString(MLIR_GetOpAttribute(op, i));
-                    else if (str_eq(MLIR_GetAttributeName(MLIR_GetOpAttribute(op, i)), str_lit("params_sig")) && MLIR_GetAttributeKind(MLIR_GetOpAttribute(op, i))==MLIR_ATTR_KIND_STRING) params = MLIR_GetAttributeString(MLIR_GetOpAttribute(op, i));
                 }
+                func_signature_from_op(ctx->mlir_ctx, op, &params, &ret);
                 if (vis.size>0) { header = str_concat(arena, header, str_lit(" ")); header = str_concat(arena, header, vis); }
                 if (name.size>0) { header = str_concat(arena, header, str_lit(" ")); header = str_concat(arena, header, name); }
                 header = str_concat(arena, header, str_lit("(")); if (params.size>0) header = str_concat(arena, header, params); header = str_concat(arena, header, str_lit(")"));

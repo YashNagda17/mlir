@@ -1,7 +1,7 @@
 module() {
 ^bb0:
-    func.func() {sym_name = "@avg", ret = "memref<10x20xf32>"} {
-    ^bb0:
+    func.func() {sym_name = "@avg", function_type = (memref<10x20xf32>, memref<10x20xf32>) -> memref<10x20xf32>} {
+    ^bb0(%arg0: memref<10x20xf32>, %arg1: memref<10x20xf32>):
         %alloc = memref.alloc() -> memref<10x20xf32>
         %c0 = arith.constant() {value = 0} -> index
         %c10 = arith.constant() {value = 10} -> index

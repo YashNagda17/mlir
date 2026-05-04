@@ -269,6 +269,11 @@ MLIR_TypeHandle MLIR_CreateTypeTensor(MLIR_Context *ctx, const int64_t *shape, s
 MLIR_TypeHandle MLIR_CreateTypeMemref(MLIR_Context *ctx, const int64_t *shape, size_t rank, MLIR_TypeHandle element_type);
 MLIR_TypeHandle MLIR_CreateTypePointer(MLIR_Context *ctx, MLIR_TypeHandle element_type, bool has_address_space, uint32_t address_space);
 MLIR_TypeHandle MLIR_CreateTypeOpaque(MLIR_Context *ctx, string name);
+// Function type: (input_types) -> (result_types). Both arrays are
+// copied; passing 0 inputs/results is allowed.
+MLIR_TypeHandle MLIR_CreateTypeFunction(MLIR_Context *ctx,
+                                         const MLIR_TypeHandle *inputs, size_t n_inputs,
+                                         const MLIR_TypeHandle *results, size_t n_results);
 
 // Mutation
 void MLIR_SetTypeIntegerProperties(MLIR_TypeHandle type, uint32_t width, bool is_signed);
@@ -286,6 +291,11 @@ bool MLIR_IsTypePointer(MLIR_TypeHandle type);
 bool MLIR_IsTypeIndex(MLIR_TypeHandle type);
 bool MLIR_IsTypeUnknown(MLIR_TypeHandle type);
 bool MLIR_IsTypeOpaque(MLIR_TypeHandle type);
+bool MLIR_IsTypeFunction(MLIR_TypeHandle type);
+size_t MLIR_GetTypeFunctionNumInputs(MLIR_TypeHandle type);
+MLIR_TypeHandle MLIR_GetTypeFunctionInput(MLIR_TypeHandle type, size_t idx);
+size_t MLIR_GetTypeFunctionNumResults(MLIR_TypeHandle type);
+MLIR_TypeHandle MLIR_GetTypeFunctionResult(MLIR_TypeHandle type, size_t idx);
 string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle type);
 
 // -----------------------------------------------------------------------------
@@ -306,6 +316,9 @@ MLIR_AttributeHandle MLIR_CreateAttributeBool(MLIR_Context *ctx, string name, bo
 MLIR_AttributeHandle MLIR_CreateAttributeString(MLIR_Context *ctx, string name, string value);
 MLIR_AttributeHandle MLIR_CreateAttributeArray(MLIR_Context *ctx, string name, MLIR_AttributeHandle *elements, size_t count);
 MLIR_AttributeHandle MLIR_CreateAttributeDict(MLIR_Context *ctx, string name, MLIR_AttributeHandle *elements, size_t count);
+// TypeAttr: an attribute that wraps a Type (e.g. func.func's
+// `function_type` attribute, which wraps a FunctionType).
+MLIR_AttributeHandle MLIR_CreateAttributeType(MLIR_Context *ctx, string name, MLIR_TypeHandle type);
 
 // Introspection
 typedef enum {
@@ -314,7 +327,8 @@ typedef enum {
     MLIR_ATTR_KIND_STRING,
     MLIR_ATTR_KIND_BOOL,
     MLIR_ATTR_KIND_ARRAY,
-    MLIR_ATTR_KIND_DICT
+    MLIR_ATTR_KIND_DICT,
+    MLIR_ATTR_KIND_TYPE
 } MLIR_AttrKind;
 
 MLIR_AttrKind MLIR_GetAttributeKind(MLIR_AttributeHandle attr);
@@ -330,6 +344,9 @@ size_t MLIR_GetAttributeArraySize(MLIR_AttributeHandle attr);
 MLIR_AttributeHandle MLIR_GetAttributeArrayElement(MLIR_AttributeHandle attr, size_t idx);
 size_t MLIR_GetAttributeDictSize(MLIR_AttributeHandle attr);
 MLIR_AttributeHandle MLIR_GetAttributeDictElement(MLIR_AttributeHandle attr, size_t idx);
+// For TypeAttr, returns the wrapped Type. For other kinds returns
+// MLIR_INVALID_HANDLE.
+MLIR_TypeHandle MLIR_GetAttributeTypeValue(MLIR_AttributeHandle attr);
 
 // -----------------------------------------------------------------------------
 // Location API

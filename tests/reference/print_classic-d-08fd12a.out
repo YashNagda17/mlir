@@ -1,5 +1,5 @@
 module {
-  func.func @tensor_i16() -> i16 {
+  func.func @tensor_i16(%arg0: tensor<10xi16>) -> i16 {
     %c0_i16 = arith.constant 0 : i16
     return %c0_i16 : i16
   }
