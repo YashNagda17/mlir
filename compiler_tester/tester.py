@@ -9,6 +9,7 @@ import os
 import re
 import pathlib
 import pprint
+import shlex
 import shutil
 import subprocess
 import sys
@@ -142,6 +143,138 @@ def unl_loop_del(b):
                      bytes('\n', encoding='utf-8'))
 
 
+class _CompletedCmd:
+    """Minimal stand-in for subprocess.CompletedProcess."""
+    def __init__(self, stdout, stderr, returncode):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+def _resolve_executable(prog):
+    """Make `./parser` (and `parser`) work on Windows by adding .exe.
+
+    The test commands are written in POSIX style (`./parser ...`) so they
+    run as-is on Linux/macOS. On Windows the built binary is `parser.exe`
+    in the current directory; CreateProcess does not implicitly try the
+    `.exe` extension, so we resolve it explicitly here.
+    """
+    if sys.platform != "win32":
+        return prog
+    candidates = []
+    if prog.startswith("./") or prog.startswith(".\\"):
+        rest = prog[2:]
+        candidates = [rest + ".exe", rest]
+    elif os.sep not in prog and "/" not in prog:
+        candidates = [prog + ".exe", prog]
+    else:
+        candidates = [prog + ".exe", prog]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return prog
+
+
+def _builtin_diff(argv):
+    """Minimal `diff FILE1 FILE2` implementation in pure Python.
+
+    Mirrors the exit codes used by GNU diff that this test suite relies
+    on: 0 if files are identical, 1 if they differ. Output (when files
+    differ) is written to stdout in unified diff form, which is good
+    enough for human inspection in test logs. We avoid spawning any
+    external `diff` binary so tests run identically on every platform.
+    """
+    import difflib
+    if len(argv) != 3:
+        return (b"", b"diff: expected exactly 2 file arguments\n", 2)
+    _, p1, p2 = argv
+    try:
+        a = open(p1, "rb").read()
+        b = open(p2, "rb").read()
+    except OSError as e:
+        return (b"", f"diff: {e}\n".encode(), 2)
+    # Normalize CRLF -> LF before comparison so that this builtin behaves
+    # consistently across platforms (on Windows the parser's redirected
+    # stdout file ends up with CRLF line endings, while the input .mlir
+    # files are checked in with LF).
+    a_norm = unl_loop_del(a)
+    b_norm = unl_loop_del(b)
+    if a_norm == b_norm:
+        return (b"", b"", 0)
+    a_lines = a_norm.decode("utf-8", errors="replace").splitlines(keepends=True)
+    b_lines = b_norm.decode("utf-8", errors="replace").splitlines(keepends=True)
+    out = "".join(difflib.unified_diff(a_lines, b_lines,
+                                       fromfile=p1, tofile=p2))
+    return (out.encode("utf-8"), b"", 1)
+
+
+def _run_cmd_no_shell(cmd2):
+    """Execute `cmd2` without spawning a shell.
+
+    Supports `&&` chaining between commands and `>` stdout redirection
+    to a file. Returns an object with .stdout, .stderr, .returncode that
+    matches the subset of subprocess.CompletedProcess we use.
+
+    `diff` is implemented in-process so the same command strings work on
+    Windows (where no `diff` binary is available in our env) and POSIX.
+    """
+    tokens = shlex.split(cmd2, posix=True)
+    # Split tokens into subcommands separated by `&&`.
+    subcommands = []
+    current = []
+    for tok in tokens:
+        if tok == "&&":
+            if current:
+                subcommands.append(current)
+            current = []
+        else:
+            current.append(tok)
+    if current:
+        subcommands.append(current)
+
+    all_stdout = b""
+    all_stderr = b""
+    returncode = 0
+    for argv in subcommands:
+        # Handle `> outfile` stdout redirection.
+        redirect_to = None
+        if ">" in argv:
+            i = argv.index(">")
+            if i + 1 >= len(argv):
+                raise RunException("Missing target after '>' in: %s" % cmd2)
+            redirect_to = argv[i + 1]
+            argv = argv[:i] + argv[i + 2:]
+        if not argv:
+            raise RunException("Empty subcommand in: %s" % cmd2)
+
+        # Built-in commands (no external binary required).
+        if argv[0] == "diff":
+            out, err, returncode = _builtin_diff(argv)
+            if redirect_to is not None:
+                with open(redirect_to, "wb") as f:
+                    f.write(out)
+            else:
+                all_stdout += out
+            all_stderr += err
+            if returncode != 0:
+                break
+            continue
+
+        argv[0] = _resolve_executable(argv[0])
+        if redirect_to is not None:
+            with open(redirect_to, "wb") as f:
+                r = subprocess.run(argv, stdout=f, stderr=subprocess.PIPE)
+        else:
+            r = subprocess.run(argv, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+            all_stdout += r.stdout
+        all_stderr += r.stderr
+        returncode = r.returncode
+        if returncode != 0:
+            break
+    return _CompletedCmd(all_stdout, all_stderr, returncode)
+
+
 def run(basename: str, cmd: Union[pathlib.Path, str],
         out_dir: Union[pathlib.Path, str], infile=None, extra_args=None):
     """
@@ -184,18 +317,11 @@ def run(basename: str, cmd: Union[pathlib.Path, str],
     cmd2 = cmd.format(infile=infile, outfile=outfile_for_shell)
     if extra_args:
         cmd2 += " " + extra_args
-    # On Windows, subprocess(shell=True) launches cmd.exe which doesn't
-    # understand `./parser ...` style command lines. Use sh.exe (provided
-    # by the conda `shell` package, available in our pixi env) so the
-    # same cmd string runs on every platform.
-    if sys.platform == "win32":
-        r = subprocess.run(["sh", "-c", cmd2],
-                           stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE)
-    else:
-        r = subprocess.run(cmd2, shell=True,
-                           stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE)
+    # Run the command without launching any shell. We tokenize the command
+    # ourselves with shlex and handle `&&` chaining and `>` stdout
+    # redirection in Python so the same `cmd` string works identically on
+    # every platform (including Windows, where no POSIX shell is required).
+    r = _run_cmd_no_shell(cmd2)
     if not os.path.exists(outfile):
         outfile = None
     if len(r.stdout):
