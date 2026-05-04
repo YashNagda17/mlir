@@ -188,6 +188,12 @@ MLIR_OpHandle MLIR_CreateOp(
     int64_t source_line_start);
 void MLIR_AppendOpAttribute(MLIR_Context *ctx, MLIR_OpHandle op, MLIR_AttributeHandle attr);
 
+// Print an operation using upstream MLIR's pretty-printer in generic form
+// (mlir::OpPrintingFlags().printGenericOpForm()). Only meaningful when the
+// implementation is the upstream-MLIR backend; the native impl returns an
+// empty string.
+string MLIR_PrintOperationUpstream(MLIR_Context *ctx, MLIR_OpHandle op);
+
 // Accessors
 MLIR_OpType MLIR_GetOpType(MLIR_OpHandle op);
 string MLIR_GetOpName(MLIR_OpHandle op);

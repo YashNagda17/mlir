@@ -143,6 +143,7 @@ MLIR_OpHandle construct_test_module_full(MLIR_Context *ctx) {
 int app_main(void) {
     bool use_construction = false;
     bool use_classic_printer = false;
+    bool use_upstream_printer = false;
     bool verbose = false;
     char *input_file = NULL;
 
@@ -182,6 +183,9 @@ int app_main(void) {
         } else if (strcmp(argv[i], "--classic") == 0 || strcmp(argv[i], "-c") == 0) {
             use_classic_printer = true;
             if (verbose) printf("Classic printer enabled\n");
+        } else if (strcmp(argv[i], "--upstream-printer") == 0) {
+            use_upstream_printer = true;
+            if (verbose) printf("Upstream printer enabled\n");
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             verbose = true;
             if (verbose) printf("Verbose mode enabled\n");
@@ -202,7 +206,9 @@ int app_main(void) {
         if (verbose) printf("=== Generic Printer Test ===\n");
         if (verbose) printf("About to print operation...\n");
         string result;
-        if (use_classic_printer) {
+        if (use_upstream_printer) {
+            result = MLIR_PrintOperationUpstream(&ctx, op);
+        } else if (use_classic_printer) {
             result = print_operation_classic(&ctx, 0, op);
         } else {
             result = print_operation_generic(&ctx, 0, op);
@@ -247,7 +253,9 @@ int app_main(void) {
         MLIR_LocationMap *locmap = NULL;
         op = mlir_parse_module(&ctx, (const char*)mlir_code.str, mlir_code.size, &locmap);
         if (verbose) println(str_lit("MLIR:"));
-        if (use_classic_printer) {
+        if (use_upstream_printer) {
+            println(str_lit("{}"), MLIR_PrintOperationUpstream(&ctx, op));
+        } else if (use_classic_printer) {
             println(str_lit("{}"), print_module_classic(&ctx, op, locmap));
         } else {
             println(str_lit("{}"), print_operation_generic(&ctx, 0, op));

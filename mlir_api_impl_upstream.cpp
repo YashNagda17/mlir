@@ -482,6 +482,16 @@ extern "C" string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle h) {
     return mkArenaString(ctx, buf);
 }
 
+extern "C" string MLIR_PrintOperationUpstream(MLIR_Context *ctx, MLIR_OpHandle h) {
+    std::string buf;
+    llvm::raw_string_ostream os(buf);
+    mlir::OpPrintingFlags flags;
+    F<mlir::Operation>(h)->print(os, flags);
+    os.flush();
+    buf.push_back('\n');
+    return mkArenaString(ctx, buf);
+}
+
 // -----------------------------------------------------------------------------
 // Attribute — handle is a heap mlir::NamedAttribute*
 // -----------------------------------------------------------------------------

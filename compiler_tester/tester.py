@@ -560,10 +560,13 @@ def tester_main(compiler, single_test, is_lcompilers_executable_installed=False)
                         help="Run all tests sequentially")
     parser.add_argument("--no-color", action="store_true",
                     help="Turn off colored tests output")
+    parser.add_argument("--upstream", action="store_true",
+                        help="Upstream-MLIR mode: tests not marked upstream_strict only smoke-parse")
     args = parser.parse_args()
     update_reference = args.update
     verify_hash = args.verify_hash
     list_tests = args.list
+    is_upstream = args.upstream
     specific_tests = list(
         itertools.chain.from_iterable(
             args.test)) if args.test else None
@@ -621,7 +624,8 @@ def tester_main(compiler, single_test, is_lcompilers_executable_installed=False)
                 verbose=verbose,
                 no_llvm=no_llvm,
                 skip_run_with_dbg=True,
-                no_color=True)
+                no_color=True,
+                is_upstream=is_upstream)
     filtered_tests = [test for test in filtered_tests if 'extrafiles' not in test]
 
     if args.sequential:
@@ -634,7 +638,8 @@ def tester_main(compiler, single_test, is_lcompilers_executable_installed=False)
                         verbose=verbose,
                         no_llvm=no_llvm,
                         skip_run_with_dbg=skip_run_with_dbg,
-                        no_color=no_color)
+                        no_color=no_color,
+                        is_upstream=is_upstream)
     # run in parallel
     else:
         single_tester_partial_args = partial(
@@ -646,7 +651,8 @@ def tester_main(compiler, single_test, is_lcompilers_executable_installed=False)
             verbose=verbose,
             no_llvm=no_llvm,
             skip_run_with_dbg=skip_run_with_dbg,
-            no_color=no_color)
+            no_color=no_color,
+            is_upstream=is_upstream)
         with ThreadPoolExecutor() as ex:
             futures = ex.map(single_tester_partial_args, filtered_tests)
             for f in futures:

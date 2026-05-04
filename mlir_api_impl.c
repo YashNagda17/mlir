@@ -432,6 +432,12 @@ MLIR_LocationHandle MLIR_GetValueLocation(MLIR_ValueHandle vh) {
     return v ? v->location : MLIR_INVALID_HANDLE;
 }
 
+// Upstream printer is only available in the upstream backend.
+string MLIR_PrintOperationUpstream(MLIR_Context *ctx, MLIR_OpHandle op) {
+    (void)ctx; (void)op;
+    return str_lit("error: --upstream-printer requires parser_upstream\n");
+}
+
 // Type to string
 string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle th) {
     IR_Type *type = resolve_type(th);
