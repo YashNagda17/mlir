@@ -1,0 +1,16 @@
+module {
+  func.func @matrix_add(%arg0: memref<10x20xf32>, %arg1: memref<10x20xf32>) -> memref<10x20xf32> {
+    %alloc = memref.alloc() : memref<10x20xf32>
+    affine.for %arg2 = 0 to 10 {
+      affine.for %arg3 = 0 to 20 {
+        %0 = memref.load %arg0[%arg2, %arg3] : memref<10x20xf32>
+        %1 = memref.load %arg1[%arg2, %arg3] : memref<10x20xf32>
+        %2 = arith.addf %0, %1 : f32
+        memref.store %2, %alloc[%arg2, %arg3] : memref<10x20xf32>
+      }
+    }
+    return %alloc : memref<10x20xf32>
+  }
+}
+
+

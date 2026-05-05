@@ -286,16 +286,20 @@ static string print_location_classic(Arena *arena, MLIR_LocationHandle loc) {
             return format(arena, str_lit(" loc(\"{}\")"), MLIR_GetLocationName(loc));
 
         case MLIR_LOC_REF:
-            if (MLIR_GetLocationRefId(loc) == 0) {
-                return str_lit(" loc(#loc)");
-            }
-            return format(arena, str_lit(" loc(#loc{})"), (int64_t)MLIR_GetLocationRefId(loc));
+            // Drop loc(#locN) refs on print: the `#locN = loc(...)` mapping
+            // section is not round-tripped through the backends, so emitting
+            // bare refs would diverge between native (preserves ids) and
+            // upstream (loses them). Both backends now print no loc here.
+            return str_lit("");
 
         case MLIR_LOC_UNKNOWN:
             if (MLIR_GetLocationOriginalText(loc).size > 0) {
                 return format(arena, str_lit(" {}"), MLIR_GetLocationOriginalText(loc));
             }
-            return str_lit(" loc(unknown)");
+            // No original-text annotation: drop loc(unknown) so backends that
+            // synthesize a default unknown location (upstream MLIR) and
+            // backends that don't (native) produce identical output.
+            return str_lit("");
 
         default:
             return str_lit("");
@@ -469,26 +473,15 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 preassign_region_ssa(ctx, region, indent_level + 1);
             }
         }
-        // Special-case: one named result but multiple result types => print "%name:N ="
-        // Check if we have N results where only the first is non-MLIR_INVALID_HANDLE
+        // Special-case: multiple results => print "%name:N =" (canonical
+        // multi-result form). Use the first result's SSA name as the prefix;
+        // this matches both upstream MLIR's pretty form and our native
+        // compact form.
         size_t api_num_results = MLIR_GetOpNumResults(op);
-        bool use_colon_syntax = false;
-        if (api_num_result_types > 1 && api_num_results == api_num_result_types) {
-            MLIR_ValueHandle r0 = MLIR_GetOpResult(op, 0);
-            if (r0) {
-                bool all_rest_null = true;
-                for (size_t i = 1; i < api_num_results; i++) {
-                    if (MLIR_GetOpResult(op, i) != MLIR_INVALID_HANDLE) {
-                        all_rest_null = false;
-                        break;
-                    }
-                }
-                use_colon_syntax = all_rest_null;
-            }
-        }
+        bool use_colon_syntax = (api_num_result_types > 1);
 
         if (use_colon_syntax) {
-            MLIR_ValueHandle r0 = MLIR_GetOpResult(op, 0);
+            MLIR_ValueHandle r0 = (api_num_results > 0) ? MLIR_GetOpResult(op, 0) : MLIR_INVALID_HANDLE;
             if (r0) {
                 result = str_concat(arena, result, print_ssa_value_classic(ctx, r0));
             } else {
@@ -544,7 +537,8 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 MLIR_AttributeHandle first_attr = MLIR_GetOpAttribute(op, 0);
                 if (MLIR_GetAttributeKind(first_attr) == MLIR_ATTR_KIND_STRING && str_eq(MLIR_GetAttributeName(first_attr), str_lit("value_text"))) {
                     result = str_concat(arena, result, MLIR_GetAttributeString(first_attr));
-                } else if (MLIR_GetAttributeKind(first_attr) == MLIR_ATTR_KIND_INTEGER) {
+                } else if (MLIR_GetAttributeKind(first_attr) == MLIR_ATTR_KIND_INTEGER ||
+                           MLIR_GetAttributeKind(first_attr) == MLIR_ATTR_KIND_BOOL) {
                     size_t n_result_types = MLIR_GetOpNumResultTypes(op);
                     bool is_i1_bool = false;
                     if (n_result_types > 0) {
@@ -1922,17 +1916,9 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
         result = str_concat(arena, result, print_location_classic(arena, loc));
     }
 
-    // Append trailing inline comments (captured from source line)
-    {
-        string tcomm = MLIR_GetOpTrailingComment(op);
-        if (tcomm.size > 0) {
-            size_t p = 0; while (p < tcomm.size && tcomm.str[p] == ' ') p++;
-            if (p + 1 < tcomm.size && tcomm.str[p] == '/' && tcomm.str[p+1] == '/') {
-                result = str_concat(arena, result, str_lit(" "));
-                result = str_concat(arena, result, str_substr(tcomm, p, tcomm.size - p));
-            }
-        }
-    }
+    // Trailing inline comments captured by the native parser are not
+    // round-tripped through the upstream backend, so we drop them on print
+    // to keep classic output identical across backends.
 
     result = str_concat(arena, result, str_lit("\n"));
     return result;

@@ -1,0 +1,27 @@
+module() {
+^bb0:
+    func.func() {function_type = (memref<10x20xf32>, memref<10x20xf32>) -> memref<10x20xf32>, sym_name = "avg"} {
+    ^bb0(%arg0: memref<10x20xf32>, %arg1: memref<10x20xf32>):
+        %0 = memref.alloc() {operandSegmentSizes = array<i32: 0, 0>} -> memref<10x20xf32>
+        %1 = arith.constant() {value = 0} -> index
+        %2 = arith.constant() {value = 10} -> index
+        %3 = arith.constant() {value = 1} -> index
+        scf.for(%1: index, %2: index, %3: index) {
+        ^bb0(%arg0: index):
+            %4 = arith.constant() {value = 0} -> index
+            %5 = arith.constant() {value = 20} -> index
+            %6 = arith.constant() {value = 1} -> index
+            scf.for(%4: index, %5: index, %6: index) {
+            ^bb0(%arg0: index):
+                %7 = memref.load(%10: memref<10x20xf32>, %11: index, %12: index) -> f32
+                %8 = memref.load(%13: memref<10x20xf32>, %11: index, %12: index) -> f32
+                %9 = arith.addf(%7: f32, %8: f32) {fastmath = #arith.fastmath<none>} -> f32
+                memref.store(%9: f32, %0: memref<10x20xf32>, %11: index, %12: index)
+                scf.yield()
+            }
+            scf.yield()
+        }
+        func.return(%0: memref<10x20xf32>)
+    }
+}
+

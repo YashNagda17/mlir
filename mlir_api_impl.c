@@ -6,6 +6,7 @@
 #include <base/vector.h>
 #include "tokenizer.h"
 #include "mlir_api.h"
+#include "mlir_api_internal.h"
 #include "mlir_op_names.h"
 #include "mlir_parser.h"
 #include <string.h>
@@ -445,13 +446,17 @@ MLIR_LocationHandle MLIR_GetValueLocation(MLIR_ValueHandle vh) {
     return v ? v->location : MLIR_INVALID_HANDLE;
 }
 
-// Upstream printer is only available in the upstream backend.
-string MLIR_PrintOperationUpstream(MLIR_Context *ctx, MLIR_OpHandle op) {
+// Type to string
+string MLIR_PrintOperation_upstream_impl(MLIR_Context *ctx, MLIR_OpHandle op) {
     (void)ctx; (void)op;
-    return str_lit("error: --upstream-printer requires parser_upstream\n");
+    return str_lit("error: MLIR_PRINT_UPSTREAM requires the upstream backend\n");
 }
 
-// Type to string
+MLIR_OpHandle MLIR_ParseText_upstream_impl(MLIR_Context *ctx, string text) {
+    (void)ctx; (void)text;
+    return MLIR_INVALID_HANDLE;
+}
+
 string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle th) {
     IR_Type *type = resolve_type(th);
     if (!type) return str_lit("null");

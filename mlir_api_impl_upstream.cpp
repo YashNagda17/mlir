@@ -33,15 +33,25 @@
 #include "mlir/IR/Region.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/AsmParser/AsmParser.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "llvm/Support/raw_ostream.h"
 
 extern "C" {
 #include "mlir_api.h"
+#include "mlir_api_internal.h"
 #include "mlir_op_names.h"
 }
 
@@ -58,10 +68,18 @@ struct UpstreamCtx {
     UpstreamCtx() {
         mlir::DialectRegistry registry;
         registry.insert<mlir::arith::ArithDialect,
+                        mlir::affine::AffineDialect,
                         mlir::func::FuncDialect,
+                        mlir::gpu::GPUDialect,
+                        mlir::index::IndexDialect,
                         mlir::scf::SCFDialect,
                         mlir::cf::ControlFlowDialect,
-                        mlir::memref::MemRefDialect>();
+                        mlir::memref::MemRefDialect,
+                        mlir::tensor::TensorDialect,
+                        mlir::vector::VectorDialect,
+                        mlir::LLVM::LLVMDialect,
+                        mlir::linalg::LinalgDialect,
+                        mlir::math::MathDialect>();
         mctx.appendDialectRegistry(registry);
         mctx.loadAllAvailableDialects();
         mctx.allowUnregisteredDialects(true);
@@ -222,10 +240,11 @@ extern "C" MLIR_OpHandle MLIR_CreateOp(
     }
     if (type == OP_TYPE_MODULE && nm == "module") {
         nm = "builtin.module";
-    } else if (nm == "return") {
-        // Bare `return` in pretty form is the alias for func.return.
-        nm = "func.return";
     }
+    // Note: we no longer rename bare "return" to "func.return" here. The
+    // upstream backend keeps the name as authored so that classic-parser-
+    // built IR and native-backend IR are byte-identical when printed via
+    // the classic and generic printers.
 
     mlir::Location loc = (location == MLIR_INVALID_HANDLE)
                              ? mlir::Location(mlir::UnknownLoc::get(&ctx))
@@ -502,13 +521,27 @@ extern "C" MLIR_TypeHandle MLIR_CreateTypeMemref(MLIR_Context *, const int64_t *
     }
     return typeH(mlir::MemRefType::get(dims, elem));
 }
-extern "C" MLIR_TypeHandle MLIR_CreateTypePointer(MLIR_Context *, MLIR_TypeHandle /*element*/,
-                                                   bool /*has_addr*/, uint32_t /*addr*/) {
+extern "C" MLIR_TypeHandle MLIR_CreateTypePointer(MLIR_Context *ctx, MLIR_TypeHandle element,
+                                                   bool has_addr, uint32_t addr) {
     // Upstream has no built-in dialect-agnostic pointer type. Use an opaque
-    // type tagged "!tt.ptr"; element type and address space are dropped.
-    auto &ctx = globalCtx().mctx;
-    return typeH(mlir::OpaqueType::get(mlir::StringAttr::get(&ctx, "tt"),
-                                        "ptr"));
+    // type tagged "!tt.ptr<elem[, addr]>" so the printed form matches the
+    // native backend.
+    auto &mctx = globalCtx().mctx;
+    std::string data = "ptr";
+    auto elem = typeF(element);
+    if (elem) {
+        std::string ebuf;
+        llvm::raw_string_ostream eos(ebuf);
+        elem.print(eos);
+        eos.flush();
+        if (has_addr) {
+            data += "<" + ebuf + ", " + std::to_string((unsigned)addr) + ">";
+        } else {
+            data += "<" + ebuf + ">";
+        }
+    }
+    (void)ctx;
+    return typeH(mlir::OpaqueType::get(mlir::StringAttr::get(&mctx, "tt"), data));
 }
 extern "C" MLIR_TypeHandle MLIR_CreateTypeOpaque(MLIR_Context *, string name) {
     auto &ctx = globalCtx().mctx;
@@ -568,14 +601,23 @@ extern "C" MLIR_TypeHandle MLIR_GetTypeFunctionResult(MLIR_TypeHandle h, size_t 
 }
 
 extern "C" string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle h) {
+    auto t = typeF(h);
+    // Normalize opaque "unknown" types (dialect `?`, type `unknown`) to the
+    // single token "unknown" so that the native and upstream backends emit
+    // identical strings.
+    if (auto opaq = llvm::dyn_cast<mlir::OpaqueType>(t)) {
+        if (opaq.getDialectNamespace() == "?" && opaq.getTypeData() == "unknown") {
+            return mkArenaString(ctx, std::string("unknown"));
+        }
+    }
     std::string buf;
     llvm::raw_string_ostream os(buf);
-    typeF(h).print(os);
+    t.print(os);
     os.flush();
     return mkArenaString(ctx, buf);
 }
 
-extern "C" string MLIR_PrintOperationUpstream(MLIR_Context *ctx, MLIR_OpHandle h) {
+extern "C" string MLIR_PrintOperation_upstream_impl(MLIR_Context *ctx, MLIR_OpHandle h) {
     std::string buf;
     llvm::raw_string_ostream os(buf);
     mlir::OpPrintingFlags flags;
@@ -584,6 +626,19 @@ extern "C" string MLIR_PrintOperationUpstream(MLIR_Context *ctx, MLIR_OpHandle h
     os.flush();
     buf.push_back('\n');
     return mkArenaString(ctx, buf);
+}
+
+extern "C" MLIR_OpHandle MLIR_ParseText_upstream_impl(MLIR_Context *ctx, string text) {
+    (void)ctx;
+    auto &mctx = globalCtx().mctx;
+    llvm::StringRef src(text.str, text.size);
+    mlir::ParserConfig config(&mctx);
+    mlir::OwningOpRef<mlir::ModuleOp> mod =
+        mlir::parseSourceString<mlir::ModuleOp>(src, config);
+    if (!mod) return MLIR_INVALID_HANDLE;
+    // Release ownership; the operation lives in the MLIRContext arena.
+    mlir::Operation *op = mod.release().getOperation();
+    return reinterpret_cast<uintptr_t>(op);
 }
 
 // -----------------------------------------------------------------------------

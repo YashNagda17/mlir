@@ -2,6 +2,7 @@
 #include "mlir_generic_printer.h"
 #include <base/hashtable.h>
 #include <base/format.h>
+#include <stdio.h>
 
 // SSA numbering keyed by value handles (uint32_t)
 static inline size_t handle_hash(MLIR_ValueHandle h) { return (size_t)h; }
@@ -187,6 +188,23 @@ static string print_operation_internal(PrintCtx *ctx, int indent_level, MLIR_OpH
                         int64_t v = MLIR_GetAttributeInteger(attr);
                         if (opty == OP_TYPE_TT_MAKE_RANGE) result = str_concat(arena, result, format(arena, str_lit("{} : i32"), v));
                         else result = str_concat(arena, result, format(arena, str_lit("{}"), v));
+                        break;
+                    }
+                    case MLIR_ATTR_KIND_BOOL: {
+                        result = str_concat(arena, result,
+                            MLIR_GetAttributeBool(attr) ? str_lit("true") : str_lit("false"));
+                        break;
+                    }
+                    case MLIR_ATTR_KIND_FLOAT: {
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%.6e", MLIR_GetAttributeFloat(attr));
+                        // Prefer the op's first result type as the attribute's
+                        // printed type (covers arith.constant which is the
+                        // common case for FloatAttr-as-value).
+                        size_t nrt = MLIR_GetOpNumResultTypes(op);
+                        MLIR_TypeHandle ft = (nrt > 0) ? MLIR_GetOpResult_type(op, 0) : MLIR_INVALID_HANDLE;
+                        string ts = ft ? MLIR_GetTypeString(ctx->mlir_ctx, ft) : str_lit("f64");
+                        result = str_concat(arena, result, format(arena, str_lit("{} : {}"), str_from_cstr_view(buf), ts));
                         break;
                     }
                     case MLIR_ATTR_KIND_STRING: {
