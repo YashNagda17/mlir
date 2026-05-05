@@ -51,7 +51,6 @@
 
 extern "C" {
 #include "mlir_api.h"
-#include "mlir_api_internal.h"
 #include "mlir_op_names.h"
 }
 
@@ -617,7 +616,7 @@ extern "C" string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle h) {
     return mkArenaString(ctx, buf);
 }
 
-extern "C" string MLIR_PrintOperation_upstream_impl(MLIR_Context *ctx, MLIR_OpHandle h) {
+extern "C" string MLIR_PrintOperationUpstream(MLIR_Context *ctx, MLIR_OpHandle h) {
     std::string buf;
     llvm::raw_string_ostream os(buf);
     mlir::OpPrintingFlags flags;
@@ -628,7 +627,7 @@ extern "C" string MLIR_PrintOperation_upstream_impl(MLIR_Context *ctx, MLIR_OpHa
     return mkArenaString(ctx, buf);
 }
 
-extern "C" MLIR_OpHandle MLIR_ParseText_upstream_impl(MLIR_Context *ctx, string text) {
+extern "C" MLIR_OpHandle MLIR_ParseTextUpstream(MLIR_Context *ctx, string text) {
     (void)ctx;
     auto &mctx = globalCtx().mctx;
     llvm::StringRef src(text.str, text.size);

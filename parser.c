@@ -142,8 +142,10 @@ MLIR_OpHandle construct_test_module_full(MLIR_Context *ctx) {
 
 int app_main(void) {
     bool use_construction = false;
-    MLIR_PrintKind print_kind = MLIR_PRINT_GENERIC;
-    MLIR_ParseKind parse_kind = MLIR_PARSE_CLASSIC;
+    typedef string (*PrintFn)(MLIR_Context *, MLIR_OpHandle);
+    typedef MLIR_OpHandle (*ParseFn)(MLIR_Context *, string);
+    PrintFn print_fn = MLIR_PrintOperationGeneric;
+    ParseFn parse_fn = MLIR_ParseTextClassic;
     bool verbose = false;
     char *input_file = NULL;
 
@@ -181,19 +183,19 @@ int app_main(void) {
             use_construction = true;
             if (verbose) printf("Construction mode enabled\n");
         } else if (strcmp(argv[i], "--classic") == 0 || strcmp(argv[i], "-c") == 0) {
-            print_kind = MLIR_PRINT_CLASSIC;
+            print_fn = MLIR_PrintOperationClassic;
         } else if (strcmp(argv[i], "--upstream-printer") == 0) {
-            print_kind = MLIR_PRINT_UPSTREAM;
+            print_fn = MLIR_PrintOperationUpstream;
         } else if (strcmp(argv[i], "--print=upstream") == 0) {
-            print_kind = MLIR_PRINT_UPSTREAM;
+            print_fn = MLIR_PrintOperationUpstream;
         } else if (strcmp(argv[i], "--print=classic") == 0) {
-            print_kind = MLIR_PRINT_CLASSIC;
+            print_fn = MLIR_PrintOperationClassic;
         } else if (strcmp(argv[i], "--print=generic") == 0) {
-            print_kind = MLIR_PRINT_GENERIC;
+            print_fn = MLIR_PrintOperationGeneric;
         } else if (strcmp(argv[i], "--parse=upstream") == 0) {
-            parse_kind = MLIR_PARSE_UPSTREAM;
+            parse_fn = MLIR_ParseTextUpstream;
         } else if (strcmp(argv[i], "--parse=classic") == 0) {
-            parse_kind = MLIR_PARSE_CLASSIC;
+            parse_fn = MLIR_ParseTextClassic;
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             verbose = true;
             if (verbose) printf("Verbose mode enabled\n");
@@ -212,7 +214,7 @@ int app_main(void) {
 
         if (verbose) printf("=== Generic Printer Test ===\n");
         if (verbose) printf("About to print operation...\n");
-        string result = MLIR_PrintOperation(&ctx, op, print_kind);
+        string result = print_fn(&ctx, op);
         if (verbose) printf("Printing result...\n");
         println(str_lit("{}"), result);
 
@@ -250,14 +252,14 @@ int app_main(void) {
 
         if (verbose) tokenizer_print_all_tokens(arena, mlir_code);
 
-        op = MLIR_ParseText(&ctx, mlir_code, parse_kind);
+        op = parse_fn(&ctx, mlir_code);
         if (op == MLIR_INVALID_HANDLE) {
             println(str_lit("error: parse failed"));
             arena_destroy(arena);
             return 1;
         }
         if (verbose) println(str_lit("MLIR:"));
-        println(str_lit("{}"), MLIR_PrintOperation(&ctx, op, print_kind));
+        println(str_lit("{}"), print_fn(&ctx, op));
         exit_code = 0;
     }
 

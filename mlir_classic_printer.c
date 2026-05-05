@@ -2130,3 +2130,7 @@ string print_module_classic(MLIR_Context *ctx, MLIR_OpHandle module, MLIR_Locati
     }
     return result;
 }
+
+string MLIR_PrintOperationClassic(MLIR_Context *ctx, MLIR_OpHandle op) {
+    return print_module_classic(ctx, op, NULL);
+}

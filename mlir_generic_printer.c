@@ -322,3 +322,7 @@ string print_block_generic(MLIR_Context *ctx, int bb_index, int indent_level, ML
     preassign_block_ssa(&pctx, block, indent_level);
     return print_block_internal(&pctx, bb_index, indent_level, block);
 }
+
+string MLIR_PrintOperationGeneric(MLIR_Context *ctx, MLIR_OpHandle op) {
+    return print_operation_generic(ctx, 0, op);
+}

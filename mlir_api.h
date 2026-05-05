@@ -188,26 +188,19 @@ MLIR_OpHandle MLIR_CreateOp(
     int64_t source_line_start);
 void MLIR_AppendOpAttribute(MLIR_Context *ctx, MLIR_OpHandle op, MLIR_AttributeHandle attr);
 
-// Print/parse kinds for the unified MLIR_PrintOperation / MLIR_ParseText API.
-typedef enum {
-    MLIR_PRINT_UPSTREAM,   // upstream MLIR pretty-printer; upstream backend only
-    MLIR_PRINT_CLASSIC,    // our pretty printer (always extended; renders any
-                           //   classic extensions stored in the IR)
-    MLIR_PRINT_GENERIC,    // our generic printer
-} MLIR_PrintKind;
+// Print an operation. Three named entry points instead of an enum-dispatched
+// MLIR_PrintOperation: each lives in its own translation unit so the linker
+// pulls in only what each binary actually calls. The Upstream variant
+// requires the upstream backend (the native backend's stub returns an
+// "error: ..." string).
+string MLIR_PrintOperationUpstream(MLIR_Context *ctx, MLIR_OpHandle op);
+string MLIR_PrintOperationClassic(MLIR_Context *ctx, MLIR_OpHandle op);
+string MLIR_PrintOperationGeneric(MLIR_Context *ctx, MLIR_OpHandle op);
 
-typedef enum {
-    MLIR_PARSE_UPSTREAM,   // upstream MLIR parser; upstream backend only
-    MLIR_PARSE_CLASSIC,    // our parser; both backends; understands extensions
-} MLIR_ParseKind;
-
-// Print an operation. Returns an empty string with a leading "error:" line if
-// the kind is unsupported by the active backend.
-string MLIR_PrintOperation(MLIR_Context *ctx, MLIR_OpHandle op, MLIR_PrintKind kind);
-
-// Parse a top-level MLIR module from text. Returns MLIR_INVALID_HANDLE if the
-// kind is unsupported by the active backend or parsing fails.
-MLIR_OpHandle MLIR_ParseText(MLIR_Context *ctx, string text, MLIR_ParseKind kind);
+// Parse a top-level MLIR module from text. Returns MLIR_INVALID_HANDLE on
+// failure (or, for Upstream on the native backend, always).
+MLIR_OpHandle MLIR_ParseTextUpstream(MLIR_Context *ctx, string text);
+MLIR_OpHandle MLIR_ParseTextClassic(MLIR_Context *ctx, string text);
 
 // Accessors
 MLIR_OpType MLIR_GetOpType(MLIR_OpHandle op);
