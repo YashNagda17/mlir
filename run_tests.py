@@ -137,6 +137,97 @@ def check_combo(exe, filename, parse_kind, print_kind):
         )
 
 
+def discover_test_files():
+    """List all *.mlir and *.ttir files directly in tests/."""
+    out = []
+    for name in sorted(os.listdir(TESTS)):
+        if name.endswith(".mlir") or name.endswith(".ttir"):
+            out.append(name)
+    return out
+
+
+def assert_toml_covers_all_files(tests):
+    """Every test file on disk must appear in tests.toml. This catches files
+    that are added but forgotten in the registry (which would silently never
+    run)."""
+    on_disk = set(discover_test_files())
+    in_toml = {t["filename"] for t in tests}
+    missing = on_disk - in_toml
+    extra = in_toml - on_disk
+    msgs = []
+    if missing:
+        msgs.append(f"tests/ has files not listed in tests.toml: {sorted(missing)}")
+    if extra:
+        msgs.append(f"tests.toml lists files not on disk: {sorted(extra)}")
+    if msgs:
+        for m in msgs:
+            print(f"error: {m}", file=sys.stderr)
+        sys.exit(1)
+
+
+def assert_combos_cover_kinds():
+    """Sanity-check that the COMBOS arrays exercise every kind exposed by
+    the public API. If a new kind is added to MLIR_PrintKind/MLIR_ParseKind,
+    this guard forces us to update the test matrix."""
+    known_print = {"upstream", "classic", "generic"}
+    known_parse = {"upstream", "classic"}
+    seen_print = set()
+    seen_parse = set()
+    for parse_k, print_k in COMBOS_CLASSIC_PARSER + COMBOS_UPSTREAM_PARSER:
+        seen_parse.add(parse_k)
+        seen_print.add(print_k)
+    if seen_print != known_print or seen_parse != known_parse:
+        print(
+            f"error: COMBOS in run_tests.py do not cover all API kinds.\n"
+            f"  parse: have {sorted(seen_parse)}, expect {sorted(known_parse)}\n"
+            f"  print: have {sorted(seen_print)}, expect {sorted(known_print)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def roundtrip_validate_refs(tests):
+    """Validate that every classic-form reference is syntactically valid MLIR
+    by feeding it back through `parser_upstream --parse=upstream`. This proves
+    our classic printer emits MLIR upstream accepts (not just text that our
+    own parser likes).
+
+    We skip *.generic.out because our generic format is a debugging
+    representation, not MLIR's standard generic form. We skip
+    *.upstream.upstream.out because it is by definition upstream's own
+    pretty form (already valid)."""
+    if not os.path.exists(UPSTREAM):
+        print(f"error: {UPSTREAM} required for round-trip ref validation", file=sys.stderr)
+        sys.exit(1)
+    failures = []
+    n = 0
+    for t in tests:
+        filename = t["filename"]
+        upstream_parser = t.get("upstream_parser", True)
+        if not upstream_parser:
+            # Files using dialects unknown to upstream MLIR (e.g. Triton)
+            # cannot be re-parsed by upstream regardless of how they were
+            # printed; skip.
+            continue
+        for parse_k, print_k in COMBOS_CLASSIC_PARSER + COMBOS_UPSTREAM_PARSER:
+            if print_k != "classic":
+                continue
+            ref = ref_path(filename, parse_k, print_k)
+            if not os.path.exists(ref):
+                continue
+            cmd = [UPSTREAM, ref, "--parse=upstream", "--print=upstream"]
+            rc, _, err = run_capture(cmd)
+            n += 1
+            if rc != 0:
+                failures.append((ref, err.decode("utf-8", errors="replace")))
+    if failures:
+        print(f"\n{len(failures)}/{n} reference file(s) failed upstream round-trip:\n", file=sys.stderr)
+        for ref, err in failures:
+            print(f"--- {os.path.basename(ref)} ---", file=sys.stderr)
+            print(err, file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-u", "--update", action="store_true",
@@ -148,6 +239,12 @@ def main():
     ap.add_argument("--native", action="store_true",
                     help="run native-backend tests only")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--validate-refs", action="store_true",
+                    help="validate that every *.classic.out reference parses cleanly through "
+                         "`parser_upstream --parse=upstream`. Surfaces classic-printer output "
+                         "that upstream MLIR rejects. Currently surfaces pre-existing bugs "
+                         "for affine.for, memref.alloc operand-list, and unnamed func args; "
+                         "fix in follow-up PRs. Not run in normal CI.")
     args = ap.parse_args()
 
     do_native = (not args.upstream) or args.native
@@ -158,6 +255,13 @@ def main():
 
     cfg = toml.load(os.path.join(TESTS, "tests.toml"))
     tests = cfg["test"]
+
+    # Static guardrails (run before any test execution).
+    assert_combos_cover_kinds()
+    assert_toml_covers_all_files(tests)
+    if not tests:
+        print("error: tests.toml has no [[test]] entries", file=sys.stderr)
+        sys.exit(1)
 
     if args.update:
         # Regenerate references; require parser_upstream.
@@ -176,6 +280,20 @@ def main():
         print("References updated.")
         return
 
+    if args.validate_refs:
+        roundtrip_validate_refs(tests)
+        print("All classic references round-trip through upstream parser.")
+        return
+
+    # Hard-fail on missing binaries instead of silently skipping the
+    # corresponding combos. The runner is meaningless without both.
+    if do_native and not os.path.exists(NATIVE):
+        print(f"error: {NATIVE} not found (run `pixi r build_<platform>` first)", file=sys.stderr)
+        sys.exit(1)
+    if do_upstream and not os.path.exists(UPSTREAM):
+        print(f"error: {UPSTREAM} not found (run `pixi r build_parser_upstream` first)", file=sys.stderr)
+        sys.exit(1)
+
     failures = []
     n = 0
     for t in tests:
@@ -189,7 +307,7 @@ def main():
         if upstream_parser:
             upstream_combos.extend(COMBOS_UPSTREAM_PARSER)
 
-        if do_native and os.path.exists(NATIVE):
+        if do_native:
             for parse_k, print_k in native_combos:
                 n += 1
                 desc = f"native {filename} parse={parse_k} print={print_k}"
@@ -199,7 +317,7 @@ def main():
                     check_combo(NATIVE, filename, parse_k, print_k)
                 except Fail as e:
                     failures.append((desc, str(e)))
-        if do_upstream and os.path.exists(UPSTREAM):
+        if do_upstream:
             for parse_k, print_k in upstream_combos:
                 n += 1
                 desc = f"upstream {filename} parse={parse_k} print={print_k}"
@@ -209,6 +327,10 @@ def main():
                     check_combo(UPSTREAM, filename, parse_k, print_k)
                 except Fail as e:
                     failures.append((desc, str(e)))
+
+    if n == 0:
+        print("error: zero test combos ran (refusing to report success)", file=sys.stderr)
+        sys.exit(1)
 
     if failures:
         print(f"\n{len(failures)}/{n} FAILED:\n")
