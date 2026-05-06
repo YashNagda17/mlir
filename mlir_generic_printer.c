@@ -2,6 +2,7 @@
 #include "mlir_generic_printer.h"
 #include <base/hashtable.h>
 #include <base/format.h>
+#include <stdio.h>
 
 // SSA numbering keyed by value handles (uint32_t)
 static inline size_t handle_hash(MLIR_ValueHandle h) { return (size_t)h; }
@@ -189,6 +190,23 @@ static string print_operation_internal(PrintCtx *ctx, int indent_level, MLIR_OpH
                         else result = str_concat(arena, result, format(arena, str_lit("{}"), v));
                         break;
                     }
+                    case MLIR_ATTR_KIND_BOOL: {
+                        result = str_concat(arena, result,
+                            MLIR_GetAttributeBool(attr) ? str_lit("true") : str_lit("false"));
+                        break;
+                    }
+                    case MLIR_ATTR_KIND_FLOAT: {
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%.6e", MLIR_GetAttributeFloat(attr));
+                        // Prefer the op's first result type as the attribute's
+                        // printed type (covers arith.constant which is the
+                        // common case for FloatAttr-as-value).
+                        size_t nrt = MLIR_GetOpNumResultTypes(op);
+                        MLIR_TypeHandle ft = (nrt > 0) ? MLIR_GetOpResult_type(op, 0) : MLIR_INVALID_HANDLE;
+                        string ts = ft ? MLIR_GetTypeString(ctx->mlir_ctx, ft) : str_lit("f64");
+                        result = str_concat(arena, result, format(arena, str_lit("{} : {}"), str_from_cstr_view(buf), ts));
+                        break;
+                    }
                     case MLIR_ATTR_KIND_STRING: {
                         string s = MLIR_GetAttributeString(attr);
                         result = str_concat(arena, result, format(arena, str_lit("\"{}\""), s));
@@ -303,4 +321,8 @@ string print_block_generic(MLIR_Context *ctx, int bb_index, int indent_level, ML
     ssa_map_init(&pctx, ctx);
     preassign_block_ssa(&pctx, block, indent_level);
     return print_block_internal(&pctx, bb_index, indent_level, block);
+}
+
+string MLIR_PrintOperationGeneric(MLIR_Context *ctx, MLIR_OpHandle op) {
+    return print_operation_generic(ctx, 0, op);
 }

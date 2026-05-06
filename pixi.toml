@@ -128,7 +128,7 @@ clang \
     corec/platform/platform_linux.c
 """, depends-on = ["tokenizer"], description = "Build mlir native binary (Linux only)" }
 
-test_linux = { cmd = "./parser --construct && python run_tests.py -s", depends-on = ["build_linux"], description = "Run mlir test suite (Linux)" }
+test_linux = { cmd = "./parser --construct && python run_tests.py -s --native", depends-on = ["build_linux"], description = "Run mlir test suite (Linux)" }
 
 [feature.linux.target.linux-64.dependencies]
 clang = ">=20.1.4,<21"
@@ -175,7 +175,7 @@ clang \
     -Wl,-e,__start
 """, depends-on = ["tokenizer"], description = "Build mlir native binary (macOS only)" }
 
-test_macos = { cmd = "./parser --construct && python run_tests.py -s", depends-on = ["build_macos"], description = "Run mlir test suite (macOS)" }
+test_macos = { cmd = "./parser --construct && python run_tests.py -s --native", depends-on = ["build_macos"], description = "Run mlir test suite (macOS)" }
 
 build_cross_native_macos = { cmd = """
 clang \
@@ -290,7 +290,7 @@ link \
     /out:parser.exe
 """, depends-on = ["tokenizer"], description = "Build parser.exe native binary (Windows only; requires MSVC vcvars64)" }
 
-test_windows = { cmd = "./parser.exe --construct && python run_tests.py -s", depends-on = ["build_windows"], description = "Run mlir test suite (Windows)" }
+test_windows = { cmd = "./parser.exe --construct && python run_tests.py -s --native", depends-on = ["build_windows"], description = "Run mlir test suite (Windows)" }
 
 [feature.windows.target.win-64.dependencies]
 # MSVC must be available on PATH (e.g. via vcvars64.bat)

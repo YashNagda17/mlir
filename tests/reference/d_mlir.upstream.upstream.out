@@ -1,0 +1,41 @@
+module {
+  func.func @tensor_i16(%arg0: tensor<10xi16>) -> i16 {
+    %c0_i16 = arith.constant 0 : i16
+    return %c0_i16 : i16
+  }
+  func.func @func1() -> f32 {
+    %idx0 = index.constant 0
+    %idx1 = index.constant 1
+    %idx2 = index.constant 2
+    %idx5 = index.constant 5
+    %true = arith.constant true
+    %c0_i16 = arith.constant 0 : i16
+    %c1_i16 = arith.constant 1 : i16
+    %alloc = memref.alloc() : memref<24xi16>
+    linalg.fill ins(%c0_i16 : i16) outs(%alloc : memref<24xi16>)
+    %0 = affine.load %alloc[%idx0] : memref<24xi16>
+    %from_elements = tensor.from_elements %0, %0, %0, %0, %0, %0, %0, %0, %0, %0 : tensor<5x2xi16>
+    %1 = scf.if %true -> (tensor<5x2xi16>) {
+      scf.yield %from_elements : tensor<5x2xi16>
+    } else {
+      scf.yield %from_elements : tensor<5x2xi16>
+    }
+    %splat = tensor.splat %c1_i16[%idx5, %idx2] : tensor<?x?xi16>
+    %2 = linalg.copy ins(%splat : tensor<?x?xi16>) outs(%from_elements : tensor<5x2xi16>) -> tensor<5x2xi16>
+    %collapsed = tensor.collapse_shape %1 [[0, 1]] : tensor<5x2xi16> into tensor<10xi16>
+    %idx10 = index.constant 10
+    %3 = scf.for %arg0 = %idx0 to %idx10 step %idx1 iter_args(%arg1 = %c0_i16) -> (i16) {
+      %extracted = tensor.extract %collapsed[%arg0] : tensor<10xi16>
+      %6 = arith.addi %arg1, %extracted : i16
+      vector.print %extracted : i16
+      scf.yield %6 : i16
+    }
+    %collapsed_0 = tensor.collapse_shape %from_elements [[0, 1]] : tensor<5x2xi16> into tensor<10xi16>
+    %collapsed_1 = tensor.collapse_shape %2 [[0, 1]] : tensor<5x2xi16> into tensor<10xi16>
+    %4 = call @tensor_i16(%collapsed_1) : (tensor<10xi16>) -> i16
+    %5 = arith.sitofp %3 : i16 to f32
+    return %5 : f32
+  }
+}
+
+

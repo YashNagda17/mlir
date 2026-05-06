@@ -1704,3 +1704,8 @@ MLIR_OpHandle parse_operation(Parser *parser) {
 
     return op;
 }
+
+MLIR_OpHandle MLIR_ParseTextClassic(MLIR_Context *ctx, string text) {
+    MLIR_LocationMap *locmap = NULL;
+    return mlir_parse_module(ctx, (const char*)text.str, text.size, &locmap);
+}

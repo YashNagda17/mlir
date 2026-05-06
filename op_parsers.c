@@ -65,9 +65,8 @@ OperationParserResult parse_arith_constant_op(Parser *parser, OperationParserPar
             parser_expect(parser, TK_NAME);
             MLIR_TypeHandle bool_type = mlir_type_create_from_string(parser->ctx, str_lit("i1"));
             append_attr(parser, &attributes, &n_attributes, &attributes_capacity,
-                        create_integer_attr(parser, str_lit("value"),
-                                            str_eq(name_str, str_lit("true")) ? 1 : 0,
-                                            bool_type));
+                        MLIR_CreateAttributeBool(parser->ctx, str_lit("value"),
+                                                 str_eq(name_str, str_lit("true"))));
 
             if (!result_value) {
                 result_value = MLIR_CreateValueOpResult(parser->ctx, MLIR_INVALID_HANDLE, 0, bool_type, (string){MLIR_INVALID_HANDLE, 0}, MLIR_INVALID_HANDLE);
@@ -3114,17 +3113,11 @@ OperationParserResult parse_scf_for_op(Parser *parser, const OperationParserPara
         results = params->lhs_results;
         n_results = params->n_lhs_results;
 
-        // Set unnamed results to MLIR_INVALID_HANDLE so they print as %_
-        // (Types are auto-synced by MLIR_CreateOp)
-        for (size_t i = 0; i < n_results; i++) {
-            string reg_name = MLIR_GetValueRegisterName(results[i]);
-            if (reg_name.size == 0) {
-                // Unnamed result: set to MLIR_INVALID_HANDLE so it prints as %_
-                results[i] = MLIR_INVALID_HANDLE;
-            }
-        }
-
-        // Use consolidated API now that counts match
+        // Use the lhs_results array as the op's results. Result Values that
+        // were created without explicit names keep their handles so the
+        // printer can auto-assign sequential names to them (matching the
+        // upstream backend's behavior); result types are auto-synced from
+        // n_iter_results by MLIR_CreateOp.
     }
 
     OperationParserResult out = {

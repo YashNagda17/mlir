@@ -188,11 +188,19 @@ MLIR_OpHandle MLIR_CreateOp(
     int64_t source_line_start);
 void MLIR_AppendOpAttribute(MLIR_Context *ctx, MLIR_OpHandle op, MLIR_AttributeHandle attr);
 
-// Print an operation using upstream MLIR's pretty-printer in generic form
-// (mlir::OpPrintingFlags().printGenericOpForm()). Only meaningful when the
-// implementation is the upstream-MLIR backend; the native impl returns an
-// empty string.
+// Print an operation. Three named entry points instead of an enum-dispatched
+// MLIR_PrintOperation: each lives in its own translation unit so the linker
+// pulls in only what each binary actually calls. The Upstream variant
+// requires the upstream backend (the native backend's stub returns an
+// "error: ..." string).
 string MLIR_PrintOperationUpstream(MLIR_Context *ctx, MLIR_OpHandle op);
+string MLIR_PrintOperationClassic(MLIR_Context *ctx, MLIR_OpHandle op);
+string MLIR_PrintOperationGeneric(MLIR_Context *ctx, MLIR_OpHandle op);
+
+// Parse a top-level MLIR module from text. Returns MLIR_INVALID_HANDLE on
+// failure (or, for Upstream on the native backend, always).
+MLIR_OpHandle MLIR_ParseTextUpstream(MLIR_Context *ctx, string text);
+MLIR_OpHandle MLIR_ParseTextClassic(MLIR_Context *ctx, string text);
 
 // Accessors
 MLIR_OpType MLIR_GetOpType(MLIR_OpHandle op);

@@ -1,0 +1,52 @@
+module() {
+^bb0:
+    func.func() {function_type = (tensor<10xi16>) -> i16, sym_name = "tensor_i16"} {
+    ^bb0(%arg0: tensor<10xi16>):
+        %0 = arith.constant() {value = 0} -> i16
+        func.return(%0: i16)
+    }
+    func.func() {function_type = () -> f32, sym_name = "func1"} {
+    ^bb0:
+        %1 = index.constant() {value = 0} -> index
+        %2 = index.constant() {value = 1} -> index
+        %3 = index.constant() {value = 2} -> index
+        %4 = index.constant() {value = 5} -> index
+        %5 = arith.constant() {value = true} -> i1
+        %6 = arith.constant() {value = 0} -> i16
+        %7 = arith.constant() {value = 1} -> i16
+        %8 = memref.alloc() {operandSegmentSizes = array<i32: 0, 0>} -> memref<24xi16>
+        linalg.fill(%6: i16, %8: memref<24xi16>) {operandSegmentSizes = array<i32: 1, 1>} {
+        ^bb0(%arg0: i16, %arg1: i16):
+            "linalg.yield"(%23: i16)
+        }
+        %9 = affine.load(%8: memref<24xi16>, %1: index) {map = affine_map<(d0) -> (d0)>} -> i16
+        %10 = "tensor.from_elements"(%9: i16, %9: i16, %9: i16, %9: i16, %9: i16, %9: i16, %9: i16, %9: i16, %9: i16, %9: i16) -> tensor<5x2xi16>
+        %11 = scf.if(%5: i1) -> tensor<5x2xi16> {
+        ^bb0:
+            scf.yield(%10: tensor<5x2xi16>)
+        }{
+        ^bb0:
+            scf.yield(%10: tensor<5x2xi16>)
+        }
+        %12 = tensor.splat(%7: i16, %4: index, %3: index) -> tensor<?x?xi16>
+        %13 = "linalg.copy"(%12: tensor<?x?xi16>, %10: tensor<5x2xi16>) {operandSegmentSizes = array<i32: 1, 1>} -> tensor<5x2xi16> {
+        ^bb0(%arg0: i16, %arg1: i16):
+            "linalg.yield"(%24: i16)
+        }
+        %14 = tensor.collapse_shape(%11: tensor<5x2xi16>) {reassociation = [...]} -> tensor<10xi16>
+        %15 = index.constant() {value = 10} -> index
+        %18 = scf.for(%1: index, %15: index, %2: index, %6: i16) -> i16 {
+        ^bb0(%arg0: index, %arg1: i16):
+            %16 = tensor.extract(%14: tensor<10xi16>, %25: index) -> i16
+            %17 = arith.addi(%26: i16, %16: i16) {overflowFlags = #arith.overflow<none>} -> i16
+            vector.print(%16: i16) {punctuation = #vector.punctuation<newline>}
+            scf.yield(%17: i16)
+        }
+        %19 = tensor.collapse_shape(%10: tensor<5x2xi16>) {reassociation = [...]} -> tensor<10xi16>
+        %20 = tensor.collapse_shape(%13: tensor<5x2xi16>) {reassociation = [...]} -> tensor<10xi16>
+        %21 = func.call(%20: tensor<10xi16>) {callee = @tensor_i16} -> i16
+        %22 = arith.sitofp(%18: i16) -> f32
+        func.return(%22: f32)
+    }
+}
+
