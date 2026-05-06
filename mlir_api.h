@@ -159,6 +159,7 @@ typedef enum {
     OP_TYPE_LLVM_GEP,
     OP_TYPE_LLVM_MLIR_ZERO,
     OP_TYPE_LLVM_MLIR_CONSTANT,
+    OP_TYPE_LLVM_ICMP,
 
     // Return operations
     OP_TYPE_RETURN,
