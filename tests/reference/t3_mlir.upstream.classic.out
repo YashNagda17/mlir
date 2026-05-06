@@ -1,6 +1,6 @@
 module {
   func.func @avg(: memref<10x20xf32>, : memref<10x20xf32>) -> memref<10x20xf32> {
-    %0 = memref.alloc : memref<10x20xf32> {operandSegmentSizes = ...}
+    %0 = memref.alloc() : memref<10x20xf32> {operandSegmentSizes = ...}
     %1 = arith.constant 0 : index
     %2 = arith.constant 10 : index
     %3 = arith.subi %2, %1 : index {overflowFlags = ...}

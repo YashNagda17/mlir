@@ -1704,9 +1704,14 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 break;
             }
 
-            // Print operands in canonical format (no types for most ops)
-            if (MLIR_GetOpNumOperands(op) > 0) {
-                result = str_concat(arena, result, str_lit(" "));
+            // Print operands in canonical format (no types for most ops).
+            // memref.alloc / memref.alloca print operands inside parens even
+            // when empty: `memref.alloc() : memref<...>`. Other ops use a
+            // bare space-separated list.
+            MLIR_OpType _ot = MLIR_GetOpType(op);
+            bool _wants_parens = (_ot == OP_TYPE_MEMREF_ALLOC);
+            if (MLIR_GetOpNumOperands(op) > 0 || _wants_parens) {
+                result = str_concat(arena, result, _wants_parens ? str_lit("(") : str_lit(" "));
                 for (int i = 0; i < MLIR_GetOpNumOperands(op); i++) {
                     if (i > 0) result = str_concat(arena, result, str_lit(", "));
                     MLIR_ValueHandle operand = MLIR_GetOpOperand(op, i);
@@ -1716,6 +1721,7 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                     }
                     result = str_concat(arena, result, print_ssa_operand_classic(ctx, operand));
                 }
+                if (_wants_parens) result = str_concat(arena, result, str_lit(")"));
             }
 
             // Inline attributes (tt.*) before type when present

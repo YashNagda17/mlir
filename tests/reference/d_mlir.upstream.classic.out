@@ -11,7 +11,7 @@ module {
     %5 = arith.constant true
     %6 = arith.constant 0 : i16
     %7 = arith.constant 1 : i16
-    %8 = memref.alloc : memref<24xi16> {operandSegmentSizes = ...}
+    %8 = memref.alloc() : memref<24xi16> {operandSegmentSizes = ...}
     linalg.fill %6, %8 : i16 {operandSegmentSizes = ...} {
     ^bb0(%arg0: i16, %arg1: i16):
       "linalg.yield" %23 : i16
