@@ -20,6 +20,7 @@ RUNTIME = HERE / "runtime.c"
 TESTS_TOML = HERE / "tests.toml"
 
 CC = os.environ.get("CC", "clang")
+LLC = os.environ.get("LLC", "llc")
 
 
 def run(cmd, **kw):
@@ -56,11 +57,17 @@ def main():
             continue
         ll.write_text(r.stdout)
 
-        # Stage 2: link
-        r = run([CC, str(ll), str(RUNTIME), "-o", str(exe)])
+        # Stage 2: compile .ll -> .o with llc (works regardless of $CC),
+        # then link with $CC + runtime.c.
+        obj = HERE / "tests" / f"{name}.o"
+        r = run([LLC, "-filetype=obj", str(ll), "-o", str(obj)])
         if r.returncode != 0:
-            head = ll.read_text()[:1000] if ll.exists() else "(missing)"
-            print(f"FAIL {name}: link failed\nstderr:\n{r.stderr}\nfirst 1000 chars of {ll.name}:\n{head}")
+            print(f"FAIL {name}: llc failed\nstderr:\n{r.stderr}")
+            failures += 1
+            continue
+        r = run([CC, str(obj), str(RUNTIME), "-o", str(exe)])
+        if r.returncode != 0:
+            print(f"FAIL {name}: link failed\nstderr:\n{r.stderr}")
             failures += 1
             continue
 
