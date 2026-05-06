@@ -112,10 +112,6 @@ COMBOS_UPSTREAM_PARSER = [
 # means new regressions are caught immediately while pre-existing structural
 # bugs can be tackled one PR at a time.
 VALIDATE_REFS_SKIP = {
-    # std.constant / std.return — input file uses an MLIR dialect that no
-    # longer exists upstream. Not a printer bug; the input itself is stale.
-    "a_mlir.classic.classic.out",
-    "a_mlir.upstream.classic.out",
     # Multiple structural classic-printer issues: missing `()` on
     # memref.alloc, `affine.for {` lacking loop bounds + induction var,
     # `memref.load %a, %b, %c` instead of `memref.load %a[%b, %c]`,
