@@ -1699,9 +1699,21 @@ OperationParserResult parse_index_constant_op(Parser *parser, const OperationPar
     MLIR_TypeHandle *result_types = MLIR_INVALID_HANDLE;
     size_t n_result_types = 0;
 
+    bool pending_int = false;
+    int64_t pending_int_val = 0;
+
     // Parse the constant value if present
     if (parser_peek(parser, TK_INTEGER)) {
+        string value_str = parser_token_str(parser);
         parser_expect(parser, TK_INTEGER);
+        int64_t parsed_value = 0;
+        for (size_t i = 0; i < value_str.size; i++) {
+            if (value_str.str[i] >= '0' && value_str.str[i] <= '9') {
+                parsed_value = parsed_value * 10 + (value_str.str[i] - '0');
+            }
+        }
+        pending_int = true;
+        pending_int_val = parsed_value;
     } else {
         while (!parser_peek(parser, TK_EOF) && !parser_peek(parser, TK_NEWLINE) &&
                !parser_peek(parser, TK_NAME) && !parser_peek(parser, TK_COLON)) {
@@ -1719,6 +1731,11 @@ OperationParserResult parse_index_constant_op(Parser *parser, const OperationPar
         result_types = arena_new_array(params->arena, MLIR_TypeHandle, 1);
         result_types[0] = mlir_type_create_from_string(params->ctx, str_lit("index"));
         n_result_types = 1;
+    }
+
+    if (pending_int) {
+        append_attr(parser, &attributes, &n_attributes, &attributes_capacity,
+                    create_integer_attr(parser, str_lit("value"), pending_int_val, result_types[0]));
     }
 
     MLIR_LocationHandle op_location = parse_optional_location(parser);

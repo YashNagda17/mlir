@@ -1,6 +1,6 @@
 module {
-  tt.func public @kernel_with_label_0d1d2d3(%arg0: !tt.ptr<f32, 1> {tt.divisibility = 16 : i32} loc("/data/users/oulgen/pytorch/test/dynamo/test_triton_kernels.py":1228:0), %arg1: !tt.ptr<f32, 1> {tt.divisibility = 16 : i32} loc("/data/users/oul
-gen/pytorch/test/dynamo/test_triton_kernels.py":1228:0), %arg2: !tt.ptr<f32, 1> {tt.divisibility = 16 : i32} loc("/data/users/oulgen/pytorch/test/dynamo/test_triton_kernels.py":1228:0)) attributes {noinline = false} {
+  tt.func public @kernel_with_label_0d1d2d3(%arg0: !tt.ptr<f32, 1> {tt.divisibility = 16 : i32} loc(""/data/users/oulgen/pytorch/test/dynamo/test_triton_kernels.py"":1228:0), %arg1: !tt.ptr<f32, 1> {tt.divisibility = 16 : i32} loc(""/data/users/oul
+gen/pytorch/test/dynamo/test_triton_kernels.py"":1228:0), %arg2: !tt.ptr<f32, 1> {tt.divisibility = 16 : i32} loc(""/data/users/oulgen/pytorch/test/dynamo/test_triton_kernels.py"":1228:0)) attributes {noinline = false} {
     %0 = tt.get_program_id x : i32
     %c1_i32 = arith.constant 1 : i32
     %1 = arith.cmpi sgt, %0, %c1_i32 : i32

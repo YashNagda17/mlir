@@ -7,10 +7,10 @@ module() {
     }
     func.func() {sym_name = "func1", function_type = () -> f32} {
     ^bb0:
-        %idx0 = index.constant() -> index
-        %idx1 = index.constant() -> index
-        %idx2 = index.constant() -> index
-        %idx5 = index.constant() -> index
+        %idx0 = index.constant() {value = 0} -> index
+        %idx1 = index.constant() {value = 1} -> index
+        %idx2 = index.constant() {value = 2} -> index
+        %idx5 = index.constant() {value = 5} -> index
         %true = arith.constant() {value = true} -> i1
         %c0_i16 = arith.constant() {value = 0} -> i16
         %c1_i16 = arith.constant() {value = 1} -> i16
@@ -28,7 +28,7 @@ module() {
         %cast_258 = tensor.splat(%c1_i16: i16, %idx5: index, %idx2: index) -> tensor<?x?xi16>
         %212 = "linalg.copy"(%cast_258: tensor<?x?xi16>) -> tensor<?x?xi16>
         %collapsed_217 = tensor.collapse_shape(%171: tensor<5x2xi16>) -> tensor<10xi16>
-        %dim = index.constant() -> index
+        %dim = index.constant() {value = 10} -> index
         %0 = scf.for(%idx0: index, %dim: index, %idx1: index, %c0_i16: i16) -> i16 {
         ^bb0(%arg1: index, %arg2: i16):
             %extracted = tensor.extract(%collapsed_217: tensor<10xi16>, %arg1: index) -> tensor<10xi16>

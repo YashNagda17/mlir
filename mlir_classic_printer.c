@@ -279,11 +279,29 @@ static string print_location_classic(Arena *arena, MLIR_LocationHandle loc) {
     if (!loc) return str_lit("");
 
     switch (MLIR_GetLocationKind(loc)) {
-        case MLIR_LOC_FILE:
+        case MLIR_LOC_FILE: {
+            string fn = MLIR_GetLocationFileFilename(loc);
+            // Quote filenames that aren't bare identifiers (e.g. "-", paths
+            // with '/', '.', etc.). The MLIR loc syntax requires
+            // loc("file":line:col) for non-identifier filenames.
+            bool needs_quote = (fn.size == 0);
+            for (size_t k = 0; k < fn.size; k++) {
+                char c = fn.str[k];
+                bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '_';
+                if (!ok) { needs_quote = true; break; }
+            }
+            if (needs_quote) {
+                return format(arena, str_lit(" loc(\"{}\":{}:{})"),
+                             fn,
+                             (int64_t)MLIR_GetLocationFileLine(loc),
+                             (int64_t)MLIR_GetLocationFileColumn(loc));
+            }
             return format(arena, str_lit(" loc({}:{}:{})"),
-                         MLIR_GetLocationFileFilename(loc),
+                         fn,
                          (int64_t)MLIR_GetLocationFileLine(loc),
                          (int64_t)MLIR_GetLocationFileColumn(loc));
+        }
 
         case MLIR_LOC_NAME:
             return format(arena, str_lit(" loc(\"{}\")"), MLIR_GetLocationName(loc));
@@ -1494,6 +1512,18 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             }
 
             // Special classic formatting for select ops
+            if (MLIR_GetOpType(op) == OP_TYPE_INDEX_CONSTANT) {
+                // index.constant N
+                for (size_t i = 0, n = MLIR_GetOpNumAttributes(op); i < n; i++) {
+                    MLIR_AttributeHandle a = MLIR_GetOpAttribute(op, i);
+                    if (str_eq(MLIR_GetAttributeName(a), str_lit("value")) &&
+                        MLIR_GetAttributeKind(a) == MLIR_ATTR_KIND_INTEGER) {
+                        result = str_concat(arena, result,
+                            format(arena, str_lit(" {}"), MLIR_GetAttributeInteger(a)));
+                        break;
+                    }
+                }
+            }
             if (MLIR_GetOpType(op) == OP_TYPE_ARITH_EXTUI) {
                 // arith.extui %v : src -> dst
                 result = str_concat(arena, result, str_lit(" "));
@@ -1805,6 +1835,8 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                         result = str_concat(arena, result, MLIR_GetTypeString(ctx->mlir_ctx, MLIR_GetValueType(MLIR_GetOpOperand(op, memref_idx))));
                     }
                 }
+            } else if (MLIR_GetOpType(op) == OP_TYPE_INDEX_CONSTANT) {
+                // index.constant N — no type annotation
             } else if (MLIR_GetOpNumResultTypes(op) > 0 && MLIR_GetOpResult_type(op, 0)) {
                 result = str_concat(arena, result, str_lit(" : "));
                 result = str_concat(arena, result, MLIR_GetTypeString(ctx->mlir_ctx, MLIR_GetOpResult_type(op, 0)));
@@ -1874,8 +1906,10 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             if (str_eq(attr_name, str_lit("function_type")) && MLIR_GetOpType(op) == OP_TYPE_FUNC_FUNC) {
                 continue;
             }
-            // Skip 'value' attribute only for arith.constant operations
-            if (str_eq(attr_name, str_lit("value")) && MLIR_GetOpType(op) == OP_TYPE_ARITH_CONSTANT) {
+            // Skip 'value' attribute only for arith.constant and index.constant operations
+            if (str_eq(attr_name, str_lit("value")) &&
+                (MLIR_GetOpType(op) == OP_TYPE_ARITH_CONSTANT ||
+                 MLIR_GetOpType(op) == OP_TYPE_INDEX_CONSTANT)) {
                 continue;
             }
             // Skip tt.* attributes here; they are printed inline before type for default ops

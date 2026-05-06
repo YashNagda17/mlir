@@ -1,5 +1,5 @@
 module {
-  tt.func public @add_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32} loc("test_add.py":31:0), %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32} loc("test_add.py":31:0), %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32} loc("test_add.py":31:0), %arg3: i32 {tt.divisibility = 16 : i32} loc("test_add.py":31:0)) attributes {noinline = false} {
+  tt.func public @add_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32} loc(""test_add.py"":31:0), %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32} loc(""test_add.py"":31:0), %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32} loc(""test_add.py"":31:0), %arg3: i32 {tt.divisibility = 16 : i32} loc(""test_add.py"":31:0)) attributes {noinline = false} {
     %c16_i32 = arith.constant 16 : i32
     %0 = tt.get_program_id x : i32
     %1 = arith.muli %0, %c16_i32 : i32
