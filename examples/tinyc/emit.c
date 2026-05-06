@@ -491,13 +491,24 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             return r;
         }
         case EX_FIELD: {
-            // s.field — base must be a struct variable.
-            if (ex->lhs->kind != EX_VAR) {
-                println(str_lit("tinyc emit: only <var>.field field access is supported"));
+            // s.field — base must be a struct or struct-pointer lvalue.
+            // Two supported shapes:
+            //   <var>.field        where <var> is TY_STRUCT
+            //   (*<var>).field     where <var> is TY_PTR_STRUCT  (also p->field)
+            Sym *s = NULL;
+            if (ex->lhs->kind == EX_VAR) {
+                s = scope_lookup(sc, ex->lhs->name);
+            } else if (ex->lhs->kind == EX_DEREF && ex->lhs->lhs->kind == EX_VAR) {
+                s = scope_lookup(sc, ex->lhs->lhs->name);
+                if (s && s->type.kind != TY_PTR_STRUCT) {
+                    println(str_lit("tinyc emit: -> requires a struct pointer"));
+                    return r;
+                }
+            } else {
+                println(str_lit("tinyc emit: only <var>.field or p->field is supported"));
                 return r;
             }
-            Sym *s = scope_lookup(sc, ex->lhs->name);
-            if (!s || s->type.kind != TY_STRUCT || !s->sdef) {
+            if (!s || (s->type.kind != TY_STRUCT && s->type.kind != TY_PTR_STRUCT) || !s->sdef) {
                 println(str_lit("tinyc emit: field access on non-struct"));
                 return r;
             }
@@ -546,24 +557,66 @@ static void unify_numeric(E *e, EVal *a, EVal *b) {
     if (!b->is_float) { b->val = emit_sitofp(e, b->val); b->is_float = true; }
 }
 
-// Load all fields of a struct local into the operand array starting at base.
-static void flatten_struct_arg(E *e, Scope *sc, Expr *arg, SlotInfo *p,
-                               MLIR_ValueHandle *out, size_t base) {
-    if (arg->kind != EX_VAR) {
-        println(str_lit("tinyc emit: struct argument must be a struct variable"));
-        return;
+// Resolve a struct or struct-ptr argument expression into the source
+// struct's per-field memref bundle. Accepts:
+//   - EX_VAR of TY_STRUCT          (the struct local itself)
+//   - EX_VAR of TY_PTR_STRUCT      (a struct-ptr local — already a bundle)
+//   - EX_ADDR of EX_VAR of TY_STRUCT  (taking the address of a struct local)
+// Returns NULL on failure (after printing). Out-params receive the source
+// StructDef and the per-field memref handle array (length sd->fields.size).
+static Sym *resolve_struct_source(E *e, Scope *sc, Expr *arg,
+                                  StructDef **out_sd, MLIR_ValueHandle **out_addrs) {
+    Expr *target = arg;
+    if (arg->kind == EX_ADDR) {
+        if (arg->lhs->kind != EX_VAR) {
+            println(str_lit("tinyc emit: &expr in struct context requires a simple variable"));
+            return NULL;
+        }
+        target = arg->lhs;
     }
-    Sym *s = scope_lookup(sc, arg->name);
-    if (!s || s->type.kind != TY_STRUCT || !s->sdef) {
-        println(str_lit("tinyc emit: struct argument {} is not a struct"), arg->name);
-        return;
+    if (target->kind != EX_VAR) {
+        println(str_lit("tinyc emit: struct argument must be a variable or &<var>"));
+        return NULL;
     }
-    if (s->sdef != p->sdef) {
+    Sym *s = scope_lookup(sc, target->name);
+    if (!s) {
+        println(str_lit("tinyc emit: undefined struct argument {}"), target->name);
+        return NULL;
+    }
+    if (s->type.kind != TY_STRUCT && s->type.kind != TY_PTR_STRUCT) {
+        println(str_lit("tinyc emit: argument {} is not a struct or struct pointer"), target->name);
+        return NULL;
+    }
+    if (!s->sdef) return NULL;
+    if (arg->kind == EX_ADDR && s->type.kind != TY_STRUCT) {
+        println(str_lit("tinyc emit: &<var> requires a struct local"));
+        return NULL;
+    }
+    *out_sd = s->sdef;
+    *out_addrs = s->field_addrs;
+    return s;
+}
+
+// Splice a struct-typed call argument into the flattened operand array.
+// If the parameter is by-value (TY_STRUCT) we load each field into a scalar.
+// If the parameter is by-pointer (TY_PTR_STRUCT) we push the per-field
+// memref handles directly (alias-only — see tinyc.h).
+static void splice_struct_call_arg(E *e, Scope *sc, Expr *arg, SlotInfo *p,
+                                   MLIR_ValueHandle *out, size_t base) {
+    StructDef *sd = NULL;
+    MLIR_ValueHandle *addrs = NULL;
+    Sym *src = resolve_struct_source(e, sc, arg, &sd, &addrs);
+    if (!src) return;
+    if (sd != p->sdef) {
         println(str_lit("tinyc emit: struct type mismatch in call argument"));
     }
-    for (size_t k = 0; k < s->sdef->fields.size; k++) {
-        bool flt = (s->sdef->fields.data[k].kind == TY_F32);
-        out[base + k] = emit_load(e, s->field_addrs[k], flt ? e->f32 : e->i32, NULL, 0);
+    for (size_t k = 0; k < sd->fields.size; k++) {
+        if (p->type.kind == TY_PTR_STRUCT) {
+            out[base + k] = addrs[k];
+        } else {
+            bool flt = (sd->fields.data[k].kind == TY_F32);
+            out[base + k] = emit_load(e, addrs[k], flt ? e->f32 : e->i32, NULL, 0);
+        }
     }
 }
 
@@ -578,8 +631,8 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
     MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, n_in ? n_in : 1);
     for (size_t i = 0; i < sig->n_params && i < args.size; i++) {
         SlotInfo *p = &sig->params[i];
-        if (p->type.kind == TY_STRUCT) {
-            flatten_struct_arg(e, sc, args.data[i], p, ops, p->flat_offset);
+        if (p->type.kind == TY_STRUCT || p->type.kind == TY_PTR_STRUCT) {
+            splice_struct_call_arg(e, sc, args.data[i], p, ops, p->flat_offset);
         } else {
             EVal v = emit_expr(e, sc, args.data[i]);
             ops[p->flat_offset] = coerce_eval(e, v, scalar_mlir_type(e, p->type.kind));
@@ -847,6 +900,40 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                         sy->addr = target->addr;
                     }
                 }
+            } else if (st->decl_type.kind == TY_PTR_STRUCT) {
+                // Alias-only struct pointer: must be initialized with &<var>
+                // where <var> is a TY_STRUCT local with the same struct type.
+                // The pointer's per-field "addresses" alias the target's
+                // per-field memrefs.
+                StructDef *sd = find_struct(e, st->decl_type.struct_name);
+                if (!sd) {
+                    println(str_lit("tinyc emit: unknown struct type {}"), st->decl_type.struct_name);
+                    return;
+                }
+                sy->sdef = sd;
+                sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle,
+                                                  sd->fields.size ? sd->fields.size : 1);
+                if (!st->decl_init || st->decl_init->kind != EX_ADDR ||
+                    st->decl_init->lhs->kind != EX_VAR) {
+                    println(str_lit("tinyc emit: struct* must be initialized with &<struct_var>"));
+                    for (size_t k = 0; k < sd->fields.size; k++) {
+                        bool flt = (sd->fields.data[k].kind == TY_F32);
+                        sy->field_addrs[k] = emit_alloc(e, flt ? e->memref_f32 : e->memref_i32);
+                    }
+                } else {
+                    Sym *target = scope_lookup(sc, st->decl_init->lhs->name);
+                    if (!target || target->type.kind != TY_STRUCT || target->sdef != sd) {
+                        println(str_lit("tinyc emit: struct* target must be a matching struct local"));
+                        for (size_t k = 0; k < sd->fields.size; k++) {
+                            bool flt = (sd->fields.data[k].kind == TY_F32);
+                            sy->field_addrs[k] = emit_alloc(e, flt ? e->memref_f32 : e->memref_i32);
+                        }
+                    } else {
+                        for (size_t k = 0; k < sd->fields.size; k++) {
+                            sy->field_addrs[k] = target->field_addrs[k];
+                        }
+                    }
+                }
             } else if (st->decl_type.kind == TY_ARRAY_I32) {
                 int64_t shape[1] = { st->decl_type.array_len };
                 MLIR_TypeHandle arr_ty = MLIR_CreateTypeMemref(e->ctx, shape, 1, e->i32);
@@ -1087,7 +1174,7 @@ static void slot_resolve(E *e, Type ty, SlotInfo *out) {
     out->sdef = NULL;
     out->flat_count = 1;
     out->flat_offset = 0;
-    if (ty.kind == TY_STRUCT) {
+    if (ty.kind == TY_STRUCT || ty.kind == TY_PTR_STRUCT) {
         out->sdef = find_struct(e, ty.struct_name);
         if (!out->sdef) {
             println(str_lit("tinyc emit: unknown struct type {}"), ty.struct_name);
@@ -1104,10 +1191,17 @@ static void slot_resolve(E *e, Type ty, SlotInfo *out) {
 // Append the flattened MLIR types of a slot into `tys` starting at `*offset`.
 static void slot_emit_flat_types(E *e, SlotInfo *s, MLIR_TypeHandle *tys, size_t *offset) {
     s->flat_offset = *offset;
-    if (s->type.kind == TY_STRUCT) {
+    if (s->type.kind == TY_STRUCT || s->type.kind == TY_PTR_STRUCT) {
         if (!s->sdef) return;
         for (size_t i = 0; i < s->sdef->fields.size; i++) {
-            tys[(*offset)++] = scalar_mlir_type(e, s->sdef->fields.data[i].kind);
+            TypeKind fk = s->sdef->fields.data[i].kind;
+            MLIR_TypeHandle t;
+            if (s->type.kind == TY_PTR_STRUCT) {
+                t = (fk == TY_F32) ? e->memref_f32 : e->memref_i32;
+            } else {
+                t = scalar_mlir_type(e, fk);
+            }
+            tys[(*offset)++] = t;
         }
     } else {
         tys[(*offset)++] = scalar_mlir_type(e, s->type.kind);
@@ -1190,6 +1284,15 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
                 MLIR_ValueHandle addr = emit_alloc(e, flt ? e->memref_f32 : e->memref_i32);
                 sy->field_addrs[k] = addr;
                 emit_store(e, flat_args[p->flat_offset + k], addr, NULL, 0);
+            }
+        } else if (p->type.kind == TY_PTR_STRUCT && p->sdef) {
+            // Alias-only pointer: bind the caller's per-field memrefs
+            // (passed as block args) directly. No alloca, no store.
+            sy->sdef = p->sdef;
+            sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle,
+                                              p->sdef->fields.size ? p->sdef->fields.size : 1);
+            for (size_t k = 0; k < p->sdef->fields.size; k++) {
+                sy->field_addrs[k] = flat_args[p->flat_offset + k];
             }
         } else {
             bool flt = (p->type.kind == TY_F32);

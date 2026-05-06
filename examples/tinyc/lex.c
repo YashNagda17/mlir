@@ -103,6 +103,7 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
             else if (c == '!' && d == '=') { k = TC_TK_NE; consumed = 2; }
             else if (c == '&' && d == '&') { k = TC_TK_AMPAMP; consumed = 2; }
             else if (c == '|' && d == '|') { k = TC_TK_PIPEPIPE; consumed = 2; }
+            else if (c == '-' && d == '>') { k = TC_TK_ARROW; consumed = 2; }
         }
         if (k == TC_TK_EOF) {
             switch (c) {

@@ -76,6 +76,19 @@ static Expr *parse_postfix(P *p, Expr *base) {
             base = e;
             continue;
         }
+        if (cur(p).kind == TC_TK_ARROW) {
+            // p->f desugars to (*p).f
+            int line = cur(p).line;
+            p->i++;
+            TcTok name = cur(p);
+            expect(p, TC_TK_IDENT, str_lit("expected field name"));
+            Expr *deref = new_expr(p, EX_DEREF, line);
+            deref->lhs = base;
+            Expr *e = new_expr(p, EX_FIELD, line);
+            e->lhs = deref; e->name = name.text;
+            base = e;
+            continue;
+        }
         break;
     }
     return base;
@@ -286,23 +299,27 @@ static void parse_block(P *p, VecStmtPtr *out) {
 }
 
 // Parse a decl statement: <type> [*] name [ '[' N ']' ] [ '=' expr ] ';'
-//   or                  : struct Name name ';'
+//   or                  : struct Name [*] name [ '=' &<var> ] ';'
 // Caller has already verified that current token starts a decl.
 static Stmt *parse_decl(P *p, bool require_semi) {
     int line = cur(p).line;
-    // struct decl: `struct Name var;`
+    // struct decl: `struct Name var;` or `struct Name * p = &s;`
     if (cur(p).kind == TC_TK_KW_STRUCT) {
         p->i++;
         TcTok sn = cur(p);
         expect(p, TC_TK_IDENT, str_lit("expected struct name"));
+        bool is_ptr = accept(p, TC_TK_STAR);
         TcTok name = cur(p);
         expect(p, TC_TK_IDENT, str_lit("expected variable name"));
         Stmt *s = new_stmt(p, ST_DECL, line);
         s->decl_name = name.text;
-        s->decl_type.kind = TY_STRUCT;
+        s->decl_type.kind = is_ptr ? TY_PTR_STRUCT : TY_STRUCT;
         s->decl_type.struct_name = sn.text;
-        if (cur(p).kind == TC_TK_ASSIGN) {
-            perror_at(p, line, str_lit("struct initializers are not supported"));
+        if (accept(p, TC_TK_ASSIGN)) {
+            if (!is_ptr) {
+                perror_at(p, line, str_lit("struct initializers are not supported"));
+            }
+            s->decl_init = parse_expr(p);
         }
         if (require_semi) expect(p, TC_TK_SEMI, str_lit("expected ';'"));
         return s;
@@ -427,7 +444,7 @@ static Stmt *parse_stmt(P *p) {
     return s;
 }
 
-// Parse a function-signature type:  int | float | struct Name
+// Parse a function-signature type:  int | float | struct Name [ '*' ]
 // Returns false if the current tokens don't start a type.
 static bool parse_sig_type(P *p, Type *out) {
     *out = (Type){0};
@@ -439,6 +456,7 @@ static bool parse_sig_type(P *p, Type *out) {
         if (!expect(p, TC_TK_IDENT, str_lit("expected struct name"))) return false;
         out->kind = TY_STRUCT;
         out->struct_name = sn.text;
+        if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_STRUCT;
         return true;
     }
     return false;
