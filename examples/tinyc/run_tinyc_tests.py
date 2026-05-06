@@ -73,6 +73,10 @@ def main():
 
         # Stage 3: run
         r = run([str(exe)])
+        if r.returncode != 0:
+            print(f"FAIL {name}: binary exited with status {r.returncode}\nstdout: {r.stdout!r}\nstderr: {r.stderr!r}")
+            failures += 1
+            continue
         if r.stdout != expected:
             print(f"FAIL {name}: stdout mismatch\n  expected: {expected!r}\n  got:      {r.stdout!r}")
             failures += 1

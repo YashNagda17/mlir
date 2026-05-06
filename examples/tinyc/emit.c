@@ -222,17 +222,61 @@ static MLIR_ValueHandle emit_expr(E *e, Scope *sc, Expr *ex) {
             return bool_to_i32(e, eq);
         }
         case EX_BIN: {
-            // Short-circuiting && and || via select (not strictly short-circuit
-            // semantically but tinyC has no side-effects in pure exprs).
+            // True short-circuit && / || via scf.if with i32 result.
+            //   a && b  ==>  scf.if a_bool -> i32 { yield (b != 0 ? 1 : 0) } else { yield 0 }
+            //   a || b  ==>  scf.if a_bool -> i32 { yield 1 } else { yield (b != 0 ? 1 : 0) }
+            // Only the LHS is evaluated unconditionally; the RHS is emitted
+            // inside the conditionally-executed region, so its side effects
+            // (calls, divisions, etc.) follow C short-circuit semantics.
             if (ex->op == OP_AND || ex->op == OP_OR) {
                 MLIR_ValueHandle a = emit_expr(e, sc, ex->lhs);
-                MLIR_ValueHandle b = emit_expr(e, sc, ex->rhs);
                 MLIR_ValueHandle ab = emit_to_bool(e, a);
-                MLIR_ValueHandle bb = emit_to_bool(e, b);
-                MLIR_ValueHandle r = (ex->op == OP_AND)
-                    ? emit_binop(e, OP_TYPE_ARITH_ANDI, str_lit("arith.andi"), e->i1, ab, bb)
-                    : emit_binop(e, OP_TYPE_ARITH_ORI,  str_lit("arith.ori"),  e->i1, ab, bb);
-                return bool_to_i32(e, r);
+
+                MLIR_RegionHandle then_r = MLIR_CreateRegion(e->ctx);
+                MLIR_BlockHandle then_b = MLIR_CreateBlock(e->ctx);
+                MLIR_AppendRegionBlock(e->ctx, then_r, then_b);
+                MLIR_RegionHandle else_r = MLIR_CreateRegion(e->ctx);
+                MLIR_BlockHandle else_b = MLIR_CreateBlock(e->ctx);
+                MLIR_AppendRegionBlock(e->ctx, else_r, else_b);
+
+                MLIR_ValueHandle if_res = MLIR_CreateValueOpResult(
+                    e->ctx, MLIR_INVALID_HANDLE, 0, e->i32, ssa_name(e), eloc(e, 0));
+                MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = e->i32;
+                MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = if_res;
+                MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = ab;
+                MLIR_RegionHandle *regs = arena_new_array(e->arena, MLIR_RegionHandle, 2);
+                regs[0] = then_r; regs[1] = else_r;
+                emit_op(e, OP_TYPE_SCF_IF, str_lit("scf.if"),
+                        rts, 1, rs, 1, ops, 1, NULL, 0, regs, 2);
+
+                MLIR_BlockHandle saved = e->cur_block;
+                // Then-branch: for &&, evaluate RHS; for ||, yield 1.
+                e->cur_block = then_b;
+                MLIR_ValueHandle then_val;
+                if (ex->op == OP_AND) {
+                    MLIR_ValueHandle b = emit_expr(e, sc, ex->rhs);
+                    then_val = bool_to_i32(e, emit_to_bool(e, b));
+                } else {
+                    then_val = emit_const_i32(e, 1);
+                }
+                MLIR_ValueHandle *ty = arena_new_array(e->arena, MLIR_ValueHandle, 1); ty[0] = then_val;
+                emit_op(e, OP_TYPE_SCF_YIELD, str_lit("scf.yield"),
+                        NULL, 0, NULL, 0, ty, 1, NULL, 0, NULL, 0);
+
+                // Else-branch: for &&, yield 0; for ||, evaluate RHS.
+                e->cur_block = else_b;
+                MLIR_ValueHandle else_val;
+                if (ex->op == OP_AND) {
+                    else_val = emit_const_i32(e, 0);
+                } else {
+                    MLIR_ValueHandle b = emit_expr(e, sc, ex->rhs);
+                    else_val = bool_to_i32(e, emit_to_bool(e, b));
+                }
+                MLIR_ValueHandle *ey = arena_new_array(e->arena, MLIR_ValueHandle, 1); ey[0] = else_val;
+                emit_op(e, OP_TYPE_SCF_YIELD, str_lit("scf.yield"),
+                        NULL, 0, NULL, 0, ey, 1, NULL, 0, NULL, 0);
+                e->cur_block = saved;
+                return if_res;
             }
             MLIR_ValueHandle a = emit_expr(e, sc, ex->lhs);
             MLIR_ValueHandle b = emit_expr(e, sc, ex->rhs);
