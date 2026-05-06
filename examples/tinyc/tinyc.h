@@ -7,33 +7,32 @@
 //
 // Subset of C supported:
 //   - Types: int (i32), float (f32), int[N], int* (alias-only),
-//     struct S { int/float fields }, struct S* (alias-only)
+//     struct S { int / float / nested-struct fields },
+//     struct S* (alias-only), struct S[N] (fixed-size array of struct)
 //   - Local variables (mutable)
 //   - Integer and float literals
 //   - Binary ops: + - * / (% on int only)
 //   - Comparisons: < <= > >= == != (int and float)
 //   - Logical: && || ! (short-circuit, int operands)
-//   - Assignments to general lvalues: x, a[i], *p, s.field, p->field
+//   - Assignments to general lvalues: x, a[i], *p, s.field, p->field,
+//     s.inner.x (nested), arr[i].x (array of struct)
 //   - if / else, while, for
 //   - break, continue, early return
 //   - Address-of (&x, &s) and dereference (*p) — alias-only pointers
 //   - Functions with int / float / struct / struct* parameters and
 //     int / float / struct return types.
 //     Struct params and returns are scalarized at the function boundary
-//     (one MLIR scalar per field, in declaration order — Clang-style ABI
-//     lowering).  `q = f(p);` and `return s;` are the supported uses;
-//     a struct-returning call cannot appear in arbitrary expression
-//     position (must be assigned to a struct local, returned, or discarded).
-//     Struct-pointer params are also lowered at the boundary as one
-//     `memref<scalar>` per field; the body sees `p->field` as a field
-//     load/store on the caller's per-field memrefs.
+//     (one MLIR scalar per LEAF field, in declaration order — Clang-style
+//     ABI lowering, recursive through nested structs).
 //   - `print(expr);` builtin -> vector.print
 //   - Top-level entry point: int main()
 //
 // Not supported: strings, pointer reassignment, pointer arithmetic,
-// arrays-of-pointer, function pointers, returning struct*, nested/array
-// of struct, struct literal initialization, struct copy `q = p;` or
-// `*q = *p;` (use a wrapper function or field-by-field assignment).
+// arrays-of-pointer, function pointers, returning struct*, pointer or
+// array-of-struct as a function parameter or return, struct fields
+// that are themselves pointers or arrays, &<sub-struct-field>, struct
+// literal initialization, struct copy `q = p;` (use a wrapper or
+// field-by-field assignment).
 #pragma once
 
 #include <stdbool.h>
@@ -56,8 +55,9 @@ typedef enum {
     TY_F32,
     TY_PTR_I32,        // alias-only pointer to int
     TY_ARRAY_I32,      // fixed-size int[N], length in `array_len`
-    TY_STRUCT,         // struct value (fields stored as separate scalars)
+    TY_STRUCT,         // struct value (fields stored as flat per-leaf scalars)
     TY_PTR_STRUCT,     // alias-only pointer to struct (bundle of memref aliases)
+    TY_ARRAY_STRUCT,   // fixed-size struct[N], length in `array_len`
 } TypeKind;
 
 typedef struct {
@@ -173,8 +173,10 @@ typedef struct {
 DEFINE_VECTOR_FOR_TYPE(Func*, VecFuncPtr)
 
 typedef struct {
-    string   name;
-    TypeKind kind;       // TY_I32 or TY_F32 only
+    string name;
+    Type   type;        // field type. May be TY_I32, TY_F32, or TY_STRUCT
+                        // (nested by-value struct). TY_PTR_STRUCT and
+                        // TY_ARRAY_STRUCT are not allowed in fields yet.
 } StructField;
 
 DEFINE_VECTOR_FOR_TYPE(StructField, VecStructField)

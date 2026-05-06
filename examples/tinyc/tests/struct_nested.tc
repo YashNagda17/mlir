@@ -1,0 +1,45 @@
+struct Inner {
+    int x;
+    int y;
+};
+
+struct Outer {
+    struct Inner i;
+    int z;
+};
+
+int sum(struct Outer o) {
+    return o.i.x + o.i.y + o.z;
+}
+
+int sum_via_ptr(struct Outer* o) {
+    return o->i.x + o->i.y + o->z;
+}
+
+struct Outer make() {
+    struct Outer o;
+    o.i.x = 1;
+    o.i.y = 2;
+    o.z = 3;
+    return o;
+}
+
+int main() {
+    struct Outer o;
+    o.i.x = 10;
+    o.i.y = 20;
+    o.z = 30;
+    print(o.i.x);
+    print(o.i.y);
+    print(o.z);
+    print(sum(o));
+    print(sum_via_ptr(&o));
+
+    struct Outer m;
+    m = make();
+    print(m.i.x);
+    print(m.i.y);
+    print(m.z);
+    print(sum(m));
+    return 0;
+}

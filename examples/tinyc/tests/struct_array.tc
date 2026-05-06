@@ -1,0 +1,29 @@
+struct Point {
+    int x;
+    int y;
+};
+
+int main() {
+    struct Point pts[3];
+    int i = 0;
+    while (i < 3) {
+        pts[i].x = i + 1;
+        pts[i].y = (i + 1) * 10;
+        i = i + 1;
+    }
+
+    int sx = 0;
+    int sy = 0;
+    int j = 0;
+    while (j < 3) {
+        sx = sx + pts[j].x;
+        sy = sy + pts[j].y;
+        j = j + 1;
+    }
+    print(sx);
+    print(sy);
+
+    pts[1].x = pts[0].x + pts[2].x;
+    print(pts[1].x);
+    return 0;
+}

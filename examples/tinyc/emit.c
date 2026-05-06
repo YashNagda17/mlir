@@ -24,9 +24,12 @@
 typedef struct Sym {
     string name;
     Type   type;                // declared type
-    MLIR_ValueHandle addr;      // memref handle backing this local
-    // For TY_STRUCT: per-field memref handles (parallel to sdef->fields).
-    // For non-struct types: NULL / unused.
+    MLIR_ValueHandle addr;      // memref handle backing this local (scalar/array/ptr-i32)
+    // For TY_STRUCT / TY_PTR_STRUCT / TY_ARRAY_STRUCT: per-LEAF memref handles
+    // (recursively flattened across nested structs).
+    //   - TY_STRUCT and TY_PTR_STRUCT: each leaf is rank-0 memref<scalar>
+    //   - TY_ARRAY_STRUCT: each leaf is rank-1 memref<NxScalar>; the array
+    //     index is applied at the load/store site.
     StructDef *sdef;
     MLIR_ValueHandle *field_addrs;
     struct Sym *next;
@@ -109,6 +112,58 @@ static int struct_field_index(StructDef *sd, string name) {
         if (str_eq(sd->fields.data[i].name, name)) return (int)i;
     }
     return -1;
+}
+
+// Forward decl.
+static StructDef *find_struct(E *e, string name);
+
+// Number of LEAF scalars contained in a value of the given field-type.
+// Nested by-value structs flatten recursively.
+static size_t leaf_count_of_field_type(E *e, Type t) {
+    if (t.kind == TY_I32 || t.kind == TY_F32) return 1;
+    if (t.kind == TY_STRUCT) {
+        StructDef *sd = find_struct(e, t.struct_name);
+        if (!sd) return 0;
+        size_t n = 0;
+        for (size_t i = 0; i < sd->fields.size; i++) {
+            n += leaf_count_of_field_type(e, sd->fields.data[i].type);
+        }
+        return n;
+    }
+    return 0;
+}
+
+static size_t struct_leaf_count(E *e, StructDef *sd) {
+    if (!sd) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < sd->fields.size; i++) {
+        n += leaf_count_of_field_type(e, sd->fields.data[i].type);
+    }
+    return n;
+}
+
+// Sum of leaf counts of fields [0..field_idx) within `sd`.
+static size_t leaf_offset_of_field(E *e, StructDef *sd, int field_idx) {
+    size_t off = 0;
+    for (int i = 0; i < field_idx; i++) {
+        off += leaf_count_of_field_type(e, sd->fields.data[i].type);
+    }
+    return off;
+}
+
+// Enumerate the leaves of a struct (recursively) and write the TypeKind
+// of each leaf into `out` starting at *off.
+static void enumerate_leaf_kinds(E *e, StructDef *sd, TypeKind *out, size_t *off) {
+    if (!sd) return;
+    for (size_t i = 0; i < sd->fields.size; i++) {
+        Type ft = sd->fields.data[i].type;
+        if (ft.kind == TY_STRUCT) {
+            StructDef *inner = find_struct(e, ft.struct_name);
+            enumerate_leaf_kinds(e, inner, out, off);
+        } else {
+            out[(*off)++] = ft.kind;
+        }
+    }
 }
 
 static FuncSig *find_sig(E *e, string name) {
@@ -443,6 +498,85 @@ typedef struct {
     MLIR_TypeHandle elem_ty;   // element type (i32 or f32)
 } LVal;
 
+// "Struct context" produced by walking the lhs of a field access. Captures
+// which leaf-flat memref bundle we're in (`leaf_addrs`), the current sub-
+// struct definition (`sd`), the leaf offset accumulated so far (each step
+// down into a nested field adds the field's own leaf offset), and an
+// optional array index (only set if we walked through an array-of-struct
+// element along the way).
+typedef struct {
+    MLIR_ValueHandle *leaf_addrs;
+    StructDef       *sd;
+    size_t           leaf_offset;
+    MLIR_ValueHandle index;     // INVALID for plain struct contexts
+    bool             ok;
+} SCtx;
+
+static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
+    SCtx r = {.leaf_addrs = NULL, .sd = NULL, .leaf_offset = 0,
+              .index = MLIR_INVALID_HANDLE, .ok = false};
+    if (ex->kind == EX_VAR) {
+        Sym *s = scope_lookup(sc, ex->name);
+        if (!s) { println(str_lit("tinyc emit: undefined variable {}"), ex->name); return r; }
+        if (s->type.kind != TY_STRUCT && s->type.kind != TY_PTR_STRUCT) {
+            println(str_lit("tinyc emit: field/index access on non-struct variable {}"), ex->name);
+            return r;
+        }
+        r.leaf_addrs = s->field_addrs;
+        r.sd = s->sdef;
+        r.ok = (s->sdef != NULL);
+        return r;
+    }
+    if (ex->kind == EX_DEREF && ex->lhs->kind == EX_VAR) {
+        Sym *s = scope_lookup(sc, ex->lhs->name);
+        if (!s || s->type.kind != TY_PTR_STRUCT || !s->sdef) {
+            println(str_lit("tinyc emit: -> requires a struct pointer"));
+            return r;
+        }
+        r.leaf_addrs = s->field_addrs;
+        r.sd = s->sdef;
+        r.ok = true;
+        return r;
+    }
+    if (ex->kind == EX_INDEX && ex->lhs->kind == EX_VAR) {
+        Sym *s = scope_lookup(sc, ex->lhs->name);
+        if (!s || s->type.kind != TY_ARRAY_STRUCT || !s->sdef) {
+            println(str_lit("tinyc emit: arr[i].f requires an array of struct"));
+            return r;
+        }
+        MLIR_ValueHandle idx_i32 = emit_expr_i32(e, sc, ex->rhs);
+        r.leaf_addrs = s->field_addrs;
+        r.sd = s->sdef;
+        r.index = emit_index_cast(e, idx_i32);
+        r.ok = true;
+        return r;
+    }
+    if (ex->kind == EX_FIELD) {
+        SCtx parent = walk_struct_lhs(e, sc, ex->lhs);
+        if (!parent.ok) return r;
+        int idx = struct_field_index(parent.sd, ex->name);
+        if (idx < 0) {
+            println(str_lit("tinyc emit: unknown struct field {}"), ex->name);
+            return r;
+        }
+        Type ft = parent.sd->fields.data[idx].type;
+        if (ft.kind != TY_STRUCT) {
+            // walk_struct_lhs is for chains that need to STAY in a struct
+            // context. A scalar field as an intermediate is wrong here.
+            println(str_lit("tinyc emit: cannot chain field access through scalar field {}"), ex->name);
+            return r;
+        }
+        r.leaf_addrs = parent.leaf_addrs;
+        r.sd = find_struct(e, ft.struct_name);
+        r.leaf_offset = parent.leaf_offset + leaf_offset_of_field(e, parent.sd, idx);
+        r.index = parent.index;
+        r.ok = (r.sd != NULL);
+        return r;
+    }
+    println(str_lit("tinyc emit: unsupported lvalue base in field access"));
+    return r;
+}
+
 static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
     LVal r = {.addr = MLIR_INVALID_HANDLE, .index = MLIR_INVALID_HANDLE, .elem_ty = e->i32};
     switch (ex->kind) {
@@ -457,13 +591,24 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             return r;
         }
         case EX_INDEX: {
-            // a[i] : a must be an array variable.
+            // a[i] : a must be an int array (TY_ARRAY_I32) or array-of-struct
+            // (TY_ARRAY_STRUCT). Indexing into an array-of-struct on its own
+            // produces a struct-typed lvalue, which we don't support; the
+            // user must access a field (handled in EX_FIELD via walk_struct_lhs).
             if (ex->lhs->kind != EX_VAR) {
                 println(str_lit("tinyc emit: only simple-array indexing is supported"));
                 return r;
             }
             Sym *s = scope_lookup(sc, ex->lhs->name);
-            if (!s || s->type.kind != TY_ARRAY_I32) {
+            if (!s) {
+                println(str_lit("tinyc emit: undefined array {}"), ex->lhs->name);
+                return r;
+            }
+            if (s->type.kind == TY_ARRAY_STRUCT) {
+                println(str_lit("tinyc emit: array-of-struct element must be field-accessed (arr[i].f)"));
+                return r;
+            }
+            if (s->type.kind != TY_ARRAY_I32) {
                 println(str_lit("tinyc emit: indexing of non-array variable"));
                 return r;
             }
@@ -491,34 +636,25 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             return r;
         }
         case EX_FIELD: {
-            // s.field — base must be a struct or struct-pointer lvalue.
-            // Two supported shapes:
-            //   <var>.field        where <var> is TY_STRUCT
-            //   (*<var>).field     where <var> is TY_PTR_STRUCT  (also p->field)
-            Sym *s = NULL;
-            if (ex->lhs->kind == EX_VAR) {
-                s = scope_lookup(sc, ex->lhs->name);
-            } else if (ex->lhs->kind == EX_DEREF && ex->lhs->lhs->kind == EX_VAR) {
-                s = scope_lookup(sc, ex->lhs->lhs->name);
-                if (s && s->type.kind != TY_PTR_STRUCT) {
-                    println(str_lit("tinyc emit: -> requires a struct pointer"));
-                    return r;
-                }
-            } else {
-                println(str_lit("tinyc emit: only <var>.field or p->field is supported"));
-                return r;
-            }
-            if (!s || (s->type.kind != TY_STRUCT && s->type.kind != TY_PTR_STRUCT) || !s->sdef) {
-                println(str_lit("tinyc emit: field access on non-struct"));
-                return r;
-            }
-            int idx = struct_field_index(s->sdef, ex->name);
+            // Final field is the leaf scalar; walk_struct_lhs descends into
+            // any chain of nested fields / array-indexed array-of-struct /
+            // p-> deref before us.
+            SCtx parent = walk_struct_lhs(e, sc, ex->lhs);
+            if (!parent.ok) return r;
+            int idx = struct_field_index(parent.sd, ex->name);
             if (idx < 0) {
                 println(str_lit("tinyc emit: unknown struct field {}"), ex->name);
                 return r;
             }
-            r.addr = s->field_addrs[idx];
-            r.elem_ty = (s->sdef->fields.data[idx].kind == TY_F32) ? e->f32 : e->i32;
+            Type ft = parent.sd->fields.data[idx].type;
+            if (ft.kind != TY_I32 && ft.kind != TY_F32) {
+                println(str_lit("tinyc emit: field {} is not a scalar lvalue"), ex->name);
+                return r;
+            }
+            size_t leaf_idx = parent.leaf_offset + leaf_offset_of_field(e, parent.sd, idx);
+            r.addr = parent.leaf_addrs[leaf_idx];
+            r.index = parent.index;
+            r.elem_ty = (ft.kind == TY_F32) ? e->f32 : e->i32;
             return r;
         }
         default:
@@ -558,12 +694,12 @@ static void unify_numeric(E *e, EVal *a, EVal *b) {
 }
 
 // Resolve a struct or struct-ptr argument expression into the source
-// struct's per-field memref bundle. Accepts:
+// struct's per-leaf memref bundle. Accepts:
 //   - EX_VAR of TY_STRUCT          (the struct local itself)
 //   - EX_VAR of TY_PTR_STRUCT      (a struct-ptr local — already a bundle)
 //   - EX_ADDR of EX_VAR of TY_STRUCT  (taking the address of a struct local)
 // Returns NULL on failure (after printing). Out-params receive the source
-// StructDef and the per-field memref handle array (length sd->fields.size).
+// StructDef and the per-leaf memref handle array (length struct_leaf_count).
 static Sym *resolve_struct_source(E *e, Scope *sc, Expr *arg,
                                   StructDef **out_sd, MLIR_ValueHandle **out_addrs) {
     Expr *target = arg;
@@ -598,9 +734,9 @@ static Sym *resolve_struct_source(E *e, Scope *sc, Expr *arg,
 }
 
 // Splice a struct-typed call argument into the flattened operand array.
-// If the parameter is by-value (TY_STRUCT) we load each field into a scalar.
-// If the parameter is by-pointer (TY_PTR_STRUCT) we push the per-field
-// memref handles directly (alias-only — see tinyc.h).
+// If the parameter is by-value (TY_STRUCT) we load each LEAF scalar (recursively
+// through nested structs). If the parameter is by-pointer (TY_PTR_STRUCT) we
+// push the per-leaf memref handles directly (alias-only — see tinyc.h).
 static void splice_struct_call_arg(E *e, Scope *sc, Expr *arg, SlotInfo *p,
                                    MLIR_ValueHandle *out, size_t base) {
     StructDef *sd = NULL;
@@ -610,12 +746,16 @@ static void splice_struct_call_arg(E *e, Scope *sc, Expr *arg, SlotInfo *p,
     if (sd != p->sdef) {
         println(str_lit("tinyc emit: struct type mismatch in call argument"));
     }
-    for (size_t k = 0; k < sd->fields.size; k++) {
+    size_t n = struct_leaf_count(e, sd);
+    TypeKind *kinds = arena_new_array(e->arena, TypeKind, n ? n : 1);
+    size_t k_off = 0;
+    enumerate_leaf_kinds(e, sd, kinds, &k_off);
+    for (size_t k = 0; k < n; k++) {
         if (p->type.kind == TY_PTR_STRUCT) {
             out[base + k] = addrs[k];
         } else {
-            bool flt = (sd->fields.data[k].kind == TY_F32);
-            out[base + k] = emit_load(e, addrs[k], flt ? e->f32 : e->i32, NULL, 0);
+            out[base + k] = emit_load(e, addrs[k],
+                                      kinds[k] == TY_F32 ? e->f32 : e->i32, NULL, 0);
         }
     }
 }
@@ -903,35 +1043,37 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             } else if (st->decl_type.kind == TY_PTR_STRUCT) {
                 // Alias-only struct pointer: must be initialized with &<var>
                 // where <var> is a TY_STRUCT local with the same struct type.
-                // The pointer's per-field "addresses" alias the target's
-                // per-field memrefs.
+                // The pointer's per-leaf "addresses" alias the target's
+                // per-leaf memrefs (recursively flattened through nested
+                // structs).
                 StructDef *sd = find_struct(e, st->decl_type.struct_name);
                 if (!sd) {
                     println(str_lit("tinyc emit: unknown struct type {}"), st->decl_type.struct_name);
                     return;
                 }
                 sy->sdef = sd;
-                sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle,
-                                                  sd->fields.size ? sd->fields.size : 1);
-                if (!st->decl_init || st->decl_init->kind != EX_ADDR ||
-                    st->decl_init->lhs->kind != EX_VAR) {
+                size_t n = struct_leaf_count(e, sd);
+                sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle, n ? n : 1);
+                TypeKind *kinds = arena_new_array(e->arena, TypeKind, n ? n : 1);
+                size_t k_off = 0;
+                enumerate_leaf_kinds(e, sd, kinds, &k_off);
+                bool ok = (st->decl_init && st->decl_init->kind == EX_ADDR &&
+                           st->decl_init->lhs->kind == EX_VAR);
+                Sym *target = NULL;
+                if (ok) {
+                    target = scope_lookup(sc, st->decl_init->lhs->name);
+                    if (!target || target->type.kind != TY_STRUCT || target->sdef != sd)
+                        ok = false;
+                }
+                if (!ok) {
                     println(str_lit("tinyc emit: struct* must be initialized with &<struct_var>"));
-                    for (size_t k = 0; k < sd->fields.size; k++) {
-                        bool flt = (sd->fields.data[k].kind == TY_F32);
-                        sy->field_addrs[k] = emit_alloc(e, flt ? e->memref_f32 : e->memref_i32);
+                    for (size_t k = 0; k < n; k++) {
+                        sy->field_addrs[k] = emit_alloc(e,
+                            kinds[k] == TY_F32 ? e->memref_f32 : e->memref_i32);
                     }
                 } else {
-                    Sym *target = scope_lookup(sc, st->decl_init->lhs->name);
-                    if (!target || target->type.kind != TY_STRUCT || target->sdef != sd) {
-                        println(str_lit("tinyc emit: struct* target must be a matching struct local"));
-                        for (size_t k = 0; k < sd->fields.size; k++) {
-                            bool flt = (sd->fields.data[k].kind == TY_F32);
-                            sy->field_addrs[k] = emit_alloc(e, flt ? e->memref_f32 : e->memref_i32);
-                        }
-                    } else {
-                        for (size_t k = 0; k < sd->fields.size; k++) {
-                            sy->field_addrs[k] = target->field_addrs[k];
-                        }
+                    for (size_t k = 0; k < n; k++) {
+                        sy->field_addrs[k] = target->field_addrs[k];
                     }
                 }
             } else if (st->decl_type.kind == TY_ARRAY_I32) {
@@ -941,6 +1083,28 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 if (st->decl_init) {
                     println(str_lit("tinyc emit: array initializers are not supported"));
                 }
+            } else if (st->decl_type.kind == TY_ARRAY_STRUCT) {
+                // Array of struct: per leaf, allocate one rank-1 memref<NxScalar>.
+                StructDef *sd = find_struct(e, st->decl_type.struct_name);
+                if (!sd) {
+                    println(str_lit("tinyc emit: unknown struct type {}"), st->decl_type.struct_name);
+                    return;
+                }
+                sy->sdef = sd;
+                size_t n = struct_leaf_count(e, sd);
+                sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle, n ? n : 1);
+                TypeKind *kinds = arena_new_array(e->arena, TypeKind, n ? n : 1);
+                size_t k_off = 0;
+                enumerate_leaf_kinds(e, sd, kinds, &k_off);
+                int64_t shape[1] = { st->decl_type.array_len };
+                for (size_t k = 0; k < n; k++) {
+                    MLIR_TypeHandle elem = (kinds[k] == TY_F32) ? e->f32 : e->i32;
+                    MLIR_TypeHandle arr_ty = MLIR_CreateTypeMemref(e->ctx, shape, 1, elem);
+                    sy->field_addrs[k] = emit_alloc(e, arr_ty);
+                }
+                if (st->decl_init) {
+                    println(str_lit("tinyc emit: array-of-struct initializers are not supported"));
+                }
             } else if (st->decl_type.kind == TY_STRUCT) {
                 StructDef *sd = find_struct(e, st->decl_type.struct_name);
                 if (!sd) {
@@ -948,13 +1112,15 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                     return;
                 }
                 sy->sdef = sd;
-                sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle,
-                                                  sd->fields.size ? sd->fields.size : 1);
-                for (size_t i = 0; i < sd->fields.size; i++) {
-                    bool flt = (sd->fields.data[i].kind == TY_F32);
+                size_t n = struct_leaf_count(e, sd);
+                sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle, n ? n : 1);
+                TypeKind *kinds = arena_new_array(e->arena, TypeKind, n ? n : 1);
+                size_t k_off = 0;
+                enumerate_leaf_kinds(e, sd, kinds, &k_off);
+                for (size_t i = 0; i < n; i++) {
+                    bool flt = (kinds[i] == TY_F32);
                     MLIR_ValueHandle addr = emit_alloc(e, flt ? e->memref_f32 : e->memref_i32);
                     sy->field_addrs[i] = addr;
-                    // zero-initialize each field
                     if (flt) emit_store(e, emit_const_f32(e, 0.0), addr, NULL, 0);
                     else     emit_store(e, emit_const_i32(e, 0),   addr, NULL, 0);
                 }
@@ -985,13 +1151,12 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
         }
         case ST_RETURN: {
             FuncSig *sig = e->cur_sig;
-            // struct return: load each field and emit multi-result return.
+            // struct return: load each LEAF and emit multi-result return.
             if (sig && sig->ret.type.kind == TY_STRUCT) {
                 StructDef *want = sig->ret.sdef;
-                size_t n = want ? want->fields.size : 0;
+                size_t n = want ? struct_leaf_count(e, want) : 0;
                 MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, n ? n : 1);
                 if (st->expr->kind == EX_CALL) {
-                    // `return f(p);` where f also returns the same struct.
                     FuncSig *csig = find_sig(e, st->expr->callee);
                     if (!csig || csig->ret.type.kind != TY_STRUCT || csig->ret.sdef != want) {
                         println(str_lit("tinyc emit: returned call type mismatch"));
@@ -1005,9 +1170,12 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                         println(str_lit("tinyc emit: returned struct type mismatch"));
                         for (size_t k = 0; k < n; k++) ops[k] = emit_const_i32(e, 0);
                     } else {
+                        TypeKind *kinds = arena_new_array(e->arena, TypeKind, n ? n : 1);
+                        size_t k_off = 0;
+                        enumerate_leaf_kinds(e, want, kinds, &k_off);
                         for (size_t k = 0; k < n; k++) {
-                            bool flt = (s->sdef->fields.data[k].kind == TY_F32);
-                            ops[k] = emit_load(e, s->field_addrs[k], flt ? e->f32 : e->i32, NULL, 0);
+                            ops[k] = emit_load(e, s->field_addrs[k],
+                                kinds[k] == TY_F32 ? e->f32 : e->i32, NULL, 0);
                         }
                     }
                 } else {
@@ -1180,7 +1348,7 @@ static void slot_resolve(E *e, Type ty, SlotInfo *out) {
             println(str_lit("tinyc emit: unknown struct type {}"), ty.struct_name);
             out->flat_count = 0;
         } else {
-            out->flat_count = out->sdef->fields.size;
+            out->flat_count = struct_leaf_count(e, out->sdef);
         }
     } else if (ty.kind != TY_I32 && ty.kind != TY_F32) {
         println(str_lit("tinyc emit: unsupported type in function signature"));
@@ -1189,17 +1357,21 @@ static void slot_resolve(E *e, Type ty, SlotInfo *out) {
 }
 
 // Append the flattened MLIR types of a slot into `tys` starting at `*offset`.
+// For struct slots, recurses into nested fields and emits one type per LEAF.
 static void slot_emit_flat_types(E *e, SlotInfo *s, MLIR_TypeHandle *tys, size_t *offset) {
     s->flat_offset = *offset;
     if (s->type.kind == TY_STRUCT || s->type.kind == TY_PTR_STRUCT) {
         if (!s->sdef) return;
-        for (size_t i = 0; i < s->sdef->fields.size; i++) {
-            TypeKind fk = s->sdef->fields.data[i].kind;
+        size_t n = struct_leaf_count(e, s->sdef);
+        TypeKind *kinds = arena_new_array(e->arena, TypeKind, n ? n : 1);
+        size_t k_off = 0;
+        enumerate_leaf_kinds(e, s->sdef, kinds, &k_off);
+        for (size_t i = 0; i < n; i++) {
             MLIR_TypeHandle t;
             if (s->type.kind == TY_PTR_STRUCT) {
-                t = (fk == TY_F32) ? e->memref_f32 : e->memref_i32;
+                t = (kinds[i] == TY_F32) ? e->memref_f32 : e->memref_i32;
             } else {
-                t = scalar_mlir_type(e, fk);
+                t = scalar_mlir_type(e, kinds[i]);
             }
             tys[(*offset)++] = t;
         }
@@ -1277,21 +1449,24 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
         sy->type = p->type;
         if (p->type.kind == TY_STRUCT && p->sdef) {
             sy->sdef = p->sdef;
-            sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle,
-                                              p->sdef->fields.size ? p->sdef->fields.size : 1);
-            for (size_t k = 0; k < p->sdef->fields.size; k++) {
-                bool flt = (p->sdef->fields.data[k].kind == TY_F32);
+            size_t n = struct_leaf_count(e, p->sdef);
+            sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle, n ? n : 1);
+            TypeKind *kinds = arena_new_array(e->arena, TypeKind, n ? n : 1);
+            size_t k_off = 0;
+            enumerate_leaf_kinds(e, p->sdef, kinds, &k_off);
+            for (size_t k = 0; k < n; k++) {
+                bool flt = (kinds[k] == TY_F32);
                 MLIR_ValueHandle addr = emit_alloc(e, flt ? e->memref_f32 : e->memref_i32);
                 sy->field_addrs[k] = addr;
                 emit_store(e, flat_args[p->flat_offset + k], addr, NULL, 0);
             }
         } else if (p->type.kind == TY_PTR_STRUCT && p->sdef) {
-            // Alias-only pointer: bind the caller's per-field memrefs
+            // Alias-only pointer: bind the caller's per-leaf memrefs
             // (passed as block args) directly. No alloca, no store.
             sy->sdef = p->sdef;
-            sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle,
-                                              p->sdef->fields.size ? p->sdef->fields.size : 1);
-            for (size_t k = 0; k < p->sdef->fields.size; k++) {
+            size_t n = struct_leaf_count(e, p->sdef);
+            sy->field_addrs = arena_new_array(e->arena, MLIR_ValueHandle, n ? n : 1);
+            for (size_t k = 0; k < n; k++) {
                 sy->field_addrs[k] = flat_args[p->flat_offset + k];
             }
         } else {

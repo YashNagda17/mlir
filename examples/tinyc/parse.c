@@ -304,6 +304,7 @@ static void parse_block(P *p, VecStmtPtr *out) {
 static Stmt *parse_decl(P *p, bool require_semi) {
     int line = cur(p).line;
     // struct decl: `struct Name var;` or `struct Name * p = &s;`
+    //              or `struct Name var[N];`
     if (cur(p).kind == TC_TK_KW_STRUCT) {
         p->i++;
         TcTok sn = cur(p);
@@ -313,11 +314,22 @@ static Stmt *parse_decl(P *p, bool require_semi) {
         expect(p, TC_TK_IDENT, str_lit("expected variable name"));
         Stmt *s = new_stmt(p, ST_DECL, line);
         s->decl_name = name.text;
-        s->decl_type.kind = is_ptr ? TY_PTR_STRUCT : TY_STRUCT;
         s->decl_type.struct_name = sn.text;
+        if (accept(p, TC_TK_LBRACK)) {
+            if (is_ptr) {
+                perror_at(p, line, str_lit("array of struct pointer is not supported"));
+            }
+            TcTok lit = cur(p);
+            expect(p, TC_TK_INT_LIT, str_lit("expected array length"));
+            expect(p, TC_TK_RBRACK, str_lit("expected ']'"));
+            s->decl_type.kind = TY_ARRAY_STRUCT;
+            s->decl_type.array_len = lit.int_value;
+        } else {
+            s->decl_type.kind = is_ptr ? TY_PTR_STRUCT : TY_STRUCT;
+        }
         if (accept(p, TC_TK_ASSIGN)) {
-            if (!is_ptr) {
-                perror_at(p, line, str_lit("struct initializers are not supported"));
+            if (s->decl_type.kind != TY_PTR_STRUCT) {
+                perror_at(p, line, str_lit("struct/array initializers are not supported"));
             }
             s->decl_init = parse_expr(p);
         }
@@ -508,17 +520,28 @@ static StructDef *parse_struct_def(P *p) {
     sd->line = line;
     VecStructField_reserve(p->arena, &sd->fields, 4);
     while (cur(p).kind != TC_TK_RBRACE && cur(p).kind != TC_TK_EOF) {
-        TypeKind k;
-        if (!parse_base_type(p, &k)) {
-            perror_at(p, cur(p).line, str_lit("expected field type (int|float)"));
+        Type ft = {0};
+        if (cur(p).kind == TC_TK_KW_STRUCT) {
+            // Nested by-value struct field: `struct Inner name;`
             p->i++;
-            continue;
+            TcTok sn = cur(p);
+            if (!expect(p, TC_TK_IDENT, str_lit("expected struct name"))) { p->i++; continue; }
+            ft.kind = TY_STRUCT;
+            ft.struct_name = sn.text;
+        } else {
+            TypeKind k;
+            if (!parse_base_type(p, &k)) {
+                perror_at(p, cur(p).line, str_lit("expected field type (int|float|struct)"));
+                p->i++;
+                continue;
+            }
+            ft.kind = k;
         }
         TcTok fn = cur(p);
         expect(p, TC_TK_IDENT, str_lit("expected field name"));
         expect(p, TC_TK_SEMI, str_lit("expected ';' after field"));
         VecStructField_push_back(p->arena, &sd->fields,
-            ((StructField){.name = fn.text, .kind = k}));
+            ((StructField){.name = fn.text, .type = ft}));
     }
     expect(p, TC_TK_RBRACE, str_lit("expected '}'"));
     expect(p, TC_TK_SEMI, str_lit("expected ';' after struct definition"));
