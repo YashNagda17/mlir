@@ -1,0 +1,35 @@
+// Regression test for nested-block scoping. Each `{}` block must get its
+// own Scope so an inner declaration shadows the outer one only within the
+// nested block, and the outer binding is restored on exit.
+
+int main() {
+    int x = 1;
+    print(x);                 // 1
+    {
+        int x = 2;
+        print(x);             // 2
+        {
+            int x = 3;
+            print(x);         // 3
+        }
+        print(x);             // 2
+    }
+    print(x);                 // 1
+
+    // for-loop induction var shadows outer x within the loop body / step.
+    for (int x = 10; x < 13; x = x + 1) {
+        print(x);             // 10, 11, 12
+    }
+    print(x);                 // 1
+
+    // Sibling blocks: each is its own scope, no leakage between them.
+    {
+        int y = 7;
+        print(y);             // 7
+    }
+    {
+        int y = 9;
+        print(y);             // 9
+    }
+    return 0;
+}

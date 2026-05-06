@@ -159,5 +159,9 @@ name = "enum_typed"
 expected_stdout = "1\n2\n3\n2\n1\n5\n"
 
 [[test]]
+name = "nested_scope"
+expected_stdout = "1\n2\n3\n2\n1\n10\n11\n12\n1\n7\n9\n"
+
+[[test]]
 name = "enum_shadow"
 expected_stdout = "1\n2\n3\n1\n"
