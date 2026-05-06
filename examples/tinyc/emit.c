@@ -136,7 +136,19 @@ typedef struct {
     MLIR_BlockHandle module_block;
     Sym             *globals;        // module-scope symbols
     bool             use_print_str;  // emit @printStr extern decl
+    int              cur_line;       // last AST node line entered; used by
+                                     // EMIT_ERR for diagnostic line numbers.
 } E;
+
+// All emit-time diagnostics route through this macro so they carry a line
+// number. `msg` must be a C string literal (it is concatenated with the
+// "tinyc emit error at line {}: " prefix at preprocess time and wrapped in
+// str_lit). The line is taken from e->cur_line, which is updated at the
+// entry of emit_expr / emit_lvalue / emit_stmt / emit_func / per-struct
+// pre-pass loops.
+#define EMIT_ERR(e, msg, ...) \
+    println(str_lit("tinyc emit error at line {}: " msg), \
+            (int64_t)((e)->cur_line), ##__VA_ARGS__)
 
 static StructDef *find_struct(E *e, string name) {
     if (!e->program) return NULL;
@@ -677,11 +689,12 @@ static void sctx_push(E *e, SCtx *c, int32_t v) {
 }
 
 static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
+    e->cur_line = ex->line;
     SCtx r = {0};
     r.dyn_index = MLIR_INVALID_HANDLE;
     if (ex->kind == EX_VAR) {
         Sym *s = lookup(e, sc, ex->name);
-        if (!s) { println(str_lit("tinyc emit: undefined variable {}"), ex->name); return r; }
+        if (!s) { EMIT_ERR(e, "undefined variable: {}", ex->name); return r; }
         if (s->type.kind == TY_STRUCT) {
             r.base_ptr = sym_addr(e, s);
             r.source_elem = find_struct_type(e, s->sdef);
@@ -699,14 +712,14 @@ static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
             r.ok = (s->sdef != NULL);
             return r;
         }
-        println(str_lit("tinyc emit: field/index access on non-struct variable {}"), ex->name);
+        EMIT_ERR(e, "field/index access on non-struct variable {}", ex->name);
         return r;
     }
     if (ex->kind == EX_DEREF) {
         if (ex->lhs->kind == EX_VAR) {
             Sym *s = lookup(e, sc, ex->lhs->name);
             if (!s || s->type.kind != TY_PTR_STRUCT || !s->sdef) {
-                println(str_lit("tinyc emit: -> requires a struct pointer"));
+                EMIT_ERR(e, "-> requires a struct pointer");
                 return r;
             }
             r.base_ptr = emit_load_v(e, sym_addr(e, s), e->ptr);
@@ -720,7 +733,7 @@ static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
         // Supports mid-chain walks like p->left->right and (*f(...)).x.
         EVal v = emit_expr(e, sc, ex->lhs);
         if (!v.is_ptr || !v.sdef) {
-            println(str_lit("tinyc emit: -> requires a struct pointer"));
+            EMIT_ERR(e, "-> requires a struct pointer");
             return r;
         }
         r.base_ptr = v.val;
@@ -733,7 +746,7 @@ static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
     if (ex->kind == EX_INDEX && ex->lhs->kind == EX_VAR) {
         Sym *s = lookup(e, sc, ex->lhs->name);
         if (!s || s->type.kind != TY_ARRAY_STRUCT || !s->sdef) {
-            println(str_lit("tinyc emit: arr[i].f requires an array of struct"));
+            EMIT_ERR(e, "arr[i].f requires an array of struct");
             return r;
         }
         MLIR_ValueHandle idx_i32 = emit_expr_i32(e, sc, ex->rhs);
@@ -753,12 +766,12 @@ static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
         if (!parent.ok) return r;
         int idx = struct_field_index(parent.sd, ex->name);
         if (idx < 0) {
-            println(str_lit("tinyc emit: unknown struct field {}"), ex->name);
+            EMIT_ERR(e, "unknown struct field {}", ex->name);
             return r;
         }
         Type ft = parent.sd->fields.data[idx].type;
         if (ft.kind != TY_STRUCT) {
-            println(str_lit("tinyc emit: cannot chain field access through scalar field {}"), ex->name);
+            EMIT_ERR(e, "cannot chain field access through scalar field {}", ex->name);
             return r;
         }
         r = parent;
@@ -767,11 +780,12 @@ static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
         r.ok = (r.sd != NULL);
         return r;
     }
-    println(str_lit("tinyc emit: unsupported lvalue base in field access"));
+    EMIT_ERR(e, "unsupported lvalue base in field access");
     return r;
 }
 
 static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
+    e->cur_line = ex->line;
     LVal r = {0};
     r.source_elem = MLIR_INVALID_HANDLE;
     r.dyn_index = MLIR_INVALID_HANDLE;
@@ -780,7 +794,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
         case EX_VAR: {
             Sym *s = lookup(e, sc, ex->name);
             if (!s) {
-                println(str_lit("tinyc emit: undefined variable {}"), ex->name);
+                EMIT_ERR(e, "undefined variable: {}", ex->name);
                 return r;
             }
             r.base_ptr = sym_addr(e, s);
@@ -813,7 +827,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                 if (parent.ok) {
                     int fidx = struct_field_index(parent.sd, field_expr->name);
                     if (fidx < 0) {
-                        println(str_lit("tinyc emit: unknown struct field {}"),
+                        EMIT_ERR(e, "unknown struct field {}",
                                 field_expr->name);
                         return r;
                     }
@@ -825,15 +839,15 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                     if (is_arr_i32 || is_arr_f32 || is_arr_pst || is_arr_pch) {
                         bool is_2d = (ft.array_len2 != 0);
                         if (is_2d && !idx_b) {
-                            println(str_lit("tinyc emit: 2D field array requires both indices, e.g. s.m[i][j]"));
+                            EMIT_ERR(e, "2D field array requires both indices, e.g. s.m[i][j]");
                             return r;
                         }
                         if (!is_2d && idx_b) {
-                            println(str_lit("tinyc emit: 1D field array indexed twice"));
+                            EMIT_ERR(e, "1D field array indexed twice");
                             return r;
                         }
                         if ((is_arr_pst || is_arr_pch) && is_2d) {
-                            println(str_lit("tinyc emit: 2D pointer-array fields are not supported"));
+                            EMIT_ERR(e, "2D pointer-array fields are not supported");
                             return r;
                         }
                         MLIR_TypeHandle elem = is_arr_f32 ? e->f32
@@ -888,16 +902,16 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                 }
             }
             if (ex->lhs->kind != EX_VAR) {
-                println(str_lit("tinyc emit: only simple-array indexing is supported"));
+                EMIT_ERR(e, "only simple-array indexing is supported");
                 return r;
             }
             Sym *s = lookup(e, sc, ex->lhs->name);
             if (!s) {
-                println(str_lit("tinyc emit: undefined array {}"), ex->lhs->name);
+                EMIT_ERR(e, "undefined array: {}", ex->lhs->name);
                 return r;
             }
             if (s->type.kind == TY_ARRAY_STRUCT) {
-                println(str_lit("tinyc emit: array-of-struct element must be field-accessed (arr[i].f)"));
+                EMIT_ERR(e, "array-of-struct element must be field-accessed (arr[i].f)");
                 return r;
             }
             // Pointer indexing: p[i] for int* / char* — GEP %p[%i].
@@ -914,11 +928,11 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                 return r;
             }
             if (s->type.kind != TY_ARRAY_I32) {
-                println(str_lit("tinyc emit: indexing of non-array variable"));
+                EMIT_ERR(e, "indexing of non-array variable");
                 return r;
             }
             if (s->type.array_len2 != 0) {
-                println(str_lit("tinyc emit: 2D array requires both indices, e.g. m[i][j]"));
+                EMIT_ERR(e, "2D array requires both indices, e.g. m[i][j]");
                 return r;
             }
             MLIR_ValueHandle idx_i32 = emit_expr_i32(e, sc, ex->rhs);
@@ -935,7 +949,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             if (ex->lhs->kind == EX_VAR) {
                 Sym *s = lookup(e, sc, ex->lhs->name);
                 if (!s || (s->type.kind != TY_PTR_I32 && s->type.kind != TY_PTR_CHAR)) {
-                    println(str_lit("tinyc emit: dereference of non-pointer"));
+                    EMIT_ERR(e, "dereference of non-pointer");
                     return r;
                 }
                 // Load the inner ptr from p's slot.
@@ -947,7 +961,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             // as a pointer expression; default elem type to i32.
             EVal v = emit_expr(e, sc, ex->lhs);
             if (!v.is_ptr) {
-                println(str_lit("tinyc emit: dereference of non-pointer expression"));
+                EMIT_ERR(e, "dereference of non-pointer expression");
                 return r;
             }
             r.base_ptr = v.val;
@@ -959,12 +973,12 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             if (!parent.ok) return r;
             int idx = struct_field_index(parent.sd, ex->name);
             if (idx < 0) {
-                println(str_lit("tinyc emit: unknown struct field {}"), ex->name);
+                EMIT_ERR(e, "unknown struct field {}", ex->name);
                 return r;
             }
             Type ft = parent.sd->fields.data[idx].type;
             if (ft.kind != TY_I32 && ft.kind != TY_F32 && ft.kind != TY_PTR_STRUCT) {
-                println(str_lit("tinyc emit: field {} is not a scalar lvalue"), ex->name);
+                EMIT_ERR(e, "field {} is not a scalar lvalue", ex->name);
                 return r;
             }
             sctx_push(e, &parent, idx);
@@ -979,7 +993,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             return r;
         }
         default:
-            println(str_lit("tinyc emit: invalid lvalue"));
+            EMIT_ERR(e, "invalid lvalue");
             return r;
     }
 }
@@ -1003,7 +1017,7 @@ static MLIR_ValueHandle resolve_struct_source(E *e, Scope *sc, Expr *arg, Struct
     Expr *target = arg;
     if (arg->kind == EX_ADDR) {
         if (arg->lhs->kind != EX_VAR) {
-            println(str_lit("tinyc emit: &expr in struct context requires a simple variable"));
+            EMIT_ERR(e, "&expr in struct context requires a simple variable");
             return MLIR_INVALID_HANDLE;
         }
         target = arg->lhs;
@@ -1012,7 +1026,7 @@ static MLIR_ValueHandle resolve_struct_source(E *e, Scope *sc, Expr *arg, Struct
         Sym *s = lookup(e, sc, target->name);
         if (s && (s->type.kind == TY_STRUCT || s->type.kind == TY_PTR_STRUCT) && s->sdef) {
             if (arg->kind == EX_ADDR && s->type.kind != TY_STRUCT) {
-                println(str_lit("tinyc emit: &<var> requires a struct local"));
+                EMIT_ERR(e, "&<var> requires a struct local");
                 return MLIR_INVALID_HANDLE;
             }
             *out_sd = s->sdef;
@@ -1023,7 +1037,7 @@ static MLIR_ValueHandle resolve_struct_source(E *e, Scope *sc, Expr *arg, Struct
     // Fallback: evaluate as a generic pointer expression.
     EVal v = emit_expr(e, sc, arg);
     if (!v.is_ptr) {
-        println(str_lit("tinyc emit: argument is not a struct or struct pointer"));
+        EMIT_ERR(e, "argument is not a struct or struct pointer");
         return MLIR_INVALID_HANDLE;
     }
     *out_sd = v.sdef;
@@ -1099,7 +1113,7 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
                            MLIR_ValueHandle *out_results,
                            MLIR_ValueHandle out_sret_buf) {
     if (args.size != sig->n_params) {
-        println(str_lit("tinyc emit: call to {} arity mismatch"), sig->name);
+        EMIT_ERR(e, "call to {} arity mismatch", sig->name);
     }
     size_t n_in = sig->n_flat_in;
     MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, n_in ? n_in : 1);
@@ -1122,7 +1136,7 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
             StructDef *sd = NULL;
             MLIR_ValueHandle src = resolve_struct_source(e, sc, args.data[i], &sd);
             if (src == MLIR_INVALID_HANDLE || sd != p->sdef) {
-                println(str_lit("tinyc emit: struct call arg type mismatch"));
+                EMIT_ERR(e, "struct call arg type mismatch");
                 ops[op_off++] = src;
                 continue;
             }
@@ -1160,6 +1174,7 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
 }
 
 static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
+    e->cur_line = ex->line;
     EVal r = {0};
     switch (ex->kind) {
         case EX_INT:
@@ -1237,7 +1252,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             // cast_type for downstream consumers.
             EVal v = emit_expr(e, sc, ex->lhs);
             if (!v.is_ptr) {
-                println(str_lit("tinyc emit: cast operand is not a pointer"));
+                EMIT_ERR(e, "cast operand is not a pointer");
             }
             v.is_ptr = true;
             v.is_float = false;
@@ -1394,7 +1409,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     if (fsig) {
                         return emit_expr(e, sc, ex->lhs);
                     }
-                    println(str_lit("tinyc emit: undefined variable {}"), ex->lhs->name);
+                    EMIT_ERR(e, "undefined variable: {}", ex->lhs->name);
                     return r;
                 }
                 r.val = sym_addr(e, s);
@@ -1411,7 +1426,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 r.ptr_elem = lv.elem_ty;
                 return r;
             }
-            println(str_lit("tinyc emit: unsupported & operand"));
+            EMIT_ERR(e, "unsupported & operand");
             return r;
         }
         case EX_ASSIGN: {
@@ -1449,7 +1464,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             }
             if (ex->op == OP_BNOT) {
                 if (a.is_float) {
-                    println(str_lit("tinyc emit: ~ not supported on floats"));
+                    EMIT_ERR(e, "~ not supported on floats");
                     r.val = emit_const_i32(e, 0);
                     return r;
                 }
@@ -1624,7 +1639,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     r.is_float = flt; return r;
                 case OP_MOD:
                     if (flt) {
-                        println(str_lit("tinyc emit: % not supported on floats"));
+                        EMIT_ERR(e, "% not supported on floats");
                         r.val = emit_const_f32(e, 0.0); r.is_float = true; return r;
                     }
                     r.val = emit_binop(e, OP_TYPE_ARITH_REMSI, str_lit("arith.remsi"), e->i32, a.val, b.val);
@@ -1638,23 +1653,23 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     return r;
                 }
                 case OP_BAND:
-                    if (flt) { println(str_lit("tinyc emit: & not supported on floats")); r.val = emit_const_i32(e, 0); return r; }
+                    if (flt) { EMIT_ERR(e, "& not supported on floats"); r.val = emit_const_i32(e, 0); return r; }
                     r.val = emit_binop(e, OP_TYPE_ARITH_ANDI, str_lit("arith.andi"), e->i32, a.val, b.val);
                     return r;
                 case OP_BOR:
-                    if (flt) { println(str_lit("tinyc emit: | not supported on floats")); r.val = emit_const_i32(e, 0); return r; }
+                    if (flt) { EMIT_ERR(e, "| not supported on floats"); r.val = emit_const_i32(e, 0); return r; }
                     r.val = emit_binop(e, OP_TYPE_ARITH_ORI, str_lit("arith.ori"), e->i32, a.val, b.val);
                     return r;
                 case OP_BXOR:
-                    if (flt) { println(str_lit("tinyc emit: ^ not supported on floats")); r.val = emit_const_i32(e, 0); return r; }
+                    if (flt) { EMIT_ERR(e, "^ not supported on floats"); r.val = emit_const_i32(e, 0); return r; }
                     r.val = emit_binop(e, OP_TYPE_ARITH_XORI, str_lit("arith.xori"), e->i32, a.val, b.val);
                     return r;
                 case OP_SHL:
-                    if (flt) { println(str_lit("tinyc emit: << not supported on floats")); r.val = emit_const_i32(e, 0); return r; }
+                    if (flt) { EMIT_ERR(e, "<< not supported on floats"); r.val = emit_const_i32(e, 0); return r; }
                     r.val = emit_binop(e, OP_TYPE_ARITH_SHLI, str_lit("arith.shli"), e->i32, a.val, b.val);
                     return r;
                 case OP_SHR:
-                    if (flt) { println(str_lit("tinyc emit: >> not supported on floats")); r.val = emit_const_i32(e, 0); return r; }
+                    if (flt) { EMIT_ERR(e, ">> not supported on floats"); r.val = emit_const_i32(e, 0); return r; }
                     r.val = emit_binop(e, OP_TYPE_ARITH_SHRSI, str_lit("arith.shrsi"), e->i32, a.val, b.val);
                     return r;
                 default: break;
@@ -1667,7 +1682,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             // sizeof), extended to i64 for the libc signature.
             if (str_eq(ex->callee, str_lit("malloc"))) {
                 if (ex->args.size != 1) {
-                    println(str_lit("tinyc emit: malloc expects 1 argument"));
+                    EMIT_ERR(e, "malloc expects 1 argument");
                     r.val = emit_null_ptr(e); r.is_ptr = true; return r;
                 }
                 MLIR_ValueHandle sz_i32 = emit_expr_i32(e, sc, ex->args.data[0]);
@@ -1686,7 +1701,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             }
             if (str_eq(ex->callee, str_lit("free"))) {
                 if (ex->args.size != 1) {
-                    println(str_lit("tinyc emit: free expects 1 argument"));
+                    EMIT_ERR(e, "free expects 1 argument");
                     return r;
                 }
                 EVal pv = emit_expr(e, sc, ex->args.data[0]);
@@ -1706,7 +1721,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 // `ex->callee` (local var, parameter, or module global).
                 Sym *sy = lookup(e, sc, ex->callee);
                 if (!sy || sy->type.kind != TY_FNPTR || !sy->type.fnptr_ret) {
-                    println(str_lit("tinyc emit: unknown function {}"), ex->callee);
+                    EMIT_ERR(e, "undefined function: {}", ex->callee);
                     r.val = emit_const_i32(e, 0);
                     return r;
                 }
@@ -1715,7 +1730,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 MLIR_ValueHandle callee_ptr = emit_load_v(e, sym_addr(e, sy), e->ptr);
                 size_t na = ex->args.size;
                 if ((int)na != fnty->fnptr_nparams) {
-                    println(str_lit("tinyc emit: indirect call to {} arity mismatch"),
+                    EMIT_ERR(e, "indirect call to {} arity mismatch",
                             ex->callee);
                 }
                 // Build the function MLIR type that func.call_indirect needs.
@@ -1766,7 +1781,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 return r;
             }
             if (sig->ret.type.kind == TY_STRUCT) {
-                println(str_lit("tinyc emit: struct-returning call cannot appear in expression position"));
+                EMIT_ERR(e, "struct-returning call cannot appear in expression position");
                 r.val = emit_const_i32(e, 0);
                 return r;
             }
@@ -1837,6 +1852,7 @@ static void emit_struct_zero(E *e, MLIR_ValueHandle base, MLIR_TypeHandle source
 
 static void emit_stmt(E *e, Scope *sc, Stmt *st) {
     if (e->terminated) return;
+    e->cur_line = st->line;
     switch (st->kind) {
         case ST_EXPR: {
             if (st->expr->kind == EX_CALL) {
@@ -1859,7 +1875,7 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 if (st->decl_init) {
                     EVal iv = emit_expr(e, sc, st->decl_init);
                     if (!iv.is_ptr) {
-                        println(str_lit("tinyc emit: int* initializer must be a pointer expression"));
+                        EMIT_ERR(e, "int* initializer must be a pointer expression");
                     } else {
                         emit_store_v(e, iv.val, sy->addr);
                     }
@@ -1885,7 +1901,7 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             } else if (st->decl_type.kind == TY_PTR_STRUCT) {
                 StructDef *sd = find_struct(e, st->decl_type.struct_name);
                 if (!sd) {
-                    println(str_lit("tinyc emit: unknown struct type {}"), st->decl_type.struct_name);
+                    EMIT_ERR(e, "unknown struct type {}", st->decl_type.struct_name);
                     return;
                 }
                 sy->sdef = sd;
@@ -1893,11 +1909,11 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 if (st->decl_init) {
                     if (st->decl_init->kind != EX_ADDR ||
                         st->decl_init->lhs->kind != EX_VAR) {
-                        println(str_lit("tinyc emit: struct* must be initialized with &<struct_var>"));
+                        EMIT_ERR(e, "struct* must be initialized with &<struct_var>");
                     } else {
                         Sym *target = lookup(e, sc, st->decl_init->lhs->name);
                         if (!target || target->type.kind != TY_STRUCT || target->sdef != sd) {
-                            println(str_lit("tinyc emit: struct* target type mismatch"));
+                            EMIT_ERR(e, "struct* target type mismatch");
                         } else {
                             emit_store_v(e, sym_addr(e, target), sy->addr);
                         }
@@ -1916,12 +1932,12 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 }
                 sy->addr = emit_alloca(e, arr_ty);
                 if (st->decl_init) {
-                    println(str_lit("tinyc emit: array initializers are not supported"));
+                    EMIT_ERR(e, "array initializers are not supported");
                 }
             } else if (st->decl_type.kind == TY_ARRAY_STRUCT) {
                 StructDef *sd = find_struct(e, st->decl_type.struct_name);
                 if (!sd) {
-                    println(str_lit("tinyc emit: unknown struct type {}"), st->decl_type.struct_name);
+                    EMIT_ERR(e, "unknown struct type {}", st->decl_type.struct_name);
                     return;
                 }
                 sy->sdef = sd;
@@ -1930,12 +1946,12 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                     e->ctx, st_ty, (uint64_t)st->decl_type.array_len);
                 sy->addr = emit_alloca(e, arr_ty);
                 if (st->decl_init) {
-                    println(str_lit("tinyc emit: array-of-struct initializers are not supported"));
+                    EMIT_ERR(e, "array-of-struct initializers are not supported");
                 }
             } else if (st->decl_type.kind == TY_STRUCT) {
                 StructDef *sd = find_struct(e, st->decl_type.struct_name);
                 if (!sd) {
-                    println(str_lit("tinyc emit: unknown struct type {}"), st->decl_type.struct_name);
+                    EMIT_ERR(e, "unknown struct type {}", st->decl_type.struct_name);
                     return;
                 }
                 sy->sdef = sd;
@@ -1945,7 +1961,7 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 prefix[0] = 0;
                 emit_struct_zero(e, sy->addr, st_ty, sd, prefix, 1);
                 if (st->decl_init) {
-                    println(str_lit("tinyc emit: struct initializers are not supported"));
+                    EMIT_ERR(e, "struct initializers are not supported");
                 }
             } else if (st->decl_type.kind == TY_F32) {
                 sy->addr = emit_alloca(e, e->f32);
@@ -1977,19 +1993,19 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 if (st->expr->kind == EX_CALL) {
                     FuncSig *csig = find_sig(e, st->expr->callee);
                     if (!csig || csig->ret.type.kind != TY_STRUCT || csig->ret.sdef != want) {
-                        println(str_lit("tinyc emit: returned call type mismatch"));
+                        EMIT_ERR(e, "returned call type mismatch");
                     } else {
                         emit_flat_call(e, sc, csig, st->expr->args, NULL, out);
                     }
                 } else if (st->expr->kind == EX_VAR) {
                     Sym *s = lookup(e, sc, st->expr->name);
                     if (!s || s->type.kind != TY_STRUCT || s->sdef != want) {
-                        println(str_lit("tinyc emit: returned struct type mismatch"));
+                        EMIT_ERR(e, "returned struct type mismatch");
                     } else {
                         emit_struct_copy(e, out, sym_addr(e, s), want);
                     }
                 } else {
-                    println(str_lit("tinyc emit: struct return must be a variable or struct call"));
+                    EMIT_ERR(e, "struct return must be a variable or struct call");
                 }
                 emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
                         NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
@@ -2004,7 +2020,7 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             MLIR_ValueHandle ret_v;
             if (want_ty == e->ptr) {
                 if (!v.is_ptr) {
-                    println(str_lit("tinyc emit: return expects a pointer value"));
+                    EMIT_ERR(e, "return expects a pointer value");
                     ret_v = emit_null_ptr(e);
                 } else {
                     ret_v = v.val;
@@ -2019,12 +2035,12 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             return;
         }
         case ST_BREAK: {
-            if (!e->loops) { println(str_lit("tinyc emit: break outside of loop")); return; }
+            if (!e->loops) { EMIT_ERR(e, "break outside of loop"); return; }
             emit_branch(e, e->loops->break_block);
             return;
         }
         case ST_CONTINUE: {
-            if (!e->loops) { println(str_lit("tinyc emit: continue outside of loop")); return; }
+            if (!e->loops) { EMIT_ERR(e, "continue outside of loop"); return; }
             emit_branch(e, e->loops->continue_block);
             return;
         }
@@ -2232,12 +2248,12 @@ static void slot_resolve(E *e, Type ty, SlotInfo *out) {
     if (ty.kind == TY_STRUCT || ty.kind == TY_PTR_STRUCT) {
         out->sdef = find_struct(e, ty.struct_name);
         if (!out->sdef) {
-            println(str_lit("tinyc emit: unknown struct type {}"), ty.struct_name);
+            EMIT_ERR(e, "unknown struct type {}", ty.struct_name);
         }
     } else if (ty.kind != TY_I32 && ty.kind != TY_F32 &&
                ty.kind != TY_PTR_I32 && ty.kind != TY_PTR_CHAR &&
                ty.kind != TY_FNPTR) {
-        println(str_lit("tinyc emit: unsupported type in function signature"));
+        EMIT_ERR(e, "unsupported type in function signature");
     }
 }
 
@@ -2284,6 +2300,7 @@ static void build_signatures(E *e) {
 }
 
 static MLIR_OpHandle emit_func(E *e, Func *f) {
+    e->cur_line = f->line;
     FuncSig *sig = find_sig(e, f->name);
 
     MLIR_RegionHandle body_r = MLIR_CreateRegion(e->ctx);
@@ -2437,11 +2454,12 @@ static int64_t type_align(E *e, Type t) {
 // Detect by-value cycles in struct definitions (TY_STRUCT field edges
 // only; pointer fields don't count). Standard 3-color DFS.
 static bool struct_cycle_dfs(E *e, StructDef *sd, int *color, StructDef **stack, int depth) {
+    e->cur_line = sd->line;
     size_t idx = 0;
     for (; idx < e->n_struct_types && e->struct_types[idx].sd != sd; idx++) {}
     if (idx >= e->n_struct_types) return false;
     if (color[idx] == 1) {
-        println(str_lit("tinyc emit: by-value cyclic struct definition involving '{}'"),
+        EMIT_ERR(e, "by-value cyclic struct definition involving '{}'",
                 sd->name);
         return true;
     }
@@ -2465,8 +2483,9 @@ static void check_struct_cycles(E *e) {
     StructDef **stack = arena_new_array(e->arena, StructDef *, e->n_struct_types);
     for (size_t i = 0; i < e->n_struct_types; i++) {
         if (color[i] == 0) {
+            e->cur_line = e->struct_types[i].sd->line;
             if (struct_cycle_dfs(e, e->struct_types[i].sd, color, stack, 0)) {
-                println(str_lit("tinyc emit: aborting due to cyclic struct definition"));
+                EMIT_ERR(e, "aborting due to cyclic struct definition");
                 exit(1);
             }
         }
@@ -2487,6 +2506,7 @@ static void init_struct_types(E *e) {
     }
     for (size_t i = 0; i < e->n_struct_types; i++) {
         StructDef *sd = e->struct_types[i].sd;
+        e->cur_line = sd->line;
         size_t n = sd->fields.size;
         MLIR_TypeHandle *body = arena_new_array(e->arena, MLIR_TypeHandle, n ? n : 1);
         for (size_t k = 0; k < n; k++) {
@@ -2517,7 +2537,7 @@ static void init_struct_types(E *e) {
                 body[k] = MLIR_CreateTypeLLVMArray(
                     e->ctx, e->ptr, (uint64_t)ft.array_len);
             } else {
-                println(str_lit("tinyc emit: unsupported struct field type in {}"), sd->name);
+                EMIT_ERR(e, "unsupported struct field type in {}", sd->name);
                 body[k] = e->i32;
             }
         }
