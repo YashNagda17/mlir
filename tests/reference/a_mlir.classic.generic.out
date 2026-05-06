@@ -1,6 +1,9 @@
 module() {
 ^bb0:
-    %0 = std.constant() -> i32
-    std.return()
+    func.func() {sym_name = "main", function_type = () -> i32} {
+    ^bb0:
+        %0 = arith.constant() {value = 42} -> i32
+        return(%0: i32)
+    }
 }
 

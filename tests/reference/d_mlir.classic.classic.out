@@ -11,7 +11,7 @@ module {
     %true = arith.constant true
     %c0_i16 = arith.constant 0 : i16
     %c1_i16 = arith.constant 1 : i16
-    %alloc_76 = memref.alloc : memref<24xi16>
+    %alloc_76 = memref.alloc() : memref<24xi16>
     linalg.fill
     %49 = affine.load %alloc_76, %idx0 : i16
     %from_elements_117 = "tensor.from_elements" %49, %49, %49, %49, %49, %49, %49, %49, %49, %49 : tensor<5x2xi16>

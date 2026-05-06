@@ -1,6 +1,8 @@
 module {
-  %0 = "std.constant"() {value = 42 : i64} : () -> i32
-  "std.return"(%0) : (i32) -> ()
+  func.func @main() -> i32 {
+    %c42_i32 = arith.constant 42 : i32
+    return %c42_i32 : i32
+  }
 }
 
 

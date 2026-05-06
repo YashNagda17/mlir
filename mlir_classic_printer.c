@@ -72,6 +72,9 @@ static void func_signature_from_op(MLIR_Context *ctx, MLIR_OpHandle op,
                     MLIR_ValueHandle v = MLIR_GetBlockArg(entry, k);
                     string nm = MLIR_GetValueRegisterName(v);
                     MLIR_TypeHandle t = MLIR_GetValueType(v);
+                    if (nm.size == 0) {
+                        nm = format(arena, str_lit("%arg{}"), (int64_t)k);
+                    }
                     *params = str_concat(arena, *params, nm);
                     *params = str_concat(arena, *params, str_lit(": "));
                     *params = str_concat(arena, *params, MLIR_GetTypeString(ctx, t));
@@ -453,8 +456,11 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
         size_t n_regions = MLIR_GetOpNumRegions(op);
         if (n_regions > 0) {
             MLIR_RegionHandle region = MLIR_GetOpRegion(op, 0);
-            line = str_concat(arena, line, str_lit(" "));
-            line = str_concat(arena, line, print_function_region_classic(ctx, indent_level, region));
+            // Declaration form: region with no blocks => no body
+            if (region && MLIR_GetRegionNumBlocks(region) > 0) {
+                line = str_concat(arena, line, str_lit(" "));
+                line = str_concat(arena, line, print_function_region_classic(ctx, indent_level, region));
+            }
         }
         MLIR_LocationHandle loc = MLIR_GetOpLocation(op);
         if (loc) line = str_concat(arena, line, print_location_classic(arena, loc));
@@ -1704,11 +1710,29 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 break;
             }
 
-            // Print operands in canonical format (no types for most ops)
-            if (MLIR_GetOpNumOperands(op) > 0) {
-                result = str_concat(arena, result, str_lit(" "));
+            // Print operands in canonical format (no types for most ops).
+            // memref.alloc / memref.alloca print operands inside parens even
+            // when empty: `memref.alloc() : memref<...>`. memref.load and
+            // memref.store use subscript syntax: `memref.load %m[%i, %j]`
+            // and `memref.store %v, %m[%i, %j]`. Other ops use a bare
+            // space-separated list.
+            MLIR_OpType _ot = MLIR_GetOpType(op);
+            bool _wants_parens = (_ot == OP_TYPE_MEMREF_ALLOC);
+            bool _is_load = (_ot == OP_TYPE_MEMREF_LOAD);
+            bool _is_store = (_ot == OP_TYPE_MEMREF_STORE);
+            if (MLIR_GetOpNumOperands(op) > 0 || _wants_parens) {
+                result = str_concat(arena, result, _wants_parens ? str_lit("(") : str_lit(" "));
+                int subscript_after = -1;
+                if (_is_load && MLIR_GetOpNumOperands(op) >= 1) subscript_after = 0;
+                if (_is_store && MLIR_GetOpNumOperands(op) >= 2) subscript_after = 1;
                 for (int i = 0; i < MLIR_GetOpNumOperands(op); i++) {
-                    if (i > 0) result = str_concat(arena, result, str_lit(", "));
+                    if (i > 0) {
+                        if (i == subscript_after + 1) {
+                            result = str_concat(arena, result, str_lit("["));
+                        } else {
+                            result = str_concat(arena, result, str_lit(", "));
+                        }
+                    }
                     MLIR_ValueHandle operand = MLIR_GetOpOperand(op, i);
                     if (operand == MLIR_INVALID_HANDLE) {
                         result = str_concat(arena, result, str_lit("NULL_OPERAND"));
@@ -1716,6 +1740,10 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                     }
                     result = str_concat(arena, result, print_ssa_operand_classic(ctx, operand));
                 }
+                if (subscript_after >= 0 && MLIR_GetOpNumOperands(op) > subscript_after + 1) {
+                    result = str_concat(arena, result, str_lit("]"));
+                }
+                if (_wants_parens) result = str_concat(arena, result, str_lit(")"));
             }
 
             // Inline attributes (tt.*) before type when present
@@ -1827,8 +1855,23 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             if (str_eq(attr_name, str_lit("sym_name")) || str_eq(attr_name, str_lit("visibility")) || str_eq(attr_name, str_lit("_sig_parens")) || str_eq(attr_name, str_lit("_sig_src")) || str_eq(attr_name, str_lit("value_text")) || (attr_name.size>0 && attr_name.str[0]=='_')) {
                 continue;
             }
+            // Skip auto-derived / discardable attributes that the upstream
+            // backend exposes but the upstream printer hides in pretty form.
+            // Re-emitting them as `name = ...` produces unparseable MLIR.
+            if (str_eq(attr_name, str_lit("operandSegmentSizes")) ||
+                str_eq(attr_name, str_lit("operand_segment_sizes")) ||
+                str_eq(attr_name, str_lit("resultSegmentSizes")) ||
+                str_eq(attr_name, str_lit("result_segment_sizes")) ||
+                str_eq(attr_name, str_lit("overflowFlags")) ||
+                str_eq(attr_name, str_lit("fastmath"))) {
+                continue;
+            }
             // Skip 'callee' which we print in header for calls
             if (str_eq(attr_name, str_lit("callee"))) {
+                continue;
+            }
+            // Skip 'function_type' on func.func (printed as part of header)
+            if (str_eq(attr_name, str_lit("function_type")) && MLIR_GetOpType(op) == OP_TYPE_FUNC_FUNC) {
                 continue;
             }
             // Skip 'value' attribute only for arith.constant operations
