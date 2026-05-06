@@ -154,7 +154,9 @@ static FuncSig *find_sig(E *e, string name) {
 }
 
 static MLIR_TypeHandle scalar_mlir_type(E *e, TypeKind k) {
-    return (k == TY_F32) ? e->f32 : e->i32;
+    if (k == TY_F32) return e->f32;
+    if (k == TY_PTR_STRUCT || k == TY_PTR_I32) return e->ptr;
+    return e->i32;
 }
 
 static MLIR_LocationHandle eloc(E *e, int line) {
@@ -609,15 +611,30 @@ static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
         println(str_lit("tinyc emit: field/index access on non-struct variable {}"), ex->name);
         return r;
     }
-    if (ex->kind == EX_DEREF && ex->lhs->kind == EX_VAR) {
-        Sym *s = scope_lookup(sc, ex->lhs->name);
-        if (!s || s->type.kind != TY_PTR_STRUCT || !s->sdef) {
+    if (ex->kind == EX_DEREF) {
+        if (ex->lhs->kind == EX_VAR) {
+            Sym *s = scope_lookup(sc, ex->lhs->name);
+            if (!s || s->type.kind != TY_PTR_STRUCT || !s->sdef) {
+                println(str_lit("tinyc emit: -> requires a struct pointer"));
+                return r;
+            }
+            r.base_ptr = emit_load_v(e, s->addr, e->ptr);
+            r.source_elem = find_struct_type(e, s->sdef);
+            r.sd = s->sdef;
+            sctx_push(e, &r, 0);
+            r.ok = true;
+            return r;
+        }
+        // General case: evaluate the inner expression as a struct pointer.
+        // Supports mid-chain walks like p->left->right and (*f(...)).x.
+        EVal v = emit_expr(e, sc, ex->lhs);
+        if (!v.is_ptr || !v.sdef) {
             println(str_lit("tinyc emit: -> requires a struct pointer"));
             return r;
         }
-        r.base_ptr = emit_load_v(e, s->addr, e->ptr);
-        r.source_elem = find_struct_type(e, s->sdef);
-        r.sd = s->sdef;
+        r.base_ptr = v.val;
+        r.sd = v.sdef;
+        r.source_elem = find_struct_type(e, v.sdef);
         sctx_push(e, &r, 0);
         r.ok = true;
         return r;
@@ -1172,6 +1189,10 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             emit_flat_call(e, sc, sig, ex->args, results, MLIR_INVALID_HANDLE);
             r.val = results[0];
             r.is_float = (sig->ret.type.kind == TY_F32);
+            if (sig->ret.type.kind == TY_PTR_STRUCT) {
+                r.is_ptr = true;
+                r.sdef = sig->ret.sdef;
+            }
             return r;
         }
     }
@@ -1344,9 +1365,22 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 e->terminated = true;
                 return;
             }
-            MLIR_TypeHandle want_ty = (sig && sig->ret.type.kind == TY_F32) ? e->f32 : e->i32;
+            MLIR_TypeHandle want_ty;
+            if (sig && sig->ret.type.kind == TY_F32) want_ty = e->f32;
+            else if (sig && sig->ret.type.kind == TY_PTR_STRUCT) want_ty = e->ptr;
+            else want_ty = e->i32;
             EVal v = emit_expr(e, sc, st->expr);
-            MLIR_ValueHandle ret_v = coerce_eval(e, v, want_ty);
+            MLIR_ValueHandle ret_v;
+            if (want_ty == e->ptr) {
+                if (!v.is_ptr) {
+                    println(str_lit("tinyc emit: return expects a pointer value"));
+                    ret_v = emit_null_ptr(e);
+                } else {
+                    ret_v = v.val;
+                }
+            } else {
+                ret_v = coerce_eval(e, v, want_ty);
+            }
             MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = ret_v;
             emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
                     NULL, 0, NULL, 0, ops, 1, NULL, 0, NULL, 0);

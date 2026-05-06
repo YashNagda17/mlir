@@ -77,3 +77,7 @@ expected_stdout = "1\n0\n1\n0\n0\n42\n99\n"
 [[test]]
 name = "sizeof_basic"
 expected_stdout = "4\n4\n8\n16\n"
+
+[[test]]
+name = "struct_ptr_return"
+expected_stdout = "60\n99\n99\n99\n"
