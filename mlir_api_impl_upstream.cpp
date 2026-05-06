@@ -1021,5 +1021,8 @@ extern "C" string MLIR_TranslateModuleToLLVMIR(MLIR_Context *ctx, MLIR_OpHandle 
     Arena *arena = MLIR_GetArenaAllocator(ctx);
     char *buf = (char*)arena_alloc(arena, out.size());
     std::memcpy(buf, out.data(), out.size());
-    return (string){.str = buf, .size = out.size()};
+    string result;
+    result.str = buf;
+    result.size = out.size();
+    return result;
 }

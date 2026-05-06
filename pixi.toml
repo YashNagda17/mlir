@@ -308,7 +308,7 @@ test_windows = { cmd = "./parser.exe --construct && python run_tests.py -s --nat
 platforms = ["linux-64", "osx-arm64", "win-64"]
 
 [feature.upstream.dependencies]
-mlir = "*"
+mlir = "19.*"
 zlib = "*"
 zstd = "*"
 
