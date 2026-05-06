@@ -119,7 +119,6 @@ VALIDATE_REFS_SKIP = {
     # block-argument names from the upstream backend.
     "t1_mlir.classic.classic.out",
     "t1_mlir.upstream.classic.out",
-    "t2_mlir.upstream.classic.out",
     "t3_mlir.classic.classic.out",
     "t3_mlir.upstream.classic.out",
     # tensor / linalg / affine.load / scf.if attribute printing not yet
@@ -127,8 +126,9 @@ VALIDATE_REFS_SKIP = {
     # non-function type`).
     "d_mlir.classic.classic.out",
     "d_mlir.upstream.classic.out",
-    # Function private declarations rendered as definitions with empty
-    # body, broken SSA renumbering, attribute "..." placeholders.
+    # cf.br / cf.cond_br successor-block operand syntax ('cf.br ^bb1(...)')
+    # not emitted by classic printer when going through the upstream backend
+    # (no _target/_ntrue/_nfalse attrs); needs a Successor API.
     "effect_mlir.upstream.classic.out",
     "simple_mlir.upstream.classic.out",
 }

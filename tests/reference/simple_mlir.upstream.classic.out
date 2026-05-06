@@ -1,9 +1,9 @@
 module {
-  func.func @putchar(i64) -> i64
+  func.func private @putchar(i64) -> i64
   func.func @main() -> i64 {
     %0 = arith.constant 0 : i64
     cf.br ^bb1(%0 : i64)
-  ^bb1(%arg0: i64 loc("-":6:8)):
+  ^bb1(%11: i64 loc("-":6:8)):
     %1 = arith.constant 10 : i64
     %2 = arith.cmpi slt, %11, %1 : i64
     %3 = arith.extui %2 : i1 to i64

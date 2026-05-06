@@ -12,7 +12,7 @@ module {
     %7 = arith.constant 0 : i64
     %8 = arith.cmpi slt, %6, %7 : i64
     cf.br ^bb1(%8, %6 : i1, i64)
-  ^bb2(%arg0: i1 loc("-":15:8), %arg1: i64 loc("-":15:16)):
+  ^bb2(%67: i1 loc("-":15:8), %68: i64 loc("-":15:16)):
     %9 = arith.extui %67 : i1 to i64
     %10 = arith.constant 0 : i64
     %11 = arith.cmpi slt, %9, %10 : i64
@@ -42,7 +42,7 @@ module {
     %21 = arith.constant 0 : i64
     %22 = arith.cmpi slt, %20, %21 : i64
     cf.br ^bb1(%22, %20 : i1, i64)
-  ^bb10(%arg0: i1 loc("-":45:9), %arg1: i64 loc("-":45:18)):
+  ^bb10(%69: i1 loc("-":45:9), %70: i64 loc("-":45:18)):
     %23 = arith.extui %69 : i1 to i64
     %24 = arith.constant 0 : i64
     %25 = arith.cmpi slt, %23, %24 : i64
@@ -76,7 +76,7 @@ module {
     %39 = arith.constant 0 : i64
     %40 = arith.cmpi slt, %38, %39 : i64
     cf.br ^bb1(%40, %38 : i1, i64)
-  ^bb18(%arg0: i1 loc("-":79:9), %arg1: i64 loc("-":79:18)):
+  ^bb18(%71: i1 loc("-":79:9), %72: i64 loc("-":79:18)):
     %41 = arith.extui %71 : i1 to i64
     %42 = arith.constant 0 : i64
     %43 = arith.cmpi slt, %41, %42 : i64
@@ -106,7 +106,7 @@ module {
     %53 = arith.constant 0 : i64
     %54 = arith.cmpi slt, %52, %53 : i64
     cf.br ^bb1(%54, %52 : i1, i64)
-  ^bb26(%arg0: i1 loc("-":109:9), %arg1: i64 loc("-":109:18)):
+  ^bb26(%73: i1 loc("-":109:9), %74: i64 loc("-":109:18)):
     %55 = arith.extui %73 : i1 to i64
     %56 = arith.constant 0 : i64
     %57 = arith.cmpi slt, %55, %56 : i64

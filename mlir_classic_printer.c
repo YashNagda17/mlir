@@ -41,8 +41,12 @@ static int parse_bb_index(string lab) {
 // otherwise the function_type's input types are used directly.
 //   params = "%arg0: memref<...>, %arg1: memref<...>"  (or "memref<...>, ..." for decls)
 //   ret    = "i32" or "(i32, i32)" (single type or parenthesized list)
-static void func_signature_from_op(MLIR_Context *ctx, MLIR_OpHandle op,
+// Forward declarations needed by func_signature_from_op
+static inline uint32_t get_or_assign_ssa(PrintCtx *ctx, MLIR_ValueHandle v);
+
+static void func_signature_from_op(PrintCtx *pctx, MLIR_OpHandle op,
                                     string *params, string *ret) {
+    MLIR_Context *ctx = pctx->mlir_ctx;
     *params = str_lit("");
     *ret = str_lit("");
     Arena *arena = ctx->arena;
@@ -59,7 +63,10 @@ static void func_signature_from_op(MLIR_Context *ctx, MLIR_OpHandle op,
     }
     if (ft == MLIR_INVALID_HANDLE) return;
 
-    // Prefer entry-block args for params (so we print %argN: type).
+    // Prefer entry-block args for params. When a block arg has no register
+    // name, route through the SSA map so the body and the signature use the
+    // same name (otherwise the body would refer to the arg by a fresh SSA
+    // number and produce 'undeclared SSA value' errors at parse time).
     bool used_block_args = false;
     if (MLIR_GetOpNumRegions(op) > 0) {
         MLIR_RegionHandle region = MLIR_GetOpRegion(op, 0);
@@ -73,7 +80,8 @@ static void func_signature_from_op(MLIR_Context *ctx, MLIR_OpHandle op,
                     string nm = MLIR_GetValueRegisterName(v);
                     MLIR_TypeHandle t = MLIR_GetValueType(v);
                     if (nm.size == 0) {
-                        nm = format(arena, str_lit("%arg{}"), (int64_t)k);
+                        uint32_t num = get_or_assign_ssa(pctx, v);
+                        nm = format(arena, str_lit("%{}"), (int64_t)num);
                     }
                     *params = str_concat(arena, *params, nm);
                     *params = str_concat(arena, *params, str_lit(": "));
@@ -346,8 +354,10 @@ static string print_block_internal_classic(PrintCtx *ctx, int bb_index, int inde
                     result = str_concat(arena, result, format(arena, str_lit("{}: {}"),
                                                             rname, MLIR_GetTypeString(ctx->mlir_ctx, arg_ty)));
                 } else {
-                    result = str_concat(arena, result, format(arena, str_lit("%arg{}: {}"),
-                                                            (int64_t)MLIR_GetValueResultIndex(arg), MLIR_GetTypeString(ctx->mlir_ctx, arg_ty)));
+                    // Route through the SSA map so labels and uses agree.
+                    uint32_t num = get_or_assign_ssa(ctx, arg);
+                    result = str_concat(arena, result, format(arena, str_lit("%{}: {}"),
+                                                            (int64_t)num, MLIR_GetTypeString(ctx->mlir_ctx, arg_ty)));
                 }
 
                 // Note: Block arguments in control flow blocks don't have tt.divisibility attributes.
@@ -462,7 +472,16 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             if (str_eq(an, str_lit("visibility")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) vis = MLIR_GetAttributeString(a);
             else if (str_eq(an, str_lit("sym_name")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) name = MLIR_GetAttributeString(a);
         }
-        func_signature_from_op(ctx->mlir_ctx, op, &params, &ret);
+        func_signature_from_op(ctx, op, &params, &ret);
+        // Declaration form (no body): require private visibility.
+        bool is_decl = false;
+        if (MLIR_GetOpNumRegions(op) > 0) {
+            MLIR_RegionHandle r0 = MLIR_GetOpRegion(op, 0);
+            if (r0 && MLIR_GetRegionNumBlocks(r0) == 0) is_decl = true;
+        } else {
+            is_decl = true;
+        }
+        if (is_decl && vis.size == 0) vis = str_lit("private");
         if (vis.size>0) { header = str_concat(arena, header, vis); header = str_concat(arena, header, str_lit(" ")); }
         if (name.size>0) { header = str_concat(arena, header, str_lit("@")); header = str_concat(arena, header, name); }
         header = str_concat(arena, header, str_lit("(")); if (params.size>0) header = str_concat(arena, header, params); header = str_concat(arena, header, str_lit(")"));
@@ -826,7 +845,7 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                 if (str_eq(an, str_lit("visibility")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) vis = MLIR_GetAttributeString(a);
                 else if (str_eq(an, str_lit("sym_name")) && MLIR_GetAttributeKind(a)==MLIR_ATTR_KIND_STRING) name = MLIR_GetAttributeString(a);
             }
-            func_signature_from_op(ctx->mlir_ctx, op, &params, &ret);
+            func_signature_from_op(ctx, op, &params, &ret);
             if (vis.size>0) { header = str_concat(arena, header, vis); header = str_concat(arena, header, str_lit(" ")); }
             if (name.size>0) { header = str_concat(arena, header, str_lit("@")); header = str_concat(arena, header, name); }
             // Params
@@ -930,7 +949,7 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
             {
                 string params_unused = str_lit("");
                 string r = str_lit("");
-                func_signature_from_op(ctx->mlir_ctx, op, &params_unused, &r);
+                func_signature_from_op(ctx, op, &params_unused, &r);
                 if (r.size > 0) {
                     result = str_concat(arena, result, str_lit(" -> "));
                     result = str_concat(arena, result, r);
@@ -1453,7 +1472,7 @@ static string print_operation_internal_classic(PrintCtx *ctx, int indent_level, 
                     if (str_eq(MLIR_GetAttributeName(MLIR_GetOpAttribute(op, i)), str_lit("visibility")) && MLIR_GetAttributeKind(MLIR_GetOpAttribute(op, i))==MLIR_ATTR_KIND_STRING) vis = MLIR_GetAttributeString(MLIR_GetOpAttribute(op, i));
                     else if (str_eq(MLIR_GetAttributeName(MLIR_GetOpAttribute(op, i)), str_lit("sym_name")) && MLIR_GetAttributeKind(MLIR_GetOpAttribute(op, i))==MLIR_ATTR_KIND_STRING) name = MLIR_GetAttributeString(MLIR_GetOpAttribute(op, i));
                 }
-                func_signature_from_op(ctx->mlir_ctx, op, &params, &ret);
+                func_signature_from_op(ctx, op, &params, &ret);
                 if (vis.size>0) { header = str_concat(arena, header, str_lit(" ")); header = str_concat(arena, header, vis); }
                 if (name.size>0) { header = str_concat(arena, header, str_lit(" @")); header = str_concat(arena, header, name); }
                 header = str_concat(arena, header, str_lit("(")); if (params.size>0) header = str_concat(arena, header, params); header = str_concat(arena, header, str_lit(")"));

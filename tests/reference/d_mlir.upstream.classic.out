@@ -1,5 +1,5 @@
 module {
-  func.func @tensor_i16(%arg0: tensor<10xi16>) -> i16 {
+  func.func @tensor_i16(%23: tensor<10xi16>) -> i16 {
     %0 = arith.constant 0 : i16
     return %0 : i16
   }
@@ -13,8 +13,8 @@ module {
     %7 = arith.constant 1 : i16
     %8 = memref.alloc() : memref<24xi16>
     linalg.fill %6, %8 : i16 {
-    ^bb0(%arg0: i16, %arg1: i16):
-      "linalg.yield" %23 : i16
+    ^bb0(%24: i16, %25: i16):
+      "linalg.yield" %24 : i16
     }
     %9 = affine.load %8, %1 : i16 {map = ...}
     %10 = "tensor.from_elements" %9, %9, %9, %9, %9, %9, %9, %9, %9, %9 : tensor<5x2xi16>
@@ -25,14 +25,14 @@ module {
     }
     %12 = tensor.splat %7, %4, %3 : tensor<?x?xi16>
     %13 = "linalg.copy" %12, %10 : tensor<5x2xi16> {
-    ^bb0(%arg0: i16, %arg1: i16):
-      "linalg.yield" %24 : i16
+    ^bb0(%26: i16, %27: i16):
+      "linalg.yield" %26 : i16
     }
     %14 = tensor.collapse_shape %11 : tensor<10xi16> {reassociation = ...}
     %15 = index.constant 10
-    %18 = scf.for %25 = %1 to %15 step %2 iter_args(%26 = %6) -> (i16)  : index {
-      %16 = tensor.extract %14, %25 : i16
-      %17 = arith.addi %26, %16 : i16
+    %18 = scf.for %28 = %1 to %15 step %2 iter_args(%29 = %6) -> (i16)  : index {
+      %16 = tensor.extract %14, %28 : i16
+      %17 = arith.addi %29, %16 : i16
       vector.print %16 : i16 {punctuation = ...}
       scf.yield %17 : i16
     }
