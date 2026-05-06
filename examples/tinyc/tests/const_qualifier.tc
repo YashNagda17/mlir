@@ -1,0 +1,38 @@
+// Exercise the `const` qualifier across the positions a parser-only
+// implementation needs to accept: globals, function return types,
+// function parameters (including `const T*`), local decls, typedef
+// target, struct field, sizeof on a `const` type, and a C-style cast.
+// Semantics are unchanged — `const` is parser noise.
+
+const int N = 7;
+const char *MSG = "hello";
+
+typedef const int CInt;
+
+struct Box {
+    const int v;
+    const char *name;
+};
+
+const int square(const int x) {
+    return x * x;
+}
+
+int read_through(const int *p) {
+    return *p;
+}
+
+int main() {
+    CInt a = 3;
+    const int b = 4;
+    int x = square(a) + square(b);
+    print(x);                       // 25
+    print(N);                       // 7
+    print(read_through(&b));        // 4
+    print(sizeof(const int));       // 4
+
+    struct Box bx;
+    bx.v = 10;
+    print(bx.v);                    // 10
+    return 0;
+}

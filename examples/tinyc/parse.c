@@ -89,6 +89,15 @@ static bool parse_abstract_type(P *p, Type *out);
 static bool try_parse_fnptr_suffix(P *p, Type *ty, string *out_name);
 static void parse_enum_decl_top(P *p);
 
+// `const` is accepted as a parser-level qualifier and silently dropped:
+// it does not affect any AST type. Skipped before a base type, after `*`
+// in pointer declarators, and (via these helpers) wherever a type can
+// appear (return type, param, sizeof/cast, typedef target, struct field,
+// local decl).
+static void skip_const(P *p) {
+    while (cur(p).kind == TC_TK_KW_CONST) p->i++;
+}
+
 // postfix := (...) | [expr] | .ident
 static Expr *parse_postfix(P *p, Expr *base) {
     for (;;) {
@@ -189,7 +198,8 @@ static Expr *parse_primary(P *p) {
         // Could be a cast `(T)expr` or a parenthesized expression.
         TcTokKind nxt = peek(p, 1).kind;
         bool is_cast = (nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT ||
-                        nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_CHAR);
+                        nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_CHAR ||
+                        nxt == TC_TK_KW_CONST);
         if (!is_cast && nxt == TC_TK_IDENT &&
             typedef_lookup(p, peek(p, 1).text)) {
             is_cast = true;
@@ -494,9 +504,10 @@ static Expr *parse_expr(P *p) { return parse_assign_or_or(p); }
 // Parse a base type keyword. Returns true if we consumed one and writes
 // the kind to *out. Pointer/array suffixes are handled at decl time.
 static bool parse_base_type(P *p, TypeKind *out) {
-    if (cur(p).kind == TC_TK_KW_INT)   { p->i++; *out = TY_I32; return true; }
-    if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; *out = TY_F32; return true; }
-    if (cur(p).kind == TC_TK_KW_CHAR)  { p->i++; *out = TY_I32; return true; }
+    skip_const(p);
+    if (cur(p).kind == TC_TK_KW_INT)   { p->i++; *out = TY_I32; skip_const(p); return true; }
+    if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; *out = TY_F32; skip_const(p); return true; }
+    if (cur(p).kind == TC_TK_KW_CHAR)  { p->i++; *out = TY_I32; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_ENUM) {
         // `enum [Tag]` as a type-spec — behaves exactly as `int`. A body
         // is not allowed in this position; only the top-level / statement
@@ -504,6 +515,7 @@ static bool parse_base_type(P *p, TypeKind *out) {
         p->i++;
         if (cur(p).kind == TC_TK_IDENT) p->i++;  // optional tag
         *out = TY_I32;
+        skip_const(p);
         return true;
     }
     return false;
@@ -526,6 +538,7 @@ static void parse_block(P *p, VecStmtPtr *out) {
 // Caller has already verified that current token starts a decl.
 static Stmt *parse_decl(P *p, bool require_semi) {
     int line = cur(p).line;
+    skip_const(p);
     // Typedef'd type-name takes precedence over manual parsing.
     if (cur(p).kind == TC_TK_IDENT && typedef_lookup(p, cur(p).text)) {
         Type ty = {0};
@@ -610,7 +623,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
         return s;
     }
     bool is_ptr = false;
-    if (accept(p, TC_TK_STAR)) is_ptr = true;
+    if (accept(p, TC_TK_STAR)) { is_ptr = true; skip_const(p); }
     TcTok name = cur(p);
     expect(p, TC_TK_IDENT, str_lit("expected identifier"));
     Stmt *s = new_stmt(p, ST_DECL, line);
@@ -700,6 +713,7 @@ static Stmt *parse_stmt(P *p) {
             s->for_init = NULL;
         } else if (cur(p).kind == TC_TK_KW_INT || cur(p).kind == TC_TK_KW_FLOAT ||
                    cur(p).kind == TC_TK_KW_CHAR || cur(p).kind == TC_TK_KW_ENUM ||
+                   cur(p).kind == TC_TK_KW_CONST ||
                    (cur(p).kind == TC_TK_IDENT && typedef_lookup(p, cur(p).text))) {
             s->for_init = parse_decl(p, /*require_semi*/ true);
         } else {
@@ -777,7 +791,7 @@ static Stmt *parse_stmt(P *p) {
     }
     if (t.kind == TC_TK_KW_INT || t.kind == TC_TK_KW_FLOAT ||
         t.kind == TC_TK_KW_STRUCT || t.kind == TC_TK_KW_CHAR ||
-        t.kind == TC_TK_KW_ENUM ||
+        t.kind == TC_TK_KW_ENUM || t.kind == TC_TK_KW_CONST ||
         (t.kind == TC_TK_IDENT && typedef_lookup(p, t.text) &&
          peek(p, 1).kind == TC_TK_IDENT)) {
         // `enum [Tag] { ... };` is a module-scope-only registration form;
@@ -879,12 +893,15 @@ static bool try_parse_fnptr_suffix(P *p, Type *ty, string *out_name) {
 // Returns false if the current tokens don't start a type.
 static bool parse_sig_type(P *p, Type *out) {
     *out = (Type){0};
-    if (cur(p).kind == TC_TK_KW_INT)   { p->i++; out->kind = TY_I32; if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_I32; return true; }
-    if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; out->kind = TY_F32; return true; }
+    skip_const(p);
+    if (cur(p).kind == TC_TK_KW_INT)   { p->i++; out->kind = TY_I32; skip_const(p); if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_I32; skip_const(p); return true; }
+    if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; out->kind = TY_F32; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_CHAR)  {
         p->i++;
+        skip_const(p);
         if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_CHAR;
         else out->kind = TY_I32;
+        skip_const(p);
         return true;
     }
     if (cur(p).kind == TC_TK_KW_STRUCT) {
@@ -893,7 +910,9 @@ static bool parse_sig_type(P *p, Type *out) {
         if (!expect(p, TC_TK_IDENT, str_lit("expected struct name"))) return false;
         out->kind = TY_STRUCT;
         out->struct_name = sn.text;
+        skip_const(p);
         if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_STRUCT;
+        skip_const(p);
         return true;
     }
     if (cur(p).kind == TC_TK_KW_ENUM) {
@@ -903,7 +922,9 @@ static bool parse_sig_type(P *p, Type *out) {
         p->i++;
         if (cur(p).kind == TC_TK_IDENT) p->i++;
         out->kind = TY_I32;
+        skip_const(p);
         if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_I32;
+        skip_const(p);
         return true;
     }
     if (cur(p).kind == TC_TK_IDENT) {
@@ -911,6 +932,7 @@ static bool parse_sig_type(P *p, Type *out) {
         if (td) {
             p->i++;
             *out = td->ty;
+            skip_const(p);
             // Allow `Td*` to add another level of pointer (only for scalar
             // typedefs; struct typedefs already encode the pointer).
             if (accept(p, TC_TK_STAR)) {
@@ -918,6 +940,7 @@ static bool parse_sig_type(P *p, Type *out) {
                 else if (out->kind == TY_STRUCT) out->kind = TY_PTR_STRUCT;
                 // else: ignore (e.g. typedef'd pointer + extra '*' not supported)
             }
+            skip_const(p);
             return true;
         }
     }
@@ -990,6 +1013,7 @@ static StructDef *parse_struct_def(P *p) {
     sd->line = line;
     VecStructField_reserve(p->arena, &sd->fields, 4);
     while (cur(p).kind != TC_TK_RBRACE && cur(p).kind != TC_TK_EOF) {
+        skip_const(p);
         Type ft = {0};
         bool is_struct_kind = false;
         bool is_ptr = false;
