@@ -59,7 +59,8 @@ def main():
         # Stage 2: link
         r = run([CC, str(ll), str(RUNTIME), "-o", str(exe)])
         if r.returncode != 0:
-            print(f"FAIL {name}: link failed\n{r.stderr}")
+            head = ll.read_text()[:1000] if ll.exists() else "(missing)"
+            print(f"FAIL {name}: link failed\nstderr:\n{r.stderr}\nfirst 1000 chars of {ll.name}:\n{head}")
             failures += 1
             continue
 
