@@ -20,7 +20,7 @@
 //   - break, continue, early return
 //   - Address-of (&x, &s) and dereference (*p) — alias-only pointers
 //   - Functions with int / float / struct / struct* parameters and
-//     int / float / struct return types.
+//     int / float / struct / struct* return types.
 //     Struct params and returns are scalarized at the function boundary
 //     (one MLIR scalar per LEAF field, in declaration order — Clang-style
 //     ABI lowering, recursive through nested structs).
