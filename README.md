@@ -1,27 +1,38 @@
 # mlir — a faster, simpler MLIR infrastructure
 
-A custom [MLIR](https://mlir.llvm.org/) parser and printer written in C, built
-on top of [Core C](https://github.com/certik/corec). The goal is a small,
-fast, dependency-free MLIR front end that can stand in for parts of the
-upstream `MLIRParser`/`MLIRPrinter` pipeline — handling the dialects we care
-about (the `arith`, `func`, `cf`, `scf`, `tensor`, `memref`, `linalg`,
-`affine`, `gpu`, `index`, `vector`, `triton` subsets exercised by `tests/`)
-and producing output that round-trips byte-for-byte through the real
-upstream parser.
+A custom [MLIR](https://mlir.llvm.org/) implementation written in C, built on
+top of [Core C](https://github.com/certik/corec). The goal is a **full
+replacement for upstream LLVM/MLIR for building compilers**: a small, fast,
+dependency-free MLIR core that lets a compiler built against this API
+build quickly and run fast via the native implementation, while staying
+100% compatible with real upstream MLIR via the upstream implementation
+of the same API.
 
-This repository is built `-nostdlib -nostdinc -fno-builtin` with the
-[`corec`](https://github.com/certik/corec) and
-[`corec-stdlib`](https://github.com/certik/corec-stdlib) submodules providing
-the platform layer, allocators, strings, formatting and a stdlib subset.
-Everything is driven by [pixi](https://pixi.sh) and runs on Linux, macOS,
-Windows and WebAssembly (WASI).
+The same compiler, written once against `mlir_api.h`, can be linked against
+either backend:
+
+* **native** — pure C, no LLVM/MLIR dependency, builds with
+  `-nostdlib -nostdinc -fno-builtin`. Tiny, fast, portable.
+* **upstream** — thin C++ shim that delegates to real `mlir::Operation`,
+  `mlir::Type`, etc. Used as the trusted oracle and for any feature only
+  upstream can validate.
+
+Both backends are required to produce byte-identical textual output for
+every input the test suite exercises, so a downstream compiler can target
+the native API confidently and fall back to upstream where needed.
+
+This repository is built `-nostdlib -nostdinc -fno-builtin` (native side)
+with the [`corec`](https://github.com/certik/corec) and
+[`corec-stdlib`](https://github.com/certik/corec-stdlib) submodules
+providing the platform layer, allocators, strings, formatting and a stdlib
+subset. Everything is driven by [pixi](https://pixi.sh) and runs on Linux,
+macOS, Windows and WebAssembly (WASI).
 
 ## Motivation
 
-Upstream MLIR is large, slow to build, and tightly coupled to LLVM. For tools
-that only need to parse, transform and pretty-print MLIR — for example a
-front-end that consumes Triton IR, applies passes, and re-emits MLIR — most
-of LLVM is unnecessary baggage.
+Upstream MLIR is large, slow to build, and tightly coupled to LLVM. For a
+compiler whose job is to ingest, transform and emit MLIR, most of LLVM is
+unnecessary baggage at build time and at runtime.
 
 This project takes the opposite approach:
 
@@ -30,15 +41,16 @@ This project takes the opposite approach:
    behind that API:
    * **native** — pure-C, no LLVM/MLIR dependency, builds with `-nostdlib`.
    * **upstream** — thin C++ shim that delegates to real `mlir::Operation`,
-     `mlir::Type`, etc. Built when available, used as the trusted oracle.
+     `mlir::Type`, etc.
 2. **Cross-validation by construction.** Every parser/printer combination is
    exercised by the test runner. Native and upstream are required to produce
    byte-identical output, and every classic-form reference must round-trip
    cleanly through the real upstream parser.
-3. **No standard library, no C runtime.** The native binary inherits Core C's
-   sandbox: a single narrow `platform.h` interface, arena allocators, custom
-   `string` / `format` / I/O. The same source compiles to native binaries on
-   Linux/macOS/Windows and to a WASI `.wasm` artifact.
+3. **No standard library, no C runtime (native side).** The native binary
+   inherits Core C's sandbox: a single narrow `platform.h` interface, arena
+   allocators, custom `string` / `format` / I/O. The same source compiles
+   to native binaries on Linux/macOS/Windows and to a WASI `.wasm`
+   artifact.
 
 ## Getting started
 
@@ -211,15 +223,18 @@ the trailing `{...}` block.
 `./parser` and `./parser_upstream` both accept:
 
 ```
-./parser [--parse=KIND] [--print=KIND] file.mlir
+./parser            [--parse=classic]                  [--print=classic|generic] file.mlir
+./parser_upstream   [--parse=classic|upstream] [--print=classic|generic|upstream] file.mlir
 ./parser --construct                # programmatically build & print a test module
 ```
 
-`KIND` is one of `classic`, `generic`, or (upstream binary only) `upstream`.
-The combinations exercised by the test runner live in
-`run_tests.py::COMBOS_CLASSIC_PARSER` and `COMBOS_UPSTREAM_PARSER`. Adding a
-new `MLIR_PARSE_KIND_*` or `MLIR_PRINT_KIND_*` requires updating those COMBO
-arrays — see *Hardening* below.
+The native binary has only the classic parser (the generic and upstream
+parse kinds are upstream-only). Both binaries can emit classic and
+generic form; only `parser_upstream` can emit upstream pretty form. The
+combinations exercised by the test runner live in
+`run_tests.py::COMBOS_CLASSIC_PARSER` and `COMBOS_UPSTREAM_PARSER`.
+Adding a new `MLIR_PARSE_KIND_*` or `MLIR_PRINT_KIND_*` requires updating
+those COMBO arrays — see *Hardening* below.
 
 The naming convention for the dispatch entry points is
 `MLIR_<Verb><Subject><Kind>`, e.g. `MLIR_PrintOperationClassic`,
