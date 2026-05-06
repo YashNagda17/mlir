@@ -274,19 +274,6 @@ static Expr *parse_primary(P *p) {
             expect(p, TC_TK_RPAREN, str_lit("expected ')'"));
             return parse_postfix(p, e);
         }
-        // Module-scope enumerator: substitute with its i32 constant value.
-        // Enumerators share the value namespace with variables/functions;
-        // they're resolved here after the call-syntax check so that an
-        // identifier in an lvalue / address / field-access context still
-        // takes precedence (it can't, since we already consumed the IDENT —
-        // but enumerators are int constants and not lvalues, so a later
-        // attempt to assign through the resulting EX_INT will fail naturally).
-        Enumerator *en = enum_lookup(p, t.text);
-        if (en) {
-            Expr *e = new_expr(p, EX_INT, t.line);
-            e->int_value = en->value;
-            return parse_postfix(p, e);
-        }
         Expr *e = new_expr(p, EX_VAR, t.line);
         e->name = t.text;
         return parse_postfix(p, e);
@@ -793,13 +780,29 @@ static Stmt *parse_stmt(P *p) {
         t.kind == TC_TK_KW_ENUM ||
         (t.kind == TC_TK_IDENT && typedef_lookup(p, t.text) &&
          peek(p, 1).kind == TC_TK_IDENT)) {
-        // `enum [Tag] { ... };` at block scope is a registration form, not
-        // a declaration. Detect by lookahead and dispatch.
+        // `enum [Tag] { ... };` is a module-scope-only registration form;
+        // a body inside a function or block scope would leak enumerators
+        // out of their lexical scope (we have no scope-pop machinery for
+        // enums), so reject it. `enum [Tag] name;` (no body) still falls
+        // through to parse_decl below, which treats `enum [Tag]` as `int`.
         if (t.kind == TC_TK_KW_ENUM) {
             size_t k = 1;
             if (peek(p, k).kind == TC_TK_IDENT) k++;
             if (peek(p, k).kind == TC_TK_LBRACE) {
-                parse_enum_decl_top(p);
+                perror_at(p, t.line, str_lit(
+                    "enum body is only allowed at module scope"));
+                // Skip to matching '}' then optional ';' to keep parsing.
+                while (cur(p).kind != TC_TK_LBRACE &&
+                       cur(p).kind != TC_TK_EOF) p->i++;
+                if (cur(p).kind == TC_TK_LBRACE) {
+                    int depth = 0;
+                    do {
+                        if (cur(p).kind == TC_TK_LBRACE) depth++;
+                        else if (cur(p).kind == TC_TK_RBRACE) depth--;
+                        p->i++;
+                    } while (depth > 0 && cur(p).kind != TC_TK_EOF);
+                }
+                accept(p, TC_TK_SEMI);
                 Stmt *empty = new_stmt(p, ST_BLOCK, t.line);
                 return empty;
             }
@@ -1307,6 +1310,15 @@ Program *tinyc_parse(Arena *arena, VecTcTok toks) {
         } else {
             perror_at(&p, f->line, str_lit("function redefinition"));
         }
+    }
+    // Publish the parser's enumerator list to the Program for emit-time
+    // resolution (lookup falls back to it after locals/globals/functions).
+    for (Enumerator *en = p.enums; en; en = en->next) {
+        ProgramEnum *pe = arena_new(arena, ProgramEnum);
+        pe->name = en->name;
+        pe->value = en->value;
+        pe->next = prog->enums;
+        prog->enums = pe;
     }
     return prog;
 }

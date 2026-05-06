@@ -299,10 +299,19 @@ typedef struct {
 
 DEFINE_VECTOR_FOR_TYPE(Global, VecGlobal)
 
+// One module-scope `enum` constant. Resolved at emit time after locals,
+// globals, and functions miss — preserves identifier shadowing.
+typedef struct ProgramEnum {
+    string  name;
+    int64_t value;
+    struct ProgramEnum *next;
+} ProgramEnum;
+
 typedef struct {
     VecFuncPtr      funcs;
     VecStructDefPtr structs;
     VecGlobal       globals;
+    ProgramEnum    *enums;   // singly-linked list, module scope
 } Program;
 
 // ---------------- Lexer ----------------
