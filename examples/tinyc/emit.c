@@ -195,7 +195,7 @@ static bool find_enum(E *e, string name, int64_t *out_value) {
 static MLIR_TypeHandle scalar_mlir_type(E *e, TypeKind k) {
     if (k == TY_F32) return e->f32;
     if (k == TY_PTR_STRUCT || k == TY_PTR_I32 || k == TY_PTR_CHAR ||
-        k == TY_FNPTR) return e->ptr;
+        k == TY_PTR_VOID || k == TY_FNPTR) return e->ptr;
     return e->i32;
 }
 
@@ -565,6 +565,8 @@ typedef struct {
                                // (INVALID otherwise). Used by pointer arithmetic.
     Type *fnptr_ty;    // when val is a function pointer, its TY_FNPTR signature
                        // (return + parameter types). NULL otherwise.
+    bool is_void_ptr;  // val is a `void*` — dereference / indexing /
+                       // pointer arithmetic are forbidden on it.
 } EVal;
 
 static EVal emit_expr(E *e, Scope *sc, Expr *ex);
@@ -800,7 +802,8 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             r.base_ptr = sym_addr(e, s);
             if (s->type.kind == TY_F32) r.elem_ty = e->f32;
             else if (s->type.kind == TY_PTR_STRUCT || s->type.kind == TY_PTR_I32 ||
-                     s->type.kind == TY_PTR_CHAR || s->type.kind == TY_FNPTR)
+                     s->type.kind == TY_PTR_CHAR || s->type.kind == TY_PTR_VOID ||
+                     s->type.kind == TY_FNPTR)
                 r.elem_ty = e->ptr;
             else r.elem_ty = e->i32;
             return r;
@@ -977,7 +980,9 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                 return r;
             }
             Type ft = parent.sd->fields.data[idx].type;
-            if (ft.kind != TY_I32 && ft.kind != TY_F32 && ft.kind != TY_PTR_STRUCT) {
+            if (ft.kind != TY_I32 && ft.kind != TY_F32 &&
+                ft.kind != TY_PTR_STRUCT && ft.kind != TY_PTR_I32 &&
+                ft.kind != TY_PTR_CHAR && ft.kind != TY_PTR_VOID) {
                 EMIT_ERR(e, "field {} is not a scalar lvalue", ex->name);
                 return r;
             }
@@ -988,7 +993,8 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             r.n_const_path = parent.n_const_path;
             r.dyn_index = parent.dyn_index;
             if (ft.kind == TY_F32) r.elem_ty = e->f32;
-            else if (ft.kind == TY_PTR_STRUCT) r.elem_ty = e->ptr;
+            else if (ft.kind == TY_PTR_STRUCT || ft.kind == TY_PTR_I32 ||
+                     ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID) r.elem_ty = e->ptr;
             else r.elem_ty = e->i32;
             return r;
         }
@@ -1059,7 +1065,7 @@ static void emit_struct_copy_path(E *e, MLIR_ValueHandle dst, MLIR_ValueHandle s
             StructDef *inner = find_struct(e, ft.struct_name);
             emit_struct_copy_path(e, dst, src, source_elem, inner, path, n_path);
         } else if (ft.kind == TY_PTR_STRUCT || ft.kind == TY_PTR_I32 ||
-                   ft.kind == TY_PTR_CHAR) {
+                   ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID) {
             MLIR_ValueHandle sp = emit_gep(e, src, source_elem, path, n_path, NULL, 0);
             MLIR_ValueHandle val = emit_load_v(e, sp, e->ptr);
             MLIR_ValueHandle dp = emit_gep(e, dst, source_elem, path, n_path, NULL, 0);
@@ -1198,6 +1204,7 @@ static bool ast_fold_int(E *e, Expr *ex, int64_t *out) {
             *out = (int64_t)(int32_t)ex->int_value;
             return true;
         case EX_SIZEOF:
+            if (ex->cast_type.kind == TY_VOID) return false;
             *out = (int64_t)(int32_t)type_size(e, ex->cast_type);
             return true;
         case EX_UN: {
@@ -1339,6 +1346,11 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             return r;
         }
         case EX_SIZEOF:
+            if (ex->cast_type.kind == TY_VOID) {
+                EMIT_ERR(e, "sizeof(void) is not allowed");
+                r.val = emit_const_i32(e, 1);
+                return r;
+            }
             r.val = emit_const_i32(e, type_size(e, ex->cast_type)); return r;
         case EX_CAST: {
             // Pointer-to-pointer cast: opaque !llvm.ptr is universal, so
@@ -1350,11 +1362,16 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             }
             v.is_ptr = true;
             v.is_float = false;
+            v.is_void_ptr = (ex->cast_type.kind == TY_PTR_VOID);
             if (ex->cast_type.kind == TY_PTR_STRUCT) {
                 v.sdef = find_struct(e, ex->cast_type.struct_name);
             } else {
                 v.sdef = NULL;
             }
+            // Reset element-type hints for non-void typed pointers.
+            if (ex->cast_type.kind == TY_PTR_I32) { v.ptr_elem = e->i32; v.is_str = false; }
+            else if (ex->cast_type.kind == TY_PTR_CHAR) { v.ptr_elem = e->i8; v.is_str = true; }
+            else if (ex->cast_type.kind == TY_PTR_VOID) { v.ptr_elem = MLIR_INVALID_HANDLE; v.is_str = false; }
             return v;
         }
         case EX_VAR:
@@ -1446,6 +1463,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                         v.sdef = s->sdef;
                         if (s->type.kind == TY_PTR_CHAR) { v.is_str = true; v.ptr_elem = e->i8; }
                         else if (s->type.kind == TY_PTR_I32) v.ptr_elem = e->i32;
+                        else if (s->type.kind == TY_PTR_VOID) v.is_void_ptr = true;
                         else if (s->type.kind == TY_FNPTR) {
                             Type *fnty = arena_new(e->arena, Type);
                             *fnty = s->type;
@@ -1647,6 +1665,9 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             }
             // Pointer arithmetic: p + i, i + p (-> !llvm.ptr via GEP).
             if (ex->op == OP_ADD && (a.is_ptr || b.is_ptr) && !(a.is_ptr && b.is_ptr)) {
+                if (a.is_void_ptr || b.is_void_ptr) {
+                    EMIT_ERR(e, "pointer arithmetic on 'void*' is not allowed");
+                }
                 EVal pv = a.is_ptr ? a : b;
                 EVal iv = a.is_ptr ? b : a;
                 MLIR_TypeHandle elem = (pv.ptr_elem != MLIR_INVALID_HANDLE) ? pv.ptr_elem : e->i32;
@@ -1661,6 +1682,9 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             }
             // Pointer minus integer: p - i -> GEP %p[-i].
             if (ex->op == OP_SUB && a.is_ptr && !b.is_ptr) {
+                if (a.is_void_ptr) {
+                    EMIT_ERR(e, "pointer arithmetic on 'void*' is not allowed");
+                }
                 MLIR_TypeHandle elem = (a.ptr_elem != MLIR_INVALID_HANDLE) ? a.ptr_elem : e->i32;
                 MLIR_ValueHandle zero = emit_const_i32(e, 0);
                 MLIR_ValueHandle neg = emit_binop(e, OP_TYPE_ARITH_SUBI,
@@ -1675,6 +1699,9 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             }
             // Pointer minus pointer (T* - T*) -> i32 element count.
             if (ex->op == OP_SUB && a.is_ptr && b.is_ptr) {
+                if (a.is_void_ptr || b.is_void_ptr) {
+                    EMIT_ERR(e, "pointer arithmetic on 'void*' is not allowed");
+                }
                 MLIR_TypeHandle elem = (a.ptr_elem != MLIR_INVALID_HANDLE) ? a.ptr_elem
                                        : (b.ptr_elem != MLIR_INVALID_HANDLE) ? b.ptr_elem
                                        : e->i32;
@@ -1879,6 +1906,12 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 r.val = emit_const_i32(e, 0);
                 return r;
             }
+            if (sig->ret.type.kind == TY_VOID) {
+                EMIT_ERR(e, "void-returning call has no value (use as a statement)");
+                emit_flat_call(e, sc, sig, ex->args, NULL, MLIR_INVALID_HANDLE);
+                r.val = emit_const_i32(e, 0);
+                return r;
+            }
             MLIR_ValueHandle *results = arena_new_array(e->arena, MLIR_ValueHandle, 1);
             emit_flat_call(e, sc, sig, ex->args, results, MLIR_INVALID_HANDLE);
             r.val = results[0];
@@ -1886,6 +1919,12 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             if (sig->ret.type.kind == TY_PTR_STRUCT) {
                 r.is_ptr = true;
                 r.sdef = sig->ret.sdef;
+            }
+            if (sig->ret.type.kind == TY_PTR_I32 ||
+                sig->ret.type.kind == TY_PTR_CHAR ||
+                sig->ret.type.kind == TY_PTR_VOID ||
+                sig->ret.type.kind == TY_FNPTR) {
+                r.is_ptr = true;
             }
             return r;
         }
@@ -1909,7 +1948,7 @@ static void emit_struct_zero(E *e, MLIR_ValueHandle base, MLIR_TypeHandle source
             StructDef *inner = find_struct(e, ft.struct_name);
             emit_struct_zero(e, base, source_elem, inner, path, n_path);
         } else if (ft.kind == TY_PTR_STRUCT || ft.kind == TY_PTR_I32 ||
-                   ft.kind == TY_PTR_CHAR) {
+                   ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID) {
             MLIR_ValueHandle p = emit_gep(e, base, source_elem, path, n_path, NULL, 0);
             emit_store_v(e, emit_null_ptr(e), p);
         } else if (ft.kind == TY_ARRAY_I32 || ft.kind == TY_ARRAY_F32 ||
@@ -1955,6 +1994,10 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                     emit_flat_call(e, sc, sig, st->expr->args, NULL, MLIR_INVALID_HANDLE);
                     return;
                 }
+                if (sig && sig->ret.type.kind == TY_VOID) {
+                    emit_flat_call(e, sc, sig, st->expr->args, NULL, MLIR_INVALID_HANDLE);
+                    return;
+                }
             }
             (void)emit_expr(e, sc, st->expr);
             return;
@@ -1964,12 +2007,12 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             sy->name = st->decl_name;
             sy->type = st->decl_type;
 
-            if (st->decl_type.kind == TY_PTR_I32) {
+            if (st->decl_type.kind == TY_PTR_I32 || st->decl_type.kind == TY_PTR_VOID) {
                 sy->addr = emit_alloca(e, e->ptr);
                 if (st->decl_init) {
                     EVal iv = emit_expr(e, sc, st->decl_init);
                     if (!iv.is_ptr) {
-                        EMIT_ERR(e, "int* initializer must be a pointer expression");
+                        EMIT_ERR(e, "pointer initializer must be a pointer expression");
                     } else {
                         emit_store_v(e, iv.val, sy->addr);
                     }
@@ -2081,6 +2124,23 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
         }
         case ST_RETURN: {
             FuncSig *sig = e->cur_sig;
+            bool is_void_fn = (sig && sig->ret.type.kind == TY_VOID);
+            if (is_void_fn) {
+                if (st->expr) {
+                    EMIT_ERR(e, "void function cannot return a value");
+                }
+                emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
+                        NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+                e->terminated = true;
+                return;
+            }
+            if (!st->expr) {
+                EMIT_ERR(e, "non-void function requires a return value");
+                emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
+                        NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+                e->terminated = true;
+                return;
+            }
             if (sig && sig->ret.type.kind == TY_STRUCT) {
                 StructDef *want = sig->ret.sdef;
                 MLIR_ValueHandle out = e->cur_sret_ptr;
@@ -2108,7 +2168,11 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             }
             MLIR_TypeHandle want_ty;
             if (sig && sig->ret.type.kind == TY_F32) want_ty = e->f32;
-            else if (sig && sig->ret.type.kind == TY_PTR_STRUCT) want_ty = e->ptr;
+            else if (sig && (sig->ret.type.kind == TY_PTR_STRUCT ||
+                             sig->ret.type.kind == TY_PTR_I32 ||
+                             sig->ret.type.kind == TY_PTR_CHAR ||
+                             sig->ret.type.kind == TY_PTR_VOID ||
+                             sig->ret.type.kind == TY_FNPTR)) want_ty = e->ptr;
             else want_ty = e->i32;
             EVal v = emit_expr(e, sc, st->expr);
             MLIR_ValueHandle ret_v;
@@ -2346,6 +2410,7 @@ static void slot_resolve(E *e, Type ty, SlotInfo *out) {
         }
     } else if (ty.kind != TY_I32 && ty.kind != TY_F32 &&
                ty.kind != TY_PTR_I32 && ty.kind != TY_PTR_CHAR &&
+               ty.kind != TY_PTR_VOID && ty.kind != TY_VOID &&
                ty.kind != TY_FNPTR) {
         EMIT_ERR(e, "unsupported type in function signature");
     }
@@ -2372,8 +2437,9 @@ static void build_signatures(E *e) {
             slot_resolve(e, f->params.data[i].type, &sig->params[i]);
         }
         sig->sret = (sig->ret.type.kind == TY_STRUCT);
+        bool is_void = (sig->ret.type.kind == TY_VOID);
         size_t in_total = sig->n_params + (sig->sret ? 1 : 0);
-        size_t out_total = sig->sret ? 0 : 1;
+        size_t out_total = (sig->sret || is_void) ? 0 : 1;
         sig->flat_in_tys  = arena_new_array(e->arena, MLIR_TypeHandle, in_total ? in_total : 1);
         sig->flat_out_tys = arena_new_array(e->arena, MLIR_TypeHandle, out_total ? out_total : 1);
         size_t off = 0;
@@ -2382,7 +2448,7 @@ static void build_signatures(E *e) {
             sig->flat_in_tys[off++] = slot_param_type(e, &sig->params[i]);
         }
         sig->n_flat_in = off;
-        if (!sig->sret) {
+        if (!sig->sret && !is_void) {
             sig->flat_out_tys[0] = scalar_mlir_type(e, sig->ret.type.kind);
             sig->n_flat_out = 1;
         } else {
@@ -2445,7 +2511,7 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
             sy->addr = emit_alloca(e, e->f32);
             emit_store_v(e, blk, sy->addr);
         } else if (p->type.kind == TY_PTR_I32 || p->type.kind == TY_PTR_CHAR ||
-                   p->type.kind == TY_FNPTR) {
+                   p->type.kind == TY_PTR_VOID || p->type.kind == TY_FNPTR) {
             sy->addr = emit_alloca(e, e->ptr);
             emit_store_v(e, blk, sy->addr);
         } else {
@@ -2458,7 +2524,7 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
 
     emit_block(e, &sc, f->body);
     if (!e->terminated) {
-        if (sig->sret) {
+        if (sig->sret || sig->ret.type.kind == TY_VOID) {
             emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
                     NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
         } else {
@@ -2495,7 +2561,7 @@ static int64_t type_size(E *e, Type t) {
     if (t.kind == TY_I32) return 4;
     if (t.kind == TY_F32) return 4;
     if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return 8;
-    if (t.kind == TY_PTR_CHAR || t.kind == TY_FNPTR) return 8;
+    if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return 8;
     if (t.kind == TY_ARRAY_I32) return 4 * t.array_len * (t.array_len2 ? t.array_len2 : 1);
     if (t.kind == TY_ARRAY_F32) return 4 * t.array_len * (t.array_len2 ? t.array_len2 : 1);
     if (t.kind == TY_ARRAY_PTR_STRUCT || t.kind == TY_ARRAY_PTR_CHAR)
@@ -2525,7 +2591,7 @@ static int64_t type_size(E *e, Type t) {
 static int64_t type_align(E *e, Type t) {
     if (t.kind == TY_I32 || t.kind == TY_F32) return 4;
     if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return 8;
-    if (t.kind == TY_PTR_CHAR || t.kind == TY_FNPTR) return 8;
+    if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return 8;
     if (t.kind == TY_ARRAY_I32 || t.kind == TY_ARRAY_F32) return 4;
     if (t.kind == TY_ARRAY_PTR_STRUCT || t.kind == TY_ARRAY_PTR_CHAR) return 8;
     if (t.kind == TY_STRUCT) {
@@ -2608,7 +2674,7 @@ static void init_struct_types(E *e) {
             if (ft.kind == TY_I32) body[k] = e->i32;
             else if (ft.kind == TY_F32) body[k] = e->f32;
             else if (ft.kind == TY_PTR_STRUCT || ft.kind == TY_PTR_I32 ||
-                     ft.kind == TY_PTR_CHAR) body[k] = e->ptr;
+                     ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID) body[k] = e->ptr;
             else if (ft.kind == TY_STRUCT) {
                 StructDef *inner = find_struct(e, ft.struct_name);
                 MLIR_TypeHandle t = find_struct_type(e, inner);
@@ -2725,7 +2791,7 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
                 NULL, e.loc);
             MLIR_AppendBlockOp(ctx, mb, gop);
         } else if (g->type.kind == TY_PTR_I32 || g->type.kind == TY_PTR_STRUCT ||
-                   g->type.kind == TY_FNPTR) {
+                   g->type.kind == TY_PTR_VOID || g->type.kind == TY_FNPTR) {
             // Emit a zero-initialized pointer global.
             MLIR_BlockHandle init_blk = MLIR_INVALID_HANDLE;
             MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, e.ptr,

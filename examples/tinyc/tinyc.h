@@ -20,7 +20,11 @@
 //   - break, continue, early return
 //   - Address-of (&x, &s) and dereference (*p) — alias-only pointers
 //   - Functions with int / float / struct / struct* parameters and
-//     int / float / struct / struct* return types.
+//     int / float / struct / struct* / void return types.
+//     `void f(...)` lowers to func.func with no results; `f(void)` is the
+//     no-parameter form. `void*` is a generic pointer type (storage:
+//     !llvm.ptr) implicitly convertible to/from any typed pointer; it
+//     cannot be dereferenced, indexed, or used in pointer arithmetic.
 //     Struct params and returns are scalarized at the function boundary
 //     (one MLIR scalar per LEAF field, in declaration order — Clang-style
 //     ABI lowering, recursive through nested structs).
@@ -106,6 +110,9 @@ typedef enum {
     TY_PTR_STRUCT,     // alias-only pointer to struct (bundle of memref aliases)
     TY_ARRAY_STRUCT,   // fixed-size struct[N], length in `array_len`
     TY_FNPTR,          // function pointer with a fixed signature
+    TY_VOID,           // void — only valid as a function return type
+                       // or as the lone parameter spec (`f(void)`)
+    TY_PTR_VOID,       // void* — generic pointer (storage: !llvm.ptr)
 } TypeKind;
 
 typedef struct Type Type;
@@ -342,6 +349,7 @@ typedef enum {
     TC_TK_KW_DEFAULT,
     TC_TK_KW_ENUM,
     TC_TK_KW_CONST,
+    TC_TK_KW_VOID,
     TC_TK_STRING_LIT,
     TC_TK_LPAREN, TC_TK_RPAREN,
     TC_TK_LBRACE, TC_TK_RBRACE,

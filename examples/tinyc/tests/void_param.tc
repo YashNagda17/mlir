@@ -1,0 +1,16 @@
+// `(void)` as the only-parameter form, plus a normal void-returning
+// function that takes one parameter.
+int answer(void) {
+    return 42;
+}
+
+void announce(int x) {
+    print(x);
+}
+
+int main() {
+    print(answer());   // 42
+    announce(7);       // 7
+    announce(answer());// 42
+    return 0;
+}
