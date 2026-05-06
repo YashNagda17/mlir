@@ -7,29 +7,33 @@
 //
 // Subset of C supported:
 //   - Types: int (i32), float (f32), int[N], int* (alias-only),
-//     struct S { int/float fields }
+//     struct S { int/float fields }, struct S* (alias-only)
 //   - Local variables (mutable)
 //   - Integer and float literals
 //   - Binary ops: + - * / (% on int only)
 //   - Comparisons: < <= > >= == != (int and float)
 //   - Logical: && || ! (short-circuit, int operands)
-//   - Assignments to general lvalues: x, a[i], *p, s.field
+//   - Assignments to general lvalues: x, a[i], *p, s.field, p->field
 //   - if / else, while, for
 //   - break, continue, early return
-//   - Address-of (&x) and dereference (*p) — alias-only pointers
-//   - Functions with int / float / struct parameters and return types.
+//   - Address-of (&x, &s) and dereference (*p) — alias-only pointers
+//   - Functions with int / float / struct / struct* parameters and
+//     int / float / struct return types.
 //     Struct params and returns are scalarized at the function boundary
 //     (one MLIR scalar per field, in declaration order — Clang-style ABI
 //     lowering).  `q = f(p);` and `return s;` are the supported uses;
 //     a struct-returning call cannot appear in arbitrary expression
 //     position (must be assigned to a struct local, returned, or discarded).
+//     Struct-pointer params are also lowered at the boundary as one
+//     `memref<scalar>` per field; the body sees `p->field` as a field
+//     load/store on the caller's per-field memrefs.
 //   - `print(expr);` builtin -> vector.print
 //   - Top-level entry point: int main()
 //
 // Not supported: strings, pointer reassignment, pointer arithmetic,
-// arrays-of-pointer, function pointers, &struct, nested/array/pointer
-// of struct, struct literal initialization, struct copy `q = p;` (use
-// a wrapper function or field-by-field assignment).
+// arrays-of-pointer, function pointers, returning struct*, nested/array
+// of struct, struct literal initialization, struct copy `q = p;` or
+// `*q = *p;` (use a wrapper function or field-by-field assignment).
 #pragma once
 
 #include <stdbool.h>
@@ -53,6 +57,7 @@ typedef enum {
     TY_PTR_I32,        // alias-only pointer to int
     TY_ARRAY_I32,      // fixed-size int[N], length in `array_len`
     TY_STRUCT,         // struct value (fields stored as separate scalars)
+    TY_PTR_STRUCT,     // alias-only pointer to struct (bundle of memref aliases)
 } TypeKind;
 
 typedef struct {
@@ -214,6 +219,7 @@ typedef enum {
     TC_TK_ASSIGN, TC_TK_BANG,
     TC_TK_AMP,
     TC_TK_AMPAMP, TC_TK_PIPEPIPE,
+    TC_TK_ARROW,                  // ->  (sugar for (*p).field)
 } TcTokKind;
 
 typedef struct {

@@ -49,3 +49,7 @@ expected_stdout = "3\n4\n25\n5\n7.5\n"
 [[test]]
 name = "struct_pass"
 expected_stdout = "11\n4\n6\n20\n30\n13\n24\n7\n3.5\n"
+
+[[test]]
+name = "struct_ptr"
+expected_stdout = "15\n5\n10\n15\n15\n55\n1\n1\n"

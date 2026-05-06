@@ -1,0 +1,69 @@
+// Struct pointers: pass-by-pointer parameters and the -> operator.
+// Pointers are alias-only (see tinyc.h): bound at decl/param time, no
+// reassignment, no arithmetic.
+
+struct Point {
+    int x;
+    int y;
+};
+
+struct Stat {
+    int n;
+    float m;
+};
+
+// Mutate through a struct pointer using both p->f and (*p).f forms.
+int bump(struct Point* p, int dx, int dy) {
+    p->x = p->x + dx;
+    (*p).y = (*p).y + dy;
+    return p->x + p->y;
+}
+
+// Read through a struct pointer.
+int sum(struct Point* p) {
+    return p->x + p->y;
+}
+
+// Forward a struct pointer through another call.
+int sum_via(struct Point* p) {
+    return sum(p);
+}
+
+// By-value struct param, then we'll also call it with *p (load each field).
+int dot(struct Point a, struct Point b) {
+    return a.x * b.x + a.y * b.y;
+}
+
+// Float field through a struct pointer.
+int floats(struct Stat* s) {
+    s->m = s->m + 1.5;
+    if (s->m > 5.0) { return 1; }
+    return 0;
+}
+
+int main() {
+    struct Point p;
+    p.x = 1;
+    p.y = 2;
+    struct Point* q = &p;        // alias: q's bundle aliases p's
+
+    print(bump(q, 4, 8));        // 1+4=5, 2+8=10, return 15
+    print(p.x);                  // 5  (mutation visible in p)
+    print(p.y);                  // 10
+    print(sum(&p));              // 15
+    print(sum_via(q));           // 15
+
+    // Pass-by-value via &-of-deref: caller has a struct local, callee
+    // takes by value -> we load each field through the var.
+    struct Point r;
+    r.x = 3; r.y = 4;
+    print(dot(p, r));            // 5*3 + 10*4 = 15 + 40 = 55
+
+    struct Stat s;
+    s.n = 0;
+    s.m = 4.0;
+    print(floats(&s));           // 4.0+1.5=5.5 > 5 -> 1
+    print(floats(&s));           // 5.5+1.5=7.0 > 5 -> 1
+
+    return 0;
+}
