@@ -873,6 +873,13 @@ MLIR_LocationHandle parse_loc(Parser *parser) {
     } else if (parser_peek(parser, TK_STRING)) {
         // loc("filename":line:col) or loc("name")
         string filename = parser_token_str(parser);
+        // The lexer includes the surrounding double quotes; strip them so
+        // the stored filename is the raw content. The printer will re-quote
+        // when needed.
+        if (filename.size >= 2 && filename.str[0] == '"' && filename.str[filename.size - 1] == '"') {
+            filename.str += 1;
+            filename.size -= 2;
+        }
         parser_next_token(parser);
 
         if (parser_peek(parser, TK_COLON)) {
