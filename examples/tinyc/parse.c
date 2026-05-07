@@ -94,8 +94,29 @@ static void parse_enum_decl_top(P *p);
 // in pointer declarators, and (via these helpers) wherever a type can
 // appear (return type, param, sizeof/cast, typedef target, struct field,
 // local decl).
+// Parser-level type qualifiers and storage-class specifiers that have no
+// effect on the AST and are silently dropped wherever a type can appear:
+//   - `const`   (qualifier)
+//   - `static`  (storage class — no linkage change in tinyC)
+//   - `inline`  (no inlining performed)
+// Any combination, in any order, even repetitions, is accepted.
 static void skip_const(P *p) {
-    while (cur(p).kind == TC_TK_KW_CONST) p->i++;
+    while (cur(p).kind == TC_TK_KW_CONST ||
+           cur(p).kind == TC_TK_KW_STATIC ||
+           cur(p).kind == TC_TK_KW_INLINE) {
+        p->i++;
+    }
+}
+
+// `static` and `inline` are parser-only storage-class qualifiers. Any
+// combination (`static`, `inline`, `static inline`, `inline static`,
+// even repetitions) is silently accepted at any position where a type
+// can appear. They do not affect the AST or codegen — names retain
+// external linkage and inline functions are not substituted.
+static void skip_storage_class(P *p) {
+    while (cur(p).kind == TC_TK_KW_STATIC || cur(p).kind == TC_TK_KW_INLINE) {
+        p->i++;
+    }
 }
 
 // postfix := (...) | [expr] | .ident
@@ -151,6 +172,28 @@ static Expr *parse_postfix(P *p, Expr *base) {
             base = as;
             continue;
         }
+        if (cur(p).kind == TC_TK_LPAREN) {
+            // Indirect call through a callable expression. Examples:
+            //   (*fp)(args)   — fp is a TY_PTR_PTR of a function pointer
+            //   funcs[i](x)   — array-of-fnptr (not yet supported)
+            // The callee expression is stored in `lhs`; `callee` (a string)
+            // stays empty so the EX_CALL emit path knows to evaluate `lhs`
+            // as a !llvm.ptr / fnptr value.
+            int line = cur(p).line;
+            p->i++;
+            Expr *e = new_expr(p, EX_CALL, line);
+            e->lhs = base;
+            if (cur(p).kind != TC_TK_RPAREN) {
+                for (;;) {
+                    Expr *a = parse_expr(p);
+                    VecExprPtr_push_back(p->arena, &e->args, a);
+                    if (!accept(p, TC_TK_COMMA)) break;
+                }
+            }
+            expect(p, TC_TK_RPAREN, str_lit("expected ')'"));
+            base = e;
+            continue;
+        }
         break;
     }
     return base;
@@ -163,6 +206,7 @@ static Expr *parse_primary(P *p) {
         p->i++;
         Expr *e = new_expr(p, EX_INT, t.line);
         e->int_value = t.int_value;
+        e->is_i64 = t.is_i64;
         return e;
     }
     if (t.kind == TC_TK_FLOAT_LIT) {
@@ -179,13 +223,29 @@ static Expr *parse_primary(P *p) {
     if (t.kind == TC_TK_KW_SIZEOF) {
         p->i++;
         expect(p, TC_TK_LPAREN, str_lit("expected '(' after sizeof"));
-        Type ty = {0};
-        if (!parse_abstract_type(p, &ty)) {
-            perror_at(p, cur(p).line, str_lit("expected type in sizeof(...)"));
+        // Disambiguate `sizeof(<type>)` vs `sizeof(<expr>)`. A type-name
+        // starts with a base-type keyword, `const`, `enum`, or a typedef
+        // identifier. Anything else is parsed as an expression.
+        Expr *e = new_expr(p, EX_SIZEOF, t.line);
+        TcTokKind nxt = cur(p).kind;
+        bool looks_like_type =
+            nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT ||
+            nxt == TC_TK_KW_CHAR || nxt == TC_TK_KW_VOID ||
+            nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_ENUM ||
+            nxt == TC_TK_KW_CONST || nxt == TC_TK_KW_LONG ||
+            nxt == TC_TK_KW_SIGNED || nxt == TC_TK_KW_UNSIGNED ||
+            (nxt == TC_TK_IDENT && typedef_lookup(p, cur(p).text) != NULL);
+        if (looks_like_type) {
+            Type ty = {0};
+            if (!parse_abstract_type(p, &ty)) {
+                perror_at(p, cur(p).line, str_lit("expected type in sizeof(...)"));
+            }
+            e->cast_type = ty;
+        } else {
+            e->lhs = parse_expr(p);
+            e->sizeof_is_expr = true;
         }
         expect(p, TC_TK_RPAREN, str_lit("expected ')'"));
-        Expr *e = new_expr(p, EX_SIZEOF, t.line);
-        e->cast_type = ty;
         return e;
     }
     if (t.kind == TC_TK_STRING_LIT) {
@@ -199,7 +259,8 @@ static Expr *parse_primary(P *p) {
         TcTokKind nxt = peek(p, 1).kind;
         bool is_cast = (nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT ||
                         nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_CHAR ||
-                        nxt == TC_TK_KW_CONST);
+                        nxt == TC_TK_KW_CONST || nxt == TC_TK_KW_LONG ||
+                        nxt == TC_TK_KW_SIGNED || nxt == TC_TK_KW_UNSIGNED);
         if (!is_cast && nxt == TC_TK_IDENT &&
             typedef_lookup(p, peek(p, 1).text)) {
             is_cast = true;
@@ -211,6 +272,23 @@ static Expr *parse_primary(P *p) {
                 perror_at(p, cur(p).line, str_lit("expected type in cast"));
             }
             expect(p, TC_TK_RPAREN, str_lit("expected ')' in cast"));
+            if (cur(p).kind == TC_TK_LBRACE) {
+                // Compound literal: (T){ v0, v1, ... }
+                p->i++;  // consume '{'
+                Expr *e = new_expr(p, EX_COMPOUND, t.line);
+                e->cast_type = ty;
+                if (cur(p).kind != TC_TK_RBRACE) {
+                    for (;;) {
+                        Expr *v = parse_expr(p);
+                        VecExprPtr_push_back(p->arena, &e->args, v);
+                        if (cur(p).kind == TC_TK_COMMA) { p->i++; continue; }
+                        break;
+                    }
+                }
+                expect(p, TC_TK_RBRACE,
+                       str_lit("expected '}' in compound literal"));
+                return e;
+            }
             Expr *operand = parse_primary(p);
             Expr *e = new_expr(p, EX_CAST, t.line);
             e->cast_type = ty;
@@ -505,7 +583,30 @@ static Expr *parse_expr(P *p) { return parse_assign_or_or(p); }
 // the kind to *out. Pointer/array suffixes are handled at decl time.
 static bool parse_base_type(P *p, TypeKind *out) {
     skip_const(p);
-    if (cur(p).kind == TC_TK_KW_INT)   { p->i++; *out = TY_I32; skip_const(p); return true; }
+    // C-style integer base specifier: optional signed/unsigned, optional
+    // long [long], optional int. Any 'long' makes the result TY_I64.
+    bool saw_int_kw = false;
+    bool saw_long_kw = false;
+    bool saw_signedness_kw = false;
+    while (cur(p).kind == TC_TK_KW_SIGNED || cur(p).kind == TC_TK_KW_UNSIGNED) {
+        saw_signedness_kw = true; p->i++; skip_const(p);
+    }
+    while (cur(p).kind == TC_TK_KW_LONG) {
+        saw_long_kw = true; p->i++; skip_const(p);
+    }
+    if (cur(p).kind == TC_TK_KW_INT) {
+        saw_int_kw = true; p->i++; skip_const(p);
+    }
+    while (cur(p).kind == TC_TK_KW_LONG) {
+        saw_long_kw = true; p->i++; skip_const(p);
+    }
+    if (cur(p).kind == TC_TK_KW_SIGNED || cur(p).kind == TC_TK_KW_UNSIGNED) {
+        saw_signedness_kw = true; p->i++; skip_const(p);
+    }
+    if (saw_long_kw)         { *out = TY_I64; skip_const(p); return true; }
+    if (saw_int_kw || saw_signedness_kw) {
+        *out = TY_I32; skip_const(p); return true;
+    }
     if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; *out = TY_F32; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_CHAR)  { p->i++; *out = TY_I32; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_VOID)  { p->i++; *out = TY_VOID; skip_const(p); return true; }
@@ -578,6 +679,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
         TcTok sn = cur(p);
         expect(p, TC_TK_IDENT, str_lit("expected struct name"));
         bool is_ptr = accept(p, TC_TK_STAR);
+        bool is_ptr_ptr = is_ptr && accept(p, TC_TK_STAR);
         TcTok name = cur(p);
         expect(p, TC_TK_IDENT, str_lit("expected variable name"));
         Stmt *s = new_stmt(p, ST_DECL, line);
@@ -592,11 +694,22 @@ static Stmt *parse_decl(P *p, bool require_semi) {
             expect(p, TC_TK_RBRACK, str_lit("expected ']'"));
             s->decl_type.kind = TY_ARRAY_STRUCT;
             s->decl_type.array_len = lit.int_value;
+        } else if (is_ptr_ptr) {
+            // struct Foo **var: TY_PTR_PTR(pointee=TY_PTR_STRUCT).
+            Type *inner = arena_new(p->arena, Type);
+            *inner = (Type){0};
+            inner->kind = TY_PTR_STRUCT;
+            inner->struct_name = sn.text;
+            s->decl_type.kind = TY_PTR_PTR;
+            s->decl_type.pointee = inner;
+            s->decl_type.struct_name = sn.text;
         } else {
             s->decl_type.kind = is_ptr ? TY_PTR_STRUCT : TY_STRUCT;
         }
         if (accept(p, TC_TK_ASSIGN)) {
-            if (s->decl_type.kind != TY_PTR_STRUCT) {
+            if (s->decl_type.kind != TY_PTR_STRUCT &&
+                s->decl_type.kind != TY_PTR_PTR &&
+                s->decl_type.kind != TY_STRUCT) {
                 perror_at(p, line, str_lit("struct/array initializers are not supported"));
             }
             s->decl_init = parse_expr(p);
@@ -624,7 +737,11 @@ static Stmt *parse_decl(P *p, bool require_semi) {
         return s;
     }
     bool is_ptr = false;
-    if (accept(p, TC_TK_STAR)) { is_ptr = true; skip_const(p); }
+    bool is_ptr_ptr = false;
+    if (accept(p, TC_TK_STAR)) {
+        is_ptr = true; skip_const(p);
+        if (accept(p, TC_TK_STAR)) { is_ptr_ptr = true; skip_const(p); }
+    }
     TcTok name = cur(p);
     expect(p, TC_TK_IDENT, str_lit("expected identifier"));
     Stmt *s = new_stmt(p, ST_DECL, line);
@@ -635,6 +752,14 @@ static Stmt *parse_decl(P *p, bool require_semi) {
         else if (base == TY_I32) s->decl_type.kind = TY_PTR_I32;
         else if (base == TY_VOID) s->decl_type.kind = TY_PTR_VOID;
         else perror_at(p, line, str_lit("only int*/char*/void* pointers are supported"));
+        if (is_ptr_ptr) {
+            // Wrap into TY_PTR_PTR carrying the inner single-level pointer.
+            Type *inner = arena_new(p->arena, Type);
+            *inner = s->decl_type;
+            s->decl_type = (Type){0};
+            s->decl_type.kind = TY_PTR_PTR;
+            s->decl_type.pointee = inner;
+        }
     } else if (base == TY_VOID) {
         perror_at(p, line, str_lit("'void' is not a valid variable type (did you mean 'void*'?)"));
     }
@@ -724,6 +849,9 @@ static Stmt *parse_stmt(P *p) {
         } else if (cur(p).kind == TC_TK_KW_INT || cur(p).kind == TC_TK_KW_FLOAT ||
                    cur(p).kind == TC_TK_KW_CHAR || cur(p).kind == TC_TK_KW_ENUM ||
                    cur(p).kind == TC_TK_KW_CONST || cur(p).kind == TC_TK_KW_VOID ||
+                   cur(p).kind == TC_TK_KW_STATIC || cur(p).kind == TC_TK_KW_INLINE ||
+                   cur(p).kind == TC_TK_KW_LONG || cur(p).kind == TC_TK_KW_SIGNED ||
+                   cur(p).kind == TC_TK_KW_UNSIGNED ||
                    (cur(p).kind == TC_TK_IDENT && typedef_lookup(p, cur(p).text))) {
             s->for_init = parse_decl(p, /*require_semi*/ true);
         } else {
@@ -803,6 +931,9 @@ static Stmt *parse_stmt(P *p) {
         t.kind == TC_TK_KW_STRUCT || t.kind == TC_TK_KW_CHAR ||
         t.kind == TC_TK_KW_ENUM || t.kind == TC_TK_KW_CONST ||
         t.kind == TC_TK_KW_VOID ||
+        t.kind == TC_TK_KW_STATIC || t.kind == TC_TK_KW_INLINE ||
+        t.kind == TC_TK_KW_LONG || t.kind == TC_TK_KW_SIGNED ||
+        t.kind == TC_TK_KW_UNSIGNED ||
         (t.kind == TC_TK_IDENT && typedef_lookup(p, t.text) &&
          peek(p, 1).kind == TC_TK_IDENT)) {
         // `enum [Tag] { ... };` is a module-scope-only registration form;
@@ -842,6 +973,7 @@ static Stmt *parse_stmt(P *p) {
 }
 
 static bool parse_sig_type(P *p, Type *out);
+static void wrap_ptr_to_ptr(P *p, Type *out);
 
 // After a base type has been parsed, optionally consume a function-pointer
 // declarator suffix: `(*[name])(T1, T2, ...)` or `(*[name])()`.
@@ -855,6 +987,12 @@ static bool try_parse_fnptr_suffix(P *p, Type *ty, string *out_name) {
     // Consume `(`, `*`.
     p->i++;
     p->i++;
+    // Optional second `*` for pointer-to-function-pointer: `int (**fp)(...)`.
+    bool ptr_to_fnptr = false;
+    if (cur(p).kind == TC_TK_STAR) {
+        ptr_to_fnptr = true;
+        p->i++;
+    }
     if (cur(p).kind == TC_TK_IDENT) {
         if (out_name) *out_name = cur(p).text;
         p->i++;
@@ -895,31 +1033,81 @@ static bool try_parse_fnptr_suffix(P *p, Type *ty, string *out_name) {
     ty->fnptr_ret = ret_box;
     ty->fnptr_params = params;
     ty->fnptr_nparams = nparams;
+    if (ptr_to_fnptr) {
+        // Wrap as TY_PTR_PTR with the fnptr as pointee.
+        wrap_ptr_to_ptr(p, ty);
+    }
     return true;
+}
+
+// Wrap an already-parsed single-level pointer type into TY_PTR_PTR
+// (consuming a SECOND `*`). Caller has just successfully parsed `T*` into
+// *out and seen another `*` token. Limit: depth 2; we do NOT recurse to
+// T*** (any further '*' is left for the caller to handle / reject).
+static void wrap_ptr_to_ptr(P *p, Type *out) {
+    Type *inner = arena_new(p->arena, Type);
+    *inner = *out;
+    *out = (Type){0};
+    out->kind = TY_PTR_PTR;
+    out->pointee = inner;
 }
 
 // Parse a function-signature type:  int | float | char [*] | struct Name [*]
 // or a typedef'd type-name (in which case any leading '*' for typedef-int
-// produces TY_PTR_I32, etc.).
+// produces TY_PTR_I32, etc.). Also accepts a SECOND '*' to produce
+// TY_PTR_PTR (e.g. `int **`, `void **`, `struct Foo **`, `BinOp *` where
+// BinOp is a typedef'd function-pointer).
 // Returns false if the current tokens don't start a type.
 static bool parse_sig_type(P *p, Type *out) {
     *out = (Type){0};
     skip_const(p);
-    if (cur(p).kind == TC_TK_KW_INT)   { p->i++; out->kind = TY_I32; skip_const(p); if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_I32; skip_const(p); return true; }
+    // Accept signed/unsigned/long modifiers in any order ahead of `int` or
+    // by themselves. Any 'long' promotes to TY_I64; otherwise TY_I32.
+    if (cur(p).kind == TC_TK_KW_SIGNED || cur(p).kind == TC_TK_KW_UNSIGNED ||
+        cur(p).kind == TC_TK_KW_LONG) {
+        bool saw_long = false;
+        while (cur(p).kind == TC_TK_KW_SIGNED || cur(p).kind == TC_TK_KW_UNSIGNED ||
+               cur(p).kind == TC_TK_KW_LONG || cur(p).kind == TC_TK_KW_INT) {
+            if (cur(p).kind == TC_TK_KW_LONG) saw_long = true;
+            p->i++; skip_const(p);
+        }
+        out->kind = saw_long ? TY_I64 : TY_I32;
+        return true;
+    }
+    if (cur(p).kind == TC_TK_KW_INT)   {
+        p->i++; out->kind = TY_I32; skip_const(p);
+        if (accept(p, TC_TK_STAR)) {
+            out->kind = TY_PTR_I32;
+            skip_const(p);
+            if (accept(p, TC_TK_STAR)) { wrap_ptr_to_ptr(p, out); skip_const(p); }
+        }
+        skip_const(p);
+        return true;
+    }
     if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; out->kind = TY_F32; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_VOID)  {
         p->i++;
         skip_const(p);
-        if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_VOID;
-        else out->kind = TY_VOID;
+        if (accept(p, TC_TK_STAR)) {
+            out->kind = TY_PTR_VOID;
+            skip_const(p);
+            if (accept(p, TC_TK_STAR)) { wrap_ptr_to_ptr(p, out); skip_const(p); }
+        } else {
+            out->kind = TY_VOID;
+        }
         skip_const(p);
         return true;
     }
     if (cur(p).kind == TC_TK_KW_CHAR)  {
         p->i++;
         skip_const(p);
-        if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_CHAR;
-        else out->kind = TY_I32;
+        if (accept(p, TC_TK_STAR)) {
+            out->kind = TY_PTR_CHAR;
+            skip_const(p);
+            if (accept(p, TC_TK_STAR)) { wrap_ptr_to_ptr(p, out); skip_const(p); }
+        } else {
+            out->kind = TY_I32;
+        }
         skip_const(p);
         return true;
     }
@@ -930,7 +1118,11 @@ static bool parse_sig_type(P *p, Type *out) {
         out->kind = TY_STRUCT;
         out->struct_name = sn.text;
         skip_const(p);
-        if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_STRUCT;
+        if (accept(p, TC_TK_STAR)) {
+            out->kind = TY_PTR_STRUCT;
+            skip_const(p);
+            if (accept(p, TC_TK_STAR)) { wrap_ptr_to_ptr(p, out); skip_const(p); }
+        }
         skip_const(p);
         return true;
     }
@@ -942,7 +1134,11 @@ static bool parse_sig_type(P *p, Type *out) {
         if (cur(p).kind == TC_TK_IDENT) p->i++;
         out->kind = TY_I32;
         skip_const(p);
-        if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_I32;
+        if (accept(p, TC_TK_STAR)) {
+            out->kind = TY_PTR_I32;
+            skip_const(p);
+            if (accept(p, TC_TK_STAR)) { wrap_ptr_to_ptr(p, out); skip_const(p); }
+        }
         skip_const(p);
         return true;
     }
@@ -957,7 +1153,17 @@ static bool parse_sig_type(P *p, Type *out) {
             if (accept(p, TC_TK_STAR)) {
                 if (out->kind == TY_I32) out->kind = TY_PTR_I32;
                 else if (out->kind == TY_STRUCT) out->kind = TY_PTR_STRUCT;
+                else if (out->kind == TY_FNPTR) {
+                    // `BinOp *` where BinOp is a typedef'd function pointer.
+                    // Wrap into TY_PTR_PTR(pointee=TY_FNPTR copy).
+                    wrap_ptr_to_ptr(p, out);
+                }
                 // else: ignore (e.g. typedef'd pointer + extra '*' not supported)
+                skip_const(p);
+                if (accept(p, TC_TK_STAR) &&
+                    (out->kind == TY_PTR_I32 || out->kind == TY_PTR_STRUCT)) {
+                    wrap_ptr_to_ptr(p, out);
+                }
             }
             skip_const(p);
             return true;
@@ -1192,12 +1398,40 @@ static void parse_enum_decl_top(P *p) {
 Program *tinyc_parse(Arena *arena, VecTcTok toks) {
     P p = {.arena = arena, .toks = toks.data, .n = toks.size, .i = 0,
            .typedefs = NULL, .enums = NULL};
+    // Built-in typedefs (treated as TY_I64, signedness ignored).
+    {
+        const char *names[] = {"int64_t", "uint64_t", "size_t", "ssize_t",
+                               "intptr_t", "uintptr_t", "ptrdiff_t"};
+        for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
+            Typedef *td = arena_new(arena, Typedef);
+            td->name = (string){.str = (char *)names[k], .size = 0};
+            // Compute string length without libc.
+            const char *s = names[k]; size_t len = 0; while (s[len]) len++;
+            td->name.size = len;
+            td->ty.kind = TY_I64;
+            td->next = p.typedefs;
+            p.typedefs = td;
+        }
+        // int32_t / uint32_t — match TY_I32 to keep existing semantics.
+        const char *n32[] = {"int32_t", "uint32_t"};
+        for (size_t k = 0; k < sizeof(n32) / sizeof(n32[0]); k++) {
+            Typedef *td = arena_new(arena, Typedef);
+            const char *s = n32[k]; size_t len = 0; while (s[len]) len++;
+            td->name = (string){.str = (char *)n32[k], .size = len};
+            td->ty.kind = TY_I32;
+            td->next = p.typedefs;
+            p.typedefs = td;
+        }
+    }
     Program *prog = arena_new(arena, Program);
     *prog = (Program){0};
     VecFuncPtr_reserve(arena, &prog->funcs, 4);
     VecStructDefPtr_reserve(arena, &prog->structs, 4);
     VecGlobal_reserve(arena, &prog->globals, 4);
     while (cur(&p).kind != TC_TK_EOF) {
+        // Top-level storage-class qualifiers are parser-noise.
+        skip_storage_class(&p);
+        if (cur(&p).kind == TC_TK_EOF) break;
         if (cur(&p).kind == TC_TK_KW_STRUCT && peek(&p, 2).kind == TC_TK_LBRACE) {
             StructDef *sd = parse_struct_def(&p);
             VecStructDefPtr_push_back(arena, &prog->structs, sd);

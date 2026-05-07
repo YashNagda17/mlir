@@ -98,6 +98,7 @@
 // and (c) decide between integer/float arithmetic ops in the emitter.
 typedef enum {
     TY_I32,
+    TY_I64,            // 64-bit signed int (long, long long, int64_t, size_t)
     TY_F32,
     TY_PTR_I32,        // alias-only pointer to int
     TY_PTR_CHAR,       // pointer to char (string literals / globals)
@@ -113,6 +114,11 @@ typedef enum {
     TY_VOID,           // void — only valid as a function return type
                        // or as the lone parameter spec (`f(void)`)
     TY_PTR_VOID,       // void* — generic pointer (storage: !llvm.ptr)
+    TY_PTR_PTR,        // generic pointer-to-pointer (T**). Storage:
+                       // !llvm.ptr. The `pointee` field carries the
+                       // (single-level) inner pointer type so a deref of
+                       // a T** loads the inner T*. Limited to depth 2:
+                       // T*** is not supported.
 } TypeKind;
 
 typedef struct Type Type;
@@ -127,6 +133,10 @@ struct Type {
     Type    *fnptr_ret;
     Type    *fnptr_params;
     int      fnptr_nparams;
+    // For TY_PTR_PTR: the (single-level) pointer type that this T** points
+    // at. Carries the inner pointee kind / fnptr signature / struct_name
+    // so a deref can be typed correctly.
+    Type    *pointee;
 };
 
 typedef enum {
@@ -146,6 +156,7 @@ typedef enum {
     EX_DEREF,          // *p
     EX_FIELD,          // s.x  (lhs = struct lvalue, name = field name)
     EX_TERNARY,        // c ? a : b — lhs=cond, rhs=then, lvalue=else
+    EX_COMPOUND,       // (T){v0, v1, ...} — cast_type + args
 } ExprKind;
 
 typedef enum {
@@ -166,6 +177,8 @@ struct Expr {
     ExprKind kind;
     // For EX_INT
     int64_t int_value;
+    bool    is_i64;          // true iff the integer literal had L/LL suffix
+                             // and so should be emitted as TY_I64.
     // For EX_FLOAT
     double float_value;
     // For EX_VAR
@@ -183,8 +196,11 @@ struct Expr {
     // For EX_INDEX (lhs = array, rhs = index)
     // For EX_ADDR / EX_DEREF (lhs = inner)
     // For EX_SIZEOF / EX_CAST: cast_type is the type being asked about /
-    // cast to. EX_CAST also uses lhs as the operand.
+    // cast to. EX_CAST also uses lhs as the operand. EX_SIZEOF may instead
+    // carry an operand expression in lhs (sizeof_is_expr=true), in which
+    // case the emitter infers the type from the expression.
     Type cast_type;
+    bool sizeof_is_expr;
     int line;
 };
 
@@ -350,6 +366,11 @@ typedef enum {
     TC_TK_KW_ENUM,
     TC_TK_KW_CONST,
     TC_TK_KW_VOID,
+    TC_TK_KW_STATIC,
+    TC_TK_KW_INLINE,
+    TC_TK_KW_LONG,
+    TC_TK_KW_SIGNED,
+    TC_TK_KW_UNSIGNED,
     TC_TK_STRING_LIT,
     TC_TK_LPAREN, TC_TK_RPAREN,
     TC_TK_LBRACE, TC_TK_RBRACE,
@@ -372,6 +393,7 @@ typedef enum {
 typedef struct {
     TcTokKind kind;
     int64_t int_value;
+    bool    is_i64;          // EX_INT / TC_TK_INT_LIT marked with L/LL suffix
     double  float_value;
     string text;             // interned identifier text (for IDENT)
     int line;

@@ -1,0 +1,25 @@
+struct Point {
+    int x;
+    int y;
+};
+
+int main() {
+    int a;
+    long long b;
+    char *s;
+    struct Point p;
+    a = 0;
+    b = 0LL;
+    s = "hi";
+    p.x = 0;
+    p.y = 0;
+    print(sizeof(int));
+    print(sizeof(a));
+    print(sizeof(b));
+    print(sizeof(s));
+    print(sizeof(p));
+    print(sizeof(p.x));
+    print(sizeof(a + 1));
+    print(sizeof(a + b));
+    return 0;
+}
