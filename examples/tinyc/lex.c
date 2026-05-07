@@ -176,6 +176,29 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
         if (is_digit(c)) {
             size_t j = i;
             int64_t v = 0;
+            // Hex literal: 0x... / 0X...
+            if (c == '0' && j + 1 < src.size &&
+                (src.str[j + 1] == 'x' || src.str[j + 1] == 'X')) {
+                j += 2;
+                while (j < src.size) {
+                    char h = src.str[j];
+                    int dv;
+                    if (h >= '0' && h <= '9') dv = h - '0';
+                    else if (h >= 'a' && h <= 'f') dv = 10 + (h - 'a');
+                    else if (h >= 'A' && h <= 'F') dv = 10 + (h - 'A');
+                    else break;
+                    v = v * 16 + dv;
+                    j++;
+                }
+                TcTok t = (TcTok){.kind = TC_TK_INT_LIT, .int_value = v, .line = line};
+                if (j < src.size && (src.str[j] == 'l' || src.str[j] == 'L')) {
+                    t.is_i64 = true; j++;
+                    if (j < src.size && (src.str[j] == 'l' || src.str[j] == 'L')) j++;
+                }
+                if (j < src.size && (src.str[j] == 'u' || src.str[j] == 'U')) j++;
+                VecTcTok_push_back(arena, &toks, t);
+                i = j; continue;
+            }
             while (j < src.size && is_digit(src.str[j])) {
                 v = v * 10 + (src.str[j] - '0');
                 j++;

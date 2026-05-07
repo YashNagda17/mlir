@@ -288,6 +288,7 @@ static Expr *parse_primary(P *p) {
             nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_ENUM ||
             nxt == TC_TK_KW_CONST || nxt == TC_TK_KW_LONG ||
             nxt == TC_TK_KW_SIGNED || nxt == TC_TK_KW_UNSIGNED ||
+            nxt == TC_TK_KW_SHORT || nxt == TC_TK_KW_BOOL ||
             (nxt == TC_TK_IDENT && typedef_lookup(p, cur(p).text) != NULL);
         if (looks_like_type) {
             Type ty = {0};
@@ -315,6 +316,7 @@ static Expr *parse_primary(P *p) {
                         nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_CHAR ||
                         nxt == TC_TK_KW_CONST || nxt == TC_TK_KW_LONG ||
                         nxt == TC_TK_KW_SIGNED || nxt == TC_TK_KW_UNSIGNED ||
+                        nxt == TC_TK_KW_SHORT || nxt == TC_TK_KW_BOOL ||
                         nxt == TC_TK_KW_VOID);
         if (!is_cast && nxt == TC_TK_IDENT &&
             typedef_lookup(p, peek(p, 1).text)) {
@@ -1010,6 +1012,7 @@ static Stmt *parse_stmt(P *p) {
                    cur(p).kind == TC_TK_KW_STATIC || cur(p).kind == TC_TK_KW_INLINE ||
                    cur(p).kind == TC_TK_KW_LONG || cur(p).kind == TC_TK_KW_SIGNED ||
                    cur(p).kind == TC_TK_KW_UNSIGNED ||
+                   cur(p).kind == TC_TK_KW_SHORT || cur(p).kind == TC_TK_KW_BOOL ||
                    (cur(p).kind == TC_TK_IDENT && typedef_lookup(p, cur(p).text))) {
             s->for_init = parse_decl(p, /*require_semi*/ true);
         } else {
@@ -1092,6 +1095,7 @@ static Stmt *parse_stmt(P *p) {
         t.kind == TC_TK_KW_STATIC || t.kind == TC_TK_KW_INLINE ||
         t.kind == TC_TK_KW_LONG || t.kind == TC_TK_KW_SIGNED ||
         t.kind == TC_TK_KW_UNSIGNED ||
+        t.kind == TC_TK_KW_SHORT || t.kind == TC_TK_KW_BOOL ||
         t.kind == TC_TK_KW_VA_LIST ||
         (t.kind == TC_TK_IDENT && typedef_lookup(p, t.text) &&
          (peek(p, 1).kind == TC_TK_IDENT || peek(p, 1).kind == TC_TK_STAR))) {

@@ -388,3 +388,7 @@ expected_stdout = "1\n2\n3\n10\n20\n30\n100\n400\n700\n"
 [[test]]
 name = "generic"
 expected_stdout = "1\n2\n3\n4\n5\n9\n100\n8\n16\n32\n"
+
+[[test]]
+name = "hex_int"
+expected_stdout = "64\n100\n255\n43981\n"
