@@ -1984,6 +1984,29 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 }
                 return v;
             }
+            // Pointer-to-integer cast: emit llvm.ptrtoint, then optionally
+            // truncate to i32. Used for `(uintptr_t)p` / `(long)p` / etc.
+            if (!ck_is_ptr && v.is_ptr) {
+                MLIR_ValueHandle iv = MLIR_CreateValueOpResult(e->ctx, MLIR_INVALID_HANDLE, 0,
+                                                               e->i64, ssa_name(e), eloc(e, 0));
+                MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = e->i64;
+                MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = iv;
+                MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = v.val;
+                emit_op(e, OP_TYPE_LLVM_PTRTOINT, str_lit("llvm.ptrtoint"),
+                        rts, 1, rs, 1, ops, 1, NULL, 0, NULL, 0);
+                v.val = iv;
+                v.is_ptr = false;
+                v.is_void_ptr = false;
+                v.sdef = NULL;
+                v.is_str = false;
+                if (ck == TY_I64) {
+                    v.is_i64 = true;
+                } else {
+                    v.val = emit_trunci_i64_to_i32(e, v.val);
+                    v.is_i64 = false;
+                }
+                return v;
+            }
             // Pointer-to-pointer cast: opaque !llvm.ptr is universal, so
             // just evaluate the operand. We tag the result type from
             // cast_type for downstream consumers.
