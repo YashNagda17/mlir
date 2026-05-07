@@ -267,6 +267,7 @@ static Expr *parse_primary(P *p) {
         p->i++;
         Expr *e = new_expr(p, EX_FLOAT, t.line);
         e->float_value = t.float_value;
+        e->is_f64 = t.is_f64;
         return e;
     }
     if (t.kind == TC_TK_KW_NULL) {
@@ -283,7 +284,7 @@ static Expr *parse_primary(P *p) {
         Expr *e = new_expr(p, EX_SIZEOF, t.line);
         TcTokKind nxt = cur(p).kind;
         bool looks_like_type =
-            nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT ||
+            nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT || nxt == TC_TK_KW_DOUBLE ||
             nxt == TC_TK_KW_CHAR || nxt == TC_TK_KW_VOID ||
             nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_ENUM ||
             nxt == TC_TK_KW_CONST || nxt == TC_TK_KW_LONG ||
@@ -312,7 +313,7 @@ static Expr *parse_primary(P *p) {
     if (t.kind == TC_TK_LPAREN) {
         // Could be a cast `(T)expr` or a parenthesized expression.
         TcTokKind nxt = peek(p, 1).kind;
-        bool is_cast = (nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT ||
+        bool is_cast = (nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT || nxt == TC_TK_KW_DOUBLE ||
                         nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_CHAR ||
                         nxt == TC_TK_KW_CONST || nxt == TC_TK_KW_LONG ||
                         nxt == TC_TK_KW_SIGNED || nxt == TC_TK_KW_UNSIGNED ||
@@ -734,6 +735,7 @@ static bool parse_base_type(P *p, TypeKind *out) {
         *out = TY_I32; skip_const(p); return true;
     }
     if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; *out = TY_F32; skip_const(p); return true; }
+    if (cur(p).kind == TC_TK_KW_DOUBLE) { p->i++; *out = TY_F64; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_VOID)  { p->i++; *out = TY_VOID; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_ENUM) {
         // `enum [Tag]` as a type-spec — behaves exactly as `int`. A body
@@ -1077,7 +1079,7 @@ static Stmt *parse_stmt(P *p) {
         if (cur(p).kind == TC_TK_SEMI) {
             p->i++;
             s->for_init = NULL;
-        } else if (cur(p).kind == TC_TK_KW_INT || cur(p).kind == TC_TK_KW_FLOAT ||
+        } else if (cur(p).kind == TC_TK_KW_INT || cur(p).kind == TC_TK_KW_FLOAT || cur(p).kind == TC_TK_KW_DOUBLE ||
                    cur(p).kind == TC_TK_KW_CHAR || cur(p).kind == TC_TK_KW_ENUM ||
                    cur(p).kind == TC_TK_KW_CONST || cur(p).kind == TC_TK_KW_VOID ||
                    cur(p).kind == TC_TK_KW_STATIC || cur(p).kind == TC_TK_KW_INLINE ||
@@ -1159,7 +1161,7 @@ static Stmt *parse_stmt(P *p) {
         expect(p, TC_TK_RBRACE, str_lit("expected '}'"));
         return s;
     }
-    if (t.kind == TC_TK_KW_INT || t.kind == TC_TK_KW_FLOAT ||
+    if (t.kind == TC_TK_KW_INT || t.kind == TC_TK_KW_FLOAT || t.kind == TC_TK_KW_DOUBLE ||
         t.kind == TC_TK_KW_STRUCT || t.kind == TC_TK_KW_CHAR ||
         t.kind == TC_TK_KW_ENUM || t.kind == TC_TK_KW_CONST ||
         t.kind == TC_TK_KW_VOID ||
@@ -1346,6 +1348,7 @@ static bool parse_sig_type(P *p, Type *out) {
         return true;
     }
     if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; out->kind = TY_F32; skip_const(p); return true; }
+    if (cur(p).kind == TC_TK_KW_DOUBLE) { p->i++; out->kind = TY_F64; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_VOID)  {
         p->i++;
         skip_const(p);

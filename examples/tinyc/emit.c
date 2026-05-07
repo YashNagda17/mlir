@@ -121,6 +121,7 @@ typedef struct {
     MLIR_TypeHandle i64;
     MLIR_TypeHandle i8;
     MLIR_TypeHandle f32;
+    MLIR_TypeHandle f64;
     MLIR_TypeHandle index;
     MLIR_TypeHandle ptr;             // !llvm.ptr
     MLIR_BlockHandle cur_block;
@@ -205,6 +206,7 @@ static bool find_enum(E *e, string name, int64_t *out_value) {
 
 static MLIR_TypeHandle scalar_mlir_type(E *e, TypeKind k) {
     if (k == TY_F32) return e->f32;
+    if (k == TY_F64) return e->f64;
     if (k == TY_I64) return e->i64;
     if (k == TY_PTR_STRUCT || k == TY_PTR_I32 || k == TY_PTR_CHAR ||
         k == TY_PTR_VOID || k == TY_FNPTR || k == TY_PTR_PTR ||
@@ -322,6 +324,42 @@ static MLIR_ValueHandle emit_const_f32(E *e, double v) {
     MLIR_AttributeHandle *as = arena_new_array(e->arena, MLIR_AttributeHandle, 1); as[0] = val;
     emit_op(e, OP_TYPE_ARITH_CONSTANT, str_lit("arith.constant"),
             rts, 1, rs, 1, NULL, 0, as, 1, NULL, 0);
+    return r;
+}
+
+static MLIR_ValueHandle emit_const_f64(E *e, double v) {
+    MLIR_ValueHandle r = MLIR_CreateValueOpResult(e->ctx, MLIR_INVALID_HANDLE, 0,
+                                                  e->f64, ssa_name(e), eloc(e, 0));
+    MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = e->f64;
+    MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = r;
+    MLIR_AttributeHandle val = MLIR_CreateAttributeFloat(e->ctx, str_lit("value"), v, e->f64);
+    MLIR_AttributeHandle *as = arena_new_array(e->arena, MLIR_AttributeHandle, 1); as[0] = val;
+    emit_op(e, OP_TYPE_ARITH_CONSTANT, str_lit("arith.constant"),
+            rts, 1, rs, 1, NULL, 0, as, 1, NULL, 0);
+    return r;
+}
+
+// arith.extf : f32 -> f64
+static MLIR_ValueHandle emit_fpext_f32_to_f64(E *e, MLIR_ValueHandle v) {
+    MLIR_ValueHandle r = MLIR_CreateValueOpResult(e->ctx, MLIR_INVALID_HANDLE, 0,
+                                                  e->f64, ssa_name(e), eloc(e, 0));
+    MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = e->f64;
+    MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = r;
+    MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = v;
+    emit_op(e, OP_TYPE_UNREGISTERED, str_lit("arith.extf"),
+            rts, 1, rs, 1, ops, 1, NULL, 0, NULL, 0);
+    return r;
+}
+
+// arith.truncf : f64 -> f32
+static MLIR_ValueHandle emit_fptrunc_f64_to_f32(E *e, MLIR_ValueHandle v) {
+    MLIR_ValueHandle r = MLIR_CreateValueOpResult(e->ctx, MLIR_INVALID_HANDLE, 0,
+                                                  e->f32, ssa_name(e), eloc(e, 0));
+    MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = e->f32;
+    MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = r;
+    MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = v;
+    emit_op(e, OP_TYPE_UNREGISTERED, str_lit("arith.truncf"),
+            rts, 1, rs, 1, ops, 1, NULL, 0, NULL, 0);
     return r;
 }
 
@@ -574,6 +612,18 @@ static MLIR_ValueHandle emit_sitofp(E *e, MLIR_ValueHandle i32_val) {
     return r;
 }
 
+// arith.sitofp : iN -> f64. iN may be i32 or i64.
+static MLIR_ValueHandle emit_sitofp_f64(E *e, MLIR_ValueHandle iv) {
+    MLIR_ValueHandle r = MLIR_CreateValueOpResult(e->ctx, MLIR_INVALID_HANDLE, 0,
+                                                  e->f64, ssa_name(e), eloc(e, 0));
+    MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = e->f64;
+    MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = r;
+    MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = iv;
+    emit_op(e, OP_TYPE_ARITH_SITOFP, str_lit("arith.sitofp"),
+            rts, 1, rs, 1, ops, 1, NULL, 0, NULL, 0);
+    return r;
+}
+
 static int64_t cmpi_pred_for(BinOp op) {
     switch (op) {
         case OP_EQ: return 0; case OP_NE: return 1;
@@ -597,6 +647,7 @@ static int64_t cmpf_pred_for(BinOp op) {
 typedef struct {
     MLIR_ValueHandle val;
     bool is_float;
+    bool is_f64;       // when is_float, the value has TY_F64 (else TY_F32)
     bool is_i64;       // val has MLIR type i64 (TY_I64)
     bool is_ptr;       // val is a !llvm.ptr (struct pointer, int*, char*, ...)
     bool is_str;       // val is a !llvm.ptr to char data (string)
@@ -632,7 +683,23 @@ static MLIR_ValueHandle emit_expr_i32(E *e, Scope *sc, Expr *ex) {
 }
 
 static MLIR_ValueHandle coerce_eval(E *e, EVal v, MLIR_TypeHandle want) {
-    if (want == e->f32 && !v.is_float) return emit_sitofp(e, v.val);
+    if (want == e->f64) {
+        if (v.is_float) {
+            if (v.is_f64) return v.val;
+            return emit_fpext_f32_to_f64(e, v.val);
+        }
+        if (v.is_i64) {
+            return emit_sitofp_f64(e, v.val);
+        }
+        return emit_sitofp_f64(e, v.val);
+    }
+    if (want == e->f32) {
+        if (v.is_float) {
+            if (v.is_f64) return emit_fptrunc_f64_to_f32(e, v.val);
+            return v.val;
+        }
+        return emit_sitofp(e, v.val);
+    }
     if (want == e->i32 && v.is_float) {
         MLIR_ValueHandle r = MLIR_CreateValueOpResult(e->ctx, MLIR_INVALID_HANDLE, 0,
                                                       e->i32, ssa_name(e), eloc(e, 0));
@@ -661,7 +728,7 @@ static MLIR_ValueHandle coerce_eval(E *e, EVal v, MLIR_TypeHandle want) {
 
 static MLIR_ValueHandle emit_to_bool_i1(E *e, EVal v) {
     if (v.is_float) {
-        MLIR_ValueHandle z = emit_const_f32(e, 0.0);
+        MLIR_ValueHandle z = v.is_f64 ? emit_const_f64(e, 0.0) : emit_const_f32(e, 0.0);
         return emit_cmpf(e, /*one*/ 6, v.val, z);
     }
     MLIR_ValueHandle z = emit_const_i32(e, 0);
@@ -710,7 +777,8 @@ static EVal load_lvalue(E *e, LVal lv) {
     EVal r = {0};
     MLIR_ValueHandle p = lval_address(e, lv);
     r.val = emit_load_v(e, p, lv.elem_ty);
-    r.is_float = (lv.elem_ty == e->f32);
+    r.is_float = (lv.elem_ty == e->f32 || lv.elem_ty == e->f64);
+    r.is_f64 = (lv.elem_ty == e->f64);
     r.is_i64 = (lv.elem_ty == e->i64);
     r.is_ptr = (lv.elem_ty == e->ptr);
     r.ptr_elem = MLIR_INVALID_HANDLE;
@@ -869,6 +937,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             }
             r.base_ptr = sym_addr(e, s);
             if (s->type.kind == TY_F32) r.elem_ty = e->f32;
+            else if (s->type.kind == TY_F64) r.elem_ty = e->f64;
             else if (s->type.kind == TY_I64) r.elem_ty = e->i64;
             else if (s->type.kind == TY_PTR_STRUCT || s->type.kind == TY_PTR_I32 ||
                      s->type.kind == TY_PTR_CHAR || s->type.kind == TY_PTR_VOID ||
@@ -1090,6 +1159,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             }
             Type ft = parent.sd->fields.data[idx].type;
             if (ft.kind != TY_I32 && ft.kind != TY_I64 && ft.kind != TY_F32 &&
+                ft.kind != TY_F64 &&
                 ft.kind != TY_PTR_STRUCT && ft.kind != TY_PTR_I32 &&
                 ft.kind != TY_PTR_CHAR && ft.kind != TY_PTR_VOID &&
                 ft.kind != TY_FNPTR && ft.kind != TY_PTR_PTR) {
@@ -1103,6 +1173,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
             r.n_const_path = parent.n_const_path;
             r.dyn_index = parent.dyn_index;
             if (ft.kind == TY_F32) r.elem_ty = e->f32;
+            else if (ft.kind == TY_F64) r.elem_ty = e->f64;
             else if (ft.kind == TY_I64) r.elem_ty = e->i64;
             else if (ft.kind == TY_PTR_STRUCT || ft.kind == TY_PTR_I32 ||
                      ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID ||
@@ -1118,16 +1189,23 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
 
 static void unify_numeric(E *e, EVal *a, EVal *b) {
     if (a->is_float || b->is_float) {
-        if (a->is_float == b->is_float) return;
+        // Promote integer side to a matching float type first.
         if (!a->is_float) {
-            // Promote i64 -> i32 first if necessary, since emit_sitofp
-            // assumes i32 input.
             if (a->is_i64) { a->val = emit_trunci_i64_to_i32(e, a->val); a->is_i64 = false; }
-            a->val = emit_sitofp(e, a->val); a->is_float = true;
+            if (b->is_f64) { a->val = emit_sitofp_f64(e, a->val); a->is_f64 = true; }
+            else           { a->val = emit_sitofp(e, a->val); }
+            a->is_float = true;
         }
         if (!b->is_float) {
             if (b->is_i64) { b->val = emit_trunci_i64_to_i32(e, b->val); b->is_i64 = false; }
-            b->val = emit_sitofp(e, b->val); b->is_float = true;
+            if (a->is_f64) { b->val = emit_sitofp_f64(e, b->val); b->is_f64 = true; }
+            else           { b->val = emit_sitofp(e, b->val); }
+            b->is_float = true;
+        }
+        // If one is f32 and the other f64, fpext the f32 side.
+        if (a->is_f64 != b->is_f64) {
+            if (!a->is_f64) { a->val = emit_fpext_f32_to_f64(e, a->val); a->is_f64 = true; }
+            if (!b->is_f64) { b->val = emit_fpext_f32_to_f64(e, b->val); b->is_f64 = true; }
         }
         return;
     }
@@ -1296,14 +1374,14 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
             ops[op_off++] = coerce_eval(e, v, scalar_mlir_type(e, p->type.kind));
         }
     }
-    // Variadic-portion arguments: pass-through with no implicit conversion.
-    // f32 is intentionally rejected (C requires float→double promotion and
-    // tinyC has no double type yet).
+    // Variadic-portion arguments: apply C default argument promotion.
+    // float -> double, integers narrower than int are already int (we
+    // model all narrow ints as i32 in tinyC).
     for (size_t i = sig->n_params; i < args.size; i++) {
         EVal v = emit_expr(e, sc, args.data[i]);
-        if (v.is_float) {
-            EMIT_ERR(e, "passing float through ... is not supported "
-                        "(no double type in tinyC)");
+        if (v.is_float && !v.is_f64) {
+            v.val = emit_fpext_f32_to_f64(e, v.val);
+            v.is_f64 = true;
         }
         ops[op_off++] = v.val;
     }
@@ -1496,7 +1574,14 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             }
             return r;
         case EX_FLOAT:
-            r.val = emit_const_f32(e, ex->float_value); r.is_float = true; return r;
+            if (ex->is_f64) {
+                r.val = emit_const_f64(e, ex->float_value);
+                r.is_float = true; r.is_f64 = true;
+            } else {
+                r.val = emit_const_f32(e, ex->float_value);
+                r.is_float = true;
+            }
+            return r;
         case EX_NULL:
             r.val = emit_null_ptr(e); r.is_ptr = true; r.sdef = NULL; return r;
         case EX_VA_ARG: {
@@ -1521,6 +1606,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             switch (tk) {
                 case TY_I32:        helper = str_lit("tinyc_va_arg_i32"); rt = e->i32; break;
                 case TY_I64:        helper = str_lit("tinyc_va_arg_i64"); rt = e->i64; break;
+                case TY_F64:        helper = str_lit("tinyc_va_arg_f64"); rt = e->f64; break;
                 case TY_PTR_CHAR:
                 case TY_PTR_VOID:
                 case TY_PTR_I32:
@@ -1547,6 +1633,8 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             e->need_va_arg_helpers = true;
             r.val = res;
             r.is_i64 = (tk == TY_I64);
+            r.is_float = (tk == TY_F64);
+            r.is_f64 = (tk == TY_F64);
             r.is_ptr = (tk == TY_PTR_CHAR || tk == TY_PTR_VOID || tk == TY_PTR_I32
                         || tk == TY_PTR_STRUCT || tk == TY_PTR_PTR);
             r.is_str = (tk == TY_PTR_CHAR);
@@ -1580,8 +1668,9 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             MLIR_BlockHandle else_tail = e->cur_block;
 
             bool any_float = av.is_float || bv.is_float;
+            bool any_f64   = av.is_f64   || bv.is_f64;
             bool any_ptr   = av.is_ptr   || bv.is_ptr;
-            MLIR_TypeHandle rty = any_ptr ? e->ptr : (any_float ? e->f32 : e->i32);
+            MLIR_TypeHandle rty = any_ptr ? e->ptr : (any_float ? (any_f64 ? e->f64 : e->f32) : e->i32);
 
             // Alloca in current (pre-branch) block.
             e->cur_block = save; e->terminated = false;
@@ -1609,6 +1698,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             e->cur_block = merge_blk; e->terminated = false;
             r.val = emit_load_v(e, slot, rty);
             r.is_float = any_float;
+            r.is_f64   = any_f64;
             r.is_ptr   = any_ptr;
             r.is_str   = av.is_str && bv.is_str;
             r.sdef     = av.sdef ? av.sdef : bv.sdef;
@@ -1640,6 +1730,30 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             // Integer-to-integer cast: convert between i32 and i64; everything
             // else is treated as i32 (TY_I8/TY_I16 etc. fold to i32 here).
             if (!ck_is_ptr && !v.is_ptr) {
+                // float-target casts (from int or float).
+                if (ck == TY_F64) {
+                    v.val = coerce_eval(e, v, e->f64);
+                    v.is_float = true; v.is_f64 = true; v.is_i64 = false;
+                    return v;
+                }
+                if (ck == TY_F32) {
+                    v.val = coerce_eval(e, v, e->f32);
+                    v.is_float = true; v.is_f64 = false; v.is_i64 = false;
+                    return v;
+                }
+                // int-target casts.
+                if (v.is_float) {
+                    // float -> int via fptosi (i32) and optional ext to i64.
+                    if (ck == TY_I64) {
+                        v.val = coerce_eval(e, v, e->i64);
+                        v.is_i64 = true;
+                    } else {
+                        v.val = coerce_eval(e, v, e->i32);
+                        v.is_i64 = false;
+                    }
+                    v.is_float = false; v.is_f64 = false;
+                    return v;
+                }
                 bool want_i64 = (ck == TY_I64);
                 if (want_i64 && !v.is_i64) {
                     v.val = emit_extsi_i32_to_i64(e, v.val);
@@ -1648,7 +1762,6 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     v.val = emit_trunci_i64_to_i32(e, v.val);
                     v.is_i64 = false;
                 }
-                v.is_float = (ck == TY_F32) ? v.is_float : false;
                 return v;
             }
             // Pointer-to-pointer cast: opaque !llvm.ptr is universal, so
@@ -1904,7 +2017,8 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             LVal lv = emit_lvalue(e, sc, ex->lvalue);
             EVal v = emit_expr(e, sc, ex->rhs_assign);
             v.val = coerce_eval(e, v, lv.elem_ty);
-            v.is_float = (lv.elem_ty == e->f32);
+            v.is_float = (lv.elem_ty == e->f32 || lv.elem_ty == e->f64);
+            v.is_f64 = (lv.elem_ty == e->f64);
             v.is_i64 = (lv.elem_ty == e->i64);
             store_lvalue(e, lv, v.val);
             return v;
@@ -1913,9 +2027,10 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             EVal a = emit_expr(e, sc, ex->lhs);
             if (ex->op == OP_NEG) {
                 if (a.is_float) {
-                    MLIR_ValueHandle z = emit_const_f32(e, 0.0);
-                    r.val = emit_binop(e, OP_TYPE_ARITH_SUBF, str_lit("arith.subf"), e->f32, z, a.val);
-                    r.is_float = true;
+                    MLIR_ValueHandle z = a.is_f64 ? emit_const_f64(e, 0.0) : emit_const_f32(e, 0.0);
+                    MLIR_TypeHandle ft = a.is_f64 ? e->f64 : e->f32;
+                    r.val = emit_binop(e, OP_TYPE_ARITH_SUBF, str_lit("arith.subf"), ft, z, a.val);
+                    r.is_float = true; r.is_f64 = a.is_f64;
                 } else {
                     MLIR_ValueHandle z = emit_const_i32(e, 0);
                     r.val = emit_binop(e, OP_TYPE_ARITH_SUBI, str_lit("arith.subi"), e->i32, z, a.val);
@@ -2089,25 +2204,27 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             }
             unify_numeric(e, &a, &b);
             bool flt = a.is_float;
+            bool flt64 = a.is_f64;
             bool i64m = a.is_i64;
             MLIR_TypeHandle ity = i64m ? e->i64 : e->i32;
+            MLIR_TypeHandle fty = flt64 ? e->f64 : e->f32;
             switch (ex->op) {
                 case OP_ADD:
-                    r.val = flt ? emit_binop(e, OP_TYPE_ARITH_ADDF, str_lit("arith.addf"), e->f32, a.val, b.val)
+                    r.val = flt ? emit_binop(e, OP_TYPE_ARITH_ADDF, str_lit("arith.addf"), fty, a.val, b.val)
                                 : emit_binop(e, OP_TYPE_ARITH_ADDI, str_lit("arith.addi"), ity, a.val, b.val);
-                    r.is_float = flt; r.is_i64 = i64m && !flt; return r;
+                    r.is_float = flt; r.is_f64 = flt && flt64; r.is_i64 = i64m && !flt; return r;
                 case OP_SUB:
-                    r.val = flt ? emit_binop(e, OP_TYPE_ARITH_SUBF, str_lit("arith.subf"), e->f32, a.val, b.val)
+                    r.val = flt ? emit_binop(e, OP_TYPE_ARITH_SUBF, str_lit("arith.subf"), fty, a.val, b.val)
                                 : emit_binop(e, OP_TYPE_ARITH_SUBI, str_lit("arith.subi"), ity, a.val, b.val);
-                    r.is_float = flt; r.is_i64 = i64m && !flt; return r;
+                    r.is_float = flt; r.is_f64 = flt && flt64; r.is_i64 = i64m && !flt; return r;
                 case OP_MUL:
-                    r.val = flt ? emit_binop(e, OP_TYPE_ARITH_MULF, str_lit("arith.mulf"), e->f32, a.val, b.val)
+                    r.val = flt ? emit_binop(e, OP_TYPE_ARITH_MULF, str_lit("arith.mulf"), fty, a.val, b.val)
                                 : emit_binop(e, OP_TYPE_ARITH_MULI, str_lit("arith.muli"), ity, a.val, b.val);
-                    r.is_float = flt; r.is_i64 = i64m && !flt; return r;
+                    r.is_float = flt; r.is_f64 = flt && flt64; r.is_i64 = i64m && !flt; return r;
                 case OP_DIV:
-                    r.val = flt ? emit_binop(e, OP_TYPE_ARITH_DIVF, str_lit("arith.divf"), e->f32, a.val, b.val)
+                    r.val = flt ? emit_binop(e, OP_TYPE_ARITH_DIVF, str_lit("arith.divf"), fty, a.val, b.val)
                                 : emit_binop(e, OP_TYPE_ARITH_DIVSI, str_lit("arith.divsi"), ity, a.val, b.val);
-                    r.is_float = flt; r.is_i64 = i64m && !flt; return r;
+                    r.is_float = flt; r.is_f64 = flt && flt64; r.is_i64 = i64m && !flt; return r;
                 case OP_MOD:
                     if (flt) {
                         EMIT_ERR(e, "% not supported on floats");
@@ -2322,7 +2439,8 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 emit_op(e, OP_TYPE_FUNC_CALL_INDIRECT, str_lit("func.call_indirect"),
                         rts, 1, rs, 1, ops, n_ops, NULL, 0, NULL, 0);
                 r.val = rs[0];
-                r.is_float = (fnty->fnptr_ret->kind == TY_F32);
+                r.is_float = (fnty->fnptr_ret->kind == TY_F32 || fnty->fnptr_ret->kind == TY_F64);
+                r.is_f64 = (fnty->fnptr_ret->kind == TY_F64);
                 r.is_ptr = (rty == e->ptr);
                 return r;
             }
@@ -2344,7 +2462,8 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             MLIR_ValueHandle *results = arena_new_array(e->arena, MLIR_ValueHandle, 1);
             emit_flat_call(e, sc, sig, ex->args, results, MLIR_INVALID_HANDLE);
             r.val = results[0];
-            r.is_float = (sig->ret.type.kind == TY_F32);
+            r.is_float = (sig->ret.type.kind == TY_F32 || sig->ret.type.kind == TY_F64);
+            r.is_f64 = (sig->ret.type.kind == TY_F64);
             r.is_i64 = (sig->ret.type.kind == TY_I64);
             if (sig->ret.type.kind == TY_PTR_STRUCT) {
                 r.is_ptr = true;
@@ -2722,10 +2841,19 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 sy->addr = emit_alloca(e, e->f32);
                 if (st->decl_init) {
                     EVal v = emit_expr(e, sc, st->decl_init);
-                    if (!v.is_float) { v.val = emit_sitofp(e, v.val); v.is_float = true; }
-                    emit_store_v(e, v.val, sy->addr);
+                    MLIR_ValueHandle iv = coerce_eval(e, v, e->f32);
+                    emit_store_v(e, iv, sy->addr);
                 } else {
                     emit_store_v(e, emit_const_f32(e, 0.0), sy->addr);
+                }
+            } else if (st->decl_type.kind == TY_F64) {
+                sy->addr = emit_alloca(e, e->f64);
+                if (st->decl_init) {
+                    EVal v = emit_expr(e, sc, st->decl_init);
+                    MLIR_ValueHandle iv = coerce_eval(e, v, e->f64);
+                    emit_store_v(e, iv, sy->addr);
+                } else {
+                    emit_store_v(e, emit_const_f64(e, 0.0), sy->addr);
                 }
             } else {
                 sy->addr = emit_alloca(e, e->i32);
@@ -2833,7 +2961,11 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 return;
             }
             MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1);
-            ops[0] = v.val;
+            if (v.is_float && v.is_f64) {
+                ops[0] = emit_fptrunc_f64_to_f32(e, v.val);
+            } else {
+                ops[0] = v.val;
+            }
             emit_op(e, OP_TYPE_VECTOR_PRINT, str_lit("vector.print"),
                     NULL, 0, NULL, 0, ops, 1, NULL, 0, NULL, 0);
             return;
@@ -3055,6 +3187,7 @@ static void slot_resolve(E *e, Type ty, SlotInfo *out) {
             EMIT_ERR(e, "unknown struct type {}", ty.struct_name);
         }
     } else if (ty.kind != TY_I32 && ty.kind != TY_I64 && ty.kind != TY_F32 &&
+               ty.kind != TY_F64 &&
                ty.kind != TY_PTR_I32 && ty.kind != TY_PTR_CHAR &&
                ty.kind != TY_PTR_VOID && ty.kind != TY_VOID &&
                ty.kind != TY_FNPTR && ty.kind != TY_PTR_PTR &&
@@ -3170,6 +3303,9 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
         } else if (p->type.kind == TY_F32) {
             sy->addr = emit_alloca(e, e->f32);
             emit_store_v(e, blk, sy->addr);
+        } else if (p->type.kind == TY_F64) {
+            sy->addr = emit_alloca(e, e->f64);
+            emit_store_v(e, blk, sy->addr);
         } else if (p->type.kind == TY_I64) {
             sy->addr = emit_alloca(e, e->i64);
             emit_store_v(e, blk, sy->addr);
@@ -3193,6 +3329,7 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
         } else {
             MLIR_TypeHandle ty = sig->flat_out_tys[0];
             MLIR_ValueHandle v = (ty == e->f32) ? emit_const_f32(e, 0.0)
+                : (ty == e->f64) ? emit_const_f64(e, 0.0)
                 : (ty == e->i64) ? emit_const_i64(e, 0)
                 : (ty == e->ptr) ? emit_null_ptr(e)
                 : emit_const_i32(e, 0);
@@ -3247,7 +3384,7 @@ static Type infer_expr_type(E *e, Scope *sc, Expr *ex) {
             if (ex->is_i64) { t.kind = TY_I64; t.int_bits = 64; }
             else            { t.kind = TY_I32; t.int_bits = 32; }
             return t;
-        case EX_FLOAT: t.kind = TY_F32; return t;
+        case EX_FLOAT: t.kind = ex->is_f64 ? TY_F64 : TY_F32; return t;
         case EX_STR:   t.kind = TY_PTR_CHAR; return t;
         case EX_NULL:  t.kind = TY_PTR_VOID; return t;
         case EX_VAR: {
@@ -3315,6 +3452,7 @@ static Type infer_expr_type(E *e, Scope *sc, Expr *ex) {
             Type b = infer_expr_type(e, sc, ex->rhs);
             // Usual arithmetic conversions (simplified): if either side
             // is i64 the result is i64; if either is f32, result is f32.
+            if (a.kind == TY_F64 || b.kind == TY_F64) { t.kind = TY_F64; return t; }
             if (a.kind == TY_F32 || b.kind == TY_F32) { t.kind = TY_F32; return t; }
             if (a.kind == TY_I64 || b.kind == TY_I64) { t.kind = TY_I64; return t; }
             return a;
@@ -3333,6 +3471,7 @@ static int64_t type_size(E *e, Type t) {
     if (t.kind == TY_I32) return 4;
     if (t.kind == TY_I64) return 8;
     if (t.kind == TY_F32) return 4;
+    if (t.kind == TY_F64) return 8;
     if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return 8;
     if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return 8;
     if (t.kind == TY_PTR_PTR) return 8;
@@ -3364,7 +3503,7 @@ static int64_t type_size(E *e, Type t) {
 }
 static int64_t type_align(E *e, Type t) {
     if (t.kind == TY_I32 || t.kind == TY_F32) return 4;
-    if (t.kind == TY_I64) return 8;
+    if (t.kind == TY_I64 || t.kind == TY_F64) return 8;
     if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return 8;
     if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return 8;
     if (t.kind == TY_PTR_PTR) return 8;
@@ -3495,6 +3634,7 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
     e.i64 = MLIR_CreateTypeInteger(ctx, 64, true);
     e.i8  = MLIR_CreateTypeInteger(ctx, 8, true);
     e.f32 = MLIR_CreateTypeFloat(ctx, 32, false);
+    e.f64 = MLIR_CreateTypeFloat(ctx, 64, false);
     e.index = MLIR_CreateTypeIndex(ctx);
     e.ptr = MLIR_CreateTypeLLVMPointer(ctx);
     e.loc = MLIR_CreateLocationUnknown(ctx, str_lit(""));
@@ -3541,6 +3681,8 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
             MLIR_TypeHandle gty;
             if (g->type.kind == TY_F32) {
                 gty = e.f32;
+            } else if (g->type.kind == TY_F64) {
+                gty = e.f64;
             } else if (g->type.kind == TY_PTR_CHAR || g->type.kind == TY_PTR_I32 ||
                        g->type.kind == TY_PTR_STRUCT || g->type.kind == TY_PTR_VOID ||
                        g->type.kind == TY_FNPTR) {
@@ -3583,6 +3725,12 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
             MLIR_AppendBlockOp(ctx, mb, gop);
         } else if (g->type.kind == TY_F32) {
             MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, e.f32,
+                /*is_constant=*/false,
+                /*init_kind=*/1, 0, g->has_init ? g->init_float : 0.0,
+                NULL, e.loc);
+            MLIR_AppendBlockOp(ctx, mb, gop);
+        } else if (g->type.kind == TY_F64) {
+            MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, e.f64,
                 /*is_constant=*/false,
                 /*init_kind=*/1, 0, g->has_init ? g->init_float : 0.0,
                 NULL, e.loc);
@@ -3705,9 +3853,10 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
         struct { string name; MLIR_TypeHandle ret; } helpers[] = {
             { str_lit("tinyc_va_arg_i32"), e.i32 },
             { str_lit("tinyc_va_arg_i64"), e.i64 },
+            { str_lit("tinyc_va_arg_f64"), e.f64 },
             { str_lit("tinyc_va_arg_ptr"), e.ptr },
         };
-        for (size_t k = 0; k < 3; k++) {
+        for (size_t k = 0; k < 4; k++) {
             MLIR_TypeHandle *ins = arena_new_array(arena, MLIR_TypeHandle, 1); ins[0] = e.ptr;
             MLIR_TypeHandle *outs = arena_new_array(arena, MLIR_TypeHandle, 1); outs[0] = helpers[k].ret;
             MLIR_TypeHandle fty = MLIR_CreateTypeFunction(ctx, ins, 1, outs, 1);

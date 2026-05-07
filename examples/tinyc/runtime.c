@@ -34,4 +34,5 @@ void printStr(const char *s) {
 // here, run the standard va_arg macro, and return the value.
 int            tinyc_va_arg_i32(va_list *ap) { return va_arg(*ap, int); }
 long long      tinyc_va_arg_i64(va_list *ap) { return va_arg(*ap, long long); }
+double         tinyc_va_arg_f64(va_list *ap) { return va_arg(*ap, double); }
 void          *tinyc_va_arg_ptr(va_list *ap) { return va_arg(*ap, void *); }

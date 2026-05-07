@@ -16,7 +16,7 @@ static bool is_alnum(char c) { return is_alpha(c) || is_digit(c); }
 static TcTokKind keyword_or_ident(string s) {
     if (str_eq(s, str_lit("int")))      return TC_TK_KW_INT;
     if (str_eq(s, str_lit("float")))    return TC_TK_KW_FLOAT;
-    if (str_eq(s, str_lit("double")))   return TC_TK_KW_FLOAT;
+    if (str_eq(s, str_lit("double")))   return TC_TK_KW_DOUBLE;
     if (str_eq(s, str_lit("return")))   return TC_TK_KW_RETURN;
     if (str_eq(s, str_lit("if")))       return TC_TK_KW_IF;
     if (str_eq(s, str_lit("else")))     return TC_TK_KW_ELSE;
@@ -230,9 +230,11 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
                     for (int k = 0; k < exp; k++) m *= 10.0;
                     if (sign < 0) f /= m; else f *= m;
                 }
-                // Optional 'f'/'F' suffix
-                if (j < src.size && (src.str[j] == 'f' || src.str[j] == 'F')) j++;
-                TcTok t = (TcTok){.kind = TC_TK_FLOAT_LIT, .float_value = f, .line = line};
+                // Optional 'f'/'F' suffix marks the literal as TY_F32; otherwise
+                // (per C99) it has TY_F64 (double).
+                bool is_f64 = true;
+                if (j < src.size && (src.str[j] == 'f' || src.str[j] == 'F')) { j++; is_f64 = false; }
+                TcTok t = (TcTok){.kind = TC_TK_FLOAT_LIT, .float_value = f, .is_f64 = is_f64, .line = line};
                 VecTcTok_push_back(arena, &toks, t);
                 i = j; continue;
             }

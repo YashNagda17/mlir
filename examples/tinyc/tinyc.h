@@ -100,6 +100,7 @@ typedef enum {
     TY_I32,
     TY_I64,            // 64-bit signed int (long, long long, int64_t, size_t)
     TY_F32,
+    TY_F64,            // 64-bit IEEE-754 double
     TY_PTR_I32,        // alias-only pointer to int
     TY_PTR_CHAR,       // pointer to char (string literals / globals)
     TY_ARRAY_I32,      // fixed-size int[N] / int[N][M] (length(s) in array_len[2])
@@ -200,6 +201,8 @@ struct Expr {
     int64_t int_value;
     bool    is_i64;          // true iff the integer literal had L/LL suffix
                              // and so should be emitted as TY_I64.
+    bool    is_f64;          // true iff the float literal has TY_F64 type
+                             // (i.e. no `f` suffix; C's default for `1.0`).
     // For EX_FLOAT
     double float_value;
     // For EX_VAR
@@ -384,6 +387,7 @@ typedef enum {
     TC_TK_IDENT,
     TC_TK_KW_INT,
     TC_TK_KW_FLOAT,
+    TC_TK_KW_DOUBLE,
     TC_TK_KW_RETURN,
     TC_TK_KW_IF,
     TC_TK_KW_ELSE,
@@ -438,6 +442,7 @@ typedef struct {
     TcTokKind kind;
     int64_t int_value;
     bool    is_i64;          // EX_INT / TC_TK_INT_LIT marked with L/LL suffix
+    bool    is_f64;          // TC_TK_FLOAT_LIT without `f` suffix (i.e. double)
     double  float_value;
     string text;             // interned identifier text (for IDENT)
     int line;
