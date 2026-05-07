@@ -797,6 +797,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
     if (is_ptr) {
         if (was_char) s->decl_type.kind = TY_PTR_CHAR;
         else if (base == TY_I32) s->decl_type.kind = TY_PTR_I32;
+        else if (base == TY_I64) s->decl_type.kind = TY_PTR_I32;
         else if (base == TY_VOID) s->decl_type.kind = TY_PTR_VOID;
         else perror_at(p, line, str_lit("only int*/char*/void* pointers are supported"));
         if (is_ptr_ptr) {
@@ -994,7 +995,7 @@ static Stmt *parse_stmt(P *p) {
         t.kind == TC_TK_KW_UNSIGNED ||
         t.kind == TC_TK_KW_VA_LIST ||
         (t.kind == TC_TK_IDENT && typedef_lookup(p, t.text) &&
-         peek(p, 1).kind == TC_TK_IDENT)) {
+         (peek(p, 1).kind == TC_TK_IDENT || peek(p, 1).kind == TC_TK_STAR))) {
         // `enum [Tag] { ... };` is a module-scope-only registration form;
         // a body inside a function or block scope would leak enumerators
         // out of their lexical scope (we have no scope-pop machinery for
@@ -1402,6 +1403,7 @@ static StructDef *parse_struct_def(P *p) {
                 is_ptr = true;
                 if (was_char) ft.kind = TY_PTR_CHAR;
                 else if (k == TY_I32) ft.kind = TY_PTR_I32;
+                else if (k == TY_I64) ft.kind = TY_PTR_I32;
                 else if (k == TY_VOID) ft.kind = TY_PTR_VOID;
                 else {
                     perror_at(p, cur(p).line, str_lit("only int*/char*/void* pointer fields are supported"));

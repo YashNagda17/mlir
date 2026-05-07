@@ -1528,25 +1528,43 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             r.val = emit_const_i32(e, type_size(e, ty)); return r;
         }
         case EX_CAST: {
+            EVal v = emit_expr(e, sc, ex->lhs);
+            TypeKind ck = ex->cast_type.kind;
+            bool ck_is_ptr = (ck == TY_PTR_VOID || ck == TY_PTR_I32 ||
+                              ck == TY_PTR_CHAR || ck == TY_PTR_STRUCT ||
+                              ck == TY_FNPTR || ck == TY_PTR_PTR);
+            // Integer-to-integer cast: convert between i32 and i64; everything
+            // else is treated as i32 (TY_I8/TY_I16 etc. fold to i32 here).
+            if (!ck_is_ptr && !v.is_ptr) {
+                bool want_i64 = (ck == TY_I64);
+                if (want_i64 && !v.is_i64) {
+                    v.val = emit_extsi_i32_to_i64(e, v.val);
+                    v.is_i64 = true;
+                } else if (!want_i64 && v.is_i64) {
+                    v.val = emit_trunci_i64_to_i32(e, v.val);
+                    v.is_i64 = false;
+                }
+                v.is_float = (ck == TY_F32) ? v.is_float : false;
+                return v;
+            }
             // Pointer-to-pointer cast: opaque !llvm.ptr is universal, so
             // just evaluate the operand. We tag the result type from
             // cast_type for downstream consumers.
-            EVal v = emit_expr(e, sc, ex->lhs);
             if (!v.is_ptr) {
                 EMIT_ERR(e, "cast operand is not a pointer");
             }
             v.is_ptr = true;
             v.is_float = false;
-            v.is_void_ptr = (ex->cast_type.kind == TY_PTR_VOID);
-            if (ex->cast_type.kind == TY_PTR_STRUCT) {
+            v.is_void_ptr = (ck == TY_PTR_VOID);
+            if (ck == TY_PTR_STRUCT) {
                 v.sdef = find_struct(e, ex->cast_type.struct_name);
             } else {
                 v.sdef = NULL;
             }
             // Reset element-type hints for non-void typed pointers.
-            if (ex->cast_type.kind == TY_PTR_I32) { v.ptr_elem = e->i32; v.is_str = false; }
-            else if (ex->cast_type.kind == TY_PTR_CHAR) { v.ptr_elem = e->i8; v.is_str = true; }
-            else if (ex->cast_type.kind == TY_PTR_VOID) { v.ptr_elem = MLIR_INVALID_HANDLE; v.is_str = false; }
+            if (ck == TY_PTR_I32) { v.ptr_elem = e->i32; v.is_str = false; }
+            else if (ck == TY_PTR_CHAR) { v.ptr_elem = e->i8; v.is_str = true; }
+            else if (ck == TY_PTR_VOID) { v.ptr_elem = MLIR_INVALID_HANDLE; v.is_str = false; }
             return v;
         }
         case EX_VAR:

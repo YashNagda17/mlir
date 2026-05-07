@@ -356,3 +356,11 @@ expected_stdout = "2\n16\n18\n"
 [[test]]
 name = "variadic_struct_return"
 expected_stdout = "13\n7\n25\n15\n"
+
+[[test]]
+name = "cast_int"
+expected_stdout = "100\n7000\n-1\n"
+
+[[test]]
+name = "typedef_ptr_decl"
+expected_stdout = "3\n4\n7\n"
