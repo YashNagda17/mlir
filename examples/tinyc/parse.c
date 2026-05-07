@@ -1241,6 +1241,10 @@ static bool parse_sig_type(P *p, Type *out) {
             // typedefs; struct typedefs already encode the pointer).
             if (accept(p, TC_TK_STAR)) {
                 if (out->kind == TY_I32) out->kind = TY_PTR_I32;
+                else if (out->kind == TY_I64) {
+                    out->kind = TY_PTR_I32;
+                    out->ptr_is_i64 = true;
+                }
                 else if (out->kind == TY_STRUCT) out->kind = TY_PTR_STRUCT;
                 else if (out->kind == TY_FNPTR) {
                     // `BinOp *` where BinOp is a typedef'd function pointer.

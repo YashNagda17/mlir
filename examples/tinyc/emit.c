@@ -641,6 +641,7 @@ static MLIR_ValueHandle coerce_eval(E *e, EVal v, MLIR_TypeHandle want) {
     }
     if (want == e->i64) {
         if (v.is_i64) return v.val;
+        if (v.is_ptr) return v.val;
         if (v.is_float) {
             // float -> i32 -> i64 (no direct fptosi-to-i64 helper here).
             EVal as_i32 = (EVal){.val = coerce_eval(e, v, e->i32)};
