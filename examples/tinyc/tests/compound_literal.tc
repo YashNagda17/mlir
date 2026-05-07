@@ -1,0 +1,22 @@
+struct Point {
+    int x;
+    int y;
+};
+
+int add_pt(struct Point *p) {
+    return p->x + p->y;
+}
+
+int main() {
+    int a;
+    long long b;
+    struct Point p = (struct Point){3, 4};
+    a = (int){42};
+    b = (long long){7};
+    print(a);
+    print(b);
+    print(p.x);
+    print(p.y);
+    print(add_pt(&p));
+    return 0;
+}

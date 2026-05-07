@@ -233,3 +233,7 @@ expected_stdout = "55\n5050\n0\n"
 [[test]]
 name = "sizeof_expr"
 expected_stdout = "4\n4\n8\n8\n8\n4\n4\n8\n"
+
+[[test]]
+name = "compound_literal"
+expected_stdout = "42\n7\n3\n4\n7\n"

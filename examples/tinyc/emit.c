@@ -587,6 +587,8 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex);
 static int64_t type_size(E *e, Type t);
 static int64_t type_align(E *e, Type t);
 static Type infer_expr_type(E *e, Scope *sc, Expr *ex);
+static void emit_struct_zero(E *e, MLIR_ValueHandle base, MLIR_TypeHandle source_elem,
+                             StructDef *sd, int32_t *prefix, size_t n_prefix);
 
 static MLIR_ValueHandle emit_expr_i32(E *e, Scope *sc, Expr *ex) {
     EVal v = emit_expr(e, sc, ex);
@@ -2062,6 +2064,79 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             }
             return r;
         }
+        case EX_COMPOUND: {
+            EVal r = (EVal){0};
+            Type t = ex->cast_type;
+            if (t.kind == TY_STRUCT) {
+                StructDef *sd = find_struct(e, t.struct_name);
+                if (!sd) {
+                    EMIT_ERR(e, "unknown struct in compound literal");
+                    return r;
+                }
+                MLIR_TypeHandle st_ty = find_struct_type(e, sd);
+                MLIR_ValueHandle addr = emit_alloca(e, st_ty);
+                int32_t prefix0[1] = {0};
+                emit_struct_zero(e, addr, st_ty, sd, prefix0, 1);
+                size_t n = ex->args.size;
+                if (n > sd->fields.size) {
+                    EMIT_ERR(e, "too many initializers in compound literal");
+                    n = sd->fields.size;
+                }
+                for (size_t i = 0; i < n; i++) {
+                    Type ft = sd->fields.data[i].type;
+                    int32_t path[2] = {0, (int32_t)i};
+                    MLIR_ValueHandle p =
+                        emit_gep(e, addr, st_ty, path, 2, NULL, 0);
+                    EVal v = emit_expr(e, sc, ex->args.data[i]);
+                    MLIR_TypeHandle want = scalar_mlir_type(e, ft.kind);
+                    MLIR_ValueHandle sv;
+                    if (ft.kind == TY_PTR_I32 || ft.kind == TY_PTR_CHAR ||
+                        ft.kind == TY_PTR_VOID || ft.kind == TY_PTR_STRUCT ||
+                        ft.kind == TY_FNPTR || ft.kind == TY_PTR_PTR) {
+                        sv = v.val;
+                    } else {
+                        sv = coerce_eval(e, v, want);
+                    }
+                    emit_store_v(e, sv, p);
+                }
+                r.val = addr;
+                r.is_ptr = true;
+                r.sdef = sd;
+                return r;
+            }
+            if (ex->args.size != 1) {
+                EMIT_ERR(e, "scalar compound literal needs exactly one value");
+                return r;
+            }
+            EVal v = emit_expr(e, sc, ex->args.data[0]);
+            if (t.kind == TY_I32) {
+                r.val = coerce_eval(e, v, e->i32);
+                return r;
+            }
+            if (t.kind == TY_I64) {
+                r.val = coerce_eval(e, v, e->i64);
+                r.is_i64 = true;
+                return r;
+            }
+            if (t.kind == TY_F32) {
+                r.val = coerce_eval(e, v, e->f32);
+                r.is_float = true;
+                return r;
+            }
+            if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_CHAR ||
+                t.kind == TY_PTR_VOID || t.kind == TY_PTR_STRUCT ||
+                t.kind == TY_PTR_PTR || t.kind == TY_FNPTR) {
+                r = v;
+                r.is_ptr = true;
+                r.is_void_ptr = (t.kind == TY_PTR_VOID);
+                if (t.kind == TY_PTR_STRUCT) {
+                    r.sdef = find_struct(e, t.struct_name);
+                }
+                return r;
+            }
+            EMIT_ERR(e, "unsupported type in compound literal");
+            return r;
+        }
     }
     r.val = emit_const_i32(e, 0);
     return r;
@@ -2233,7 +2308,40 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 prefix[0] = 0;
                 emit_struct_zero(e, sy->addr, st_ty, sd, prefix, 1);
                 if (st->decl_init) {
-                    EMIT_ERR(e, "struct initializers are not supported");
+                    if (st->decl_init->kind != EX_COMPOUND ||
+                        st->decl_init->cast_type.kind != TY_STRUCT ||
+                        !str_eq(st->decl_init->cast_type.struct_name,
+                                st->decl_type.struct_name)) {
+                        EMIT_ERR(e, "struct initializer must be a "
+                                    "matching compound literal");
+                    } else {
+                        size_t n = st->decl_init->args.size;
+                        if (n > sd->fields.size) {
+                            EMIT_ERR(e, "too many initializers");
+                            n = sd->fields.size;
+                        }
+                        for (size_t i = 0; i < n; i++) {
+                            Type ft = sd->fields.data[i].type;
+                            int32_t path[2] = {0, (int32_t)i};
+                            MLIR_ValueHandle p = emit_gep(
+                                e, sy->addr, st_ty, path, 2, NULL, 0);
+                            EVal v = emit_expr(
+                                e, sc, st->decl_init->args.data[i]);
+                            MLIR_ValueHandle sv;
+                            if (ft.kind == TY_PTR_I32 ||
+                                ft.kind == TY_PTR_CHAR ||
+                                ft.kind == TY_PTR_VOID ||
+                                ft.kind == TY_PTR_STRUCT ||
+                                ft.kind == TY_FNPTR ||
+                                ft.kind == TY_PTR_PTR) {
+                                sv = v.val;
+                            } else {
+                                sv = coerce_eval(
+                                    e, v, scalar_mlir_type(e, ft.kind));
+                            }
+                            emit_store_v(e, sv, p);
+                        }
+                    }
                 }
             } else if (st->decl_type.kind == TY_I64) {
                 sy->addr = emit_alloca(e, e->i64);
@@ -2774,6 +2882,7 @@ static Type infer_expr_type(E *e, Scope *sc, Expr *ex) {
             return t;
         }
         case EX_CAST: return ex->cast_type;
+        case EX_COMPOUND: return ex->cast_type;
         case EX_SIZEOF: t.kind = TY_I32; return t;
         case EX_BIN: {
             Type a = infer_expr_type(e, sc, ex->lhs);

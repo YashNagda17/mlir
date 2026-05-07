@@ -272,6 +272,23 @@ static Expr *parse_primary(P *p) {
                 perror_at(p, cur(p).line, str_lit("expected type in cast"));
             }
             expect(p, TC_TK_RPAREN, str_lit("expected ')' in cast"));
+            if (cur(p).kind == TC_TK_LBRACE) {
+                // Compound literal: (T){ v0, v1, ... }
+                p->i++;  // consume '{'
+                Expr *e = new_expr(p, EX_COMPOUND, t.line);
+                e->cast_type = ty;
+                if (cur(p).kind != TC_TK_RBRACE) {
+                    for (;;) {
+                        Expr *v = parse_expr(p);
+                        VecExprPtr_push_back(p->arena, &e->args, v);
+                        if (cur(p).kind == TC_TK_COMMA) { p->i++; continue; }
+                        break;
+                    }
+                }
+                expect(p, TC_TK_RBRACE,
+                       str_lit("expected '}' in compound literal"));
+                return e;
+            }
             Expr *operand = parse_primary(p);
             Expr *e = new_expr(p, EX_CAST, t.line);
             e->cast_type = ty;
@@ -691,7 +708,8 @@ static Stmt *parse_decl(P *p, bool require_semi) {
         }
         if (accept(p, TC_TK_ASSIGN)) {
             if (s->decl_type.kind != TY_PTR_STRUCT &&
-                s->decl_type.kind != TY_PTR_PTR) {
+                s->decl_type.kind != TY_PTR_PTR &&
+                s->decl_type.kind != TY_STRUCT) {
                 perror_at(p, line, str_lit("struct/array initializers are not supported"));
             }
             s->decl_init = parse_expr(p);

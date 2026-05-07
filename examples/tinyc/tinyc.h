@@ -156,6 +156,7 @@ typedef enum {
     EX_DEREF,          // *p
     EX_FIELD,          // s.x  (lhs = struct lvalue, name = field name)
     EX_TERNARY,        // c ? a : b — lhs=cond, rhs=then, lvalue=else
+    EX_COMPOUND,       // (T){v0, v1, ...} — cast_type + args
 } ExprKind;
 
 typedef enum {
