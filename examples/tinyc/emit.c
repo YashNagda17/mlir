@@ -152,6 +152,7 @@ typedef struct {
     Sym             *globals;        // module-scope symbols
     bool             use_print_str;  // emit @printStr extern decl
     bool             need_va_arg_helpers;  // emit tinyc_va_arg_* externs
+    bool             need_va_arg_struct;   // emit tinyc_va_arg_struct extern
     int              cur_line;       // last AST node line entered; used by
                                      // EMIT_ERR for diagnostic line numbers.
     int              err_count;      // count of EMIT_ERR diagnostics
@@ -1518,6 +1519,17 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
     size_t n_fixed = sig->n_flat_in;
     size_t n_extra = sig->is_variadic ? (args.size - sig->n_params) : 0;
     size_t n_in = n_fixed + n_extra;
+    // Variadic struct args may expand into multiple i64 words; account for that.
+    if (sig->is_variadic) {
+        for (size_t i = sig->n_params; i < args.size; i++) {
+            Type at = infer_expr_type(e, sc, args.data[i]);
+            if (at.kind == TY_STRUCT) {
+                int64_t bytes = type_size(e, at);
+                int64_t words = (bytes + 7) / 8;
+                if (words > 1) n_in += (words - 1);
+            }
+        }
+    }
     MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, n_in ? n_in : 1);
     size_t op_off = 0;
     MLIR_ValueHandle ret_buf = MLIR_INVALID_HANDLE;
@@ -1557,8 +1569,28 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
     }
     // Variadic-portion arguments: apply C default argument promotion.
     // float -> double, integers narrower than int are already int (we
-    // model all narrow ints as i32 in tinyC).
+    // model all narrow ints as i32 in tinyC). Struct-by-value args are
+    // unpacked into i64 words to match the helper-side va_arg layout.
     for (size_t i = sig->n_params; i < args.size; i++) {
+        Type at = infer_expr_type(e, sc, args.data[i]);
+        if (at.kind == TY_STRUCT) {
+            StructDef *asd = NULL;
+            MLIR_ValueHandle src = resolve_struct_source(e, sc, args.data[i], &asd);
+            if (src == MLIR_INVALID_HANDLE || !asd) {
+                EMIT_ERR(e, "variadic struct argument: cannot resolve");
+                continue;
+            }
+            int64_t bytes = type_size(e, at);
+            int64_t words = (bytes + 7) / 8;
+            MLIR_TypeHandle warr = MLIR_CreateTypeLLVMArray(e->ctx, e->i64, (uint64_t)words);
+            for (int64_t w = 0; w < words; w++) {
+                int32_t path[2] = {0, (int32_t)w};
+                MLIR_ValueHandle wp = emit_gep(e, src, warr, path, 2, NULL, 0);
+                MLIR_ValueHandle wv = emit_load_v(e, wp, e->i64);
+                ops[op_off++] = wv;
+            }
+            continue;
+        }
         EVal v = emit_expr(e, sc, args.data[i]);
         if (v.is_float && !v.is_f64) {
             v.val = emit_fpext_f32_to_f64(e, v.val);
@@ -1830,6 +1862,34 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 r.val = emit_const_i32(e, 0); return r;
             }
             TypeKind tk = ex->cast_type.kind;
+            if (tk == TY_STRUCT) {
+                // va_arg of a struct: alloca, then call a generic helper
+                // that copies sizeof(struct) bytes (rounded up to 8) out
+                // of the va_list into our buffer.
+                StructDef *sd = find_struct(e, ex->cast_type.struct_name);
+                if (!sd) {
+                    EMIT_ERR(e, "unknown struct in va_arg");
+                    r.val = emit_const_i32(e, 0); return r;
+                }
+                MLIR_TypeHandle st_ty = find_struct_type(e, sd);
+                MLIR_ValueHandle out = emit_alloca(e, st_ty);
+                MLIR_ValueHandle ap_ptr = sym_addr(e, sy);
+                MLIR_ValueHandle sz = emit_const_i64(e, (int64_t)type_size(e, ex->cast_type));
+                MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 3);
+                ops[0] = ap_ptr; ops[1] = out; ops[2] = sz;
+                MLIR_AttributeHandle ca = MLIR_CreateAttributeSymbolRef(
+                    e->ctx, str_lit("callee"), str_lit("tinyc_va_arg_struct"));
+                MLIR_AttributeHandle *as = arena_new_array(e->arena, MLIR_AttributeHandle, 1);
+                as[0] = ca;
+                emit_op(e, OP_TYPE_FUNC_CALL, str_lit("func.call"),
+                        NULL, 0, NULL, 0, ops, 3, as, 1, NULL, 0);
+                e->need_va_arg_helpers = true;
+                e->need_va_arg_struct = true;
+                r.val = out;
+                r.is_ptr = true;
+                r.sdef = sd;
+                return r;
+            }
             string helper;
             MLIR_TypeHandle rt;
             switch (tk) {
@@ -4550,6 +4610,24 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
                                                regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
             MLIR_AppendBlockOp(ctx, mb, decl);
         }
+    }
+
+    if (e.need_va_arg_struct) {
+        // void tinyc_va_arg_struct(va_list *ap, void *out, i64 size)
+        MLIR_TypeHandle *ins = arena_new_array(arena, MLIR_TypeHandle, 3);
+        ins[0] = e.ptr; ins[1] = e.ptr; ins[2] = e.i64;
+        MLIR_TypeHandle fty = MLIR_CreateTypeFunction(ctx, ins, 3, NULL, 0);
+        MLIR_AttributeHandle a0 = MLIR_CreateAttributeString(ctx, str_lit("sym_name"), str_lit("tinyc_va_arg_struct"));
+        MLIR_AttributeHandle a1 = MLIR_CreateAttributeType(ctx, str_lit("function_type"), fty);
+        MLIR_AttributeHandle a2 = MLIR_CreateAttributeString(ctx, str_lit("sym_visibility"), str_lit("private"));
+        MLIR_AttributeHandle *attrs = arena_new_array(arena, MLIR_AttributeHandle, 3);
+        attrs[0] = a0; attrs[1] = a1; attrs[2] = a2;
+        MLIR_RegionHandle body = MLIR_CreateRegion(ctx);
+        MLIR_RegionHandle *regs = arena_new_array(arena, MLIR_RegionHandle, 1); regs[0] = body;
+        MLIR_OpHandle decl = MLIR_CreateOp(ctx, OP_TYPE_FUNC_FUNC, str_lit("func.func"),
+                                           attrs, 3, NULL, 0, NULL, 0, NULL, 0,
+                                           regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+        MLIR_AppendBlockOp(ctx, mb, decl);
     }
 
     // Emit any string-literal globals collected by ST_PRINT/EX_STR.

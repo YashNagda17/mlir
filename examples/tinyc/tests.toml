@@ -484,3 +484,7 @@ expected_stdout = "-16\n"
 [[test]]
 name = "global_ptr_array"
 expected_stdout = "1\n"
+
+[[test]]
+name = "va_arg_struct"
+expected_stdout = "33\n"

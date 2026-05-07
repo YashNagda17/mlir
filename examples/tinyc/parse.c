@@ -501,7 +501,8 @@ static Expr *parse_primary(P *p) {
         if (cur(p).kind == TC_TK_LPAREN) {
             // Built-in `va_arg(ap, T)`: second argument is a TYPE-NAME, not
             // an expression. Lower to EX_VA_ARG.
-            if (str_eq(t.text, str_lit("va_arg"))) {
+            if (str_eq(t.text, str_lit("va_arg")) ||
+                str_eq(t.text, str_lit("__builtin_va_arg"))) {
                 p->i++;  // consume '('
                 Expr *e = new_expr(p, EX_VA_ARG, t.line);
                 e->lhs = parse_expr(p);
