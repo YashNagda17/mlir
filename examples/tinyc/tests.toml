@@ -368,3 +368,7 @@ expected_stdout = "3\n4\n7\n"
 [[test]]
 name = "struct_ptr_field_index"
 expected_stdout = "10\n11\n12\n1000000\n2000000\n3000000\n"
+
+[[test]]
+name = "struct_call_in_arg"
+expected_stdout = "1\n10\n20\n2\n30\n40\n"

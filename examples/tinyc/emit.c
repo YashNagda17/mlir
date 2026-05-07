@@ -2252,8 +2252,12 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 return r;
             }
             if (sig->ret.type.kind == TY_STRUCT) {
-                EMIT_ERR(e, "struct-returning call cannot appear in expression position");
-                r.val = emit_const_i32(e, 0);
+                MLIR_TypeHandle st = find_struct_type(e, sig->ret.sdef);
+                MLIR_ValueHandle tmp = emit_alloca(e, st);
+                emit_flat_call(e, sc, sig, ex->args, NULL, tmp);
+                r.val = tmp;
+                r.is_ptr = true;
+                r.sdef = sig->ret.sdef;
                 return r;
             }
             if (sig->ret.type.kind == TY_VOID) {
