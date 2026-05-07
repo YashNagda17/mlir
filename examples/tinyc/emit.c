@@ -2333,6 +2333,13 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                             Type ft = parent.sd->fields.data[fidx].type;
                             if (ft.kind == TY_PTR_STRUCT) {
                                 v.sdef = find_struct(e, ft.struct_name);
+                            } else if (ft.kind == TY_PTR_CHAR) {
+                                v.is_str = true;
+                                v.ptr_elem = e->i8;
+                            } else if (ft.kind == TY_PTR_I32) {
+                                v.ptr_elem = ft.ptr_is_i64 ? e->i64 : e->i32;
+                            } else if (ft.kind == TY_PTR_VOID) {
+                                v.is_void_ptr = true;
                             }
                         }
                     }

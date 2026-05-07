@@ -535,3 +535,7 @@ expected_stdout = "105 14 12\nsum=131\n"
 [[test]]
 name = "typedef_u8_ptr"
 expected_stdout = "a=ABCDEF\nb=abcdef\nc=012345\n"
+
+[[test]]
+name = "struct_field_char_ptr"
+expected_stdout = "buf=ABCDE\n"
