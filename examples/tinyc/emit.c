@@ -3398,9 +3398,18 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
         MLIR_AppendBlockOp(ctx, mb, decl);
     }
 
-    // Always emit `malloc`/`free` extern declarations at module scope so
-    // that user code calling them links against libc.
-    {
+    // Emit `malloc`/`free` extern declarations at module scope so that
+    // user code calling them links against libc — unless the user has
+    // already provided their own forward declaration above (which would
+    // otherwise create duplicate symbols and fail symbol verification).
+    bool have_user_malloc = false, have_user_free = false;
+    for (size_t i = 0; i < program->funcs.size; i++) {
+        Func *fwd = program->funcs.data[i];
+        if (!fwd->is_forward) continue;
+        if (str_eq(fwd->name, str_lit("malloc"))) have_user_malloc = true;
+        else if (str_eq(fwd->name, str_lit("free"))) have_user_free = true;
+    }
+    if (!have_user_malloc) {
         MLIR_TypeHandle *ins = arena_new_array(arena, MLIR_TypeHandle, 1); ins[0] = e.i64;
         MLIR_TypeHandle *outs = arena_new_array(arena, MLIR_TypeHandle, 1); outs[0] = e.ptr;
         MLIR_TypeHandle fty = MLIR_CreateTypeFunction(ctx, ins, 1, outs, 1);
@@ -3416,7 +3425,7 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
                                            regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
         MLIR_AppendBlockOp(ctx, mb, decl);
     }
-    {
+    if (!have_user_free) {
         MLIR_TypeHandle *ins = arena_new_array(arena, MLIR_TypeHandle, 1); ins[0] = e.ptr;
         MLIR_TypeHandle fty = MLIR_CreateTypeFunction(ctx, ins, 1, NULL, 0);
         MLIR_AttributeHandle a0 = MLIR_CreateAttributeString(ctx, str_lit("sym_name"), str_lit("free"));

@@ -253,3 +253,7 @@ expected_stdout = "int=7\nlong=1234567890123\nstr=hi\n"
 [[test]]
 name = "variadic_forward_decl"
 expected_stdout = "10\n300\n"
+
+[[test]]
+name = "extern_malloc_free"
+expected_stdout = "42\n99\n"

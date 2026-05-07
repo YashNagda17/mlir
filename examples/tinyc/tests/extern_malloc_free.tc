@@ -1,0 +1,16 @@
+// Regression: a user `extern` declaration of malloc/free must NOT cause
+// duplicate symbols. Previously the emitter unconditionally emitted its
+// own malloc/free decls in addition to the user forward decl.
+extern void *malloc(long n);
+extern void free(void *p);
+
+int main() {
+    int *p;
+    p = (int*)malloc(16);
+    p[0] = 42;
+    p[1] = 99;
+    print(p[0]);
+    print(p[1]);
+    free(p);
+    return 0;
+}
