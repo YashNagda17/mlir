@@ -191,11 +191,14 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
                     j++;
                 }
                 TcTok t = (TcTok){.kind = TC_TK_INT_LIT, .int_value = v, .line = line};
-                if (j < src.size && (src.str[j] == 'l' || src.str[j] == 'L')) {
-                    t.is_i64 = true; j++;
-                    if (j < src.size && (src.str[j] == 'l' || src.str[j] == 'L')) j++;
+                // Optional integer-literal suffix: any mix of 'l'/'L' /
+                // 'u'/'U' in any order (see below for the decimal path).
+                for (int k = 0; k < 3 && j < src.size; k++) {
+                    char c2 = src.str[j];
+                    if (c2 == 'l' || c2 == 'L') { t.is_i64 = true; j++; }
+                    else if (c2 == 'u' || c2 == 'U') { j++; }
+                    else break;
                 }
-                if (j < src.size && (src.str[j] == 'u' || src.str[j] == 'U')) j++;
                 VecTcTok_push_back(arena, &toks, t);
                 i = j; continue;
             }
@@ -239,15 +242,16 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
                 i = j; continue;
             }
             TcTok t = (TcTok){.kind = TC_TK_INT_LIT, .int_value = v, .line = line};
-            // Optional integer-literal suffix: 'l', 'L', 'll', 'LL' marks
-            // the literal as TY_I64. We do not distinguish signedness.
-            if (j < src.size && (src.str[j] == 'l' || src.str[j] == 'L')) {
-                t.is_i64 = true;
-                j++;
-                if (j < src.size && (src.str[j] == 'l' || src.str[j] == 'L')) j++;
+            // Optional integer-literal suffix: any combination of 'l'/'L'
+            // (denoting TY_I64) and 'u'/'U' (signedness, silently dropped),
+            // in either order. So 'L', 'LL', 'UL', 'LU', 'ULL', 'LLU', 'U'
+            // are all accepted. We do not distinguish signedness.
+            for (int k = 0; k < 3 && j < src.size; k++) {
+                char c2 = src.str[j];
+                if (c2 == 'l' || c2 == 'L') { t.is_i64 = true; j++; }
+                else if (c2 == 'u' || c2 == 'U') { j++; }
+                else break;
             }
-            // Also accept a trailing 'u'/'U' (silently — we don't track signedness).
-            if (j < src.size && (src.str[j] == 'u' || src.str[j] == 'U')) j++;
             VecTcTok_push_back(arena, &toks, t);
             i = j; continue;
         }

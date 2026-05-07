@@ -1497,6 +1497,23 @@ static bool parse_abstract_type(P *p, Type *out) {
     if (!parse_sig_type(p, out)) return false;
     string dummy = (string){0};
     try_parse_fnptr_suffix(p, out, &dummy);
+    // Optional array suffix: `T[]` (unsized — common in compound-literal
+    // positions like `(T[]){...}`) or `T[N]`. Wraps the element type into
+    // a TY_ARRAY_STRUCT (struct base) or TY_ARRAY_I32 (int/char base).
+    if (cur(p).kind == TC_TK_LBRACK) {
+        p->i++;  // '['
+        int64_t alen = 0; Expr *aexpr = NULL;
+        parse_array_len_bracket(p, &alen, &aexpr);
+        if (out->kind == TY_STRUCT) {
+            out->kind = TY_ARRAY_STRUCT;
+        } else if (out->kind == TY_PTR_CHAR) {
+            out->kind = TY_ARRAY_PTR_CHAR;
+        } else {
+            out->kind = TY_ARRAY_I32;
+        }
+        out->array_len = alen;
+        out->array_len_expr = aexpr;
+    }
     return true;
 }
 

@@ -1129,7 +1129,44 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                 return r;
             }
             if (s->type.kind == TY_ARRAY_STRUCT) {
-                EMIT_ERR(e, "array-of-struct element must be field-accessed (arr[i].f)");
+                // For lvalue context that takes the *address* of arr[i]
+                // (e.g. `&arr[i]`), GEP into the local array. Field access
+                // (`arr[i].f`) goes through other paths that build the GEP
+                // themselves; we still keep the original guard for that.
+                StructDef *sd = find_struct(e, s->type.struct_name);
+                if (!sd) {
+                    EMIT_ERR(e, "unknown struct in array");
+                    return r;
+                }
+                MLIR_TypeHandle st_ty = find_struct_type(e, sd);
+                MLIR_ValueHandle idx_i32 = emit_expr_i32(e, sc, ex->rhs);
+                r.base_ptr = sym_addr(e, s);
+                r.source_elem = MLIR_CreateTypeLLVMArray(e->ctx, st_ty,
+                    (uint64_t)s->type.array_len);
+                int32_t *path = arena_new_array(e->arena, int32_t, 2);
+                path[0] = 0; path[1] = LLVM_GEP_DYN;
+                r.const_path = path; r.n_const_path = 2;
+                r.dyn_index = idx_i32;
+                r.elem_ty = st_ty;
+                return r;
+            }
+            if (s->type.kind == TY_PTR_STRUCT) {
+                // p[i] for a struct pointer parameter / local: load the
+                // pointer then GEP by the struct stride.
+                StructDef *sd = find_struct(e, s->type.struct_name);
+                if (!sd) {
+                    EMIT_ERR(e, "unknown struct ptr");
+                    return r;
+                }
+                MLIR_TypeHandle st_ty = find_struct_type(e, sd);
+                MLIR_ValueHandle idx_i32 = emit_expr_i32(e, sc, ex->rhs);
+                MLIR_ValueHandle base = emit_load_v(e, sym_addr(e, s), e->ptr);
+                int32_t *path = arena_new_array(e->arena, int32_t, 1);
+                path[0] = LLVM_GEP_DYN;
+                MLIR_ValueHandle *dyn = arena_new_array(e->arena, MLIR_ValueHandle, 1);
+                dyn[0] = idx_i32;
+                r.base_ptr = emit_gep(e, base, st_ty, path, 1, dyn, 1);
+                r.elem_ty = st_ty;
                 return r;
             }
             // Pointer indexing: p[i] for int* / char* — GEP %p[%i].
@@ -1294,6 +1331,33 @@ static void unify_numeric(E *e, EVal *a, EVal *b) {
 static MLIR_ValueHandle resolve_struct_source(E *e, Scope *sc, Expr *arg, StructDef **out_sd) {
     Expr *target = arg;
     if (arg->kind == EX_ADDR) {
+        // `&<var>` — handled below.
+        // `&arr[i]` where arr is array-of-struct: GEP to element address.
+        if (arg->lhs->kind == EX_INDEX && arg->lhs->lhs->kind == EX_VAR) {
+            Sym *s = lookup(e, sc, arg->lhs->lhs->name);
+            if (s && s->type.kind == TY_ARRAY_STRUCT && s->sdef) {
+                MLIR_ValueHandle idx = emit_expr_i32(e, sc, arg->lhs->rhs);
+                MLIR_TypeHandle st_ty = find_struct_type(e, s->sdef);
+                MLIR_TypeHandle arr_ty = MLIR_CreateTypeLLVMArray(
+                    e->ctx, st_ty, (uint64_t)s->type.array_len);
+                int32_t path[2] = {0, LLVM_GEP_DYN};
+                MLIR_ValueHandle dyn[1] = {idx};
+                MLIR_ValueHandle p = emit_gep(e, sym_addr(e, s), arr_ty, path, 2, dyn, 1);
+                *out_sd = s->sdef;
+                return p;
+            }
+            // `&p[i]` where p is struct*: load p, then GEP by i (stride sizeof(struct)).
+            if (s && s->type.kind == TY_PTR_STRUCT && s->sdef) {
+                MLIR_ValueHandle idx = emit_expr_i32(e, sc, arg->lhs->rhs);
+                MLIR_ValueHandle base = emit_load_v(e, sym_addr(e, s), e->ptr);
+                MLIR_TypeHandle st_ty = find_struct_type(e, s->sdef);
+                int32_t path[1] = {LLVM_GEP_DYN};
+                MLIR_ValueHandle dyn[1] = {idx};
+                MLIR_ValueHandle p = emit_gep(e, base, st_ty, path, 1, dyn, 1);
+                *out_sd = s->sdef;
+                return p;
+            }
+        }
         if (arg->lhs->kind != EX_VAR) {
             EMIT_ERR(e, "&expr in struct context requires a simple variable");
             return MLIR_INVALID_HANDLE;
@@ -1690,6 +1754,25 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
     if (ex->kind == EX_GENERIC) {
         return emit_expr(e, sc, generic_select(e, sc, ex));
     }
+    // `__func__` is a magic predefined identifier carrying the enclosing
+    // function's name as a NUL-terminated string literal. Synthesize the
+    // string from the current FuncSig at emit time.
+    if (ex->kind == EX_VAR &&
+        ex->name.size == 8 &&
+        memcmp(ex->name.str, "__func__", 8) == 0 &&
+        !lookup(e, sc, ex->name)) {
+        string fname = e->cur_sig ? e->cur_sig->name : str_lit("");
+        // Build a NUL-terminated copy in arena and intern.
+        char *buf = arena_alloc(e->arena, fname.size + 1);
+        for (size_t i = 0; i < fname.size; i++) buf[i] = fname.str[i];
+        buf[fname.size] = '\0';
+        string bytes = (string){.str = buf, .size = fname.size + 1};
+        string sym = intern_string(e, bytes);
+        r.val = emit_addressof(e, sym);
+        r.is_ptr = true;
+        r.is_str = true;
+        return r;
+    }
     // Pre-pass: literal-only integer subtree -> a single arith.constant.
     // Only kicks in for nodes that ast_fold_int actually folds; anything
     // with a side effect or a non-int operand falls through unchanged.
@@ -2022,6 +2105,14 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                              s->type.kind == TY_ARRAY_PTR_CHAR) r.ptr_elem = e->ptr;
                     else r.ptr_elem = e->i32;
                     if (s->type.kind == TY_ARRAY_STRUCT) r.sdef = s->sdef;
+                    return r;
+                }
+                // va_list value is the buffer pointer itself (the alloca
+                // address). Passing va_list as an argument or to va_arg
+                // wants this !llvm.ptr, not a load of its content.
+                if (s && s->type.kind == TY_VA_LIST) {
+                    r.val = sym_addr(e, s);
+                    r.is_ptr = true;
                     return r;
                 }
             }
@@ -2496,9 +2587,14 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             // address (the alloca pointer) directly.
             if (!indirect_fnty && (str_eq(ex->callee, str_lit("va_start"))
                                  || str_eq(ex->callee, str_lit("va_end"))
-                                 || str_eq(ex->callee, str_lit("va_copy")))) {
-                bool is_start = str_eq(ex->callee, str_lit("va_start"));
-                bool is_copy  = str_eq(ex->callee, str_lit("va_copy"));
+                                 || str_eq(ex->callee, str_lit("va_copy"))
+                                 || str_eq(ex->callee, str_lit("__builtin_va_start"))
+                                 || str_eq(ex->callee, str_lit("__builtin_va_end"))
+                                 || str_eq(ex->callee, str_lit("__builtin_va_copy")))) {
+                bool is_start = str_eq(ex->callee, str_lit("va_start")) ||
+                                str_eq(ex->callee, str_lit("__builtin_va_start"));
+                bool is_copy  = str_eq(ex->callee, str_lit("va_copy")) ||
+                                str_eq(ex->callee, str_lit("__builtin_va_copy"));
                 size_t expected = is_start ? 2 : (is_copy ? 2 : 1);
                 if (ex->args.size != expected) {
                     EMIT_ERR(e, "{} expects {} argument(s)", ex->callee, (int64_t)expected);
@@ -2687,6 +2783,68 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
         case EX_COMPOUND: {
             EVal r = (EVal){0};
             Type t = ex->cast_type;
+            if (t.kind == TY_ARRAY_STRUCT) {
+                // Array-of-struct compound literal `(S[]){{...}, {...}, ...}`.
+                // Each arg is itself an EX_COMPOUND for a single struct
+                // element. Length defaults to the number of args when the
+                // bracket was empty (`(S[]){...}`).
+                StructDef *sd = find_struct(e, t.struct_name);
+                if (!sd) { EMIT_ERR(e, "unknown struct in array compound literal"); return r; }
+                int64_t n = (int64_t)ex->args.size;
+                if (t.array_len > 0) {
+                    if (t.array_len < n) n = t.array_len;
+                } else {
+                    t.array_len = n;
+                }
+                MLIR_TypeHandle st_ty = find_struct_type(e, sd);
+                MLIR_TypeHandle arr_ty = MLIR_CreateTypeLLVMArray(
+                    e->ctx, st_ty, (uint64_t)t.array_len);
+                MLIR_ValueHandle addr = emit_alloca(e, arr_ty);
+                for (int64_t i = 0; i < n; i++) {
+                    Expr *elem = ex->args.data[i];
+                    int32_t path[2] = {0, (int32_t)i};
+                    MLIR_ValueHandle p = emit_gep(e, addr, arr_ty, path, 2, NULL, 0);
+                    if (elem->kind == EX_COMPOUND) {
+                        // Fill element struct fields directly (avoid
+                        // emitting a second alloca + memcpy).
+                        size_t fn = elem->args.size;
+                        if (fn > sd->fields.size) fn = sd->fields.size;
+                        // Zero first.
+                        int32_t pz[1] = {0};
+                        emit_struct_zero(e, p, st_ty, sd, pz, 1);
+                        for (size_t fi = 0; fi < fn; fi++) {
+                            Type ft = sd->fields.data[fi].type;
+                            int32_t fpath[2] = {0, (int32_t)fi};
+                            MLIR_ValueHandle fp = emit_gep(e, p, st_ty, fpath, 2, NULL, 0);
+                            EVal vv = emit_expr(e, sc, elem->args.data[fi]);
+                            MLIR_TypeHandle want = scalar_mlir_type(e, ft.kind);
+                            MLIR_ValueHandle sv;
+                            if (ft.kind == TY_PTR_I32 || ft.kind == TY_PTR_CHAR ||
+                                ft.kind == TY_PTR_VOID || ft.kind == TY_PTR_STRUCT ||
+                                ft.kind == TY_FNPTR || ft.kind == TY_PTR_PTR) {
+                                sv = vv.val;
+                            } else {
+                                sv = coerce_eval(e, vv, want);
+                            }
+                            emit_store_v(e, sv, fp);
+                        }
+                    } else {
+                        // Allow a struct-typed expression as an element
+                        // (e.g. an existing struct local) by copying.
+                        StructDef *esd = NULL;
+                        MLIR_ValueHandle src = resolve_struct_source(e, sc, elem, &esd);
+                        if (src != MLIR_INVALID_HANDLE && esd == sd) {
+                            emit_struct_copy(e, p, src, sd);
+                        } else {
+                            EMIT_ERR(e, "array compound literal element type mismatch");
+                        }
+                    }
+                }
+                r.val = addr;
+                r.is_ptr = true;
+                r.sdef = sd;
+                return r;
+            }
             if (t.kind == TY_STRUCT) {
                 StructDef *sd = find_struct(e, t.struct_name);
                 if (!sd) {
@@ -3598,6 +3756,11 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
             sy->sdef = p->sdef;
             sy->addr = emit_alloca(e, e->ptr);
             emit_store_v(e, blk, sy->addr);
+        } else if (p->type.kind == TY_VA_LIST) {
+            // va_list is passed as the alloca pointer of the caller's
+            // 32-byte slot. Reuse it directly so va_arg / va_end operate
+            // on the caller's slot.
+            sy->addr = blk;
         } else if (p->type.kind == TY_F32) {
             sy->addr = emit_alloca(e, e->f32);
             emit_store_v(e, blk, sy->addr);
