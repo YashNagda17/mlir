@@ -472,3 +472,7 @@ expected_stdout = "16\n"
 [[test]]
 name = "goto_label"
 expected_stdout = "10\n"
+
+[[test]]
+name = "compound_designated"
+expected_stdout = "3 7 10 20\n"

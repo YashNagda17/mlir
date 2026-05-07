@@ -2912,8 +2912,24 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     n = sd->fields.size;
                 }
                 for (size_t i = 0; i < n; i++) {
-                    Type ft = sd->fields.data[i].type;
-                    int32_t path[2] = {0, (int32_t)i};
+                    size_t fi = i;
+                    if (ex->compound_field_names &&
+                        ex->compound_field_names[i].size > 0) {
+                        bool found = false;
+                        for (size_t k = 0; k < sd->fields.size; k++) {
+                            if (str_eq(sd->fields.data[k].name,
+                                       ex->compound_field_names[i])) {
+                                fi = k; found = true; break;
+                            }
+                        }
+                        if (!found) {
+                            EMIT_ERR(e, "unknown field '{}' in designated initializer",
+                                     ex->compound_field_names[i]);
+                            continue;
+                        }
+                    }
+                    Type ft = sd->fields.data[fi].type;
+                    int32_t path[2] = {0, (int32_t)fi};
                     MLIR_ValueHandle p =
                         emit_gep(e, addr, st_ty, path, 2, NULL, 0);
                     EVal v = emit_expr(e, sc, ex->args.data[i]);
@@ -3408,6 +3424,14 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                         EMIT_ERR(e, "returned struct type mismatch");
                     } else {
                         emit_struct_copy(e, out, sym_addr(e, s), want);
+                    }
+                } else if (st->expr->kind == EX_COMPOUND &&
+                           st->expr->cast_type.kind == TY_STRUCT) {
+                    EVal cv = emit_expr(e, sc, st->expr);
+                    if (cv.sdef != want) {
+                        EMIT_ERR(e, "returned compound literal type mismatch");
+                    } else {
+                        emit_struct_copy(e, out, cv.val, want);
                     }
                 } else {
                     EMIT_ERR(e, "struct return must be a variable or struct call");

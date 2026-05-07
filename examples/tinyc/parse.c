@@ -358,20 +358,44 @@ static Expr *parse_primary(P *p) {
             }
             expect(p, TC_TK_RPAREN, str_lit("expected ')' in cast"));
             if (cur(p).kind == TC_TK_LBRACE) {
-                // Compound literal: (T){ v0, v1, ... }
+                // Compound literal: (T){ v0, v1, ... } or (T){.f = v, ...}
                 p->i++;  // consume '{'
                 Expr *e = new_expr(p, EX_COMPOUND, t.line);
                 e->cast_type = ty;
+                string *names = NULL;
+                size_t nn = 0, cap = 0;
+                bool any_designated = false;
                 if (cur(p).kind != TC_TK_RBRACE) {
                     for (;;) {
+                        string fname = (string){0};
+                        if (cur(p).kind == TC_TK_DOT) {
+                            p->i++;
+                            TcTok ft = cur(p);
+                            expect(p, TC_TK_IDENT, str_lit("expected field name after '.'"));
+                            expect(p, TC_TK_ASSIGN, str_lit("expected '=' in designated initializer"));
+                            fname = ft.text;
+                            any_designated = true;
+                        }
                         Expr *v = parse_expr(p);
                         VecExprPtr_push_back(p->arena, &e->args, v);
-                        if (cur(p).kind == TC_TK_COMMA) { p->i++; continue; }
+                        if (nn == cap) {
+                            size_t ncap = cap ? cap * 2 : 4;
+                            string *nb = arena_new_array(p->arena, string, ncap);
+                            for (size_t k = 0; k < nn; k++) nb[k] = names[k];
+                            names = nb; cap = ncap;
+                        }
+                        names[nn++] = fname;
+                        if (cur(p).kind == TC_TK_COMMA) {
+                            p->i++;
+                            if (cur(p).kind == TC_TK_RBRACE) break;
+                            continue;
+                        }
                         break;
                     }
                 }
                 expect(p, TC_TK_RBRACE,
                        str_lit("expected '}' in compound literal"));
+                if (any_designated) e->compound_field_names = names;
                 return e;
             }
             Expr *operand = parse_primary(p);
