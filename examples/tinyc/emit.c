@@ -2470,18 +2470,36 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             }
             LVal lv = emit_lvalue(e, sc, ex->lvalue);
             if (ex->is_post_step) {
-                // Postfix `x++` / `x--`: yield the old value, then store
-                // `old ± 1` back into the lvalue. Skip evaluating
-                // `ex->rhs_assign` (which references `ex->lvalue` on the
-                // LHS); compute the step directly from the loaded value.
                 EVal old = load_lvalue(e, lv);
+                bool sub = (ex->rhs_assign && ex->rhs_assign->op == OP_SUB);
+                if (lv.elem_ty == e->ptr) {
+                    // Pointer postfix `p++` / `p--`: step by sizeof(*p)
+                    // via GEP, store new pointer, return the OLD pointer.
+                    Type lt = infer_expr_type(e, sc, ex->lvalue);
+                    MLIR_TypeHandle pe = e->i32;
+                    if (lt.kind == TY_PTR_CHAR) pe = e->i8;
+                    else if (lt.kind == TY_PTR_I32) {
+                        if (lt.array_elem_is_i64) pe = e->i64;
+                        else pe = e->i32;
+                    }
+                    else if (lt.kind == TY_PTR_PTR) pe = e->ptr;
+                    int32_t step = sub ? -1 : 1;
+                    MLIR_ValueHandle idx = emit_const_i32(e, step);
+                    int32_t *path = arena_new_array(e->arena, int32_t, 1);
+                    path[0] = LLVM_GEP_DYN;
+                    MLIR_ValueHandle *dyn = arena_new_array(e->arena, MLIR_ValueHandle, 1);
+                    dyn[0] = idx;
+                    MLIR_ValueHandle stepped = emit_gep(e, old.val, pe, path, 1, dyn, 1);
+                    store_lvalue(e, lv, stepped);
+                    old.is_ptr = true;
+                    old.ptr_elem = pe;
+                    return old;
+                }
                 MLIR_TypeHandle ity = old.is_i64 ? e->i64 : e->i32;
                 MLIR_ValueHandle one_v = old.is_i64 ? emit_const_i64(e, 1)
                                                     : emit_const_i32(e, 1);
-                MLIR_OpType opty = (ex->rhs_assign && ex->rhs_assign->op == OP_SUB)
-                                       ? OP_TYPE_ARITH_SUBI : OP_TYPE_ARITH_ADDI;
-                string opname = (ex->rhs_assign && ex->rhs_assign->op == OP_SUB)
-                                    ? str_lit("arith.subi") : str_lit("arith.addi");
+                MLIR_OpType opty = sub ? OP_TYPE_ARITH_SUBI : OP_TYPE_ARITH_ADDI;
+                string opname = sub ? str_lit("arith.subi") : str_lit("arith.addi");
                 MLIR_ValueHandle stepped = emit_binop(e, opty, opname, ity,
                                                        old.val, one_v);
                 MLIR_ValueHandle stored = coerce_eval(e,
@@ -2495,6 +2513,12 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             v.is_f64 = (lv.elem_ty == e->f64);
             v.is_i64 = (lv.elem_ty == e->i64);
             store_lvalue(e, lv, v.val);
+            if (lv.elem_ty == e->i8) {
+                // The stored value is i8, but the EVal we hand back to the
+                // surrounding expression must be i32 (tinyc treats `char`
+                // as `int` in arithmetic / comparisons), so sign-extend.
+                v.val = emit_extsi_i8_to_i32(e, v.val);
+            }
             return v;
         }
         case EX_UN: {
