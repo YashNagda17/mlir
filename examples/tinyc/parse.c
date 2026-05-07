@@ -1448,6 +1448,55 @@ static void parse_enum_decl_top(P *p) {
 }
 
 Program *tinyc_parse(Arena *arena, VecTcTok toks) {
+    Program *prog = arena_new(arena, Program);
+    *prog = (Program){0};
+    tinyc_parse_into(arena, prog, toks);
+    return prog;
+}
+
+// Compare two struct definitions structurally. Two struct definitions of
+// the same name across files (e.g., included from a shared header) must
+// have identical field lists.
+static bool struct_def_equal(StructDef *a, StructDef *b) {
+    if (a->fields.size != b->fields.size) return false;
+    for (size_t i = 0; i < a->fields.size; i++) {
+        StructField *fa = &a->fields.data[i];
+        StructField *fb = &b->fields.data[i];
+        if (!str_eq(fa->name, fb->name)) return false;
+        if (fa->type.kind != fb->type.kind) return false;
+        if (fa->type.array_len != fb->type.array_len) return false;
+        if (!str_eq(fa->type.struct_name, fb->type.struct_name)) return false;
+    }
+    return true;
+}
+
+// Push a global onto `prog->globals`, applying tentative-definition
+// merging across files:
+//   * existing has_init=false + new has_init=false -> dedup.
+//   * existing has_init=false + new has_init=true  -> replace.
+//   * existing has_init=true  + new has_init=false -> drop new.
+//   * both has_init=true                           -> error.
+static void merge_push_global(P *p, Program *prog, Global g) {
+    for (size_t i = 0; i < prog->globals.size; i++) {
+        Global *ex = &prog->globals.data[i];
+        if (!str_eq(ex->name, g.name)) continue;
+        if (ex->type.kind != g.type.kind) {
+            perror_at(p, g.line,
+                str_lit("conflicting global declaration types"));
+            return;
+        }
+        if (!ex->has_init && g.has_init) {
+            *ex = g;        // tentative replaced by definition
+        } else if (ex->has_init && g.has_init) {
+            perror_at(p, g.line, str_lit("global redefinition"));
+        }
+        // tentative + tentative or definition + tentative: dedup.
+        return;
+    }
+    VecGlobal_push_back(p->arena, &prog->globals, g);
+}
+
+void tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks) {
     P p = {.arena = arena, .toks = toks.data, .n = toks.size, .i = 0,
            .typedefs = NULL, .enums = NULL};
     // Built-in typedefs (treated as TY_I64, signedness ignored).
@@ -1475,18 +1524,33 @@ Program *tinyc_parse(Arena *arena, VecTcTok toks) {
             p.typedefs = td;
         }
     }
-    Program *prog = arena_new(arena, Program);
-    *prog = (Program){0};
-    VecFuncPtr_reserve(arena, &prog->funcs, 4);
-    VecStructDefPtr_reserve(arena, &prog->structs, 4);
-    VecGlobal_reserve(arena, &prog->globals, 4);
+    if (prog->funcs.max == 0) {
+        VecFuncPtr_reserve(arena, &prog->funcs, 4);
+        VecStructDefPtr_reserve(arena, &prog->structs, 4);
+        VecGlobal_reserve(arena, &prog->globals, 4);
+    }
     while (cur(&p).kind != TC_TK_EOF) {
         // Top-level storage-class qualifiers are parser-noise.
         skip_storage_class(&p);
         if (cur(&p).kind == TC_TK_EOF) break;
         if (cur(&p).kind == TC_TK_KW_STRUCT && peek(&p, 2).kind == TC_TK_LBRACE) {
             StructDef *sd = parse_struct_def(&p);
-            VecStructDefPtr_push_back(arena, &prog->structs, sd);
+            // Dedup against existing struct of the same name (cross-file
+            // include of a shared header). Identical -> skip; mismatched
+            // -> diagnostic.
+            StructDef *existing_sd = NULL;
+            for (size_t i = 0; i < prog->structs.size; i++) {
+                if (str_eq(prog->structs.data[i]->name, sd->name)) {
+                    existing_sd = prog->structs.data[i];
+                    break;
+                }
+            }
+            if (!existing_sd) {
+                VecStructDefPtr_push_back(arena, &prog->structs, sd);
+            } else if (!struct_def_equal(existing_sd, sd)) {
+                perror_at(&p, sd->line,
+                    str_lit("conflicting redefinition of struct"));
+            }
             continue;
         }
         // Top-level enum body: `enum [Tag] { ... };`. Anything else that
@@ -1569,7 +1633,7 @@ Program *tinyc_parse(Arena *arena, VecTcTok toks) {
                 g.name = fnp_name;
                 g.type = tty;
                 g.line = cur(&p).line;
-                VecGlobal_push_back(arena, &prog->globals, g);
+                merge_push_global(&p, prog, g);
                 continue;
             }
             if (cur(&p).kind == TC_TK_IDENT) {
@@ -1618,7 +1682,7 @@ Program *tinyc_parse(Arena *arena, VecTcTok toks) {
                         }
                     }
                     expect(&p, TC_TK_SEMI, str_lit("expected ';' after global"));
-                    VecGlobal_push_back(arena, &prog->globals, g);
+                    merge_push_global(&p, prog, g);
                     continue;
                 }
             }
@@ -1666,5 +1730,4 @@ Program *tinyc_parse(Arena *arena, VecTcTok toks) {
         pe->next = prog->enums;
         prog->enums = pe;
     }
-    return prog;
 }

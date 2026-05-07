@@ -1,0 +1,12 @@
+// multi_global: a.tc forward-declares the global `counter` (extern),
+// b.tc provides the definition. The parser merges tentative+def into
+// the initialized definition.
+
+extern int counter;
+
+int main() {
+    print(counter);    // 10
+    counter = counter + 5;
+    print(counter);    // 15
+    return 0;
+}

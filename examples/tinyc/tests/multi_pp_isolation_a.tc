@@ -1,0 +1,7 @@
+// multi_pp_isolation: each input file is preprocessed independently.
+// The `#define X 1` in a.tc must NOT leak into b.tc, which has its
+// own `#define X 2`.
+
+#define X 1
+
+int get_a_x() { return X; }

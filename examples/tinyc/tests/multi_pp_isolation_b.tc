@@ -1,0 +1,9 @@
+#define X 2
+
+int get_b_x() { return X; }
+
+int main() {
+    print(get_a_x());  // 1 — value of X in a.tc
+    print(get_b_x());  // 2 — value of X in b.tc
+    return 0;
+}

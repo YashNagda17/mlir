@@ -428,6 +428,17 @@ string tinyc_preprocess(Arena *arena, string path,
 
 Program *tinyc_parse(Arena *arena, VecTcTok toks);
 
+// Multi-file: parse a single translation unit's tokens and APPEND its
+// declarations (funcs, globals, structs, enums) to an existing
+// Program. Cross-file deduplication is performed:
+//   * funcs: forward+def and dup forwards merge; two definitions error.
+//   * structs: same name with identical fields merges; mismatched errors.
+//   * globals: tentative + tentative merges; tentative + initialized
+//     keeps the initialized one; two initialized errors.
+// Each call has its own typedef / enumerator scope (matching per-file
+// preprocessor isolation): typedefs do not leak across files.
+void tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks);
+
 // ---------------- Emitter ----------------
 
 // Build a top-level MLIR module from `program`. The returned op handle

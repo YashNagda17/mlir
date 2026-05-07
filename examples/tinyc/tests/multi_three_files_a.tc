@@ -1,0 +1,9 @@
+int b_func(int x);
+int c_func(int x);
+
+int main() {
+    print(b_func(10));        // 20
+    print(c_func(10));        // 100
+    print(b_func(c_func(2))); // c_func(2)=4, b_func(4)=8
+    return 0;
+}

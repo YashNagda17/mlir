@@ -1,0 +1,5 @@
+#include "multi_struct_shared.h"
+
+int foo_sum(struct Foo s) {
+    return s.x + s.y;
+}

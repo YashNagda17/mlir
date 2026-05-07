@@ -1,0 +1,1 @@
+int c_func(int x) { return x * x; }

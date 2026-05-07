@@ -59,13 +59,19 @@ def main():
     for t in tests:
         name = t["name"]
         expected = t["expected_stdout"]
-        src = HERE / "tests" / f"{name}.tc"
+        # Multi-file tests pass `sources = [...]`; single-file tests
+        # default to `<name>.tc` for backwards compatibility.
+        sources = t.get("sources", [f"{name}.tc"])
+        srcs = [HERE / "tests" / s for s in sources]
         ll  = HERE / "tests" / f"{name}.ll"
         obj = HERE / "tests" / (f"{name}.obj" if IS_WIN else f"{name}.o")
         exe = HERE / "tests" / (f"{name}.exe" if IS_WIN else f"{name}.bin")
 
-        # Stage 1: emit LLVM IR
-        r = run([str(TINYC), "--emit=llvm", str(src)])
+        # Stage 1: emit LLVM IR. The driver accepts multiple input files
+        # and merges them into a single MLIR module.
+        # `-I tests` so multi-file tests can `#include "shared.h"`.
+        r = run([str(TINYC), "--emit=llvm", "-I", str(HERE / "tests"),
+                 *[str(s) for s in srcs]])
         if r.returncode != 0:
             print(f"FAIL {name}: tinyc returned {r.returncode}\nstderr:\n{r.stderr}\nstdout (first 200 chars):\n{r.stdout[:200]}")
             failures += 1

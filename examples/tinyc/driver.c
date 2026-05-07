@@ -1,4 +1,5 @@
-// tinyC driver — read .tc file, lex/parse/emit MLIR, print to stdout.
+// tinyC driver — read one or more .tc files, lex/parse/emit a single
+// MLIR module, print to stdout (or to -o <path>).
 
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +14,21 @@
 
 extern string read_file_ok(Arena *arena, string path);
 
+static int write_string_to_file(string out, const char *path) {
+    size_t plen = 0; while (path[plen]) plen++;
+    platform_fd_t fd = platform_path_open(path, plen,
+        PLATFORM_RIGHTS_WRITE, PLATFORM_O_CREAT | PLATFORM_O_TRUNC);
+    if (fd < 0) return 1;
+    ciovec_t iovs[2];
+    iovs[0].buf = out.str;
+    iovs[0].buf_len = out.size;
+    iovs[1].buf = "\n";
+    iovs[1].buf_len = 1;
+    uint32_t werr = write_all(fd, iovs, 2);
+    platform_fd_close(fd);
+    return werr ? 1 : 0;
+}
+
 int app_main(void) {
     size_t pargc = 0, argv_buf_size = 0;
     int rc = platform_args_sizes_get(&pargc, &argv_buf_size);
@@ -26,9 +42,14 @@ int app_main(void) {
 
     typedef string (*PrintFn)(MLIR_Context *, MLIR_OpHandle);
     PrintFn print_fn = MLIR_PrintOperationUpstream;
-    char *input_file = NULL;
     bool emit_llvm = false;
     bool emit_lowered = false;
+    char *output_file = NULL;
+
+    // Multiple positional input files (multi-file compilation merges them
+    // into a single Program / single MLIR module).
+    char **input_files = arena_new_array(boot_arena, char *, argc + 1);
+    size_t n_input_files = 0;
 
     // -I include directories (repeatable). Allocated in boot_arena.
     string *include_dirs = arena_new_array(boot_arena, string, argc + 1);
@@ -42,11 +63,17 @@ int app_main(void) {
             include_dirs[n_include_dirs++] = str_from_cstr_view(argv[i] + 2);
         } else if (strcmp(argv[i], "-I") == 0 && i + 1 < argc) {
             include_dirs[n_include_dirs++] = str_from_cstr_view(argv[++i]);
-        } else if (argv[i][0] != '-') input_file = argv[i];
+        } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+            output_file = argv[++i];
+        } else if (strncmp(argv[i], "-o", 2) == 0 && argv[i][2] != '\0') {
+            output_file = argv[i] + 2;
+        } else if (argv[i][0] != '-') {
+            input_files[n_input_files++] = argv[i];
+        }
     }
 
-    if (!input_file) {
-        println(str_lit("usage: tinyc [--emit=mlir|lowered|llvm] [-I dir ...] FILE.tc"));
+    if (n_input_files == 0) {
+        println(str_lit("usage: tinyc [--emit=mlir|lowered|llvm] [-I dir ...] [-o OUT] FILE.tc [FILE2.tc ...]"));
         arena_destroy(boot_arena);
         return 1;
     }
@@ -55,11 +82,19 @@ int app_main(void) {
     MLIR_Context ctx = {0};
     MLIR_SetArenaAllocator(&ctx, arena);
 
-    string src = tinyc_preprocess(arena, str_from_cstr_view(input_file),
-                                  include_dirs, n_include_dirs);
-    if (src.size > 0 && src.str[src.size - 1] == '\0') src.size -= 1;
-    VecTcTok toks = tinyc_lex(arena, src);
-    Program *prog = tinyc_parse(arena, toks);
+    // Per-file preprocess + lex + parse-into accumulating Program. The
+    // preprocessor is per-file (so #define / #pragma once do NOT leak
+    // across files); -I dirs are shared. Cross-file func / global /
+    // struct dedup happens inside tinyc_parse_into.
+    Program *prog = arena_new(arena, Program);
+    *prog = (Program){0};
+    for (size_t k = 0; k < n_input_files; k++) {
+        string src = tinyc_preprocess(arena, str_from_cstr_view(input_files[k]),
+                                      include_dirs, n_include_dirs);
+        if (src.size > 0 && src.str[src.size - 1] == '\0') src.size -= 1;
+        VecTcTok toks = tinyc_lex(arena, src);
+        tinyc_parse_into(arena, prog, toks);
+    }
     MLIR_OpHandle module = tinyc_emit_module(&ctx, prog);
 
     if (emit_lowered || emit_llvm) {
@@ -69,19 +104,25 @@ int app_main(void) {
             return 1;
         }
     }
+    string out;
     if (emit_llvm) {
-        string ll = MLIR_TranslateModuleToLLVMIR(&ctx, module);
-        if (ll.size == 0) {
+        out = MLIR_TranslateModuleToLLVMIR(&ctx, module);
+        if (out.size == 0) {
             arena_destroy(arena);
             arena_destroy(boot_arena);
             return 1;
         }
-        println(str_lit("{}"), ll);
     } else {
-        println(str_lit("{}"), print_fn(&ctx, module));
+        out = print_fn(&ctx, module);
+    }
+    int wrc = 0;
+    if (output_file) {
+        wrc = write_string_to_file(out, output_file);
+    } else {
+        println(str_lit("{}"), out);
     }
 
     arena_destroy(arena);
     arena_destroy(boot_arena);
-    return 0;
+    return wrc;
 }
