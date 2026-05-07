@@ -2558,8 +2558,23 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                             n = sd->fields.size;
                         }
                         for (size_t i = 0; i < n; i++) {
-                            Type ft = sd->fields.data[i].type;
-                            int32_t path[2] = {0, (int32_t)i};
+                            // Map positional or designated initializer
+                            // entry to the target field index. For
+                            // designated entries (.fname = v), look up
+                            // fname in the struct's field list.
+                            int fidx = (int)i;
+                            if (st->decl_init->compound_field_names) {
+                                string fname = st->decl_init->compound_field_names[i];
+                                if (fname.size != 0) {
+                                    fidx = struct_field_index(sd, fname);
+                                    if (fidx < 0) {
+                                        EMIT_ERR(e, "unknown struct field {} in initializer", fname);
+                                        continue;
+                                    }
+                                }
+                            }
+                            Type ft = sd->fields.data[fidx].type;
+                            int32_t path[2] = {0, (int32_t)fidx};
                             MLIR_ValueHandle p = emit_gep(
                                 e, sy->addr, st_ty, path, 2, NULL, 0);
                             EVal v = emit_expr(

@@ -211,6 +211,11 @@ struct Expr {
     // case the emitter infers the type from the expression.
     Type cast_type;
     bool sizeof_is_expr;
+    // For EX_COMPOUND with designated initializers: parallel to `args`.
+    // compound_field_names[i].size == 0 indicates a positional entry; a
+    // non-empty name selects the named field. NULL when there are no
+    // designated entries at all.
+    string *compound_field_names;
     int line;
 };
 

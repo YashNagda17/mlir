@@ -90,6 +90,57 @@ static bool try_parse_fnptr_suffix(P *p, Type *ty, string *out_name);
 static void parse_enum_decl_top(P *p);
 static void parse_enum_body(P *p);
 
+// Aggregate initializer: `{ v0, v1, ... }` or `{ .f1 = v0, .f2 = v1, ... }`.
+// Builds an EX_COMPOUND whose cast_type is the decl's type (struct or
+// array). Caller has already consumed the `=` token. Returns NULL when
+// the next token is not `{` (caller should fall back to parse_expr).
+static Expr *parse_aggregate_init(P *p, Type decl_type) {
+    if (cur(p).kind != TC_TK_LBRACE) return NULL;
+    int line = cur(p).line;
+    p->i++;  // '{'
+    Expr *e = new_expr(p, EX_COMPOUND, line);
+    e->cast_type = decl_type;
+    // Collect (name, value) pairs in a temporary array; allocate the
+    // parallel name array once at the end.
+    string *names = NULL;
+    size_t nn = 0, cap = 0;
+    bool any_designated = false;
+    if (cur(p).kind != TC_TK_RBRACE) {
+        for (;;) {
+            string fname = (string){0};
+            if (cur(p).kind == TC_TK_DOT) {
+                p->i++;
+                TcTok ft = cur(p);
+                expect(p, TC_TK_IDENT, str_lit("expected field name after '.'"));
+                expect(p, TC_TK_ASSIGN, str_lit("expected '=' in designated initializer"));
+                fname = ft.text;
+                any_designated = true;
+            }
+            Expr *v = parse_expr(p);
+            VecExprPtr_push_back(p->arena, &e->args, v);
+            if (nn == cap) {
+                size_t ncap = cap ? cap * 2 : 4;
+                string *nb = arena_new_array(p->arena, string, ncap);
+                for (size_t k = 0; k < nn; k++) nb[k] = names[k];
+                names = nb; cap = ncap;
+            }
+            names[nn++] = fname;
+            if (cur(p).kind == TC_TK_COMMA) {
+                p->i++;
+                if (cur(p).kind == TC_TK_RBRACE) break;
+                continue;
+            }
+            break;
+        }
+    }
+    expect(p, TC_TK_RBRACE, str_lit("expected '}' in initializer"));
+    if (any_designated) {
+        e->compound_field_names = names;
+    }
+    return e;
+}
+
+
 // `const` is accepted as a parser-level qualifier and silently dropped:
 // it does not affect any AST type. Skipped before a base type, after `*`
 // in pointer declarators, and (via these helpers) wherever a type can
@@ -703,7 +754,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
             }
         }
         if (accept(p, TC_TK_ASSIGN)) {
-            s->decl_init = parse_expr(p);
+            { Expr *agg = parse_aggregate_init(p, s->decl_type); s->decl_init = agg ? agg : parse_expr(p); }
         }
         if (require_semi) expect(p, TC_TK_SEMI, str_lit("expected ';'"));
         return s;
@@ -748,7 +799,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
                 s->decl_type.kind != TY_STRUCT) {
                 perror_at(p, line, str_lit("struct/array initializers are not supported"));
             }
-            s->decl_init = parse_expr(p);
+            { Expr *agg = parse_aggregate_init(p, s->decl_type); s->decl_init = agg ? agg : parse_expr(p); }
         }
         if (require_semi) expect(p, TC_TK_SEMI, str_lit("expected ';'"));
         return s;
@@ -779,7 +830,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
         }
         s->decl_name = nm;
         if (accept(p, TC_TK_ASSIGN)) {
-            s->decl_init = parse_expr(p);
+            { Expr *agg = parse_aggregate_init(p, s->decl_type); s->decl_init = agg ? agg : parse_expr(p); }
         }
         if (require_semi) expect(p, TC_TK_SEMI, str_lit("expected ';'"));
         return s;
@@ -830,7 +881,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
         }
     }
     if (accept(p, TC_TK_ASSIGN)) {
-        s->decl_init = parse_expr(p);
+        { Expr *agg = parse_aggregate_init(p, s->decl_type); s->decl_init = agg ? agg : parse_expr(p); }
     }
     if (require_semi) expect(p, TC_TK_SEMI, str_lit("expected ';'"));
     return s;
@@ -1409,7 +1460,9 @@ static StructDef *parse_struct_def(P *p) {
                 continue;
             }
             ft.kind = k;
-            // Optional pointer suffix on base types.
+            // Optional pointer suffix on base types: `T *` (single) or
+            // `T **` (pointer-to-pointer). The `**` form wraps the
+            // single-level pointer kind into a TY_PTR_PTR.
             if (accept(p, TC_TK_STAR)) {
                 is_ptr = true;
                 if (was_char) ft.kind = TY_PTR_CHAR;
@@ -1418,6 +1471,13 @@ static StructDef *parse_struct_def(P *p) {
                 else if (k == TY_VOID) ft.kind = TY_PTR_VOID;
                 else {
                     perror_at(p, cur(p).line, str_lit("only int*/char*/void* pointer fields are supported"));
+                }
+                if (accept(p, TC_TK_STAR)) {
+                    Type *inner = arena_new(p->arena, Type);
+                    *inner = ft;
+                    ft = (Type){0};
+                    ft.kind = TY_PTR_PTR;
+                    ft.pointee = inner;
                 }
             } else if (k == TY_VOID) {
                 perror_at(p, cur(p).line, str_lit("'void' is not a valid struct field type"));
