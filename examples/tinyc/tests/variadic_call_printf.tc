@@ -1,0 +1,10 @@
+// Call libc printf via a variadic forward declaration. The forward decl
+// must keep its variadic flag end-to-end (parser, signatures, llvm.func
+// extern decl, llvm.call with var_callee_type).
+extern int printf(const char *fmt, ...);
+
+int main() {
+    printf("%d %d %d\n", 1, 2, 3);
+    printf("%s = %d\n", "answer", 42);
+    return 0;
+}

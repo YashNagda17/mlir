@@ -736,6 +736,23 @@ MLIR_TypeHandle MLIR_CreateTypeLLVMArray(MLIR_Context *ctx, MLIR_TypeHandle elem
     return alloc_type(ctx, t);
 }
 
+MLIR_TypeHandle MLIR_CreateTypeLLVMFunction(MLIR_Context *ctx,
+                                             MLIR_TypeHandle result,
+                                             const MLIR_TypeHandle *inputs,
+                                             size_t n_inputs,
+                                             bool is_var_arg) {
+    IR_Type t = {0};
+    t.kind = TYPE_KIND_OPAQUE;
+    (void)result; (void)inputs; (void)n_inputs; (void)is_var_arg;
+    return alloc_type(ctx, t);
+}
+
+MLIR_TypeHandle MLIR_CreateTypeLLVMVoid(MLIR_Context *ctx) {
+    IR_Type t = {0};
+    t.kind = TYPE_KIND_OPAQUE;
+    return alloc_type(ctx, t);
+}
+
 // LLVM-dialect global helpers — not implemented natively. These features
 // (string literals / module-scope globals) are exercised only via the
 // upstream backend in tinyc.

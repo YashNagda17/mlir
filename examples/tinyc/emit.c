@@ -90,11 +90,17 @@ typedef struct FuncSig {
     SlotInfo      *params;
     size_t         n_params;
     bool           sret;             // struct return -> hidden first ptr param
+    bool           is_variadic;      // C `f(T, ...)` — emitted as `llvm.func`
+                                     // and called via `llvm.call` with a
+                                     // `var_callee_type` attribute.
     MLIR_TypeHandle *flat_in_tys;    // including sret arg if sret
     size_t         n_flat_in;
     MLIR_TypeHandle *flat_out_tys;   // 0 if void/sret, 1 otherwise
     size_t         n_flat_out;
-    MLIR_TypeHandle fn_ty;
+    MLIR_TypeHandle fn_ty;           // FunctionType (non-variadic) or
+                                     // LLVMFunctionType (variadic).
+    MLIR_TypeHandle llvm_fn_ty;      // LLVMFunctionType — only set for
+                                     // variadic; used as `var_callee_type`.
 } FuncSig;
 
 typedef struct StructTypeEntry {
@@ -136,6 +142,7 @@ typedef struct {
     MLIR_BlockHandle module_block;
     Sym             *globals;        // module-scope symbols
     bool             use_print_str;  // emit @printStr extern decl
+    bool             need_va_arg_helpers;  // emit tinyc_va_arg_* externs
     int              cur_line;       // last AST node line entered; used by
                                      // EMIT_ERR for diagnostic line numbers.
 } E;
@@ -234,6 +241,20 @@ static MLIR_OpHandle emit_op(E *e,
                                      str_lit(""), -1);
     if (e->cur_block) MLIR_AppendBlockOp(e->ctx, e->cur_block, op);
     return op;
+}
+
+// Emit a function-return op. The right op depends on the surrounding
+// function dialect: variadic functions are emitted as `llvm.func`, all
+// others as `func.func`. Number of operands is 0 (void/sret returns) or 1
+// (scalar/pointer return). LLVMReturnOp accepts at most one operand.
+static void emit_return_op(E *e, MLIR_ValueHandle *ops, size_t n_ops) {
+    if (e->cur_sig && e->cur_sig->is_variadic) {
+        emit_op(e, OP_TYPE_LLVM_RETURN, str_lit("llvm.return"),
+                NULL, 0, NULL, 0, ops, n_ops, NULL, 0, NULL, 0);
+    } else {
+        emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
+                NULL, 0, NULL, 0, ops, n_ops, NULL, 0, NULL, 0);
+    }
 }
 
 static void emit_branch(E *e, MLIR_BlockHandle target) {
@@ -1159,18 +1180,29 @@ static void emit_struct_copy(E *e, MLIR_ValueHandle dst, MLIR_ValueHandle src, S
     emit_struct_copy_path(e, dst, src, st, sd, prefix, 1);
 }
 
-// Emit a func.call. For struct-returning functions a hidden first sret
-// !llvm.ptr operand is prepended; the function returns void; out_results[0]
-// (if non-NULL) is set to that sret pointer (so callers can copy from it).
-// If out_sret_buf is non-INVALID, that ptr is used as the sret buffer
-// instead of allocating a fresh one.
+// Emit a func.call (non-variadic) or llvm.call (variadic). For
+// struct-returning functions a hidden first sret !llvm.ptr operand is
+// prepended; the function returns void; out_results[0] (if non-NULL) is
+// set to that sret pointer. If out_sret_buf is non-INVALID, that ptr is
+// used as the sret buffer instead of allocating a fresh one.
+//
+// For variadic callees the operand list may have MORE entries than
+// sig->n_params; trailing args are appended verbatim (with the standard C
+// promotion of f32 to f64 — currently rejected with a clear error since
+// tinyC has no double type).
 static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
                            MLIR_ValueHandle *out_results,
                            MLIR_ValueHandle out_sret_buf) {
-    if (args.size != sig->n_params) {
+    if (!sig->is_variadic && args.size != sig->n_params) {
         EMIT_ERR(e, "call to {} arity mismatch", sig->name);
     }
-    size_t n_in = sig->n_flat_in;
+    if (sig->is_variadic && args.size < sig->n_params) {
+        EMIT_ERR(e, "call to variadic {} requires at least {} fixed arg(s)",
+                 sig->name, (int64_t)sig->n_params);
+    }
+    size_t n_fixed = sig->n_flat_in;
+    size_t n_extra = sig->is_variadic ? (args.size - sig->n_params) : 0;
+    size_t n_in = n_fixed + n_extra;
     MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, n_in ? n_in : 1);
     size_t op_off = 0;
     MLIR_ValueHandle ret_buf = MLIR_INVALID_HANDLE;
@@ -1208,6 +1240,17 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
             ops[op_off++] = coerce_eval(e, v, scalar_mlir_type(e, p->type.kind));
         }
     }
+    // Variadic-portion arguments: pass-through with no implicit conversion.
+    // f32 is intentionally rejected (C requires float→double promotion and
+    // tinyC has no double type yet).
+    for (size_t i = sig->n_params; i < args.size; i++) {
+        EVal v = emit_expr(e, sc, args.data[i]);
+        if (v.is_float) {
+            EMIT_ERR(e, "passing float through ... is not supported "
+                        "(no double type in tinyC)");
+        }
+        ops[op_off++] = v.val;
+    }
     size_t n_out = sig->n_flat_out;
     MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, n_out ? n_out : 1);
     MLIR_ValueHandle *rs  = arena_new_array(e->arena, MLIR_ValueHandle, n_out ? n_out : 1);
@@ -1218,10 +1261,19 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
     }
     MLIR_AttributeHandle callee_attr = MLIR_CreateAttributeSymbolRef(
         e->ctx, str_lit("callee"), sig->name);
-    MLIR_AttributeHandle *as = arena_new_array(e->arena, MLIR_AttributeHandle, 1);
-    as[0] = callee_attr;
-    emit_op(e, OP_TYPE_FUNC_CALL, str_lit("func.call"),
-            rts, n_out, rs, n_out, ops, op_off, as, 1, NULL, 0);
+    if (sig->is_variadic) {
+        MLIR_AttributeHandle var_ty = MLIR_CreateAttributeType(
+            e->ctx, str_lit("var_callee_type"), sig->llvm_fn_ty);
+        MLIR_AttributeHandle *as = arena_new_array(e->arena, MLIR_AttributeHandle, 2);
+        as[0] = callee_attr; as[1] = var_ty;
+        emit_op(e, OP_TYPE_UNREGISTERED, str_lit("llvm.call"),
+                rts, n_out, rs, n_out, ops, op_off, as, 2, NULL, 0);
+    } else {
+        MLIR_AttributeHandle *as = arena_new_array(e->arena, MLIR_AttributeHandle, 1);
+        as[0] = callee_attr;
+        emit_op(e, OP_TYPE_FUNC_CALL, str_lit("func.call"),
+                rts, n_out, rs, n_out, ops, op_off, as, 1, NULL, 0);
+    }
     if (out_results) {
         if (sig->sret) out_results[0] = ret_buf;
         else for (size_t i = 0; i < n_out; i++) out_results[i] = rs[i];
@@ -1339,6 +1391,60 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             r.val = emit_const_f32(e, ex->float_value); r.is_float = true; return r;
         case EX_NULL:
             r.val = emit_null_ptr(e); r.is_ptr = true; r.sdef = NULL; return r;
+        case EX_VA_ARG: {
+            // MLIR's LLVM dialect does not expose a `va_arg` op (only the
+            // start/end/copy intrinsics) — and clang traditionally lowers
+            // va_arg manually because its IR variant is buggy on x86_64.
+            // We side-step both problems by calling small runtime helpers
+            // (defined in runtime.c) that wrap stdarg.h; the helpers
+            // receive a !llvm.ptr to our 32-byte va_list buffer.
+            if (!ex->lhs || ex->lhs->kind != EX_VAR) {
+                EMIT_ERR(e, "va_arg first argument must be a va_list variable");
+                r.val = emit_const_i32(e, 0); return r;
+            }
+            Sym *sy = lookup(e, sc, ex->lhs->name);
+            if (!sy || sy->type.kind != TY_VA_LIST) {
+                EMIT_ERR(e, "va_arg first argument must be of type va_list");
+                r.val = emit_const_i32(e, 0); return r;
+            }
+            TypeKind tk = ex->cast_type.kind;
+            string helper;
+            MLIR_TypeHandle rt;
+            switch (tk) {
+                case TY_I32:        helper = str_lit("tinyc_va_arg_i32"); rt = e->i32; break;
+                case TY_I64:        helper = str_lit("tinyc_va_arg_i64"); rt = e->i64; break;
+                case TY_PTR_CHAR:
+                case TY_PTR_VOID:
+                case TY_PTR_I32:
+                case TY_PTR_STRUCT:
+                case TY_PTR_PTR:    helper = str_lit("tinyc_va_arg_ptr"); rt = e->ptr; break;
+                default:
+                    EMIT_ERR(e, "va_arg only supports int, long, and pointer types");
+                    r.val = emit_const_i32(e, 0); return r;
+            }
+            MLIR_ValueHandle ap_ptr = sym_addr(e, sy);
+            MLIR_ValueHandle res = MLIR_CreateValueOpResult(
+                e->ctx, MLIR_INVALID_HANDLE, 0, rt, ssa_name(e), eloc(e, 0));
+            MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = rt;
+            MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = res;
+            MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = ap_ptr;
+            MLIR_AttributeHandle ca = MLIR_CreateAttributeSymbolRef(
+                e->ctx, str_lit("callee"), helper);
+            MLIR_AttributeHandle *as = arena_new_array(e->arena, MLIR_AttributeHandle, 1);
+            as[0] = ca;
+            emit_op(e, OP_TYPE_FUNC_CALL, str_lit("func.call"),
+                    rts, 1, rs, 1, ops, 1, as, 1, NULL, 0);
+            // Mark the helper as needed so that we emit its extern decl at
+            // module scope.
+            e->need_va_arg_helpers = true;
+            r.val = res;
+            r.is_i64 = (tk == TY_I64);
+            r.is_ptr = (tk == TY_PTR_CHAR || tk == TY_PTR_VOID || tk == TY_PTR_I32
+                        || tk == TY_PTR_STRUCT || tk == TY_PTR_PTR);
+            r.is_str = (tk == TY_PTR_CHAR);
+            r.is_void_ptr = (tk == TY_PTR_VOID);
+            return r;
+        }
         case EX_STR: {
             // String literal: emit a !llvm.ptr to a deduplicated
             // module-level llvm.mlir.global string buffer.
@@ -1927,10 +2033,61 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 indirect_fnty = cv.fnptr_ty;
                 indirect_callee_ptr = cv.val;
             }
+            // Built-in va_start/va_end/va_copy: lower to LLVM intrinsics
+            // operating on the !llvm.ptr that backs the va_list buffer.
+            // The first argument must be a va_list lvalue; we take its
+            // address (the alloca pointer) directly.
+            if (!indirect_fnty && (str_eq(ex->callee, str_lit("va_start"))
+                                 || str_eq(ex->callee, str_lit("va_end"))
+                                 || str_eq(ex->callee, str_lit("va_copy")))) {
+                bool is_start = str_eq(ex->callee, str_lit("va_start"));
+                bool is_copy  = str_eq(ex->callee, str_lit("va_copy"));
+                size_t expected = is_start ? 2 : (is_copy ? 2 : 1);
+                if (ex->args.size != expected) {
+                    EMIT_ERR(e, "{} expects {} argument(s)", ex->callee, (int64_t)expected);
+                    r.val = emit_const_i32(e, 0); return r;
+                }
+                Expr *ap = ex->args.data[0];
+                if (ap->kind != EX_VAR) {
+                    EMIT_ERR(e, "{} first argument must be a va_list variable", ex->callee);
+                    r.val = emit_const_i32(e, 0); return r;
+                }
+                Sym *sy = lookup(e, sc, ap->name);
+                if (!sy || sy->type.kind != TY_VA_LIST) {
+                    EMIT_ERR(e, "{} first argument must be of type va_list", ex->callee);
+                    r.val = emit_const_i32(e, 0); return r;
+                }
+                MLIR_ValueHandle ap_ptr = sym_addr(e, sy);
+                if (is_copy) {
+                    Expr *src = ex->args.data[1];
+                    if (src->kind != EX_VAR) {
+                        EMIT_ERR(e, "va_copy second argument must be a va_list variable");
+                        r.val = emit_const_i32(e, 0); return r;
+                    }
+                    Sym *ssy = lookup(e, sc, src->name);
+                    if (!ssy || ssy->type.kind != TY_VA_LIST) {
+                        EMIT_ERR(e, "va_copy second argument must be of type va_list");
+                        r.val = emit_const_i32(e, 0); return r;
+                    }
+                    MLIR_ValueHandle src_ptr = sym_addr(e, ssy);
+                    MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 2);
+                    ops[0] = ap_ptr; ops[1] = src_ptr;
+                    emit_op(e, OP_TYPE_UNREGISTERED, str_lit("llvm.intr.vacopy"),
+                            NULL, 0, NULL, 0, ops, 2, NULL, 0, NULL, 0);
+                } else {
+                    MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1);
+                    ops[0] = ap_ptr;
+                    string opname = is_start ? str_lit("llvm.intr.vastart")
+                                             : str_lit("llvm.intr.vaend");
+                    emit_op(e, OP_TYPE_UNREGISTERED, opname,
+                            NULL, 0, NULL, 0, ops, 1, NULL, 0, NULL, 0);
+                }
+                r.val = emit_const_i32(e, 0);
+                return r;
+            }
             // Built-in malloc(size) -> !llvm.ptr; size is i32 (typically
             // sizeof), extended to i64 for the libc signature.
-            if (!indirect_fnty && str_eq(ex->callee, str_lit("malloc"))) {
-                if (ex->args.size != 1) {
+            if (!indirect_fnty && str_eq(ex->callee, str_lit("malloc"))) {                if (ex->args.size != 1) {
                     EMIT_ERR(e, "malloc expects 1 argument");
                     r.val = emit_null_ptr(e); r.is_ptr = true; return r;
                 }
@@ -2216,6 +2373,16 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             sy->name = st->decl_name;
             sy->type = st->decl_type;
 
+            if (st->decl_type.kind == TY_VA_LIST) {
+                // Allocate a 32-byte buffer (sufficient for x86_64-SysV
+                // and aarch64 va_list layouts on Linux/macOS/Windows). We
+                // hand out the pointer; va_start/va_arg/va_end consume it.
+                MLIR_TypeHandle buf_ty = MLIR_CreateTypeLLVMArray(e->ctx, e->i8, 32);
+                sy->addr = emit_alloca(e, buf_ty);
+                sy->next = sc->head;
+                sc->head = sy;
+                break;
+            }
             if (st->decl_type.kind == TY_PTR_I32 || st->decl_type.kind == TY_PTR_VOID ||
                 st->decl_type.kind == TY_PTR_PTR) {
                 sy->addr = emit_alloca(e, e->ptr);
@@ -2381,15 +2548,13 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 if (st->expr) {
                     EMIT_ERR(e, "void function cannot return a value");
                 }
-                emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
-                        NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+                emit_return_op(e, NULL, 0);
                 e->terminated = true;
                 return;
             }
             if (!st->expr) {
                 EMIT_ERR(e, "non-void function requires a return value");
-                emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
-                        NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+                emit_return_op(e, NULL, 0);
                 e->terminated = true;
                 return;
             }
@@ -2413,8 +2578,7 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 } else {
                     EMIT_ERR(e, "struct return must be a variable or struct call");
                 }
-                emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
-                        NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+                emit_return_op(e, NULL, 0);
                 e->terminated = true;
                 return;
             }
@@ -2441,8 +2605,7 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 ret_v = coerce_eval(e, v, want_ty);
             }
             MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = ret_v;
-            emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
-                    NULL, 0, NULL, 0, ops, 1, NULL, 0, NULL, 0);
+            emit_return_op(e, ops, 1);
             e->terminated = true;
             return;
         }
@@ -2684,6 +2847,7 @@ static void build_signatures(E *e) {
         *sig = (FuncSig){0};
         sig->name = f->name;
         sig->func = f;
+        sig->is_variadic = f->is_variadic;
         slot_resolve(e, f->return_type, &sig->ret);
         sig->n_params = f->params.size;
         sig->params = arena_new_array(e->arena, SlotInfo, sig->n_params ? sig->n_params : 1);
@@ -2691,6 +2855,9 @@ static void build_signatures(E *e) {
             slot_resolve(e, f->params.data[i].type, &sig->params[i]);
         }
         sig->sret = (sig->ret.type.kind == TY_STRUCT);
+        if (sig->is_variadic && sig->sret) {
+            EMIT_ERR(e, "variadic function {} cannot return a struct", f->name);
+        }
         bool is_void = (sig->ret.type.kind == TY_VOID);
         size_t in_total = sig->n_params + (sig->sret ? 1 : 0);
         size_t out_total = (sig->sret || is_void) ? 0 : 1;
@@ -2710,6 +2877,15 @@ static void build_signatures(E *e) {
         }
         sig->fn_ty = MLIR_CreateTypeFunction(e->ctx,
             sig->flat_in_tys, sig->n_flat_in, sig->flat_out_tys, sig->n_flat_out);
+        if (sig->is_variadic) {
+            // LLVMFunctionType has at most one result; "void" is represented
+            // by the LLVM void type rather than a 0-result tuple.
+            MLIR_TypeHandle ret_ty = (sig->n_flat_out == 1)
+                ? sig->flat_out_tys[0]
+                : MLIR_CreateTypeLLVMVoid(e->ctx);
+            sig->llvm_fn_ty = MLIR_CreateTypeLLVMFunction(e->ctx,
+                ret_ty, sig->flat_in_tys, sig->n_flat_in, /*is_var_arg=*/true);
+        }
     }
 }
 
@@ -2783,14 +2959,15 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
     emit_block(e, &sc, f->body);
     if (!e->terminated) {
         if (sig->sret || sig->ret.type.kind == TY_VOID) {
-            emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
-                    NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+            emit_return_op(e, NULL, 0);
         } else {
             MLIR_TypeHandle ty = sig->flat_out_tys[0];
-            MLIR_ValueHandle v = (ty == e->f32) ? emit_const_f32(e, 0.0) : emit_const_i32(e, 0);
+            MLIR_ValueHandle v = (ty == e->f32) ? emit_const_f32(e, 0.0)
+                : (ty == e->i64) ? emit_const_i64(e, 0)
+                : (ty == e->ptr) ? emit_null_ptr(e)
+                : emit_const_i32(e, 0);
             MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = v;
-            emit_op(e, OP_TYPE_FUNC_RETURN, str_lit("func.return"),
-                    NULL, 0, NULL, 0, ops, 1, NULL, 0, NULL, 0);
+            emit_return_op(e, ops, 1);
         }
         e->terminated = true;
     }
@@ -2800,14 +2977,26 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
     e->cur_sret_ptr = saved_sret;
 
     MLIR_AttributeHandle sym_name = MLIR_CreateAttributeString(e->ctx, str_lit("sym_name"), f->name);
-    MLIR_AttributeHandle fn_ty_attr = MLIR_CreateAttributeType(e->ctx, str_lit("function_type"), sig->fn_ty);
+    // Variadic functions are emitted as `llvm.func` with an LLVMFunctionType
+    // attribute (which carries the var_arg flag); non-variadic ones stay as
+    // `func.func` with a regular FunctionType.
+    MLIR_TypeHandle ft = sig->is_variadic ? sig->llvm_fn_ty : sig->fn_ty;
+    MLIR_AttributeHandle fn_ty_attr = MLIR_CreateAttributeType(e->ctx, str_lit("function_type"), ft);
     MLIR_AttributeHandle *attrs = arena_new_array(e->arena, MLIR_AttributeHandle, 2);
     attrs[0] = sym_name; attrs[1] = fn_ty_attr;
     MLIR_RegionHandle *regs = arena_new_array(e->arena, MLIR_RegionHandle, 1); regs[0] = body_r;
-    MLIR_OpHandle fn = MLIR_CreateOp(e->ctx, OP_TYPE_FUNC_FUNC, str_lit("func.func"),
-                                     attrs, 2, NULL, 0, NULL, 0, NULL, 0,
-                                     regs, 1, eloc(e, 0), MLIR_INVALID_HANDLE,
-                                     str_lit(""), -1);
+    MLIR_OpHandle fn;
+    if (sig->is_variadic) {
+        fn = MLIR_CreateOp(e->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.func"),
+                           attrs, 2, NULL, 0, NULL, 0, NULL, 0,
+                           regs, 1, eloc(e, 0), MLIR_INVALID_HANDLE,
+                           str_lit(""), -1);
+    } else {
+        fn = MLIR_CreateOp(e->ctx, OP_TYPE_FUNC_FUNC, str_lit("func.func"),
+                           attrs, 2, NULL, 0, NULL, 0, NULL, 0,
+                           regs, 1, eloc(e, 0), MLIR_INVALID_HANDLE,
+                           str_lit(""), -1);
+    }
     return fn;
 }
 
@@ -3175,6 +3364,40 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
         MLIR_AppendBlockOp(ctx, mb, fn);
     }
 
+    // Emit extern declarations for any forward-declared functions that
+    // never received a definition. Without these, `func.call` / `llvm.call`
+    // ops referring to them would fail symbol verification. Variadic decls
+    // become `llvm.func` (so the variadic flag is preserved); non-variadic
+    // ones use `func.func` matching the existing malloc/free pattern.
+    for (size_t i = 0; i < program->funcs.size; i++) {
+        Func *fwd = program->funcs.data[i];
+        if (!fwd->is_forward) continue;
+        FuncSig *sig = NULL;
+        for (size_t j = 0; j < e.n_sigs; j++) {
+            if (str_eq(e.sigs[j].name, fwd->name)) { sig = &e.sigs[j]; break; }
+        }
+        if (!sig) continue;
+        MLIR_AttributeHandle a0 = MLIR_CreateAttributeString(ctx, str_lit("sym_name"), fwd->name);
+        MLIR_TypeHandle ft = sig->is_variadic ? sig->llvm_fn_ty : sig->fn_ty;
+        MLIR_AttributeHandle a1 = MLIR_CreateAttributeType(ctx, str_lit("function_type"), ft);
+        MLIR_AttributeHandle a2 = MLIR_CreateAttributeString(ctx, str_lit("sym_visibility"), str_lit("private"));
+        MLIR_AttributeHandle *attrs = arena_new_array(arena, MLIR_AttributeHandle, 3);
+        attrs[0] = a0; attrs[1] = a1; attrs[2] = a2;
+        MLIR_RegionHandle body = MLIR_CreateRegion(ctx);
+        MLIR_RegionHandle *regs = arena_new_array(arena, MLIR_RegionHandle, 1); regs[0] = body;
+        MLIR_OpHandle decl;
+        if (sig->is_variadic) {
+            decl = MLIR_CreateOp(ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.func"),
+                                 attrs, 3, NULL, 0, NULL, 0, NULL, 0,
+                                 regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+        } else {
+            decl = MLIR_CreateOp(ctx, OP_TYPE_FUNC_FUNC, str_lit("func.func"),
+                                 attrs, 3, NULL, 0, NULL, 0, NULL, 0,
+                                 regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+        }
+        MLIR_AppendBlockOp(ctx, mb, decl);
+    }
+
     // Always emit `malloc`/`free` extern declarations at module scope so
     // that user code calling them links against libc.
     {
@@ -3207,6 +3430,32 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
                                            attrs, 3, NULL, 0, NULL, 0, NULL, 0,
                                            regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
         MLIR_AppendBlockOp(ctx, mb, decl);
+    }
+
+    // tinyc_va_arg_* helpers (defined in runtime.c) — emitted on demand
+    // when the user code uses va_arg.
+    if (e.need_va_arg_helpers) {
+        struct { string name; MLIR_TypeHandle ret; } helpers[] = {
+            { str_lit("tinyc_va_arg_i32"), e.i32 },
+            { str_lit("tinyc_va_arg_i64"), e.i64 },
+            { str_lit("tinyc_va_arg_ptr"), e.ptr },
+        };
+        for (size_t k = 0; k < 3; k++) {
+            MLIR_TypeHandle *ins = arena_new_array(arena, MLIR_TypeHandle, 1); ins[0] = e.ptr;
+            MLIR_TypeHandle *outs = arena_new_array(arena, MLIR_TypeHandle, 1); outs[0] = helpers[k].ret;
+            MLIR_TypeHandle fty = MLIR_CreateTypeFunction(ctx, ins, 1, outs, 1);
+            MLIR_AttributeHandle a0 = MLIR_CreateAttributeString(ctx, str_lit("sym_name"), helpers[k].name);
+            MLIR_AttributeHandle a1 = MLIR_CreateAttributeType(ctx, str_lit("function_type"), fty);
+            MLIR_AttributeHandle a2 = MLIR_CreateAttributeString(ctx, str_lit("sym_visibility"), str_lit("private"));
+            MLIR_AttributeHandle *attrs = arena_new_array(arena, MLIR_AttributeHandle, 3);
+            attrs[0] = a0; attrs[1] = a1; attrs[2] = a2;
+            MLIR_RegionHandle body = MLIR_CreateRegion(ctx);
+            MLIR_RegionHandle *regs = arena_new_array(arena, MLIR_RegionHandle, 1); regs[0] = body;
+            MLIR_OpHandle decl = MLIR_CreateOp(ctx, OP_TYPE_FUNC_FUNC, str_lit("func.func"),
+                                               attrs, 3, NULL, 0, NULL, 0, NULL, 0,
+                                               regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+            MLIR_AppendBlockOp(ctx, mb, decl);
+        }
     }
 
     // Emit any string-literal globals collected by ST_PRINT/EX_STR.

@@ -1,0 +1,23 @@
+// Define a variadic function and consume its varargs via the standard
+// va_list / va_start / va_arg / va_end machinery.
+int sum(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    int total;
+    total = 0;
+    int i;
+    i = 0;
+    while (i < n) {
+        total = total + va_arg(ap, int);
+        i = i + 1;
+    }
+    va_end(ap);
+    return total;
+}
+
+int main() {
+    print(sum(3, 10, 20, 30));   // 60
+    print(sum(5, 1, 2, 3, 4, 5)); // 15
+    print(sum(1, 99));            // 99
+    return 0;
+}

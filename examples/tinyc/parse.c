@@ -349,6 +349,22 @@ static Expr *parse_primary(P *p) {
     if (t.kind == TC_TK_IDENT) {
         p->i++;
         if (cur(p).kind == TC_TK_LPAREN) {
+            // Built-in `va_arg(ap, T)`: second argument is a TYPE-NAME, not
+            // an expression. Lower to EX_VA_ARG.
+            if (str_eq(t.text, str_lit("va_arg"))) {
+                p->i++;  // consume '('
+                Expr *e = new_expr(p, EX_VA_ARG, t.line);
+                e->lhs = parse_expr(p);
+                expect(p, TC_TK_COMMA, str_lit("expected ',' in va_arg(ap, T)"));
+                Type ty = {0};
+                if (!parse_abstract_type(p, &ty)) {
+                    perror_at(p, cur(p).line,
+                        str_lit("expected type in va_arg(ap, T)"));
+                }
+                e->cast_type = ty;
+                expect(p, TC_TK_RPAREN, str_lit("expected ')'"));
+                return parse_postfix(p, e);
+            }
             p->i++;
             Expr *e = new_expr(p, EX_CALL, t.line);
             e->callee = t.text;
@@ -717,6 +733,18 @@ static Stmt *parse_decl(P *p, bool require_semi) {
         if (require_semi) expect(p, TC_TK_SEMI, str_lit("expected ';'"));
         return s;
     }
+    // `va_list ap;` — special atomic type: must declare a single named
+    // variable, no pointer/array decoration.
+    if (cur(p).kind == TC_TK_KW_VA_LIST) {
+        p->i++;
+        TcTok name = cur(p);
+        expect(p, TC_TK_IDENT, str_lit("expected identifier"));
+        Stmt *s = new_stmt(p, ST_DECL, line);
+        s->decl_name = name.text;
+        s->decl_type.kind = TY_VA_LIST;
+        if (require_semi) expect(p, TC_TK_SEMI, str_lit("expected ';'"));
+        return s;
+    }
     TypeKind base = TY_I32;
     bool was_char = (cur(p).kind == TC_TK_KW_CHAR);
     parse_base_type(p, &base);
@@ -934,6 +962,7 @@ static Stmt *parse_stmt(P *p) {
         t.kind == TC_TK_KW_STATIC || t.kind == TC_TK_KW_INLINE ||
         t.kind == TC_TK_KW_LONG || t.kind == TC_TK_KW_SIGNED ||
         t.kind == TC_TK_KW_UNSIGNED ||
+        t.kind == TC_TK_KW_VA_LIST ||
         (t.kind == TC_TK_IDENT && typedef_lookup(p, t.text) &&
          peek(p, 1).kind == TC_TK_IDENT)) {
         // `enum [Tag] { ... };` is a module-scope-only registration form;
@@ -1142,6 +1171,12 @@ static bool parse_sig_type(P *p, Type *out) {
         skip_const(p);
         return true;
     }
+    if (cur(p).kind == TC_TK_KW_VA_LIST) {
+        p->i++;
+        out->kind = TY_VA_LIST;
+        skip_const(p);
+        return true;
+    }
     if (cur(p).kind == TC_TK_IDENT) {
         Typedef *td = typedef_lookup(p, cur(p).text);
         if (td) {
@@ -1202,6 +1237,18 @@ static Func *parse_func(P *p) {
         p->i++;  // consume `void`
     } else if (cur(p).kind != TC_TK_RPAREN) {
         for (;;) {
+            // `...` as a "parameter": variadic marker. Must be the last
+            // entry in the list, and there must be at least one fixed
+            // parameter before it (matches C99 `f(int x, ...)`).
+            if (cur(p).kind == TC_TK_ELLIPSIS) {
+                if (f->params.size == 0) {
+                    perror_at(p, cur(p).line,
+                        str_lit("'...' requires at least one named parameter"));
+                }
+                p->i++;
+                f->is_variadic = true;
+                break;
+            }
             int pline = cur(p).line;
             Type pty = {0};
             if (!parse_sig_type(p, &pty)) {
@@ -1588,15 +1635,21 @@ Program *tinyc_parse(Arena *arena, VecTcTok toks) {
         }
         if (!existing) {
             VecFuncPtr_push_back(arena, &prog->funcs, f);
-        } else if (!existing->is_forward && f->is_forward) {
-            // Drop redundant forward decl after definition.
-        } else if (existing->is_forward && f->is_forward) {
-            // Drop redundant forward decl after another forward decl.
-        } else if (existing->is_forward && !f->is_forward) {
-            // Replace the forward decl with the real definition.
-            prog->funcs.data[existing_idx] = f;
         } else {
-            perror_at(&p, f->line, str_lit("function redefinition"));
+            if (existing->is_variadic != f->is_variadic) {
+                perror_at(&p, f->line,
+                    str_lit("variadic-ness mismatch between forward decl and definition"));
+            }
+            if (!existing->is_forward && f->is_forward) {
+                // Drop redundant forward decl after definition.
+            } else if (existing->is_forward && f->is_forward) {
+                // Drop redundant forward decl after another forward decl.
+            } else if (existing->is_forward && !f->is_forward) {
+                // Replace the forward decl with the real definition.
+                prog->funcs.data[existing_idx] = f;
+            } else {
+                perror_at(&p, f->line, str_lit("function redefinition"));
+            }
         }
     }
     // Publish the parser's enumerator list to the Program for emit-time
