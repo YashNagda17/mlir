@@ -385,6 +385,20 @@ MLIR_TypeHandle MLIR_CreateTypeFunction(MLIR_Context *ctx,
                                          const MLIR_TypeHandle *inputs, size_t n_inputs,
                                          const MLIR_TypeHandle *results, size_t n_results);
 
+// LLVM-dialect function type (LLVMFunctionType). Differs from the standard
+// FunctionType in two ways: it has at most one result (use the LLVM `void`
+// type for "no result"), and it has an `is_var_arg` flag used to model C
+// variadic functions like `int printf(const char *, ...)`. The result type
+// must be either an LLVM-compatible scalar/pointer type or the LLVM void
+// type (see MLIR_CreateTypeLLVMVoid).
+MLIR_TypeHandle MLIR_CreateTypeLLVMFunction(MLIR_Context *ctx,
+                                             MLIR_TypeHandle result,
+                                             const MLIR_TypeHandle *inputs,
+                                             size_t n_inputs,
+                                             bool is_var_arg);
+// LLVM `void` type — only valid as the result of an LLVMFunctionType.
+MLIR_TypeHandle MLIR_CreateTypeLLVMVoid(MLIR_Context *ctx);
+
 // Mutation
 void MLIR_SetTypeIntegerProperties(MLIR_TypeHandle type, uint32_t width, bool is_signed);
 void MLIR_SetTypeFloatProperties(MLIR_TypeHandle type, uint32_t width, bool is_bfloat);

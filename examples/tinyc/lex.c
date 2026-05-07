@@ -41,6 +41,7 @@ static TcTokKind keyword_or_ident(string s) {
     if (str_eq(s, str_lit("long")))     return TC_TK_KW_LONG;
     if (str_eq(s, str_lit("signed")))   return TC_TK_KW_SIGNED;
     if (str_eq(s, str_lit("unsigned"))) return TC_TK_KW_UNSIGNED;
+    if (str_eq(s, str_lit("va_list"))) return TC_TK_KW_VA_LIST;
     return TC_TK_IDENT;
 }
 
@@ -234,6 +235,7 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
             char d = src.str[i + 1], e2 = src.str[i + 2];
             if      (c == '<' && d == '<' && e2 == '=') { k = TC_TK_SHLEQ; consumed = 3; }
             else if (c == '>' && d == '>' && e2 == '=') { k = TC_TK_SHREQ; consumed = 3; }
+            else if (c == '.' && d == '.' && e2 == '.') { k = TC_TK_ELLIPSIS; consumed = 3; }
         }
         if (k == TC_TK_EOF && i + 1 < src.size) {
             char d = src.str[i + 1];

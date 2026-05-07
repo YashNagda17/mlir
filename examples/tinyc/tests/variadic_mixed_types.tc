@@ -1,0 +1,36 @@
+// va_arg on mixed types: pull an int, a long, and a char* from the same
+// variadic call.
+extern int printf(const char *fmt, ...);
+
+void show(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    int i;
+    i = 0;
+    while (i < n) {
+        int kind;
+        kind = va_arg(ap, int);
+        if (kind == 0) {
+            int v;
+            v = va_arg(ap, int);
+            printf("int=%d\n", v);
+        } else {
+            if (kind == 1) {
+                long v;
+                v = va_arg(ap, long);
+                printf("long=%lld\n", v);
+            } else {
+                char *s;
+                s = va_arg(ap, char*);
+                printf("str=%s\n", s);
+            }
+        }
+        i = i + 1;
+    }
+    va_end(ap);
+}
+
+int main() {
+    show(3, 0, 7, 1, 1234567890123LL, 2, "hi");
+    return 0;
+}

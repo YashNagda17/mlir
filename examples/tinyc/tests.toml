@@ -237,3 +237,19 @@ expected_stdout = "4\n4\n8\n8\n8\n4\n4\n8\n"
 [[test]]
 name = "compound_literal"
 expected_stdout = "42\n7\n3\n4\n7\n"
+
+[[test]]
+name = "variadic_call_printf"
+expected_stdout = "1 2 3\nanswer = 42\n"
+
+[[test]]
+name = "variadic_define_sum"
+expected_stdout = "60\n15\n99\n"
+
+[[test]]
+name = "variadic_mixed_types"
+expected_stdout = "int=7\nlong=1234567890123\nstr=hi\n"
+
+[[test]]
+name = "variadic_forward_decl"
+expected_stdout = "10\n300\n"

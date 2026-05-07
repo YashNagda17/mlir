@@ -849,6 +849,22 @@ extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMArray(MLIR_Context *, MLIR_TypeHan
     return typeH(mlir::LLVM::LLVMArrayType::get(typeF(elem), count));
 }
 
+extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMFunction(MLIR_Context *,
+                                                       MLIR_TypeHandle result,
+                                                       const MLIR_TypeHandle *inputs,
+                                                       size_t n_inputs,
+                                                       bool is_var_arg) {
+    llvm::SmallVector<mlir::Type, 8> in;
+    in.reserve(n_inputs);
+    for (size_t i = 0; i < n_inputs; i++) in.push_back(typeF(inputs[i]));
+    return typeH(mlir::LLVM::LLVMFunctionType::get(typeF(result), in, is_var_arg));
+}
+
+extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMVoid(MLIR_Context *) {
+    auto &ctx = globalCtx().mctx;
+    return typeH(mlir::LLVM::LLVMVoidType::get(&ctx));
+}
+
 extern "C" MLIR_OpHandle MLIR_CreateLLVMGlobalString(MLIR_Context *,
                                                      string sym_name,
                                                      string bytes,

@@ -119,6 +119,10 @@ typedef enum {
                        // (single-level) inner pointer type so a deref of
                        // a T** loads the inner T*. Limited to depth 2:
                        // T*** is not supported.
+    TY_VA_LIST,        // variadic argument list (`va_list`). Storage:
+                       // !llvm.ptr to an !llvm.array<32 x i8> alloca, sized
+                       // to cover x86_64-SysV / aarch64 layouts. Used as the
+                       // operand to llvm.intr.vastart/vaend and llvm.va_arg.
 } TypeKind;
 
 typedef struct Type Type;
@@ -157,6 +161,7 @@ typedef enum {
     EX_FIELD,          // s.x  (lhs = struct lvalue, name = field name)
     EX_TERNARY,        // c ? a : b — lhs=cond, rhs=then, lvalue=else
     EX_COMPOUND,       // (T){v0, v1, ...} — cast_type + args
+    EX_VA_ARG,         // va_arg(ap, T) — lhs = ap lvalue, cast_type = T
 } ExprKind;
 
 typedef enum {
@@ -277,6 +282,10 @@ typedef struct {
     bool       is_forward;   // true when this Func is just a prototype
                              // (no body). Replaced in-place by a later
                              // definition with the same name.
+    bool       is_variadic;  // true for `f(T, ...)` — last "parameter" was
+                             // an ellipsis. Such functions are emitted as
+                             // `llvm.func` (not `func.func`) so the var-arg
+                             // ABI is modeled at the call site.
     int        line;
 } Func;
 
@@ -371,6 +380,7 @@ typedef enum {
     TC_TK_KW_LONG,
     TC_TK_KW_SIGNED,
     TC_TK_KW_UNSIGNED,
+    TC_TK_KW_VA_LIST,
     TC_TK_STRING_LIT,
     TC_TK_LPAREN, TC_TK_RPAREN,
     TC_TK_LBRACE, TC_TK_RBRACE,
@@ -388,6 +398,7 @@ typedef enum {
     TC_TK_PLUSPLUS, TC_TK_MINUSMINUS,
     TC_TK_QUESTION, TC_TK_COLON,
     TC_TK_ARROW,                  // ->  (sugar for (*p).field)
+    TC_TK_ELLIPSIS,               // ... (variadic parameter marker)
 } TcTokKind;
 
 typedef struct {

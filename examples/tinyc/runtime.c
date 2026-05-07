@@ -25,3 +25,13 @@ void printStr(const char *s) {
     fputc('\n', stdout);
 }
 
+
+#include <stdarg.h>
+// va_arg helpers used by tinyC. The MLIR LLVM dialect doesn't expose a
+// `va_arg` op, and clang traditionally lowers va_arg manually anyway, so
+// the tinyC compiler emits calls to these wrappers instead. The va_list
+// in the caller is a 32-byte alloca passed by pointer; we dereference it
+// here, run the standard va_arg macro, and return the value.
+int            tinyc_va_arg_i32(va_list *ap) { return va_arg(*ap, int); }
+long long      tinyc_va_arg_i64(va_list *ap) { return va_arg(*ap, long long); }
+void          *tinyc_va_arg_ptr(va_list *ap) { return va_arg(*ap, void *); }

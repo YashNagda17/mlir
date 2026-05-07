@@ -1,0 +1,25 @@
+// Forward-declare a variadic function, then define it. The variadic flag
+// must match between the prototype and the definition; a single
+// llvm.func definition is emitted (no stale extern declaration).
+int total(int n, ...);
+
+int total(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    int s;
+    s = 0;
+    int i;
+    i = 0;
+    while (i < n) {
+        s = s + va_arg(ap, int);
+        i = i + 1;
+    }
+    va_end(ap);
+    return s;
+}
+
+int main() {
+    print(total(4, 1, 2, 3, 4));  // 10
+    print(total(2, 100, 200));    // 300
+    return 0;
+}
