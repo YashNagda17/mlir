@@ -800,6 +800,17 @@ static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
     }
     if (ex->kind == EX_INDEX && ex->lhs->kind == EX_VAR) {
         Sym *s = lookup(e, sc, ex->lhs->name);
+        if (s && s->type.kind == TY_PTR_STRUCT && s->sdef) {
+            // `p[i].f` where p is a struct pointer: load p, then GEP by index.
+            MLIR_ValueHandle idx_i32 = emit_expr_i32(e, sc, ex->rhs);
+            r.base_ptr = emit_load_v(e, sym_addr(e, s), e->ptr);
+            r.source_elem = find_struct_type(e, s->sdef);
+            r.sd = s->sdef;
+            sctx_push(e, &r, LLVM_GEP_DYN);
+            r.dyn_index = idx_i32;
+            r.ok = true;
+            return r;
+        }
         if (!s || s->type.kind != TY_ARRAY_STRUCT || !s->sdef) {
             EMIT_ERR(e, "arr[i].f requires an array of struct");
             return r;
