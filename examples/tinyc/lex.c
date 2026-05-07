@@ -35,6 +35,7 @@ static TcTokKind keyword_or_ident(string s) {
     if (str_eq(s, str_lit("default")))  return TC_TK_KW_DEFAULT;
     if (str_eq(s, str_lit("enum")))     return TC_TK_KW_ENUM;
     if (str_eq(s, str_lit("const")))    return TC_TK_KW_CONST;
+    if (str_eq(s, str_lit("void")))     return TC_TK_KW_VOID;
     return TC_TK_IDENT;
 }
 

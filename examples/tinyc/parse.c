@@ -508,6 +508,7 @@ static bool parse_base_type(P *p, TypeKind *out) {
     if (cur(p).kind == TC_TK_KW_INT)   { p->i++; *out = TY_I32; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; *out = TY_F32; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_CHAR)  { p->i++; *out = TY_I32; skip_const(p); return true; }
+    if (cur(p).kind == TC_TK_KW_VOID)  { p->i++; *out = TY_VOID; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_ENUM) {
         // `enum [Tag]` as a type-spec — behaves exactly as `int`. A body
         // is not allowed in this position; only the top-level / statement
@@ -632,7 +633,10 @@ static Stmt *parse_decl(P *p, bool require_semi) {
     if (is_ptr) {
         if (was_char) s->decl_type.kind = TY_PTR_CHAR;
         else if (base == TY_I32) s->decl_type.kind = TY_PTR_I32;
-        else perror_at(p, line, str_lit("only int*/char* pointers are supported"));
+        else if (base == TY_VOID) s->decl_type.kind = TY_PTR_VOID;
+        else perror_at(p, line, str_lit("only int*/char*/void* pointers are supported"));
+    } else if (base == TY_VOID) {
+        perror_at(p, line, str_lit("'void' is not a valid variable type (did you mean 'void*'?)"));
     }
     if (accept(p, TC_TK_LBRACK)) {
         if (base != TY_I32 || is_ptr) perror_at(p, line, str_lit("only int[N] arrays are supported"));
@@ -665,7 +669,13 @@ static Stmt *parse_stmt(P *p) {
     if (t.kind == TC_TK_KW_RETURN) {
         p->i++;
         Stmt *s = new_stmt(p, ST_RETURN, t.line);
-        s->expr = parse_expr(p);
+        if (cur(p).kind == TC_TK_SEMI) {
+            // bare `return;` — only legal in void-returning functions
+            // (validated at emit time).
+            s->expr = NULL;
+        } else {
+            s->expr = parse_expr(p);
+        }
         expect(p, TC_TK_SEMI, str_lit("expected ';' after return"));
         return s;
     }
@@ -713,7 +723,7 @@ static Stmt *parse_stmt(P *p) {
             s->for_init = NULL;
         } else if (cur(p).kind == TC_TK_KW_INT || cur(p).kind == TC_TK_KW_FLOAT ||
                    cur(p).kind == TC_TK_KW_CHAR || cur(p).kind == TC_TK_KW_ENUM ||
-                   cur(p).kind == TC_TK_KW_CONST ||
+                   cur(p).kind == TC_TK_KW_CONST || cur(p).kind == TC_TK_KW_VOID ||
                    (cur(p).kind == TC_TK_IDENT && typedef_lookup(p, cur(p).text))) {
             s->for_init = parse_decl(p, /*require_semi*/ true);
         } else {
@@ -792,6 +802,7 @@ static Stmt *parse_stmt(P *p) {
     if (t.kind == TC_TK_KW_INT || t.kind == TC_TK_KW_FLOAT ||
         t.kind == TC_TK_KW_STRUCT || t.kind == TC_TK_KW_CHAR ||
         t.kind == TC_TK_KW_ENUM || t.kind == TC_TK_KW_CONST ||
+        t.kind == TC_TK_KW_VOID ||
         (t.kind == TC_TK_IDENT && typedef_lookup(p, t.text) &&
          peek(p, 1).kind == TC_TK_IDENT)) {
         // `enum [Tag] { ... };` is a module-scope-only registration form;
@@ -896,6 +907,14 @@ static bool parse_sig_type(P *p, Type *out) {
     skip_const(p);
     if (cur(p).kind == TC_TK_KW_INT)   { p->i++; out->kind = TY_I32; skip_const(p); if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_I32; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; out->kind = TY_F32; skip_const(p); return true; }
+    if (cur(p).kind == TC_TK_KW_VOID)  {
+        p->i++;
+        skip_const(p);
+        if (accept(p, TC_TK_STAR)) out->kind = TY_PTR_VOID;
+        else out->kind = TY_VOID;
+        skip_const(p);
+        return true;
+    }
     if (cur(p).kind == TC_TK_KW_CHAR)  {
         p->i++;
         skip_const(p);
@@ -972,11 +991,19 @@ static Func *parse_func(P *p) {
     f->line = line;
     VecParam_reserve(p->arena, &f->params, 4);
     VecStmtPtr_reserve(p->arena, &f->body, 8);
-    if (cur(p).kind != TC_TK_RPAREN) {
+    // `f(void)` — single `void` token (not `void*` or named) means no params.
+    if (cur(p).kind == TC_TK_KW_VOID && peek(p, 1).kind == TC_TK_RPAREN) {
+        p->i++;  // consume `void`
+    } else if (cur(p).kind != TC_TK_RPAREN) {
         for (;;) {
+            int pline = cur(p).line;
             Type pty = {0};
             if (!parse_sig_type(p, &pty)) {
                 perror_at(p, cur(p).line, str_lit("expected parameter type"));
+            }
+            if (pty.kind == TY_VOID) {
+                perror_at(p, pline,
+                    str_lit("'void' is only valid as the lone parameter spec"));
             }
             string pname = (string){0};
             // Optional function-pointer parameter declarator: `int (*f)(int)`.
@@ -1045,9 +1072,12 @@ static StructDef *parse_struct_def(P *p) {
                 is_ptr = true;
                 if (was_char) ft.kind = TY_PTR_CHAR;
                 else if (k == TY_I32) ft.kind = TY_PTR_I32;
+                else if (k == TY_VOID) ft.kind = TY_PTR_VOID;
                 else {
-                    perror_at(p, cur(p).line, str_lit("only int*/char* pointer fields are supported"));
+                    perror_at(p, cur(p).line, str_lit("only int*/char*/void* pointer fields are supported"));
                 }
+            } else if (k == TY_VOID) {
+                perror_at(p, cur(p).line, str_lit("'void' is not a valid struct field type"));
             }
         }
         TcTok fn = cur(p);

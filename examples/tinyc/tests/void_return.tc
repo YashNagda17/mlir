@@ -1,0 +1,15 @@
+// `void` return type with a bare `return;` early exit.
+void greet(int n) {
+    if (n < 0) {
+        print(-1);
+        return;
+    }
+    print(n);
+}
+
+int main() {
+    greet(7);     // 7
+    greet(-3);    // -1
+    greet(42);    // 42
+    return 0;
+}
