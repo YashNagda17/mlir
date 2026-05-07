@@ -1172,10 +1172,15 @@ static bool parse_sig_type(P *p, Type *out) {
         return true;
     }
     if (cur(p).kind == TC_TK_KW_VA_LIST) {
-        p->i++;
-        out->kind = TY_VA_LIST;
-        skip_const(p);
-        return true;
+        // `va_list` is only valid as the type of a local variable
+        // declaration (handled separately). It is not supported as a
+        // parameter / return / cast / sizeof type, because the emitter
+        // does not lower it in those positions. Reject up front so that
+        // the front-end fails cleanly instead of silently mis-emitting.
+        perror_at(p, cur(p).line,
+                  str_lit("va_list is not supported in this position "
+                          "(only as a local variable declaration)"));
+        return false;
     }
     if (cur(p).kind == TC_TK_IDENT) {
         Typedef *td = typedef_lookup(p, cur(p).text);
