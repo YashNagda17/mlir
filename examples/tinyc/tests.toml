@@ -516,3 +516,6 @@ expected_stdout = "4 9\n"
 [[test]]
 name = "static_func"
 expected_stdout = "21\n"
+[[test]]
+name = "struct_ptr_arith"
+expected_stdout = "sz=24\nq-p=24\nr-p=48\n"

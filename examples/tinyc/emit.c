@@ -2561,13 +2561,16 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 }
                 EVal pv = a.is_ptr ? a : b;
                 EVal iv = a.is_ptr ? b : a;
-                MLIR_TypeHandle elem = (pv.ptr_elem != MLIR_INVALID_HANDLE) ? pv.ptr_elem : e->i32;
+                MLIR_TypeHandle elem = (pv.ptr_elem != MLIR_INVALID_HANDLE) ? pv.ptr_elem
+                    : (pv.sdef ? find_struct_type(e, pv.sdef) : e->i32);
+                if (elem == MLIR_INVALID_HANDLE) elem = e->i32;
                 MLIR_ValueHandle idx = iv.is_float ? emit_const_i32(e, 0) : iv.val;
                 int32_t *path = arena_new_array(e->arena, int32_t, 1); path[0] = LLVM_GEP_DYN;
                 MLIR_ValueHandle *dyn = arena_new_array(e->arena, MLIR_ValueHandle, 1); dyn[0] = idx;
                 r.val = emit_gep(e, pv.val, elem, path, 1, dyn, 1);
                 r.is_ptr = true;
-                r.ptr_elem = elem;
+                r.ptr_elem = pv.ptr_elem;
+                r.sdef = pv.sdef;
                 r.is_str = pv.is_str;
                 return r;
             }
@@ -2576,7 +2579,9 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 if (a.is_void_ptr) {
                     EMIT_ERR(e, "pointer arithmetic on 'void*' is not allowed");
                 }
-                MLIR_TypeHandle elem = (a.ptr_elem != MLIR_INVALID_HANDLE) ? a.ptr_elem : e->i32;
+                MLIR_TypeHandle elem = (a.ptr_elem != MLIR_INVALID_HANDLE) ? a.ptr_elem
+                    : (a.sdef ? find_struct_type(e, a.sdef) : e->i32);
+                if (elem == MLIR_INVALID_HANDLE) elem = e->i32;
                 MLIR_ValueHandle zero = emit_const_i32(e, 0);
                 MLIR_ValueHandle neg = emit_binop(e, OP_TYPE_ARITH_SUBI,
                                                   str_lit("arith.subi"), e->i32, zero, b.val);
@@ -2584,7 +2589,8 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 MLIR_ValueHandle *dyn = arena_new_array(e->arena, MLIR_ValueHandle, 1); dyn[0] = neg;
                 r.val = emit_gep(e, a.val, elem, path, 1, dyn, 1);
                 r.is_ptr = true;
-                r.ptr_elem = elem;
+                r.ptr_elem = a.ptr_elem;
+                r.sdef = a.sdef;
                 r.is_str = a.is_str;
                 return r;
             }
