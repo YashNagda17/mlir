@@ -383,6 +383,8 @@ typedef enum {
     TC_TK_KW_LONG,
     TC_TK_KW_SIGNED,
     TC_TK_KW_UNSIGNED,
+    TC_TK_KW_SHORT,
+    TC_TK_KW_BOOL,
     TC_TK_KW_VA_LIST,
     TC_TK_STRING_LIT,
     TC_TK_LPAREN, TC_TK_RPAREN,

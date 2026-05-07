@@ -203,7 +203,8 @@ static MLIR_TypeHandle scalar_mlir_type(E *e, TypeKind k) {
     if (k == TY_F32) return e->f32;
     if (k == TY_I64) return e->i64;
     if (k == TY_PTR_STRUCT || k == TY_PTR_I32 || k == TY_PTR_CHAR ||
-        k == TY_PTR_VOID || k == TY_FNPTR || k == TY_PTR_PTR) return e->ptr;
+        k == TY_PTR_VOID || k == TY_FNPTR || k == TY_PTR_PTR ||
+        k == TY_VA_LIST) return e->ptr;
     return e->i32;
 }
 
@@ -2853,7 +2854,8 @@ static void slot_resolve(E *e, Type ty, SlotInfo *out) {
     } else if (ty.kind != TY_I32 && ty.kind != TY_I64 && ty.kind != TY_F32 &&
                ty.kind != TY_PTR_I32 && ty.kind != TY_PTR_CHAR &&
                ty.kind != TY_PTR_VOID && ty.kind != TY_VOID &&
-               ty.kind != TY_FNPTR && ty.kind != TY_PTR_PTR) {
+               ty.kind != TY_FNPTR && ty.kind != TY_PTR_PTR &&
+               ty.kind != TY_VA_LIST) {
         EMIT_ERR(e, "unsupported type in function signature");
     }
 }
@@ -3236,6 +3238,7 @@ static void init_struct_types(E *e) {
         for (size_t k = 0; k < n; k++) {
             Type ft = sd->fields.data[k].type;
             if (ft.kind == TY_I32) body[k] = e->i32;
+            else if (ft.kind == TY_I64) body[k] = e->i64;
             else if (ft.kind == TY_F32) body[k] = e->f32;
             else if (ft.kind == TY_PTR_STRUCT || ft.kind == TY_PTR_I32 ||
                      ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID) body[k] = e->ptr;

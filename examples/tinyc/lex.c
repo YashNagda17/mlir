@@ -16,6 +16,7 @@ static bool is_alnum(char c) { return is_alpha(c) || is_digit(c); }
 static TcTokKind keyword_or_ident(string s) {
     if (str_eq(s, str_lit("int")))      return TC_TK_KW_INT;
     if (str_eq(s, str_lit("float")))    return TC_TK_KW_FLOAT;
+    if (str_eq(s, str_lit("double")))   return TC_TK_KW_FLOAT;
     if (str_eq(s, str_lit("return")))   return TC_TK_KW_RETURN;
     if (str_eq(s, str_lit("if")))       return TC_TK_KW_IF;
     if (str_eq(s, str_lit("else")))     return TC_TK_KW_ELSE;
@@ -42,7 +43,11 @@ static TcTokKind keyword_or_ident(string s) {
     if (str_eq(s, str_lit("long")))     return TC_TK_KW_LONG;
     if (str_eq(s, str_lit("signed")))   return TC_TK_KW_SIGNED;
     if (str_eq(s, str_lit("unsigned"))) return TC_TK_KW_UNSIGNED;
+    if (str_eq(s, str_lit("short")))    return TC_TK_KW_SHORT;
+    if (str_eq(s, str_lit("_Bool")))    return TC_TK_KW_BOOL;
+    if (str_eq(s, str_lit("bool")))     return TC_TK_KW_BOOL;
     if (str_eq(s, str_lit("va_list"))) return TC_TK_KW_VA_LIST;
+    if (str_eq(s, str_lit("__builtin_va_list"))) return TC_TK_KW_VA_LIST;
     return TC_TK_IDENT;
 }
 

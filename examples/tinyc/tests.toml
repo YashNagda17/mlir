@@ -336,3 +336,15 @@ expected_stdout = "10\n101\n7\n18\n"
 [[test]]
 name = "do_while_macro"
 expected_stdout = "42\n"
+
+[[test]]
+name = "braceless_if"
+expected_stdout = "8\n7\n7\n7\n"
+
+[[test]]
+name = "typedef_struct_anon"
+expected_stdout = "7\n30\n"
+
+[[test]]
+name = "typedef_enum"
+expected_stdout = "1\n200\n2\n"

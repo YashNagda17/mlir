@@ -88,6 +88,7 @@ static bool parse_sig_type(P *p, Type *out);
 static bool parse_abstract_type(P *p, Type *out);
 static bool try_parse_fnptr_suffix(P *p, Type *ty, string *out_name);
 static void parse_enum_decl_top(P *p);
+static void parse_enum_body(P *p);
 
 // `const` is accepted as a parser-level qualifier and silently dropped:
 // it does not affect any AST type. Skipped before a base type, after `*`
@@ -599,32 +600,42 @@ static Expr *parse_expr(P *p) { return parse_assign_or_or(p); }
 // the kind to *out. Pointer/array suffixes are handled at decl time.
 static bool parse_base_type(P *p, TypeKind *out) {
     skip_const(p);
-    // C-style integer base specifier: optional signed/unsigned, optional
-    // long [long], optional int. Any 'long' makes the result TY_I64.
+    // C-style integer base specifier: any sequence of signed / unsigned /
+    // short / long / int / char / _Bool / bool. Any 'long' promotes to
+    // TY_I64; everything else is TY_I32.
     bool saw_int_kw = false;
     bool saw_long_kw = false;
     bool saw_signedness_kw = false;
-    while (cur(p).kind == TC_TK_KW_SIGNED || cur(p).kind == TC_TK_KW_UNSIGNED) {
-        saw_signedness_kw = true; p->i++; skip_const(p);
-    }
-    while (cur(p).kind == TC_TK_KW_LONG) {
-        saw_long_kw = true; p->i++; skip_const(p);
-    }
-    if (cur(p).kind == TC_TK_KW_INT) {
-        saw_int_kw = true; p->i++; skip_const(p);
-    }
-    while (cur(p).kind == TC_TK_KW_LONG) {
-        saw_long_kw = true; p->i++; skip_const(p);
-    }
-    if (cur(p).kind == TC_TK_KW_SIGNED || cur(p).kind == TC_TK_KW_UNSIGNED) {
-        saw_signedness_kw = true; p->i++; skip_const(p);
+    bool saw_short_kw = false;
+    bool saw_char_kw = false;
+    bool saw_bool_kw = false;
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        while (cur(p).kind == TC_TK_KW_SIGNED || cur(p).kind == TC_TK_KW_UNSIGNED) {
+            saw_signedness_kw = true; p->i++; skip_const(p); progress = true;
+        }
+        while (cur(p).kind == TC_TK_KW_LONG) {
+            saw_long_kw = true; p->i++; skip_const(p); progress = true;
+        }
+        while (cur(p).kind == TC_TK_KW_SHORT) {
+            saw_short_kw = true; p->i++; skip_const(p); progress = true;
+        }
+        if (cur(p).kind == TC_TK_KW_INT) {
+            saw_int_kw = true; p->i++; skip_const(p); progress = true;
+        }
+        if (cur(p).kind == TC_TK_KW_CHAR) {
+            saw_char_kw = true; p->i++; skip_const(p); progress = true;
+        }
+        if (cur(p).kind == TC_TK_KW_BOOL) {
+            saw_bool_kw = true; p->i++; skip_const(p); progress = true;
+        }
     }
     if (saw_long_kw)         { *out = TY_I64; skip_const(p); return true; }
-    if (saw_int_kw || saw_signedness_kw) {
+    if (saw_int_kw || saw_signedness_kw || saw_short_kw || saw_char_kw || saw_bool_kw) {
         *out = TY_I32; skip_const(p); return true;
     }
     if (cur(p).kind == TC_TK_KW_FLOAT) { p->i++; *out = TY_F32; skip_const(p); return true; }
-    if (cur(p).kind == TC_TK_KW_CHAR)  { p->i++; *out = TY_I32; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_VOID)  { p->i++; *out = TY_VOID; skip_const(p); return true; }
     if (cur(p).kind == TC_TK_KW_ENUM) {
         // `enum [Tag]` as a type-spec — behaves exactly as `int`. A body
@@ -642,6 +653,14 @@ static bool parse_base_type(P *p, TypeKind *out) {
 static Stmt *parse_stmt(P *p);
 
 static void parse_block(P *p, VecStmtPtr *out) {
+    // Support both brace blocks `{ ... }` and unbraced single statements
+    // (used everywhere in real C as the body of `if`, `else`, `while`,
+    // `for`). The single-statement form only allows ONE statement.
+    if (cur(p).kind != TC_TK_LBRACE) {
+        Stmt *s = parse_stmt(p);
+        VecStmtPtr_push_back(p->arena, out, s);
+        return;
+    }
     expect(p, TC_TK_LBRACE, str_lit("expected '{'"));
     while (cur(p).kind != TC_TK_RBRACE && cur(p).kind != TC_TK_EOF) {
         Stmt *s = parse_stmt(p);
@@ -1101,17 +1120,31 @@ static void wrap_ptr_to_ptr(P *p, Type *out) {
 static bool parse_sig_type(P *p, Type *out) {
     *out = (Type){0};
     skip_const(p);
-    // Accept signed/unsigned/long modifiers in any order ahead of `int` or
-    // by themselves. Any 'long' promotes to TY_I64; otherwise TY_I32.
+    // Accept signed/unsigned/short/long/char/_Bool/bool/int modifiers in any
+    // order. Any 'long' promotes to TY_I64; otherwise TY_I32. If `char` is
+    // among the consumed modifiers and a single trailing '*' follows, the
+    // result is TY_PTR_CHAR rather than TY_PTR_I32 (matches existing tinyC
+    // behaviour for `char*`).
     if (cur(p).kind == TC_TK_KW_SIGNED || cur(p).kind == TC_TK_KW_UNSIGNED ||
-        cur(p).kind == TC_TK_KW_LONG) {
+        cur(p).kind == TC_TK_KW_LONG   || cur(p).kind == TC_TK_KW_SHORT  ||
+        cur(p).kind == TC_TK_KW_BOOL) {
         bool saw_long = false;
+        bool saw_char = false;
         while (cur(p).kind == TC_TK_KW_SIGNED || cur(p).kind == TC_TK_KW_UNSIGNED ||
-               cur(p).kind == TC_TK_KW_LONG || cur(p).kind == TC_TK_KW_INT) {
+               cur(p).kind == TC_TK_KW_LONG   || cur(p).kind == TC_TK_KW_INT     ||
+               cur(p).kind == TC_TK_KW_SHORT  || cur(p).kind == TC_TK_KW_CHAR    ||
+               cur(p).kind == TC_TK_KW_BOOL) {
             if (cur(p).kind == TC_TK_KW_LONG) saw_long = true;
+            if (cur(p).kind == TC_TK_KW_CHAR) saw_char = true;
             p->i++; skip_const(p);
         }
         out->kind = saw_long ? TY_I64 : TY_I32;
+        skip_const(p);
+        if (accept(p, TC_TK_STAR)) {
+            out->kind = saw_char ? TY_PTR_CHAR : (saw_long ? TY_PTR_I32 : TY_PTR_I32);
+            skip_const(p);
+            if (accept(p, TC_TK_STAR)) { wrap_ptr_to_ptr(p, out); skip_const(p); }
+        }
         return true;
     }
     if (cur(p).kind == TC_TK_KW_INT)   {
@@ -1183,15 +1216,15 @@ static bool parse_sig_type(P *p, Type *out) {
         return true;
     }
     if (cur(p).kind == TC_TK_KW_VA_LIST) {
-        // `va_list` is only valid as the type of a local variable
-        // declaration (handled separately). It is not supported as a
-        // parameter / return / cast / sizeof type, because the emitter
-        // does not lower it in those positions. Reject up front so that
-        // the front-end fails cleanly instead of silently mis-emitting.
-        perror_at(p, cur(p).line,
-                  str_lit("va_list is not supported in this position "
-                          "(only as a local variable declaration)"));
-        return false;
+        // tinyC's emitter only supports va_list fully as a local variable
+        // declaration. Accept it in parameter / typedef position too so
+        // that headers with declarations like `void f(..., va_list ap)`
+        // parse cleanly (the emitter treats it as an opaque pointer-sized
+        // value when it actually has to emit one).
+        p->i++;
+        out->kind = TY_VA_LIST;
+        skip_const(p);
+        return true;
     }
     if (cur(p).kind == TC_TK_IDENT) {
         Typedef *td = typedef_lookup(p, cur(p).text);
@@ -1300,12 +1333,16 @@ static Func *parse_func(P *p) {
 static StructDef *parse_struct_def(P *p) {
     int line = cur(p).line;
     expect(p, TC_TK_KW_STRUCT, str_lit("expected 'struct'"));
-    TcTok name = cur(p);
-    expect(p, TC_TK_IDENT, str_lit("expected struct name"));
+    string name = (string){0};
+    if (cur(p).kind == TC_TK_IDENT) {
+        name = cur(p).text;
+        p->i++;
+    }
+    // Anonymous struct (no tag): caller must patch sd->name afterwards.
     expect(p, TC_TK_LBRACE, str_lit("expected '{'"));
     StructDef *sd = arena_new(p->arena, StructDef);
     *sd = (StructDef){0};
-    sd->name = name.text;
+    sd->name = name;
     sd->line = line;
     VecStructField_reserve(p->arena, &sd->fields, 4);
     while (cur(p).kind != TC_TK_RBRACE && cur(p).kind != TC_TK_EOF) {
@@ -1326,6 +1363,30 @@ static StructDef *parse_struct_def(P *p) {
             ft.kind = is_ptr ? TY_PTR_STRUCT : TY_STRUCT;
             ft.struct_name = sn.text;
             is_struct_kind = true;
+        } else if (cur(p).kind == TC_TK_IDENT && typedef_lookup(p, cur(p).text)) {
+            // Typedef'd field type, e.g. `size_t buf_len;` or `ciovec_t* p;`.
+            // We resolve the typedef and reuse the existing pointer/array
+            // logic by mapping the resolved type to one of the supported
+            // field kinds.
+            Typedef *td = typedef_lookup(p, cur(p).text);
+            p->i++;
+            ft = td->ty;
+            // Pointer suffix `*` applies to the resolved typedef.
+            if (accept(p, TC_TK_STAR)) {
+                is_ptr = true;
+                if (ft.kind == TY_STRUCT) {
+                    ft.kind = TY_PTR_STRUCT;
+                } else if (ft.kind == TY_VOID) {
+                    ft.kind = TY_PTR_VOID;
+                } else if (ft.kind == TY_I32 || ft.kind == TY_I64) {
+                    // No distinct TY_PTR_I64 today — bucket integer
+                    // pointers under TY_PTR_I32 as a conservative alias.
+                    ft.kind = TY_PTR_I32;
+                } else {
+                    perror_at(p, cur(p).line,
+                        str_lit("unsupported pointer-to-typedef field type"));
+                }
+            }
         } else {
             TypeKind k;
             was_char = (cur(p).kind == TC_TK_KW_CHAR);
@@ -1400,7 +1461,6 @@ static StructDef *parse_struct_def(P *p) {
             ((StructField){.name = fn.text, .type = ft}));
     }
     expect(p, TC_TK_RBRACE, str_lit("expected '}'"));
-    expect(p, TC_TK_SEMI, str_lit("expected ';' after struct definition"));
     return sd;
 }
 
@@ -1412,13 +1472,10 @@ static StructDef *parse_struct_def(P *p) {
 // Constant expression accepted for `= ...`: an INT_LIT, optionally with
 // a leading unary `-`, OR a previously-declared enumerator name. This is
 // intentionally a tight subset (per the spec).
-static void parse_enum_decl_top(P *p) {
-    int line = cur(p).line;
-    expect(p, TC_TK_KW_ENUM, str_lit("expected 'enum'"));
-    // Optional tag — accepted for source compatibility, not stored. The
-    // tag namespace is implicit: `enum Tag` always lowers to `int`, so
-    // there's nothing to look up later.
-    if (cur(p).kind == TC_TK_IDENT) p->i++;
+// Parse the body of an enum:  `{ NAME [= EXPR], ... }`. Caller has
+// already consumed `enum` and the optional tag and verified that the
+// next token is `{`. Does not consume any trailing punctuation after `}`.
+static void parse_enum_body(P *p) {
     expect(p, TC_TK_LBRACE, str_lit("expected '{' to begin enum body"));
     int64_t next_value = 0;
     while (cur(p).kind != TC_TK_RBRACE && cur(p).kind != TC_TK_EOF) {
@@ -1454,6 +1511,16 @@ static void parse_enum_decl_top(P *p) {
         if (!accept(p, TC_TK_COMMA)) break;
     }
     expect(p, TC_TK_RBRACE, str_lit("expected '}'"));
+}
+
+static void parse_enum_decl_top(P *p) {
+    int line = cur(p).line;
+    expect(p, TC_TK_KW_ENUM, str_lit("expected 'enum'"));
+    // Optional tag — accepted for source compatibility, not stored. The
+    // tag namespace is implicit: `enum Tag` always lowers to `int`, so
+    // there's nothing to look up later.
+    if (cur(p).kind == TC_TK_IDENT) p->i++;
+    parse_enum_body(p);
     expect(p, TC_TK_SEMI, str_lit("expected ';' after enum declaration"));
     (void)line;
 }
@@ -1546,6 +1613,7 @@ void tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks) {
         if (cur(&p).kind == TC_TK_EOF) break;
         if (cur(&p).kind == TC_TK_KW_STRUCT && peek(&p, 2).kind == TC_TK_LBRACE) {
             StructDef *sd = parse_struct_def(&p);
+            expect(&p, TC_TK_SEMI, str_lit("expected ';' after struct definition"));
             // Dedup against existing struct of the same name (cross-file
             // include of a shared header). Identical -> skip; mismatched
             // -> diagnostic.
@@ -1564,6 +1632,37 @@ void tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks) {
             }
             continue;
         }
+        // Forward declaration of an opaque struct: `struct Tag;` — no body.
+        // We register a StructDef with no fields so that TY_PTR_STRUCT
+        // references don't trip find_struct lookups in the emitter. If
+        // the struct gains a body later, that real definition will dedup
+        // the field set and overwrite the placeholder via the regular
+        // struct merge path.
+        if (cur(&p).kind == TC_TK_KW_STRUCT &&
+            peek(&p, 1).kind == TC_TK_IDENT &&
+            peek(&p, 2).kind == TC_TK_SEMI) {
+            int line = cur(&p).line;
+            p.i++;
+            string nm = cur(&p).text;
+            p.i++;  // IDENT
+            p.i++;  // SEMI
+            StructDef *existing = NULL;
+            for (size_t i = 0; i < prog->structs.size; i++) {
+                if (str_eq(prog->structs.data[i]->name, nm)) {
+                    existing = prog->structs.data[i];
+                    break;
+                }
+            }
+            if (!existing) {
+                StructDef *sd = arena_new(arena, StructDef);
+                *sd = (StructDef){0};
+                sd->name = nm;
+                sd->line = line;
+                VecStructField_reserve(arena, &sd->fields, 0);
+                VecStructDefPtr_push_back(arena, &prog->structs, sd);
+            }
+            continue;
+        }
         // Top-level enum body: `enum [Tag] { ... };`. Anything else that
         // starts with `enum` (a global/function whose type-spec is `enum
         // Tag`) falls through to the generic decl path below, where
@@ -1579,6 +1678,110 @@ void tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks) {
         if (cur(&p).kind == TC_TK_KW_TYPEDEF) {
             int line = cur(&p).line;
             p.i++;
+            // Skip typedefs of the va_list keyword to itself (or aliases).
+            // tinyC already provides `va_list` as a built-in; corec does
+            // `typedef __builtin_va_list va_list;` which we map to a no-op.
+            if (cur(&p).kind == TC_TK_KW_VA_LIST) {
+                while (cur(&p).kind != TC_TK_SEMI && cur(&p).kind != TC_TK_EOF) p.i++;
+                accept(&p, TC_TK_SEMI);
+                continue;
+            }
+            // `typedef enum [Tag] { ... } Alias;` — register the
+            // enumerators and treat Alias as TY_I32 (consistent with
+            // tinyC's existing `enum [Tag]` handling in parse_sig_type).
+            if (cur(&p).kind == TC_TK_KW_ENUM) {
+                p.i++;
+                if (cur(&p).kind == TC_TK_IDENT) p.i++;  // optional tag
+                if (cur(&p).kind == TC_TK_LBRACE) {
+                    parse_enum_body(&p);
+                }
+                if (cur(&p).kind == TC_TK_IDENT) {
+                    TcTok nm = cur(&p);
+                    p.i++;
+                    Type ty = (Type){0};
+                    ty.kind = TY_I32;
+                    Typedef *td = arena_new(arena, Typedef);
+                    td->name = nm.text;
+                    td->ty = ty;
+                    td->next = p.typedefs;
+                    p.typedefs = td;
+                }
+                expect(&p, TC_TK_SEMI, str_lit("expected ';' after typedef"));
+                continue;
+            }
+            // `typedef struct [Tag] { ... } Alias;`  — parse the struct
+            // body (creating / merging struct Tag, generating an anonymous
+            // tag if absent) and register Alias as a typedef for it.
+            // Also accept `typedef struct Tag Alias;` (no body).
+            if (cur(&p).kind == TC_TK_KW_STRUCT) {
+                size_t la = 1;
+                if (peek(&p, la).kind == TC_TK_IDENT) la++;
+                if (peek(&p, la).kind == TC_TK_LBRACE) {
+                    StructDef *sd = parse_struct_def(&p);
+                    // Alias name is required for anonymous structs.
+                    string alias = (string){0};
+                    if (cur(&p).kind == TC_TK_IDENT) {
+                        alias = cur(&p).text;
+                        p.i++;
+                    }
+                    if (sd->name.size == 0) {
+                        if (alias.size == 0) {
+                            perror_at(&p, line,
+                                str_lit("typedef of anonymous struct requires a name"));
+                        }
+                        sd->name = alias;
+                    }
+                    // Merge with existing struct of same tag.
+                    StructDef *existing_sd = NULL;
+                    for (size_t i = 0; i < prog->structs.size; i++) {
+                        if (str_eq(prog->structs.data[i]->name, sd->name)) {
+                            existing_sd = prog->structs.data[i];
+                            break;
+                        }
+                    }
+                    if (!existing_sd) {
+                        VecStructDefPtr_push_back(arena, &prog->structs, sd);
+                    } else if (!struct_def_equal(existing_sd, sd)) {
+                        perror_at(&p, sd->line, str_lit("conflicting redefinition of struct"));
+                    }
+                    if (alias.size != 0) {
+                        Type ty = (Type){0};
+                        ty.kind = TY_STRUCT;
+                        ty.struct_name = sd->name;
+                        Typedef *td = arena_new(arena, Typedef);
+                        td->name = alias;
+                        td->ty = ty;
+                        td->next = p.typedefs;
+                        p.typedefs = td;
+                    }
+                    expect(&p, TC_TK_SEMI, str_lit("expected ';' after typedef"));
+                    continue;
+                }
+                // No body: `typedef struct Tag Alias;`. Register an
+                // opaque placeholder StructDef for Tag (if not already
+                // defined) so that emit-time `find_struct` succeeds for
+                // pointer-only uses, then fall through to parse_sig_type
+                // which will return TY_STRUCT/TY_PTR_STRUCT as the
+                // typedef target type.
+                if (peek(&p, 1).kind == TC_TK_IDENT) {
+                    string tag = peek(&p, 1).text;
+                    bool found = false;
+                    for (size_t i = 0; i < prog->structs.size; i++) {
+                        if (str_eq(prog->structs.data[i]->name, tag)) {
+                            found = true; break;
+                        }
+                    }
+                    if (!found) {
+                        StructDef *sd = arena_new(arena, StructDef);
+                        *sd = (StructDef){0};
+                        sd->name = tag;
+                        sd->line = line;
+                        VecStructField_reserve(arena, &sd->fields, 0);
+                        VecStructDefPtr_push_back(arena, &prog->structs, sd);
+                    }
+                }
+                // Fall through to parse_sig_type below (which handles `struct Tag`).
+            }
             Type ty = {0};
             if (!parse_sig_type(&p, &ty)) {
                 perror_at(&p, line, str_lit("expected type after 'typedef'"));
