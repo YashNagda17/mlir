@@ -3136,6 +3136,25 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     int32_t path[2] = {0, (int32_t)fi};
                     MLIR_ValueHandle p =
                         emit_gep(e, addr, st_ty, path, 2, NULL, 0);
+                    if (ft.kind == TY_STRUCT) {
+                        StructDef *fsd = find_struct(e, ft.struct_name);
+                        if (!fsd) {
+                            EMIT_ERR(e, "unknown struct type for compound-literal field");
+                            continue;
+                        }
+                        Expr *ae = ex->args.data[i];
+                        if (ae->kind == EX_INT && ae->int_value == 0) {
+                            // Already zero-initialized by emit_struct_zero above.
+                            continue;
+                        }
+                        EVal vv = emit_expr(e, sc, ae);
+                        if (vv.is_ptr && vv.val != MLIR_INVALID_HANDLE) {
+                            emit_struct_copy(e, p, vv.val, fsd);
+                        } else {
+                            EMIT_ERR(e, "compound-literal struct field needs a struct value");
+                        }
+                        continue;
+                    }
                     EVal v = emit_expr(e, sc, ex->args.data[i]);
                     MLIR_TypeHandle want = scalar_mlir_type(e, ft.kind);
                     MLIR_ValueHandle sv;

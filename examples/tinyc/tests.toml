@@ -539,3 +539,7 @@ expected_stdout = "a=ABCDEF\nb=abcdef\nc=012345\n"
 [[test]]
 name = "struct_field_char_ptr"
 expected_stdout = "buf=ABCDE\n"
+
+[[test]]
+name = "compound_struct_field"
+expected_stdout = "tag=7 x=11 y=22\ntag=1 x=0 y=0\n"
