@@ -2598,6 +2598,17 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 prefix[0] = 0;
                 emit_struct_zero(e, sy->addr, st_ty, sd, prefix, 1);
                 if (st->decl_init) {
+                    // Struct rhs from a struct-returning call: `S x = f(...)`.
+                    if (st->decl_init->kind == EX_CALL) {
+                        FuncSig *sig = find_sig(e, st->decl_init->callee);
+                        if (sig && sig->ret.type.kind == TY_STRUCT &&
+                            sig->ret.sdef == sd) {
+                            emit_flat_call(e, sc, sig, st->decl_init->args, NULL, sy->addr);
+                            sy->next = sc->head;
+                            sc->head = sy;
+                            return;
+                        }
+                    }
                     if (st->decl_init->kind != EX_COMPOUND ||
                         st->decl_init->cast_type.kind != TY_STRUCT ||
                         !str_eq(st->decl_init->cast_type.struct_name,
@@ -3390,7 +3401,8 @@ static void init_struct_types(E *e) {
             else if (ft.kind == TY_I64) body[k] = e->i64;
             else if (ft.kind == TY_F32) body[k] = e->f32;
             else if (ft.kind == TY_PTR_STRUCT || ft.kind == TY_PTR_I32 ||
-                     ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID) body[k] = e->ptr;
+                     ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID ||
+                     ft.kind == TY_PTR_PTR || ft.kind == TY_FNPTR) body[k] = e->ptr;
             else if (ft.kind == TY_STRUCT) {
                 StructDef *inner = find_struct(e, ft.struct_name);
                 MLIR_TypeHandle t = find_struct_type(e, inner);

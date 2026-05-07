@@ -404,3 +404,7 @@ expected_stdout = "10\n11\n20\n21\n"
 [[test]]
 name = "structptr_index_field"
 expected_stdout = "100\n200\n"
+
+[[test]]
+name = "struct_return_decl"
+expected_stdout = "7\n42\n100\n200\n"
