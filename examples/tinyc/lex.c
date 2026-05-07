@@ -207,16 +207,22 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
                 v = v * 10 + (src.str[j] - '0');
                 j++;
             }
-            // Float literal: <digits>.<digits>[ (e|E)[+-]?<digits> ]
-            if (j < src.size && src.str[j] == '.' &&
-                j + 1 < src.size && is_digit(src.str[j + 1])) {
+            // Float literal: <digits>.<digits>[(e|E)[+-]?<digits>] OR
+            // <digits>(e|E)[+-]?<digits>
+            bool has_dot = (j < src.size && src.str[j] == '.' &&
+                            j + 1 < src.size && is_digit(src.str[j + 1]));
+            bool has_exp_only = (!has_dot && j < src.size &&
+                                 (src.str[j] == 'e' || src.str[j] == 'E'));
+            if (has_dot || has_exp_only) {
                 double f = (double)v;
-                j++; // consume '.'
-                double scale = 0.1;
-                while (j < src.size && is_digit(src.str[j])) {
-                    f += (double)(src.str[j] - '0') * scale;
-                    scale *= 0.1;
-                    j++;
+                if (has_dot) {
+                    j++; // consume '.'
+                    double scale = 0.1;
+                    while (j < src.size && is_digit(src.str[j])) {
+                        f += (double)(src.str[j] - '0') * scale;
+                        scale *= 0.1;
+                        j++;
+                    }
                 }
                 if (j < src.size && (src.str[j] == 'e' || src.str[j] == 'E')) {
                     j++;
