@@ -586,6 +586,7 @@ typedef struct {
 static EVal emit_expr(E *e, Scope *sc, Expr *ex);
 static int64_t type_size(E *e, Type t);
 static int64_t type_align(E *e, Type t);
+static Type infer_expr_type(E *e, Scope *sc, Expr *ex);
 
 static MLIR_ValueHandle emit_expr_i32(E *e, Scope *sc, Expr *ex) {
     EVal v = emit_expr(e, sc, ex);
@@ -1397,13 +1398,23 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             r.sdef     = av.sdef ? av.sdef : bv.sdef;
             return r;
         }
-        case EX_SIZEOF:
-            if (ex->cast_type.kind == TY_VOID) {
-                EMIT_ERR(e, "sizeof(void) is not allowed");
-                r.val = emit_const_i32(e, 1);
-                return r;
+        case EX_SIZEOF: {
+            Type ty;
+            if (ex->sizeof_is_expr) {
+                ty = infer_expr_type(e, sc, ex->lhs);
+                if (ty.kind == TY_VOID) {
+                    EMIT_ERR(e, "sizeof of unsupported expression");
+                    r.val = emit_const_i32(e, 1); return r;
+                }
+            } else {
+                ty = ex->cast_type;
+                if (ty.kind == TY_VOID) {
+                    EMIT_ERR(e, "sizeof(void) is not allowed");
+                    r.val = emit_const_i32(e, 1); return r;
+                }
             }
-            r.val = emit_const_i32(e, type_size(e, ex->cast_type)); return r;
+            r.val = emit_const_i32(e, type_size(e, ty)); return r;
+        }
         case EX_CAST: {
             // Pointer-to-pointer cast: opaque !llvm.ptr is universal, so
             // just evaluate the operand. We tag the result type from
@@ -2696,6 +2707,93 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
 // padded sum of fields (round each field to its alignment, struct align =
 // max field align, total rounded up to that). Used for sizeof().
 static int64_t type_align(E *e, Type t);
+
+// Infer the static C-level Type of an expression for `sizeof(<expr>)`.
+// We do NOT emit any operations — we walk the AST and look up symbols /
+// struct fields by name. Returns TY_VOID to signal "unsupported" (the
+// caller emits an error). Side-effecting expressions are still safe
+// because we never evaluate them.
+static Type infer_expr_type(E *e, Scope *sc, Expr *ex) {
+    Type t = (Type){0};
+    switch (ex->kind) {
+        case EX_INT:   t.kind = ex->is_i64 ? TY_I64 : TY_I32; return t;
+        case EX_FLOAT: t.kind = TY_F32; return t;
+        case EX_STR:   t.kind = TY_PTR_CHAR; return t;
+        case EX_NULL:  t.kind = TY_PTR_VOID; return t;
+        case EX_VAR: {
+            Sym *s = lookup(e, sc, ex->name);
+            if (s) return s->type;
+            int64_t en;
+            if (find_enum(e, ex->name, &en)) { t.kind = TY_I32; return t; }
+            return t;
+        }
+        case EX_DEREF: {
+            Type inner = infer_expr_type(e, sc, ex->lhs);
+            if (inner.kind == TY_PTR_I32) { t.kind = TY_I32; return t; }
+            if (inner.kind == TY_PTR_CHAR) { t.kind = TY_I32; return t; }
+            if (inner.kind == TY_PTR_PTR && inner.pointee) return *inner.pointee;
+            if (inner.kind == TY_PTR_STRUCT) {
+                t.kind = TY_STRUCT; t.struct_name = inner.struct_name; return t;
+            }
+            return t;
+        }
+        case EX_ADDR: {
+            Type inner = infer_expr_type(e, sc, ex->lhs);
+            if (inner.kind == TY_I32) { t.kind = TY_PTR_I32; return t; }
+            // For other base kinds we report a generic pointer; sizeof
+            // is the same regardless.
+            t.kind = TY_PTR_VOID; return t;
+        }
+        case EX_FIELD: {
+            Type st = infer_expr_type(e, sc, ex->lhs);
+            StructDef *sd = NULL;
+            if (st.kind == TY_STRUCT)      sd = find_struct(e, st.struct_name);
+            else if (st.kind == TY_PTR_STRUCT) sd = find_struct(e, st.struct_name);
+            if (!sd) return t;
+            for (size_t i = 0; i < sd->fields.size; i++) {
+                if (str_eq(sd->fields.data[i].name, ex->name))
+                    return sd->fields.data[i].type;
+            }
+            return t;
+        }
+        case EX_INDEX: {
+            Type base = infer_expr_type(e, sc, ex->lhs);
+            if (base.kind == TY_ARRAY_I32 || base.kind == TY_PTR_I32) {
+                t.kind = TY_I32; return t;
+            }
+            if (base.kind == TY_PTR_CHAR) { t.kind = TY_I32; return t; }
+            if (base.kind == TY_ARRAY_F32) { t.kind = TY_F32; return t; }
+            if (base.kind == TY_ARRAY_STRUCT) {
+                t.kind = TY_STRUCT; t.struct_name = base.struct_name; return t;
+            }
+            return t;
+        }
+        case EX_CALL: {
+            FuncSig *sig = find_sig(e, ex->callee);
+            if (sig) return sig->ret.type;
+            return t;
+        }
+        case EX_CAST: return ex->cast_type;
+        case EX_SIZEOF: t.kind = TY_I32; return t;
+        case EX_BIN: {
+            Type a = infer_expr_type(e, sc, ex->lhs);
+            Type b = infer_expr_type(e, sc, ex->rhs);
+            // Usual arithmetic conversions (simplified): if either side
+            // is i64 the result is i64; if either is f32, result is f32.
+            if (a.kind == TY_F32 || b.kind == TY_F32) { t.kind = TY_F32; return t; }
+            if (a.kind == TY_I64 || b.kind == TY_I64) { t.kind = TY_I64; return t; }
+            return a;
+        }
+        case EX_UN:
+        case EX_TERNARY:
+        case EX_ASSIGN: {
+            // Use the LHS type as the result type.
+            return infer_expr_type(e, sc, ex->lhs ? ex->lhs : ex->lvalue);
+        }
+        default: return t;
+    }
+}
+
 static int64_t type_size(E *e, Type t) {
     if (t.kind == TY_I32) return 4;
     if (t.kind == TY_I64) return 8;

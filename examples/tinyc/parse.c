@@ -223,13 +223,29 @@ static Expr *parse_primary(P *p) {
     if (t.kind == TC_TK_KW_SIZEOF) {
         p->i++;
         expect(p, TC_TK_LPAREN, str_lit("expected '(' after sizeof"));
-        Type ty = {0};
-        if (!parse_abstract_type(p, &ty)) {
-            perror_at(p, cur(p).line, str_lit("expected type in sizeof(...)"));
+        // Disambiguate `sizeof(<type>)` vs `sizeof(<expr>)`. A type-name
+        // starts with a base-type keyword, `const`, `enum`, or a typedef
+        // identifier. Anything else is parsed as an expression.
+        Expr *e = new_expr(p, EX_SIZEOF, t.line);
+        TcTokKind nxt = cur(p).kind;
+        bool looks_like_type =
+            nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT ||
+            nxt == TC_TK_KW_CHAR || nxt == TC_TK_KW_VOID ||
+            nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_ENUM ||
+            nxt == TC_TK_KW_CONST || nxt == TC_TK_KW_LONG ||
+            nxt == TC_TK_KW_SIGNED || nxt == TC_TK_KW_UNSIGNED ||
+            (nxt == TC_TK_IDENT && typedef_lookup(p, cur(p).text) != NULL);
+        if (looks_like_type) {
+            Type ty = {0};
+            if (!parse_abstract_type(p, &ty)) {
+                perror_at(p, cur(p).line, str_lit("expected type in sizeof(...)"));
+            }
+            e->cast_type = ty;
+        } else {
+            e->lhs = parse_expr(p);
+            e->sizeof_is_expr = true;
         }
         expect(p, TC_TK_RPAREN, str_lit("expected ')'"));
-        Expr *e = new_expr(p, EX_SIZEOF, t.line);
-        e->cast_type = ty;
         return e;
     }
     if (t.kind == TC_TK_STRING_LIT) {

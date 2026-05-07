@@ -195,8 +195,11 @@ struct Expr {
     // For EX_INDEX (lhs = array, rhs = index)
     // For EX_ADDR / EX_DEREF (lhs = inner)
     // For EX_SIZEOF / EX_CAST: cast_type is the type being asked about /
-    // cast to. EX_CAST also uses lhs as the operand.
+    // cast to. EX_CAST also uses lhs as the operand. EX_SIZEOF may instead
+    // carry an operand expression in lhs (sizeof_is_expr=true), in which
+    // case the emitter infers the type from the expression.
     Type cast_type;
+    bool sizeof_is_expr;
     int line;
 };
 
