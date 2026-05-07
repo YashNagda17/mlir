@@ -195,7 +195,7 @@ static bool find_enum(E *e, string name, int64_t *out_value) {
 static MLIR_TypeHandle scalar_mlir_type(E *e, TypeKind k) {
     if (k == TY_F32) return e->f32;
     if (k == TY_PTR_STRUCT || k == TY_PTR_I32 || k == TY_PTR_CHAR ||
-        k == TY_PTR_VOID || k == TY_FNPTR) return e->ptr;
+        k == TY_PTR_VOID || k == TY_FNPTR || k == TY_PTR_PTR) return e->ptr;
     return e->i32;
 }
 
@@ -951,13 +951,17 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
         case EX_DEREF: {
             if (ex->lhs->kind == EX_VAR) {
                 Sym *s = lookup(e, sc, ex->lhs->name);
-                if (!s || (s->type.kind != TY_PTR_I32 && s->type.kind != TY_PTR_CHAR)) {
+                if (!s || (s->type.kind != TY_PTR_I32 &&
+                           s->type.kind != TY_PTR_CHAR &&
+                           s->type.kind != TY_PTR_PTR)) {
                     EMIT_ERR(e, "dereference of non-pointer");
                     return r;
                 }
                 // Load the inner ptr from p's slot.
                 r.base_ptr = emit_load_v(e, sym_addr(e, s), e->ptr);
-                r.elem_ty = (s->type.kind == TY_PTR_CHAR) ? e->i8 : e->i32;
+                if (s->type.kind == TY_PTR_CHAR) r.elem_ty = e->i8;
+                else if (s->type.kind == TY_PTR_PTR) r.elem_ty = e->ptr;
+                else r.elem_ty = e->i32;
                 return r;
             }
             // General `*<expr>` form (e.g. *(p+i)). Evaluate the operand
@@ -1464,9 +1468,45 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                         if (s->type.kind == TY_PTR_CHAR) { v.is_str = true; v.ptr_elem = e->i8; }
                         else if (s->type.kind == TY_PTR_I32) v.ptr_elem = e->i32;
                         else if (s->type.kind == TY_PTR_VOID) v.is_void_ptr = true;
+                        else if (s->type.kind == TY_PTR_PTR) {
+                            // Reading the value of a T** yields a T* — tag
+                            // the EVal so a subsequent dereference can load
+                            // the inner T at the right element type. The
+                            // pointee field carries the inner pointer's
+                            // element kind.
+                            v.ptr_elem = e->ptr;
+                            if (s->type.pointee) {
+                                Type *pe = s->type.pointee;
+                                if (pe->kind == TY_PTR_CHAR) v.is_str = true;
+                                else if (pe->kind == TY_PTR_STRUCT) {
+                                    v.sdef = find_struct(e, pe->struct_name);
+                                } else if (pe->kind == TY_FNPTR) {
+                                    Type *fnty = arena_new(e->arena, Type);
+                                    *fnty = *pe;
+                                    v.fnptr_ty = fnty;
+                                }
+                            }
+                        }
                         else if (s->type.kind == TY_FNPTR) {
                             Type *fnty = arena_new(e->arena, Type);
                             *fnty = s->type;
+                            v.fnptr_ty = fnty;
+                        }
+                    }
+                } else if (ex->kind == EX_DEREF && ex->lhs->kind == EX_VAR) {
+                    // *pp where pp is T**: the loaded value is a T*. Tag
+                    // it from the pointee so further reads / calls work.
+                    Sym *s = lookup(e, sc, ex->lhs->name);
+                    if (s && s->type.kind == TY_PTR_PTR && s->type.pointee) {
+                        Type *pe = s->type.pointee;
+                        if (pe->kind == TY_PTR_I32) v.ptr_elem = e->i32;
+                        else if (pe->kind == TY_PTR_CHAR) { v.is_str = true; v.ptr_elem = e->i8; }
+                        else if (pe->kind == TY_PTR_VOID) v.is_void_ptr = true;
+                        else if (pe->kind == TY_PTR_STRUCT) {
+                            v.sdef = find_struct(e, pe->struct_name);
+                        } else if (pe->kind == TY_FNPTR) {
+                            Type *fnty = arena_new(e->arena, Type);
+                            *fnty = *pe;
                             v.fnptr_ty = fnty;
                         }
                     }
@@ -1528,6 +1568,13 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 r.is_ptr = true;
                 if (s->type.kind == TY_I32 || s->type.kind == TY_ARRAY_I32) r.ptr_elem = e->i32;
                 else if (s->type.kind == TY_F32) r.ptr_elem = e->f32;
+                else if (s->type.kind == TY_PTR_I32 || s->type.kind == TY_PTR_CHAR ||
+                         s->type.kind == TY_PTR_VOID || s->type.kind == TY_PTR_STRUCT ||
+                         s->type.kind == TY_FNPTR || s->type.kind == TY_PTR_PTR) {
+                    // &p where p is itself a pointer: yield a T** (storage
+                    // !llvm.ptr) whose deref loads another !llvm.ptr.
+                    r.ptr_elem = e->ptr;
+                }
                 return r;
             }
             if (ex->lhs->kind == EX_INDEX) {
@@ -1799,9 +1846,26 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             return r;
         }
         case EX_CALL: {
+            // Indirect call through a callable expression captured in
+            // `ex->lhs` (e.g. `(*fp)(args)` produced by parse_postfix). The
+            // expression must yield an EVal with is_ptr=true and a
+            // fnptr_ty signature. We branch into the same call_indirect
+            // emission used for the named-fnptr-variable case below.
+            Type *indirect_fnty = NULL;
+            MLIR_ValueHandle indirect_callee_ptr = MLIR_INVALID_HANDLE;
+            if (ex->callee.size == 0 && ex->lhs) {
+                EVal cv = emit_expr(e, sc, ex->lhs);
+                if (!cv.is_ptr || !cv.fnptr_ty || !cv.fnptr_ty->fnptr_ret) {
+                    EMIT_ERR(e, "callee expression is not a function pointer");
+                    r.val = emit_const_i32(e, 0);
+                    return r;
+                }
+                indirect_fnty = cv.fnptr_ty;
+                indirect_callee_ptr = cv.val;
+            }
             // Built-in malloc(size) -> !llvm.ptr; size is i32 (typically
             // sizeof), extended to i64 for the libc signature.
-            if (str_eq(ex->callee, str_lit("malloc"))) {
+            if (!indirect_fnty && str_eq(ex->callee, str_lit("malloc"))) {
                 if (ex->args.size != 1) {
                     EMIT_ERR(e, "malloc expects 1 argument");
                     r.val = emit_null_ptr(e); r.is_ptr = true; return r;
@@ -1820,7 +1884,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                         rts, 1, rs, 1, ops, 1, as, 1, NULL, 0);
                 r.val = res; r.is_ptr = true; return r;
             }
-            if (str_eq(ex->callee, str_lit("free"))) {
+            if (!indirect_fnty && str_eq(ex->callee, str_lit("free"))) {
                 if (ex->args.size != 1) {
                     EMIT_ERR(e, "free expects 1 argument");
                     return r;
@@ -1836,19 +1900,26 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 r.val = emit_const_i32(e, 0);
                 return r;
             }
-            FuncSig *sig = find_sig(e, ex->callee);
+            FuncSig *sig = indirect_fnty ? NULL : find_sig(e, ex->callee);
             if (!sig) {
-                // Indirect call through a function-pointer value bound to
-                // `ex->callee` (local var, parameter, or module global).
-                Sym *sy = lookup(e, sc, ex->callee);
-                if (!sy || sy->type.kind != TY_FNPTR || !sy->type.fnptr_ret) {
-                    EMIT_ERR(e, "undefined function: {}", ex->callee);
-                    r.val = emit_const_i32(e, 0);
-                    return r;
+                Type *fnty = NULL;
+                MLIR_ValueHandle callee_ptr = MLIR_INVALID_HANDLE;
+                if (indirect_fnty) {
+                    fnty = indirect_fnty;
+                    callee_ptr = indirect_callee_ptr;
+                } else {
+                    // Indirect call through a function-pointer value bound to
+                    // `ex->callee` (local var, parameter, or module global).
+                    Sym *sy = lookup(e, sc, ex->callee);
+                    if (!sy || sy->type.kind != TY_FNPTR || !sy->type.fnptr_ret) {
+                        EMIT_ERR(e, "undefined function: {}", ex->callee);
+                        r.val = emit_const_i32(e, 0);
+                        return r;
+                    }
+                    fnty = &sy->type;
+                    // Load the !llvm.ptr from the variable's storage.
+                    callee_ptr = emit_load_v(e, sym_addr(e, sy), e->ptr);
                 }
-                Type *fnty = &sy->type;
-                // Load the !llvm.ptr from the variable's storage.
-                MLIR_ValueHandle callee_ptr = emit_load_v(e, sym_addr(e, sy), e->ptr);
                 size_t na = ex->args.size;
                 if ((int)na != fnty->fnptr_nparams) {
                     EMIT_ERR(e, "indirect call to {} arity mismatch",
@@ -2007,7 +2078,8 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             sy->name = st->decl_name;
             sy->type = st->decl_type;
 
-            if (st->decl_type.kind == TY_PTR_I32 || st->decl_type.kind == TY_PTR_VOID) {
+            if (st->decl_type.kind == TY_PTR_I32 || st->decl_type.kind == TY_PTR_VOID ||
+                st->decl_type.kind == TY_PTR_PTR) {
                 sy->addr = emit_alloca(e, e->ptr);
                 if (st->decl_init) {
                     EVal iv = emit_expr(e, sc, st->decl_init);
@@ -2172,7 +2244,8 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                              sig->ret.type.kind == TY_PTR_I32 ||
                              sig->ret.type.kind == TY_PTR_CHAR ||
                              sig->ret.type.kind == TY_PTR_VOID ||
-                             sig->ret.type.kind == TY_FNPTR)) want_ty = e->ptr;
+                             sig->ret.type.kind == TY_FNPTR ||
+                             sig->ret.type.kind == TY_PTR_PTR)) want_ty = e->ptr;
             else want_ty = e->i32;
             EVal v = emit_expr(e, sc, st->expr);
             MLIR_ValueHandle ret_v;
@@ -2411,7 +2484,7 @@ static void slot_resolve(E *e, Type ty, SlotInfo *out) {
     } else if (ty.kind != TY_I32 && ty.kind != TY_F32 &&
                ty.kind != TY_PTR_I32 && ty.kind != TY_PTR_CHAR &&
                ty.kind != TY_PTR_VOID && ty.kind != TY_VOID &&
-               ty.kind != TY_FNPTR) {
+               ty.kind != TY_FNPTR && ty.kind != TY_PTR_PTR) {
         EMIT_ERR(e, "unsupported type in function signature");
     }
 }
@@ -2511,7 +2584,8 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
             sy->addr = emit_alloca(e, e->f32);
             emit_store_v(e, blk, sy->addr);
         } else if (p->type.kind == TY_PTR_I32 || p->type.kind == TY_PTR_CHAR ||
-                   p->type.kind == TY_PTR_VOID || p->type.kind == TY_FNPTR) {
+                   p->type.kind == TY_PTR_VOID || p->type.kind == TY_FNPTR ||
+                   p->type.kind == TY_PTR_PTR) {
             sy->addr = emit_alloca(e, e->ptr);
             emit_store_v(e, blk, sy->addr);
         } else {
@@ -2562,6 +2636,7 @@ static int64_t type_size(E *e, Type t) {
     if (t.kind == TY_F32) return 4;
     if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return 8;
     if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return 8;
+    if (t.kind == TY_PTR_PTR) return 8;
     if (t.kind == TY_ARRAY_I32) return 4 * t.array_len * (t.array_len2 ? t.array_len2 : 1);
     if (t.kind == TY_ARRAY_F32) return 4 * t.array_len * (t.array_len2 ? t.array_len2 : 1);
     if (t.kind == TY_ARRAY_PTR_STRUCT || t.kind == TY_ARRAY_PTR_CHAR)
@@ -2592,6 +2667,7 @@ static int64_t type_align(E *e, Type t) {
     if (t.kind == TY_I32 || t.kind == TY_F32) return 4;
     if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return 8;
     if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return 8;
+    if (t.kind == TY_PTR_PTR) return 8;
     if (t.kind == TY_ARRAY_I32 || t.kind == TY_ARRAY_F32) return 4;
     if (t.kind == TY_ARRAY_PTR_STRUCT || t.kind == TY_ARRAY_PTR_CHAR) return 8;
     if (t.kind == TY_STRUCT) {

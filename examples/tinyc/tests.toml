@@ -209,3 +209,11 @@ expected_stdout = "17\n17\n99\n99\n5\n99\n"
 [[test]]
 name = "storage_class"
 expected_stdout = "1\n2\n3\n25\n27\n30\n"
+
+[[test]]
+name = "ptr_to_ptr"
+expected_stdout = "41\n42\n"
+
+[[test]]
+name = "ptr_to_fnptr"
+expected_stdout = "5\n7\n"

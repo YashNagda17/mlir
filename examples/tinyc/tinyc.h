@@ -113,6 +113,11 @@ typedef enum {
     TY_VOID,           // void — only valid as a function return type
                        // or as the lone parameter spec (`f(void)`)
     TY_PTR_VOID,       // void* — generic pointer (storage: !llvm.ptr)
+    TY_PTR_PTR,        // generic pointer-to-pointer (T**). Storage:
+                       // !llvm.ptr. The `pointee` field carries the
+                       // (single-level) inner pointer type so a deref of
+                       // a T** loads the inner T*. Limited to depth 2:
+                       // T*** is not supported.
 } TypeKind;
 
 typedef struct Type Type;
@@ -127,6 +132,10 @@ struct Type {
     Type    *fnptr_ret;
     Type    *fnptr_params;
     int      fnptr_nparams;
+    // For TY_PTR_PTR: the (single-level) pointer type that this T** points
+    // at. Carries the inner pointee kind / fnptr signature / struct_name
+    // so a deref can be typed correctly.
+    Type    *pointee;
 };
 
 typedef enum {

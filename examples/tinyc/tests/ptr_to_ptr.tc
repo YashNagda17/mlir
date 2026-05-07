@@ -1,0 +1,12 @@
+int main() {
+    int x;
+    int *p;
+    int **pp;
+    x = 41;
+    p = &x;
+    pp = &p;
+    print(**pp);
+    **pp = 42;
+    print(x);
+    return 0;
+}
