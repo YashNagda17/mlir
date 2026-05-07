@@ -1244,6 +1244,22 @@ static MLIR_ValueHandle resolve_struct_source(E *e, Scope *sc, Expr *arg, Struct
             return sym_addr(e, s);
         }
     }
+    // `*<expr>` where <expr> is a struct pointer: yield the loaded
+    // !llvm.ptr value; the caller treats it as the struct source for
+    // a by-value copy.
+    if (arg->kind == EX_DEREF) {
+        Type inner = infer_expr_type(e, sc, arg->lhs);
+        if (inner.kind == TY_PTR_STRUCT) {
+            StructDef *sd = find_struct(e, inner.struct_name);
+            if (sd) {
+                EVal pv = emit_expr(e, sc, arg->lhs);
+                if (pv.is_ptr) {
+                    *out_sd = sd;
+                    return pv.val;
+                }
+            }
+        }
+    }
     // Fallback: evaluate as a generic pointer expression.
     EVal v = emit_expr(e, sc, arg);
     if (!v.is_ptr) {
