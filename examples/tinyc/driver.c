@@ -102,6 +102,11 @@ int app_main(void) {
         return 1;
     }
     MLIR_OpHandle module = tinyc_emit_module(&ctx, prog);
+    if (tinyc_last_emit_errors() > 0) {
+        arena_destroy(arena);
+        arena_destroy(boot_arena);
+        return 1;
+    }
 
     if (emit_lowered || emit_llvm) {
         if (!MLIR_LowerToLLVMDialect(&ctx, module)) {

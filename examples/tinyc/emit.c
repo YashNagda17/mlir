@@ -145,6 +145,7 @@ typedef struct {
     bool             need_va_arg_helpers;  // emit tinyc_va_arg_* externs
     int              cur_line;       // last AST node line entered; used by
                                      // EMIT_ERR for diagnostic line numbers.
+    int              err_count;      // count of EMIT_ERR diagnostics
 } E;
 
 // All emit-time diagnostics route through this macro so they carry a line
@@ -154,8 +155,11 @@ typedef struct {
 // entry of emit_expr / emit_lvalue / emit_stmt / emit_func / per-struct
 // pre-pass loops.
 #define EMIT_ERR(e, msg, ...) \
-    println(str_lit("tinyc emit error at line {}: " msg), \
-            (int64_t)((e)->cur_line), ##__VA_ARGS__)
+    do { \
+        println(str_lit("tinyc emit error at line {}: " msg), \
+                (int64_t)((e)->cur_line), ##__VA_ARGS__); \
+        (e)->err_count++; \
+    } while (0)
 
 static StructDef *find_struct(E *e, string name) {
     if (!e->program) return NULL;
@@ -3479,6 +3483,8 @@ static void init_struct_types(E *e) {
     }
 }
 
+static int g_last_emit_errors = 0;
+
 MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
     Arena *arena = MLIR_GetArenaAllocator(ctx);
     E e = (E){0};
@@ -3743,5 +3749,8 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
                                            regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
         MLIR_AppendBlockOp(ctx, mb, decl);
     }
+    g_last_emit_errors = e.err_count;
     return module;
 }
+
+int tinyc_last_emit_errors(void) { return g_last_emit_errors; }

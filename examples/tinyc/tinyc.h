@@ -478,3 +478,4 @@ int tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks);
 // Build a top-level MLIR module from `program`. The returned op handle
 // is the `builtin.module` op. Uses only mlir_api.h.
 MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program);
+int tinyc_last_emit_errors(void);
