@@ -1,0 +1,13 @@
+// Regression: tinyc must concatenate adjacent string literals like C.
+// Used heavily in mlir/parser.c (multi-line MLIR text literals).
+int main() {
+    char *s;
+    s = "hello"
+        " "
+        "world";
+    print(s[0]);
+    print(s[5]);
+    print(s[6]);
+    print(s[10]);
+    return 0;
+}
