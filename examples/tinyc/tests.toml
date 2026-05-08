@@ -259,6 +259,10 @@ name = "extern_malloc_free"
 expected_stdout = "42\n99\n"
 
 [[test]]
+name = "escape_chars"
+expected_stdout = "11\n12\n7\n8\n63\n11\n12\n7\n8\n63\n"
+
+[[test]]
 name = "multi_basic"
 sources = ["multi_basic_a.tc", "multi_basic_b.tc"]
 expected_stdout = "5\n"

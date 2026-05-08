@@ -1,0 +1,17 @@
+// Regression: tinyc must accept the full C escape set in both string
+// and character literals. Previously \v \f \a \b \? were rejected.
+int main() {
+    char *s;
+    s = "\v\f\a\b\?";
+    print(s[0]);
+    print(s[1]);
+    print(s[2]);
+    print(s[3]);
+    print(s[4]);
+    print('\v');
+    print('\f');
+    print('\a');
+    print('\b');
+    print('\?');
+    return 0;
+}
