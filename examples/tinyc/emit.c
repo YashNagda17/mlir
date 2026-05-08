@@ -4800,7 +4800,8 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
     bool have_user_malloc = false, have_user_free = false;
     for (size_t i = 0; i < program->funcs.size; i++) {
         Func *fwd = program->funcs.data[i];
-        if (!fwd->is_forward) continue;
+        // Skip the auto-decl if the user already has a forward decl OR a
+        // full definition (corec-stdlib's stdlib/stdlib.c defines them).
         if (str_eq(fwd->name, str_lit("malloc"))) have_user_malloc = true;
         else if (str_eq(fwd->name, str_lit("free"))) have_user_free = true;
     }

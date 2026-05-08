@@ -1,0 +1,28 @@
+// Regression: a user *definition* (not just a forward decl) of malloc/free
+// must NOT collide with the emitter's auto-injected libc decl. Previously
+// only forward decls suppressed the auto-decl, so defining malloc in the
+// TU produced "redefinition of symbol named 'malloc'" during MLIR
+// lowering. corec-stdlib's stdlib/stdlib.c hits this.
+static char heap[1024];
+static int heap_off = 0;
+
+void *malloc(long n) {
+    void *p;
+    p = (void*)(heap + heap_off);
+    heap_off = heap_off + (int)n;
+    return p;
+}
+
+void free(void *p) {
+}
+
+int main() {
+    int *p;
+    p = (int*)malloc(8);
+    p[0] = 7;
+    p[1] = 13;
+    print(p[0]);
+    print(p[1]);
+    free(p);
+    return 0;
+}
