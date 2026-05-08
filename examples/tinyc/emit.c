@@ -3459,10 +3459,13 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 sy->addr = emit_alloca(e, e->ptr);
                 if (st->decl_init) {
                     EVal iv = emit_expr(e, sc, st->decl_init);
-                    if (!iv.is_ptr) {
-                        EMIT_ERR(e, "pointer initializer must be a pointer expression");
-                    } else {
+                    if (iv.is_ptr) {
                         emit_store_v(e, iv.val, sy->addr);
+                    } else if (st->decl_init->kind == EX_INT && st->decl_init->int_value == 0) {
+                        // Null-pointer constant: `T *p = 0;` / `T *p = NULL;`.
+                        emit_store_v(e, emit_null_ptr(e), sy->addr);
+                    } else {
+                        EMIT_ERR(e, "pointer initializer must be a pointer expression");
                     }
                 }
             } else if (st->decl_type.kind == TY_PTR_CHAR) {
