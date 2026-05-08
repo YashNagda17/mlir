@@ -5,7 +5,7 @@ int main() {
     a = 100LL;
     b = 200LL;
     c = a + b;
-    print(c);
-    print(c * 3LL);
+    _tinyc_print(c);
+    _tinyc_print(c * 3LL);
     return 0;
 }

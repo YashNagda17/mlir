@@ -4,6 +4,6 @@
 // add() even though it has no prototype here.
 
 int main() {
-    print(add(2, 3));
+    _tinyc_print(add(2, 3));
     return 0;
 }

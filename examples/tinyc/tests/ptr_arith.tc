@@ -6,13 +6,13 @@ int main() {
     }
 
     int* p = &a[0];
-    print(*p);          // 10
-    print(*(p + 2));    // 30
-    print(p[3]);        // 40
+    _tinyc_print(*p);          // 10
+    _tinyc_print(*(p + 2));    // 30
+    _tinyc_print(p[3]);        // 40
 
     int* q = p + 4;
-    print(*q);          // 50
-    print(q - p);       // 4
+    _tinyc_print(*q);          // 50
+    _tinyc_print(q - p);       // 4
 
     int sum = 0;
     int* it = &a[0];
@@ -21,6 +21,6 @@ int main() {
         sum = sum + *it;
         it = it + 1;
     }
-    print(sum);         // 10+20+30+40+50 = 150
+    _tinyc_print(sum);         // 10+20+30+40+50 = 150
     return 0;
 }

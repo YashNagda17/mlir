@@ -13,7 +13,7 @@ int main() {
     Pt *b;
     a = find(-1);
     b = find(7);
-    if (a == ((Pt *)0)) print(1);
-    if (b == ((void*)0)) print(2);
+    if (a == ((Pt *)0)) _tinyc_print(1);
+    if (b == ((void*)0)) _tinyc_print(2);
     return 0;
 }

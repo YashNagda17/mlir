@@ -14,10 +14,10 @@ Point shift(int n, int x0, ...) {
 int main() {
     Point a;
     a = shift(10, 3);
-    print(a.x);  // 13
-    print(a.y);  // 7
+    _tinyc_print(a.x);  // 13
+    _tinyc_print(a.y);  // 7
     a = shift(20, 5, 99, 88);
-    print(a.x);  // 25
-    print(a.y);  // 15
+    _tinyc_print(a.x);  // 25
+    _tinyc_print(a.y);  // 15
     return 0;
 }

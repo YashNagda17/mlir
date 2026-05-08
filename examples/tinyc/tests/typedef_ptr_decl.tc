@@ -10,10 +10,10 @@ int main() {
 
     Point *p;
     p = &a;
-    print(p->x);     // 3
-    print(p->y);     // 4
+    _tinyc_print(p->x);     // 3
+    _tinyc_print(p->y);     // 4
 
     Point *q = &a;
-    print(q->x + q->y);  // 7
+    _tinyc_print(q->x + q->y);  // 7
     return 0;
 }

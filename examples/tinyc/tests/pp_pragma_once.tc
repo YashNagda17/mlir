@@ -5,7 +5,7 @@
 #include "pp_b.h"
 
 int main() {
-    print(once_value()); // 7
-    print(b_call());     // 7
+    _tinyc_print(once_value()); // 7
+    _tinyc_print(b_call());     // 7
     return 0;
 }

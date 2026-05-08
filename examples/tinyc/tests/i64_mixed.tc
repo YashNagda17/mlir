@@ -3,8 +3,8 @@ int main() {
     long long y;
     x = 5;
     y = 10LL;
-    print(x + y);
-    print(y - x);
-    print(y * x);
+    _tinyc_print(x + y);
+    _tinyc_print(y - x);
+    _tinyc_print(y * x);
     return 0;
 }

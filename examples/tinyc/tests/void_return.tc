@@ -1,10 +1,10 @@
 // `void` return type with a bare `return;` early exit.
 void greet(int n) {
     if (n < 0) {
-        print(-1);
+        _tinyc_print(-1);
         return;
     }
-    print(n);
+    _tinyc_print(n);
 }
 
 int main() {

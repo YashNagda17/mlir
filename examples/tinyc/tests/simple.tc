@@ -1,5 +1,5 @@
 int main() {
     int x = 1 + 2;
-    print(x);
+    _tinyc_print(x);
     return 0;
 }

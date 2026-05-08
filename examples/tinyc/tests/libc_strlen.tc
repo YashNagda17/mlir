@@ -2,8 +2,8 @@
 extern long strlen(char *s);
 
 int main() {
-    print(strlen(""));
-    print(strlen("hello"));
-    print(strlen("hello world"));
+    _tinyc_print(strlen(""));
+    _tinyc_print(strlen("hello"));
+    _tinyc_print(strlen("hello world"));
     return 0;
 }

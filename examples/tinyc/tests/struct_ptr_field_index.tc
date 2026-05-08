@@ -26,9 +26,9 @@ int main() {
     iv.n = 3LL;
     fill_iv(&iv);
 
-    print(iv.data[0]); // 10
-    print(iv.data[1]); // 11
-    print(iv.data[2]); // 12
+    _tinyc_print(iv.data[0]); // 10
+    _tinyc_print(iv.data[1]); // 11
+    _tinyc_print(iv.data[2]); // 12
 
     long *lbuf;
     lbuf = (long *)malloc(sizeof(long) * 3);
@@ -37,9 +37,9 @@ int main() {
     lv.n = 3LL;
     fill_lv(&lv);
 
-    print(lv.data[0]);  // 1000000
-    print(lv.data[1]);  // 2000000
-    print(lv.data[2]);  // 3000000
+    _tinyc_print(lv.data[0]);  // 1000000
+    _tinyc_print(lv.data[1]);  // 2000000
+    _tinyc_print(lv.data[2]);  // 3000000
     free(lbuf);
     free(ibuf);
     return 0;

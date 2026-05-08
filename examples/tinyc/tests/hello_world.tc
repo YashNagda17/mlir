@@ -1,6 +1,6 @@
 int main() {
-    print("Hello, world!");
-    print("Foo");
-    print("");
+    _tinyc_print("Hello, world!");
+    _tinyc_print("Foo");
+    _tinyc_print("");
     return 0;
 }

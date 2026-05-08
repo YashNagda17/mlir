@@ -9,8 +9,8 @@ int main() {
     p = (int*)malloc(16);
     p[0] = 42;
     p[1] = 99;
-    print(p[0]);
-    print(p[1]);
+    _tinyc_print(p[0]);
+    _tinyc_print(p[1]);
     free(p);
     return 0;
 }

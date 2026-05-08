@@ -16,8 +16,8 @@ int sum(int n, ...) {
 }
 
 int main() {
-    print(sum(3, 10, 20, 30));   // 60
-    print(sum(5, 1, 2, 3, 4, 5)); // 15
-    print(sum(1, 99));            // 99
+    _tinyc_print(sum(3, 10, 20, 30));   // 60
+    _tinyc_print(sum(5, 1, 2, 3, 4, 5)); // 15
+    _tinyc_print(sum(1, 99));            // 99
     return 0;
 }

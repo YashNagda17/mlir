@@ -35,7 +35,7 @@ native binary
 - Types: `int` only (i32).
 - Locals: `int x;` and `int x = expr;` — stored in `memref<i32>`.
 - Operators: `+ - * / %`, `< <= > >= == !=`, `&& || !`, unary `-`.
-- Statements: assignment, `if`/`else`, `while`, `return`, `print(expr);`,
+- Statements: assignment, `if`/`else`, `while`, `return`, `_tinyc_print(expr);`,
   blocks `{ … }`. `print` lowers to `vector.print`.
 - Functions: `int name(int p, int q, …) { … }` returning int.
 - `main()` is the program entry point.

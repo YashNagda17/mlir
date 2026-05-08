@@ -19,11 +19,11 @@ int use_param(int B) {  // parameter shadows enum B
 }
 
 int main() {
-    print(use_enum() - 99);    // 100 - 99 = 1
-    print(use_local());        // 2
-    print(use_param(3));       // 3
+    _tinyc_print(use_enum() - 99);    // 100 - 99 = 1
+    _tinyc_print(use_local());        // 2
+    _tinyc_print(use_param(3));       // 3
     int A;
     A = 1;
-    print(A);                  // 1, not 100
+    _tinyc_print(A);                  // 1, not 100
     return 0;
 }

@@ -9,13 +9,13 @@ int bump() {
 }
 
 int main() {
-    print(greeting);
-    print(counter);
+    _tinyc_print(greeting);
+    _tinyc_print(counter);
     bump();
     bump();
-    print(counter);
+    _tinyc_print(counter);
     total = counter * 10;
-    print(total);
-    print(pi);
+    _tinyc_print(total);
+    _tinyc_print(pi);
     return 0;
 }

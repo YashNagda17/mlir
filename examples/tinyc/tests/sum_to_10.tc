@@ -10,6 +10,6 @@ int sum_to(int n) {
 
 int main() {
     int x = sum_to(10);
-    print(x);
+    _tinyc_print(x);
     return 0;
 }

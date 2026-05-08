@@ -10,8 +10,8 @@ int sign(int x) {
 }
 
 int main() {
-    print(sign(strcmp("abc", "abc")));
-    print(sign(strcmp("abc", "abd")));
-    print(sign(strcmp("abd", "abc")));
+    _tinyc_print(sign(strcmp("abc", "abc")));
+    _tinyc_print(sign(strcmp("abc", "abd")));
+    _tinyc_print(sign(strcmp("abd", "abc")));
     return 0;
 }

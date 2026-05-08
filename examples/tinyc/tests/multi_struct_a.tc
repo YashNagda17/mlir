@@ -4,6 +4,6 @@ int main() {
     struct Foo s;
     s.x = 4;
     s.y = 7;
-    print(foo_sum(s));    // 11
+    _tinyc_print(foo_sum(s));    // 11
     return 0;
 }

@@ -20,10 +20,10 @@ int main() {
         sy = sy + pts[j].y;
         j = j + 1;
     }
-    print(sx);
-    print(sy);
+    _tinyc_print(sx);
+    _tinyc_print(sy);
 
     pts[1].x = pts[0].x + pts[2].x;
-    print(pts[1].x);
+    _tinyc_print(pts[1].x);
     return 0;
 }

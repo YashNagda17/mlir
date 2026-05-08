@@ -16,10 +16,10 @@ int main() {
     v.max = 4LL;
     grow(&v);
     grow(&v);
-    print(v.size);  // 2
-    print(v.max);   // 16
+    _tinyc_print(v.size);  // 2
+    _tinyc_print(v.max);   // 16
     long s;
     s = v.size + v.max;
-    print(s);       // 18
+    _tinyc_print(s);       // 18
     return 0;
 }

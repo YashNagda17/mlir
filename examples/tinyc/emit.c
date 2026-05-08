@@ -2359,7 +2359,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 } else if (ex->kind == EX_INDEX) {
                     // Reading an element of a struct-field array of
                     // pointers: tag the result so downstream consumers
-                    // (print(), -> chains) see the right element kind.
+                    // (_tinyc_print(), -> chains) see the right element kind.
                     Expr *fe = NULL;
                     if (ex->lhs->kind == EX_FIELD) fe = ex->lhs;
                     else if (ex->lhs->kind == EX_INDEX &&
@@ -3747,7 +3747,7 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
         case ST_PRINT: {
             EVal v = emit_expr(e, sc, st->expr);
             if (v.is_str) {
-                // print(<string>) -> @printStr(!llvm.ptr)
+                // _tinyc_print(<string>) -> @printStr(!llvm.ptr)
                 e->use_print_str = true;
                 MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1);
                 ops[0] = v.val;
@@ -4841,7 +4841,7 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
         MLIR_AppendBlockOp(ctx, mb, gop);
     }
 
-    // If any user-code path used print(<string>), declare @printStr.
+    // If any user-code path used _tinyc_print(<string>), declare @printStr.
     if (e.use_print_str) {
         MLIR_TypeHandle *ins = arena_new_array(arena, MLIR_TypeHandle, 1); ins[0] = e.ptr;
         MLIR_TypeHandle fty = MLIR_CreateTypeFunction(ctx, ins, 1, NULL, 0);
