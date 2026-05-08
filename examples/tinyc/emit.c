@@ -2483,6 +2483,25 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 return r;
             }
             if (ex->lhs->kind == EX_INDEX) {
+                // &p->arr[i] / &(s.f)[i]: address of a struct element via
+                // a chain. Use resolve_struct_source so the GEP descends
+                // through the arrow/field chain instead of expecting a
+                // simple-array base.
+                Type lt = infer_expr_type(e, sc, ex->lhs);
+                if (lt.kind == TY_STRUCT) {
+                    StructDef *sd = find_struct(e, lt.struct_name);
+                    if (sd) {
+                        StructDef *src_sd = NULL;
+                        MLIR_ValueHandle p = resolve_struct_source(
+                            e, sc, ex->lhs, &src_sd);
+                        if (p != MLIR_INVALID_HANDLE && src_sd == sd) {
+                            r.val = p;
+                            r.is_ptr = true;
+                            r.sdef = sd;
+                            return r;
+                        }
+                    }
+                }
                 // &arr[i] -> GEP address.
                 LVal lv = emit_lvalue(e, sc, ex->lhs);
                 r.val = lval_address(e, lv);
