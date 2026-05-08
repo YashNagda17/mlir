@@ -1019,6 +1019,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
             s->decl_type.kind = TY_ARRAY_PTR_CHAR;
         } else {
             s->decl_type.kind = TY_ARRAY_I32;
+            if (was_char) s->decl_type.array_elem_is_i8 = true;
         }
         s->decl_type.array_len = alen;
         s->decl_type.array_len_expr = aexpr;

@@ -1267,7 +1267,9 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                 return r;
             }
             MLIR_ValueHandle idx_i32 = emit_expr_i32(e, sc, ex->rhs);
-            MLIR_TypeHandle aelem = s->type.array_elem_is_i64 ? e->i64 : e->i32;
+            MLIR_TypeHandle aelem = s->type.array_elem_is_i64 ? e->i64
+                                  : s->type.array_elem_is_i8  ? e->i8
+                                  : e->i32;
             r.base_ptr = sym_addr(e, s);
             r.source_elem = MLIR_CreateTypeLLVMArray(e->ctx, aelem, (uint64_t)s->type.array_len);
             int32_t *path = arena_new_array(e->arena, int32_t, 2);
@@ -2267,6 +2269,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     else if (s->type.kind == TY_ARRAY_PTR_STRUCT ||
                              s->type.kind == TY_ARRAY_PTR_CHAR) r.ptr_elem = e->ptr;
                     else if (s->type.kind == TY_ARRAY_I32 && s->type.array_elem_is_i64) r.ptr_elem = e->i64;
+                    else if (s->type.kind == TY_ARRAY_I32 && s->type.array_elem_is_i8) r.ptr_elem = e->i8;
                     else r.ptr_elem = e->i32;
                     if (s->type.kind == TY_ARRAY_STRUCT) r.sdef = s->sdef;
                     return r;
@@ -3381,7 +3384,9 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                     }
                 }
             } else if (st->decl_type.kind == TY_ARRAY_I32) {
-                MLIR_TypeHandle elem_ty = st->decl_type.array_elem_is_i64 ? e->i64 : e->i32;
+                MLIR_TypeHandle elem_ty = st->decl_type.array_elem_is_i64 ? e->i64
+                                        : st->decl_type.array_elem_is_i8  ? e->i8
+                                        : e->i32;
                 MLIR_TypeHandle arr_ty;
                 if (st->decl_type.array_len2 != 0) {
                     MLIR_TypeHandle inner = MLIR_CreateTypeLLVMArray(
@@ -4650,7 +4655,9 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
                        g->type.kind == TY_ARRAY_PTR_STRUCT) {
                 elem = e.ptr;
             } else {
-                elem = g->type.array_elem_is_i64 ? e.i64 : e.i32;
+                elem = g->type.array_elem_is_i64 ? e.i64
+                     : g->type.array_elem_is_i8  ? e.i8
+                     : e.i32;
             }
             MLIR_TypeHandle arr_ty = MLIR_CreateTypeLLVMArray(
                 ctx, elem, (uint64_t)g->type.array_len);
