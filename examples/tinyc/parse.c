@@ -1035,6 +1035,14 @@ static Stmt *parse_decl(P *p, bool require_semi) {
     }
     if (accept(p, TC_TK_ASSIGN)) {
         { Expr *agg = parse_aggregate_init(p, s->decl_type); s->decl_init = agg ? agg : parse_expr(p); }
+        // `char arr[] = "string"` — infer array length from the string
+        // literal (size includes the trailing NUL set by the lexer).
+        if (s->decl_init && s->decl_init->kind == EX_STR &&
+            s->decl_type.kind == TY_ARRAY_I32 &&
+            s->decl_type.array_elem_is_i8 &&
+            s->decl_type.array_len == 0) {
+            s->decl_type.array_len = (int64_t)s->decl_init->name.size;
+        }
     }
     // Comma-separated additional declarators sharing the same base type:
     //   `int i = 1, j = 2, *p = 0;`. Wrap into an ST_BLOCK if present.
@@ -1082,6 +1090,12 @@ static Stmt *parse_decl(P *p, bool require_semi) {
             if (accept(p, TC_TK_ASSIGN)) {
                 Expr *agg = parse_aggregate_init(p, ds->decl_type);
                 ds->decl_init = agg ? agg : parse_expr(p);
+                if (ds->decl_init && ds->decl_init->kind == EX_STR &&
+                    ds->decl_type.kind == TY_ARRAY_I32 &&
+                    ds->decl_type.array_elem_is_i8 &&
+                    ds->decl_type.array_len == 0) {
+                    ds->decl_type.array_len = (int64_t)ds->decl_init->name.size;
+                }
             }
             VecStmtPtr_push_back(p->arena, &blk->block_body, ds);
         }
