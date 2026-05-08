@@ -2241,17 +2241,12 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 if (!s) {
                     FuncSig *fsig = find_sig(e, ex->name);
                     if (fsig) {
-                        // Build the function MLIR type for func.constant.
-                        size_t np = fsig->n_params;
-                        MLIR_TypeHandle *in_tys = arena_new_array(e->arena,
-                            MLIR_TypeHandle, np ? np : 1);
-                        for (size_t i = 0; i < np; i++)
-                            in_tys[i] = scalar_mlir_type(e, fsig->params[i].type.kind);
-                        MLIR_TypeHandle ret_ty = scalar_mlir_type(e,
-                            fsig->ret.type.kind);
-                        MLIR_TypeHandle out_tys[1] = { ret_ty };
+                        // Build the function MLIR type for func.constant
+                        // using the flat (sret/void-aware) signature so it
+                        // matches the actual func.func definition.
                         MLIR_TypeHandle f_ty = MLIR_CreateTypeFunction(e->ctx,
-                            in_tys, np, out_tys, 1);
+                            fsig->flat_in_tys, fsig->n_flat_in,
+                            fsig->flat_out_tys, fsig->n_flat_out);
                         // %fn = func.constant @sym : (T...) -> R
                         MLIR_ValueHandle fn_v = MLIR_CreateValueOpResult(
                             e->ctx, MLIR_INVALID_HANDLE, 0, f_ty, ssa_name(e),
@@ -3022,16 +3017,40 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     EMIT_ERR(e, "indirect call to {} arity mismatch",
                             ex->callee);
                 }
+                // Struct-returning indirect call uses sret ABI: a hidden
+                // first !llvm.ptr param receives the buffer the callee
+                // writes the struct into; the call itself returns void.
+                bool ret_is_struct = (fnty->fnptr_ret->kind == TY_STRUCT);
+                StructDef *ret_sd = NULL;
+                MLIR_TypeHandle ret_st_ty = MLIR_INVALID_HANDLE;
+                MLIR_ValueHandle sret_buf = MLIR_INVALID_HANDLE;
+                if (ret_is_struct) {
+                    ret_sd = find_struct(e, fnty->fnptr_ret->struct_name);
+                    if (!ret_sd) {
+                        EMIT_ERR(e, "unknown struct return type {}",
+                                 fnty->fnptr_ret->struct_name);
+                        r.val = emit_const_i32(e, 0);
+                        return r;
+                    }
+                    ret_st_ty = find_struct_type(e, ret_sd);
+                    sret_buf = emit_alloca(e, ret_st_ty);
+                }
                 // Build the function MLIR type that func.call_indirect needs.
                 size_t np = (size_t)fnty->fnptr_nparams;
+                size_t n_in_tys = np + (ret_is_struct ? 1 : 0);
                 MLIR_TypeHandle *in_tys = arena_new_array(e->arena, MLIR_TypeHandle,
-                                                           np ? np : 1);
+                                                           n_in_tys ? n_in_tys : 1);
+                size_t in_off = 0;
+                if (ret_is_struct) in_tys[in_off++] = e->ptr;
                 for (size_t i = 0; i < np; i++)
-                    in_tys[i] = scalar_mlir_type(e, fnty->fnptr_params[i].kind);
-                MLIR_TypeHandle rty = scalar_mlir_type(e, fnty->fnptr_ret->kind);
+                    in_tys[in_off++] = scalar_mlir_type(e, fnty->fnptr_params[i].kind);
+                MLIR_TypeHandle rty = ret_is_struct
+                    ? e->i32 /* unused */
+                    : scalar_mlir_type(e, fnty->fnptr_ret->kind);
                 MLIR_TypeHandle out_tys[1] = { rty };
+                size_t n_out_tys = ret_is_struct ? 0 : 1;
                 MLIR_TypeHandle f_ty = MLIR_CreateTypeFunction(e->ctx,
-                    in_tys, np, out_tys, 1);
+                    in_tys, n_in_tys, out_tys, n_out_tys);
                 // Cast !llvm.ptr -> function type so func.call_indirect's
                 // verifier is happy. The reconcile-unrealized-casts pass
                 // eliminates this after func-to-llvm lowering.
@@ -3047,23 +3066,34 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                         str_lit("builtin.unrealized_conversion_cast"),
                         crts, 1, crs, 1, cops, 1, NULL, 0, NULL, 0);
 
-                size_t n_ops = 1 + na;
+                size_t n_ops = 1 + na + (ret_is_struct ? 1 : 0);
                 MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle,
                                                          n_ops ? n_ops : 1);
-                ops[0] = callee_v;
+                size_t op_off = 0;
+                ops[op_off++] = callee_v;
+                if (ret_is_struct) ops[op_off++] = sret_buf;
                 for (size_t i = 0; i < na; i++) {
                     EVal av = emit_expr(e, sc, ex->args.data[i]);
                     TypeKind want = (i < (size_t)fnty->fnptr_nparams)
                         ? fnty->fnptr_params[i].kind : TY_I32;
-                    ops[1 + i] = coerce_eval(e, av, scalar_mlir_type(e, want));
+                    ops[op_off++] = coerce_eval(e, av, scalar_mlir_type(e, want));
                 }
+                size_t n_rts = ret_is_struct ? 0 : 1;
                 MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1);
                 MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1);
-                rts[0] = rty;
-                rs[0] = MLIR_CreateValueOpResult(e->ctx, MLIR_INVALID_HANDLE, 0,
-                                                  rty, ssa_name(e), eloc(e, 0));
+                if (!ret_is_struct) {
+                    rts[0] = rty;
+                    rs[0] = MLIR_CreateValueOpResult(e->ctx, MLIR_INVALID_HANDLE, 0,
+                                                      rty, ssa_name(e), eloc(e, 0));
+                }
                 emit_op(e, OP_TYPE_FUNC_CALL_INDIRECT, str_lit("func.call_indirect"),
-                        rts, 1, rs, 1, ops, n_ops, NULL, 0, NULL, 0);
+                        rts, n_rts, rs, n_rts, ops, n_ops, NULL, 0, NULL, 0);
+                if (ret_is_struct) {
+                    r.val = sret_buf;
+                    r.is_ptr = true;
+                    r.sdef = ret_sd;
+                    return r;
+                }
                 r.val = rs[0];
                 r.is_float = (fnty->fnptr_ret->kind == TY_F32 || fnty->fnptr_ret->kind == TY_F64);
                 r.is_f64 = (fnty->fnptr_ret->kind == TY_F64);
