@@ -2286,8 +2286,10 @@ int tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks) {
                             g.type.kind = TY_ARRAY_PTR_STRUCT;
                         } else if (g.type.kind == TY_I32 || g.type.kind == TY_I64) {
                             bool is_i64 = (g.type.kind == TY_I64);
+                            bool is_i8  = (g.type.kind == TY_I32 && g.type.int_bits == 8);
                             g.type.kind = TY_ARRAY_I32;
                             g.type.array_elem_is_i64 = is_i64;
+                            g.type.array_elem_is_i8  = is_i8;
                         } else {
                             perror_at(&p, nm.line,
                                 str_lit("unsupported global array element type"));

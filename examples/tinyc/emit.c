@@ -2499,8 +2499,10 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     MLIR_TypeHandle pe = e->i32;
                     if (lt.kind == TY_PTR_CHAR) pe = e->i8;
                     else if (lt.kind == TY_PTR_I32) {
-                        if (lt.array_elem_is_i64) pe = e->i64;
-                        else pe = e->i32;
+                        if (lt.ptr_is_i64)      pe = e->i64;
+                        else if (lt.ptr_is_f64) pe = e->f64;
+                        else if (lt.ptr_is_f32) pe = e->f32;
+                        else                    pe = e->i32;
                     }
                     else if (lt.kind == TY_PTR_PTR) pe = e->ptr;
                     int32_t step = sub ? -1 : 1;
