@@ -163,6 +163,8 @@ Final status:
 - **Don't fix unrelated failures.** If the target command's output also
   shows pre-existing non-tinyC failures, surface them but don't try to
   fix them via this loop.
+- **Commit hygiene**: any commits made by this skill or the skills it
+  delegates to must NOT include `Co-authored-by` trailers.
 
 ## Tips
 

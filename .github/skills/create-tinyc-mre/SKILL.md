@@ -225,6 +225,8 @@ The subject **must** start with `tinyc-mre: ` — this is the contract that
 Only the test file and `tests.toml` should be in this commit. Do not bundle
 fixes, formatting, or unrelated changes.
 
+Do NOT include `Co-authored-by` trailers.
+
 ### Phase 8: Summary
 
 Print to the user:

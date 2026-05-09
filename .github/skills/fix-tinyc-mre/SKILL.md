@@ -186,6 +186,8 @@ examples/tinyc/tests/<name>.tc now passes."
 Do **not** amend the original `tinyc-mre:` commit — keep it as a permanent
 record of the bug. The fix sits on top as follow-up commits.
 
+Do NOT include `Co-authored-by` trailers in any of these commits.
+
 ### Phase 8: Summary
 
 Print:
