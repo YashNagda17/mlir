@@ -1,0 +1,8 @@
+extern int strlen(char *p);
+
+int main() {
+    char *p = 0;
+    if (p) print(strlen(p));
+    print(42);
+    return 0;
+}

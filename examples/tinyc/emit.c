@@ -803,6 +803,10 @@ static MLIR_ValueHandle coerce_eval(E *e, EVal v, MLIR_TypeHandle want) {
         }
         return emit_trunci_to_i8(e, v.val);
     }
+    if (want == e->ptr) {
+        if (v.is_ptr) return v.val;
+        return emit_null_ptr(e);
+    }
     return v.val;
 }
 
