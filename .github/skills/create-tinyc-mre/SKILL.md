@@ -182,25 +182,67 @@ passing automatically (CI catches regressions).
 For a **bug being fixed in the same change**, run the same command and
 verify the test now passes alongside the others (`All N tinyC tests passed`).
 
-### Phase 7: Summary
+### Phase 7: Commit (REQUIRED)
+
+The skill is **not done** until the MRE is committed. The commit is the
+handoff to `fix-tinyc-mre`. Make **exactly one** commit on the current
+branch with this canonical format:
+
+```
+tinyc-mre: <name>
+
+Bug: <one-line summary>
+Test: examples/tinyc/tests/<name>.tc
+Symptom: <parse-error | emit-error | lowering-error | link-error | wrong-output>
+Failure signature: <copy the key line from tinyc output, e.g. "tinyc emit error at line 42: undefined identifier 'foo'">
+Expected stdout (clang): <bytes printed by the reference binary>
+Actual (tinyc):          <error message OR bytes printed by tinyc-built binary>
+Hypothesis: <where in tinyc the bug likely lives, if known; else "unknown">
+```
+
+Steps:
+
+```bash
+git add examples/tinyc/tests/<name>.tc examples/tinyc/tests.toml
+git status            # confirm only those two paths are staged
+git commit -F - <<'MSG'
+tinyc-mre: <name>
+
+Bug: ...
+Test: examples/tinyc/tests/<name>.tc
+Symptom: ...
+Failure signature: ...
+Expected stdout (clang): ...
+Actual (tinyc):          ...
+Hypothesis: ...
+MSG
+```
+
+The subject **must** start with `tinyc-mre: ` — this is the contract that
+`fix-tinyc-mre` and `fix-tinyc-bugs` rely on. They look at `git log -1
+--format=%s` and refuse to run if the subject doesn't match.
+
+Only the test file and `tests.toml` should be in this commit. Do not bundle
+fixes, formatting, or unrelated changes.
+
+### Phase 8: Summary
 
 Print to the user:
 
 ```
-tinyC MRE created.
+tinyC MRE created and committed.
 
+Commit: <short SHA> tinyc-mre: <name>
 Files:
   examples/tinyc/tests/<name>.tc  (NEW)
   examples/tinyc/tests.toml       (entry added)
 
-Bug: <one-line description>
-Failure signature: <copy the key line from tinyc output>
 Status: <FAILS | PASSES> in test_tinyc_upstream
 
-Reproduce:
-  pixi run -e upstream build_tinyc_upstream
-  ./tinyc --emit=llvm -o /tmp/x.ll examples/tinyc/tests/<name>.tc
+Next: invoke fix-tinyc-mre to fix the underlying bug.
 
+Reproduce manually:
+  ./tinyc --emit=llvm -o /tmp/x.ll examples/tinyc/tests/<name>.tc
 Verify with clang:
   clang -O0 -x c -o /tmp/ref examples/tinyc/tests/<name>.tc && /tmp/ref
 ```
