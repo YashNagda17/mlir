@@ -1,0 +1,14 @@
+struct S { int a; int b; };
+
+struct S t() { struct S r; r.a = 1; r.b = 2; return r; }
+struct S f() { struct S r; r.a = 9; r.b = 8; return r; }
+
+struct S choose(int c) { return c ? t() : f(); }
+
+int main() {
+    struct S r = choose(1);
+    print(r.a + r.b);
+    struct S q = choose(0);
+    print(q.a + q.b);
+    return 0;
+}

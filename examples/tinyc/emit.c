@@ -3934,7 +3934,13 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                         emit_struct_copy(e, out, cv.val, want);
                     }
                 } else {
-                    EMIT_ERR(e, "struct return must be a variable or struct call");
+                    StructDef *src_sd = NULL;
+                    MLIR_ValueHandle src = resolve_struct_source(e, sc, st->expr, &src_sd);
+                    if (src != MLIR_INVALID_HANDLE && src_sd == want) {
+                        emit_struct_copy(e, out, src, want);
+                    } else {
+                        EMIT_ERR(e, "struct return must be a variable or struct call");
+                    }
                 }
                 emit_return_op(e, NULL, 0);
                 e->terminated = true;
