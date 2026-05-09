@@ -223,6 +223,18 @@ extern "C" void MLIR_InsertBlockOpBeforeTerminator(MLIR_Context *,
         block->push_back(o);
     }
 }
+extern "C" void MLIR_InsertBlockOpAtIndex(MLIR_Context *,
+                                          MLIR_BlockHandle b,
+                                          MLIR_OpHandle op, size_t idx) {
+    auto *block = F<mlir::Block>(b);
+    auto *o = F<mlir::Operation>(op);
+    auto &ops = block->getOperations();
+    size_t n = 0;
+    for (auto it = ops.begin(); it != ops.end(); ++it, ++n) {
+        if (n == idx) { ops.insert(it, o); return; }
+    }
+    block->push_back(o);
+}
 extern "C" void MLIR_AppendBlockArg(MLIR_Context *, MLIR_BlockHandle bh,
                                      MLIR_ValueHandle vh) {
     auto *block = F<mlir::Block>(bh);
