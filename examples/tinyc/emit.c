@@ -3999,6 +3999,39 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                             int32_t path[2] = {0, (int32_t)fidx};
                             MLIR_ValueHandle p = emit_gep(
                                 e, sy->addr, st_ty, path, 2, NULL, 0);
+                            if (ft.kind == TY_STRUCT) {
+                                // Nested struct field: copy from the
+                                // initializer's source struct field-by-field
+                                // (a single emit_store_v would only copy the
+                                // first 8 bytes).
+                                StructDef *fsd = find_struct(e, ft.struct_name);
+                                if (!fsd) {
+                                    EMIT_ERR(e, "unknown struct type for "
+                                                "nested-struct field "
+                                                "initializer");
+                                    continue;
+                                }
+                                Expr *ae = st->decl_init->args.data[i];
+                                if (ae->kind == EX_INT && ae->int_value == 0) {
+                                    continue; // already zero-initialised
+                                }
+                                StructDef *src_sd = NULL;
+                                MLIR_ValueHandle src = resolve_struct_source(
+                                    e, sc, ae, &src_sd);
+                                if (src != MLIR_INVALID_HANDLE && src_sd == fsd) {
+                                    emit_struct_copy(e, p, src, fsd);
+                                } else {
+                                    EVal vv = emit_expr(e, sc, ae);
+                                    if (vv.is_ptr && vv.val != MLIR_INVALID_HANDLE) {
+                                        emit_struct_copy(e, p, vv.val, fsd);
+                                    } else {
+                                        EMIT_ERR(e, "nested-struct field "
+                                                    "initializer needs a "
+                                                    "struct value");
+                                    }
+                                }
+                                continue;
+                            }
                             EVal v = emit_expr(
                                 e, sc, st->decl_init->args.data[i]);
                             MLIR_ValueHandle sv;
