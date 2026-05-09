@@ -103,35 +103,46 @@ Starting from the isolated unit:
 
 ### Phase 4: Restructure as a tinyC Test
 
+The MRE must compile with **both** tinyc and clang (clang is the reference
+oracle). To keep that simple, use `printf` from libc — both compilers see
+it via a one-line `extern` declaration. **Do not use `_tinyc_print`**: it's
+a tinyC builtin that clang doesn't understand.
+
 The test format is:
 
 ```c
+extern int printf(const char *fmt, ...);
+
 // Brief description of the bug and what semantics the test guards.
 
 int main(void) {
     // ... exercise the construct ...
-    if (/* bad result */) { _tinyc_print(1); return 1; }
-    if (/* bad result */) { _tinyc_print(2); return 2; }
+    if (/* bad result */) { printf("FAIL 1\n"); return 1; }
+    if (/* bad result */) { printf("FAIL 2\n"); return 2; }
     // ... more checks ...
-    _tinyc_print(0);
+    printf("OK\n");
     return 0;
 }
 ```
 
 Conventions (verified against existing tests in
+`examples/tinyc/tests/va_list_pass.tc`,
 `examples/tinyc/tests/struct_zero_init_64bit.tc`,
-`examples/tinyc/tests/union_field_offset.tc`,
-`examples/tinyc/tests/ptr_postfix_stride.tc`):
+`examples/tinyc/tests/union_field_offset.tc`):
 
-- **No `#include`**. tinyC has no preprocessor for files; declare what you
-  need locally (`extern int printf(const char *, ...);` is fine).
-- **Use `_tinyc_print(int)`** for output (NOT `print()` — it was renamed in
-  PR #124). It prints the integer + newline. There's also `_tinyc_print` for
-  float and string.
-- **Print 0 and return 0 on success**, print a non-zero index on each
-  specific failure path so the test reports *which* check failed.
-- **Self-contained**: define every type and helper inside the file. Don't
-  pull in corec headers.
+- **Always start with** `extern int printf(const char *fmt, ...);` —
+  works in both tinyc (variadic call support) and clang (matches libc).
+  No `#include <stdio.h>` (tinyc does not preprocess `.tc` files for
+  `#include`).
+- **Use `printf` for all output.** Do NOT use `_tinyc_print` — it's a
+  tinyC builtin and clang has no idea what it is.
+- **No other `#include` directives.** Declare any other libc symbols you
+  need with `extern` (e.g. `extern void *malloc(unsigned long);`).
+- **Print a success sentinel and return 0** (e.g. `printf("OK\n")`).
+  Print a distinct failure marker per check so the test reports *which*
+  check failed (`printf("FAIL 1\n"); return 1;`).
+- **Self-contained**: define every type and helper inside the file.
+  Don't pull in corec headers.
 - **Minimum size**: typically 20-80 lines.
 
 ### Phase 5: Wire Up the Test
@@ -141,11 +152,10 @@ Conventions (verified against existing tests in
    ```toml
    [[test]]
    name = "<name>"
-   expected_stdout = "0\n"
+   expected_stdout = "OK\n"
    ```
-   The `expected_stdout` is whatever `_tinyc_print(0)` (or other final
-   print) emits when the test passes. Get this from the clang reference
-   binary you already verified in Phase 3.
+   The `expected_stdout` is whatever the success path prints. Get the
+   exact bytes from the clang reference binary you built in Phase 3.
 
 ### Phase 6: Verify
 
@@ -153,8 +163,8 @@ Run BOTH checks:
 
 ```bash
 # 1. Reference: clang must compile and produce the expected output.
-clang -O0 -o /tmp/mre_ref examples/tinyc/tests/<name>.tc \
-      examples/tinyc/runtime.c
+#    The .tc file is plain C — clang accepts it via -x c.
+clang -O0 -x c -o /tmp/mre_ref examples/tinyc/tests/<name>.tc
 /tmp/mre_ref
 # Must print exactly the expected_stdout you put in tests.toml.
 
@@ -192,8 +202,7 @@ Reproduce:
   ./tinyc --emit=llvm -o /tmp/x.ll examples/tinyc/tests/<name>.tc
 
 Verify with clang:
-  clang -O0 -o /tmp/ref examples/tinyc/tests/<name>.tc \
-        examples/tinyc/runtime.c && /tmp/ref
+  clang -O0 -x c -o /tmp/ref examples/tinyc/tests/<name>.tc && /tmp/ref
 ```
 
 ## Tips
