@@ -118,9 +118,14 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
                         case 'n': ch = '\n'; break;
                         case 't': ch = '\t'; break;
                         case 'r': ch = '\r'; break;
+                        case 'v': ch = '\v'; break;
+                        case 'f': ch = '\f'; break;
+                        case 'a': ch = '\a'; break;
+                        case 'b': ch = '\b'; break;
                         case '\\': ch = '\\'; break;
                         case '"': ch = '"'; break;
                         case '\'': ch = '\''; break;
+                        case '?': ch = '?'; break;
                         case '0': ch = '\0'; break;
                         default:
                             println(str_lit("tinyc lex error at line {}: unknown escape '\\{}'"),
@@ -155,9 +160,14 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
                     case 'n': v = '\n'; break;
                     case 't': v = '\t'; break;
                     case 'r': v = '\r'; break;
+                    case 'v': v = '\v'; break;
+                    case 'f': v = '\f'; break;
+                    case 'a': v = '\a'; break;
+                    case 'b': v = '\b'; break;
                     case '\\': v = '\\'; break;
                     case '\'': v = '\''; break;
                     case '"': v = '"'; break;
+                    case '?': v = '?'; break;
                     case '0': v = '\0'; break;
                     default:
                         println(str_lit("tinyc lex error at line {}: unknown char escape"),
