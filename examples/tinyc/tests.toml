@@ -656,3 +656,9 @@ name = "struct_zero_init_64bit"
 expected_stdout = """\
 0
 """
+
+[[test]]
+name = "union_field_offset"
+expected_stdout = """\
+0
+"""

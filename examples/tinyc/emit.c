@@ -1028,7 +1028,28 @@ static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
             return r;
         }
         r = parent;
-        sctx_push(e, &r, idx);
+        if (parent.sd->is_union) {
+            // Crossing a union boundary into a nested struct member.
+            // Emit a partial GEP to offset 0 of the union, then start
+            // a fresh GEP rooted at the nested struct's type. This is
+            // necessary because tinyc lays unions out as sequential
+            // structs, so subsequent indices into the nested struct
+            // would otherwise descend into the wrong union member's
+            // LLVM type.
+            sctx_push(e, &r, 0);
+            MLIR_ValueHandle base = emit_gep(e, r.base_ptr, r.source_elem,
+                                              r.const_path, r.n_const_path,
+                                              NULL, 0);
+            r.base_ptr = base;
+            r.source_elem = find_struct_type(e, find_struct(e, ft.struct_name));
+            r.const_path = NULL;
+            r.n_const_path = 0;
+            r.cap_const_path = 0;
+            r.dyn_index = MLIR_INVALID_HANDLE;
+            sctx_push(e, &r, 0);
+        } else {
+            sctx_push(e, &r, idx);
+        }
         r.sd = find_struct(e, ft.struct_name);
         r.ok = (r.sd != NULL);
         return r;
@@ -1509,7 +1530,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                 EMIT_ERR(e, "field {} is not a scalar lvalue", ex->name);
                 return r;
             }
-            sctx_push(e, &parent, idx);
+            sctx_push(e, &parent, parent.sd->is_union ? 0 : idx);
             r.base_ptr = parent.base_ptr;
             r.source_elem = parent.source_elem;
             r.const_path = parent.const_path;
@@ -4706,6 +4727,11 @@ static Type infer_expr_type(E *e, Scope *sc, Expr *ex) {
         case EX_CALL: {
             FuncSig *sig = find_sig(e, ex->callee);
             if (sig) return sig->ret.type;
+            // Indirect call through a fnptr-typed local/param/global.
+            Sym *sy = lookup(e, sc, ex->callee);
+            if (sy && sy->type.kind == TY_FNPTR && sy->type.fnptr_ret) {
+                return *sy->type.fnptr_ret;
+            }
             return t;
         }
         case EX_CAST: return ex->cast_type;

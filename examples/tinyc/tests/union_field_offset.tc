@@ -1,0 +1,57 @@
+// Regression test for union field semantics.
+// tinyc represents `union` as a sequential struct (each member at its own
+// offset) rather than a true overlapping union. To make code that relies
+// on union aliasing work, all union member accesses must be normalised
+// to offset 0 of the union storage.
+//
+// This test: write through one union member, read back through the SAME
+// member (must round-trip), then write through a different scalar member
+// and read back via the new member (must also round-trip — confirms each
+// access lands at offset 0, so members alias).
+
+typedef struct A {
+    int kind;
+    union {
+        long  i;
+        int   b;
+        double d;
+        struct {
+            int *p;
+            long n;
+        } arr;
+    } data;
+    int after;
+} A;
+
+int main(void) {
+    A a = {0};
+    a.kind = 7;
+    a.after = 99;
+
+    a.data.b = 1;
+    if (a.data.b != 1) { print(1); return 1; }
+
+    a.data.i = 42;
+    if (a.data.i != 42) { print(2); return 2; }
+
+    // Cross-member: writing `b` then reading `i` reads the low bits we
+    // just wrote (alias at offset 0).
+    a.data.b = 5;
+    if ((int)a.data.i != 5) { print(3); return 3; }
+
+    // Nested struct member of a union: write the inner fields and read
+    // them back (exercises the "partial GEP, restart with nested struct
+    // type" path in tinyc when crossing a union -> struct boundary).
+    int x = 0;
+    a.data.arr.p = &x;
+    a.data.arr.n = 11;
+    if (a.data.arr.p != &x) { print(4); return 4; }
+    if (a.data.arr.n != 11) { print(5); return 5; }
+
+    // Outer struct fields are unaffected.
+    if (a.kind != 7) { print(6); return 6; }
+    if (a.after != 99) { print(7); return 7; }
+
+    print(0);
+    return 0;
+}
