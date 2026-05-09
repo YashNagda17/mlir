@@ -1724,7 +1724,13 @@ static Func *parse_func(P *p) {
 
 static StructDef *parse_struct_def(P *p) {
     int line = cur(p).line;
-    expect(p, TC_TK_KW_STRUCT, str_lit("expected 'struct'"));
+    bool is_union = false;
+    if (cur(p).kind == TC_TK_KW_UNION) {
+        is_union = true;
+        p->i++;
+    } else {
+        expect(p, TC_TK_KW_STRUCT, str_lit("expected 'struct'"));
+    }
     string name = (string){0};
     if (cur(p).kind == TC_TK_IDENT) {
         name = cur(p).text;
@@ -1736,6 +1742,7 @@ static StructDef *parse_struct_def(P *p) {
     *sd = (StructDef){0};
     sd->name = name;
     sd->line = line;
+    sd->is_union = is_union;
     VecStructField_reserve(p->arena, &sd->fields, 4);
     while (cur(p).kind != TC_TK_RBRACE && cur(p).kind != TC_TK_EOF) {
         skip_const(p);
@@ -2024,8 +2031,8 @@ static void parse_typedef_decl(P *p) {
         expect(p, TC_TK_SEMI, str_lit("expected ';' after typedef"));
         return;
     }
-    // `typedef struct [Tag] { ... } Alias;`
-    if (cur(p).kind == TC_TK_KW_STRUCT) {
+    // `typedef struct [Tag] { ... } Alias;` or `typedef union ...`
+    if (cur(p).kind == TC_TK_KW_STRUCT || cur(p).kind == TC_TK_KW_UNION) {
         size_t la = 1;
         if (peek(p, la).kind == TC_TK_IDENT) la++;
         if (peek(p, la).kind == TC_TK_LBRACE) {
@@ -2199,7 +2206,9 @@ int tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks) {
             p.i++;
         }
         if (cur(&p).kind == TC_TK_EOF) break;
-        if (cur(&p).kind == TC_TK_KW_STRUCT && peek(&p, 2).kind == TC_TK_LBRACE) {
+        if ((cur(&p).kind == TC_TK_KW_STRUCT || cur(&p).kind == TC_TK_KW_UNION) &&
+            (peek(&p, 1).kind == TC_TK_LBRACE ||
+             (peek(&p, 1).kind == TC_TK_IDENT && peek(&p, 2).kind == TC_TK_LBRACE))) {
             StructDef *sd = parse_struct_def(&p);
             expect(&p, TC_TK_SEMI, str_lit("expected ';' after struct definition"));
             // Dedup against existing struct of the same name (cross-file
