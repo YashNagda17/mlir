@@ -344,6 +344,22 @@ void MLIR_InsertBlockOpBeforeTerminator(MLIR_Context *ctx, MLIR_BlockHandle bh, 
     MLIR_AppendBlockOp(ctx, bh, op);
 }
 
+void MLIR_InsertBlockOpAtIndex(MLIR_Context *ctx, MLIR_BlockHandle bh, MLIR_OpHandle op, size_t idx) {
+    IR_Block *block = resolve_block(bh);
+    if (!block || !ctx || !ctx->arena) return;
+    if (idx > block->n_operations) idx = block->n_operations;
+    Arena *arena = ctx->arena;
+    MLIR_OpHandle *new_ops = arena_new_array(arena, MLIR_OpHandle, block->n_operations + 1);
+    if (block->operations && idx > 0)
+        memcpy(new_ops, block->operations, idx * sizeof(MLIR_OpHandle));
+    new_ops[idx] = op;
+    if (block->operations && idx < block->n_operations)
+        memcpy(new_ops + idx + 1, block->operations + idx,
+               (block->n_operations - idx) * sizeof(MLIR_OpHandle));
+    block->operations = new_ops;
+    block->n_operations++;
+}
+
 void MLIR_AppendBlockArg(MLIR_Context *ctx, MLIR_BlockHandle bh, MLIR_ValueHandle arg) {
     IR_Block *block = resolve_block(bh);
     if (!block || !ctx || !ctx->arena) return;

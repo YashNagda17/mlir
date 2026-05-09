@@ -317,7 +317,7 @@ static Expr *parse_primary(P *p) {
         bool looks_like_type =
             nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT || nxt == TC_TK_KW_DOUBLE ||
             nxt == TC_TK_KW_CHAR || nxt == TC_TK_KW_VOID ||
-            nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_ENUM ||
+            nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_UNION || nxt == TC_TK_KW_ENUM ||
             nxt == TC_TK_KW_CONST || nxt == TC_TK_KW_LONG ||
             nxt == TC_TK_KW_SIGNED || nxt == TC_TK_KW_UNSIGNED ||
             nxt == TC_TK_KW_SHORT || nxt == TC_TK_KW_BOOL ||
@@ -337,6 +337,32 @@ static Expr *parse_primary(P *p) {
     }
     if (t.kind == TC_TK_STRING_LIT) {
         p->i++;
+        // Adjacent string-literal concatenation: "abc" "def" "ghi" -> "abcdefghi".
+        // Note: lexer stores each literal's text with a trailing NUL counted
+        // in size, so we strip the NUL from all but the last segment.
+        if (cur(p).kind == TC_TK_STRING_LIT) {
+            size_t total = (t.text.size > 0 ? t.text.size - 1 : 0);
+            size_t k = p->i;
+            size_t last_size = 0;
+            while (k < p->n && p->toks[k].kind == TC_TK_STRING_LIT) {
+                last_size = p->toks[k].text.size;
+                total += (last_size > 0 ? last_size - 1 : 0);
+                k++;
+            }
+            total += 1;  // single trailing NUL
+            char *buf = arena_new_array(p->arena, char, total);
+            size_t off = 0;
+            size_t body0 = (t.text.size > 0 ? t.text.size - 1 : 0);
+            for (size_t j = 0; j < body0; j++) buf[off++] = t.text.str[j];
+            while (cur(p).kind == TC_TK_STRING_LIT) {
+                TcTok nx = cur(p);
+                size_t body = (nx.text.size > 0 ? nx.text.size - 1 : 0);
+                for (size_t j = 0; j < body; j++) buf[off++] = nx.text.str[j];
+                p->i++;
+            }
+            buf[off++] = '\0';
+            t.text = (string){.str = buf, .size = off};
+        }
         Expr *e = new_expr(p, EX_STR, t.line);
         e->name = t.text;
         return e;
@@ -345,7 +371,7 @@ static Expr *parse_primary(P *p) {
         // Could be a cast `(T)expr` or a parenthesized expression.
         TcTokKind nxt = peek(p, 1).kind;
         bool is_cast = (nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT || nxt == TC_TK_KW_DOUBLE ||
-                        nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_CHAR ||
+                        nxt == TC_TK_KW_STRUCT || nxt == TC_TK_KW_UNION || nxt == TC_TK_KW_CHAR ||
                         nxt == TC_TK_KW_CONST || nxt == TC_TK_KW_LONG ||
                         nxt == TC_TK_KW_SIGNED || nxt == TC_TK_KW_UNSIGNED ||
                         nxt == TC_TK_KW_SHORT || nxt == TC_TK_KW_BOOL ||
@@ -900,7 +926,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
     }
     // struct decl: `struct Name var;` or `struct Name * p = &s;`
     //              or `struct Name var[N];`
-    if (cur(p).kind == TC_TK_KW_STRUCT) {
+    if (cur(p).kind == TC_TK_KW_STRUCT || cur(p).kind == TC_TK_KW_UNION) {
         p->i++;
         TcTok sn = cur(p);
         expect(p, TC_TK_IDENT, str_lit("expected struct name"));
@@ -1291,7 +1317,7 @@ static Stmt *parse_stmt(P *p) {
         return s;
     }
     if (t.kind == TC_TK_KW_INT || t.kind == TC_TK_KW_FLOAT || t.kind == TC_TK_KW_DOUBLE ||
-        t.kind == TC_TK_KW_STRUCT || t.kind == TC_TK_KW_CHAR ||
+        t.kind == TC_TK_KW_STRUCT || t.kind == TC_TK_KW_UNION || t.kind == TC_TK_KW_CHAR ||
         t.kind == TC_TK_KW_ENUM || t.kind == TC_TK_KW_CONST ||
         t.kind == TC_TK_KW_VOID ||
         t.kind == TC_TK_KW_STATIC || t.kind == TC_TK_KW_INLINE ||
@@ -1523,7 +1549,7 @@ static bool parse_sig_type(P *p, Type *out) {
         skip_const(p);
         return true;
     }
-    if (cur(p).kind == TC_TK_KW_STRUCT) {
+    if (cur(p).kind == TC_TK_KW_STRUCT || cur(p).kind == TC_TK_KW_UNION) {
         p->i++;
         TcTok sn = cur(p);
         if (!expect(p, TC_TK_IDENT, str_lit("expected struct name"))) return false;
@@ -1698,7 +1724,13 @@ static Func *parse_func(P *p) {
 
 static StructDef *parse_struct_def(P *p) {
     int line = cur(p).line;
-    expect(p, TC_TK_KW_STRUCT, str_lit("expected 'struct'"));
+    bool is_union = false;
+    if (cur(p).kind == TC_TK_KW_UNION) {
+        is_union = true;
+        p->i++;
+    } else {
+        expect(p, TC_TK_KW_STRUCT, str_lit("expected 'struct'"));
+    }
     string name = (string){0};
     if (cur(p).kind == TC_TK_IDENT) {
         name = cur(p).text;
@@ -1710,6 +1742,7 @@ static StructDef *parse_struct_def(P *p) {
     *sd = (StructDef){0};
     sd->name = name;
     sd->line = line;
+    sd->is_union = is_union;
     VecStructField_reserve(p->arena, &sd->fields, 4);
     while (cur(p).kind != TC_TK_RBRACE && cur(p).kind != TC_TK_EOF) {
         skip_const(p);
@@ -1718,7 +1751,34 @@ static StructDef *parse_struct_def(P *p) {
         bool is_ptr = false;
         bool was_char = false;
         bool was_float = false;
-        if (cur(p).kind == TC_TK_KW_STRUCT) {
+        if ((cur(p).kind == TC_TK_KW_STRUCT || cur(p).kind == TC_TK_KW_UNION) &&
+            (peek(p, 1).kind == TC_TK_LBRACE ||
+             (peek(p, 1).kind == TC_TK_IDENT && peek(p, 2).kind == TC_TK_LBRACE))) {
+            // Nested anonymous (or tagged) struct/union as a field type:
+            //   struct { ... } name;
+            //   union  { ... } name;
+            // Parse the body via parse_struct_def, synthesize a name if
+            // anonymous, register it in prog->structs, and treat the field
+            // as a TY_STRUCT pointing at it.
+            StructDef *nested = parse_struct_def(p);
+            if (nested->name.size == 0) {
+                static int anon_counter = 0;
+                anon_counter++;
+                char *buf = arena_new_array(p->arena, char, 32);
+                int n = 0; int v = anon_counter;
+                char digits[16]; int dn = 0;
+                if (v == 0) digits[dn++] = '0';
+                while (v > 0) { digits[dn++] = (char)('0' + (v % 10)); v /= 10; }
+                const char *prefix = "__anon_";
+                for (size_t k = 0; prefix[k]; k++) buf[n++] = prefix[k];
+                while (dn > 0) buf[n++] = digits[--dn];
+                nested->name = (string){.str = buf, .size = (size_t)n};
+            }
+            VecStructDefPtr_push_back(p->arena, &p->prog->structs, nested);
+            ft.kind = TY_STRUCT;
+            ft.struct_name = nested->name;
+            is_struct_kind = true;
+        } else if (cur(p).kind == TC_TK_KW_STRUCT || cur(p).kind == TC_TK_KW_UNION) {
             // Nested struct field: `struct Inner name;` (by-value),
             // `struct Inner* name;` (pointer to struct), or
             // `struct Inner* name[N];` (array of struct pointers).
@@ -1729,6 +1789,24 @@ static StructDef *parse_struct_def(P *p) {
             ft.kind = is_ptr ? TY_PTR_STRUCT : TY_STRUCT;
             ft.struct_name = sn.text;
             is_struct_kind = true;
+        } else if (cur(p).kind == TC_TK_KW_ENUM &&
+                   (peek(p, 1).kind == TC_TK_LBRACE ||
+                    (peek(p, 1).kind == TC_TK_IDENT && peek(p, 2).kind == TC_TK_LBRACE))) {
+            // Anonymous (or tagged) enum body inline in struct:
+            //   enum { K_A, K_B } kind;
+            // Register enumerators globally (parser-level), and treat the
+            // field as TY_I32.
+            p->i++;
+            if (cur(p).kind == TC_TK_IDENT) p->i++;
+            if (cur(p).kind == TC_TK_LBRACE) parse_enum_body(p);
+            ft.kind = TY_I32;
+            ft.int_bits = 32;
+        } else if (cur(p).kind == TC_TK_KW_ENUM) {
+            // `enum Tag` field: treat as int.
+            p->i++;
+            if (cur(p).kind == TC_TK_IDENT) p->i++;
+            ft.kind = TY_I32;
+            ft.int_bits = 32;
         } else if (cur(p).kind == TC_TK_IDENT && typedef_lookup(p, cur(p).text)) {
             // Typedef'd field type, e.g. `size_t buf_len;` or `ciovec_t* p;`.
             // We resolve the typedef and reuse the existing pointer/array
@@ -1755,6 +1833,13 @@ static StructDef *parse_struct_def(P *p) {
                 } else {
                     perror_at(p, cur(p).line,
                         str_lit("unsupported pointer-to-typedef field type"));
+                }
+                if (accept(p, TC_TK_STAR)) {
+                    Type *inner = arena_new(p->arena, Type);
+                    *inner = ft;
+                    ft = (Type){0};
+                    ft.kind = TY_PTR_PTR;
+                    ft.pointee = inner;
                 }
             }
         } else {
@@ -1790,55 +1875,63 @@ static StructDef *parse_struct_def(P *p) {
                 perror_at(p, cur(p).line, str_lit("'void' is not a valid struct field type"));
             }
         }
-        TcTok fn = cur(p);
-        expect(p, TC_TK_IDENT, str_lit("expected field name"));
-        // Optional array suffix `[N]` or `[N][M]`.
-        if (accept(p, TC_TK_LBRACK)) {
-            if (cur(p).kind == TC_TK_RBRACK) {
-                perror_at(p, cur(p).line, str_lit("flexible array fields are not supported"));
-            }
-            TcTok lit = cur(p);
-            expect(p, TC_TK_INT_LIT, str_lit("expected array length"));
-            expect(p, TC_TK_RBRACK, str_lit("expected ']'"));
-            int64_t n1 = lit.int_value;
-            int64_t n2 = 0;
+        // One or more comma-separated declarators sharing the base type
+        // `ft` parsed above. Each may add its own `[N]`/`[N][M]` suffix.
+        Type base_ft = ft;
+        bool more_decls = true;
+        while (more_decls) {
+            Type ft = base_ft;
+            TcTok fn = cur(p);
+            expect(p, TC_TK_IDENT, str_lit("expected field name"));
+            // Optional array suffix `[N]` or `[N][M]`.
             if (accept(p, TC_TK_LBRACK)) {
-                TcTok lit2 = cur(p);
+                if (cur(p).kind == TC_TK_RBRACK) {
+                    perror_at(p, cur(p).line, str_lit("flexible array fields are not supported"));
+                }
+                TcTok lit = cur(p);
                 expect(p, TC_TK_INT_LIT, str_lit("expected array length"));
                 expect(p, TC_TK_RBRACK, str_lit("expected ']'"));
-                n2 = lit2.int_value;
-            }
-            // Map (element-type, dim) -> array TypeKind.
-            if (is_struct_kind) {
-                if (!is_ptr) {
-                    perror_at(p, cur(p).line, str_lit("array of nested struct value is not supported as a field"));
-                } else if (n2 != 0) {
-                    perror_at(p, cur(p).line, str_lit("only 1D arrays of struct pointers are supported"));
-                } else {
-                    ft.kind = TY_ARRAY_PTR_STRUCT;
+                int64_t n1 = lit.int_value;
+                int64_t n2 = 0;
+                if (accept(p, TC_TK_LBRACK)) {
+                    TcTok lit2 = cur(p);
+                    expect(p, TC_TK_INT_LIT, str_lit("expected array length"));
+                    expect(p, TC_TK_RBRACK, str_lit("expected ']'"));
+                    n2 = lit2.int_value;
+                }
+                // Map (element-type, dim) -> array TypeKind.
+                if (is_struct_kind) {
+                    if (!is_ptr) {
+                        perror_at(p, cur(p).line, str_lit("array of nested struct value is not supported as a field"));
+                    } else if (n2 != 0) {
+                        perror_at(p, cur(p).line, str_lit("only 1D arrays of struct pointers are supported"));
+                    } else {
+                        ft.kind = TY_ARRAY_PTR_STRUCT;
+                        ft.array_len = n1;
+                    }
+                } else if (was_char && is_ptr) {
+                    if (n2 != 0) {
+                        perror_at(p, cur(p).line, str_lit("only 1D arrays of char* are supported"));
+                    }
+                    ft.kind = TY_ARRAY_PTR_CHAR;
                     ft.array_len = n1;
+                } else if (is_ptr) {
+                    perror_at(p, cur(p).line, str_lit("array of int* is not supported as a field"));
+                } else if (was_float) {
+                    ft.kind = TY_ARRAY_F32;
+                    ft.array_len = n1;
+                    ft.array_len2 = n2;
+                } else {
+                    ft.kind = TY_ARRAY_I32;
+                    ft.array_len = n1;
+                    ft.array_len2 = n2;
                 }
-            } else if (was_char && is_ptr) {
-                if (n2 != 0) {
-                    perror_at(p, cur(p).line, str_lit("only 1D arrays of char* are supported"));
-                }
-                ft.kind = TY_ARRAY_PTR_CHAR;
-                ft.array_len = n1;
-            } else if (is_ptr) {
-                perror_at(p, cur(p).line, str_lit("array of int* is not supported as a field"));
-            } else if (was_float) {
-                ft.kind = TY_ARRAY_F32;
-                ft.array_len = n1;
-                ft.array_len2 = n2;
-            } else {
-                ft.kind = TY_ARRAY_I32;
-                ft.array_len = n1;
-                ft.array_len2 = n2;
             }
+            VecStructField_push_back(p->arena, &sd->fields,
+                ((StructField){.name = fn.text, .type = ft}));
+            more_decls = accept(p, TC_TK_COMMA);
         }
         expect(p, TC_TK_SEMI, str_lit("expected ';' after field"));
-        VecStructField_push_back(p->arena, &sd->fields,
-            ((StructField){.name = fn.text, .type = ft}));
     }
     expect(p, TC_TK_RBRACE, str_lit("expected '}'"));
     return sd;
@@ -1990,8 +2083,8 @@ static void parse_typedef_decl(P *p) {
         expect(p, TC_TK_SEMI, str_lit("expected ';' after typedef"));
         return;
     }
-    // `typedef struct [Tag] { ... } Alias;`
-    if (cur(p).kind == TC_TK_KW_STRUCT) {
+    // `typedef struct [Tag] { ... } Alias;` or `typedef union ...`
+    if (cur(p).kind == TC_TK_KW_STRUCT || cur(p).kind == TC_TK_KW_UNION) {
         size_t la = 1;
         if (peek(p, la).kind == TC_TK_IDENT) la++;
         if (peek(p, la).kind == TC_TK_LBRACE) {
@@ -2165,7 +2258,9 @@ int tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks) {
             p.i++;
         }
         if (cur(&p).kind == TC_TK_EOF) break;
-        if (cur(&p).kind == TC_TK_KW_STRUCT && peek(&p, 2).kind == TC_TK_LBRACE) {
+        if ((cur(&p).kind == TC_TK_KW_STRUCT || cur(&p).kind == TC_TK_KW_UNION) &&
+            (peek(&p, 1).kind == TC_TK_LBRACE ||
+             (peek(&p, 1).kind == TC_TK_IDENT && peek(&p, 2).kind == TC_TK_LBRACE))) {
             StructDef *sd = parse_struct_def(&p);
             expect(&p, TC_TK_SEMI, str_lit("expected ';' after struct definition"));
             // Dedup against existing struct of the same name (cross-file

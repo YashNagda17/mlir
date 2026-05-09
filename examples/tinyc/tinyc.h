@@ -370,6 +370,7 @@ typedef struct StructDef {
     string         name;
     VecStructField fields;
     int            line;
+    bool           is_union;
 } StructDef;
 
 DEFINE_VECTOR_FOR_TYPE(StructDef*, VecStructDefPtr)
@@ -430,6 +431,7 @@ typedef enum {
     TC_TK_KW_CONTINUE,
     TC_TK_KW_PRINT,
     TC_TK_KW_STRUCT,
+    TC_TK_KW_UNION,
     TC_TK_KW_NULL,
     TC_TK_KW_SIZEOF,
     TC_TK_KW_CHAR,

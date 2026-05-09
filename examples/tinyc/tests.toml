@@ -103,6 +103,10 @@ name = "ternary"
 expected_stdout = "7\n3\n5\n3\n1\n"
 
 [[test]]
+name = "ternary_i64"
+expected_stdout = "1\n3\n0\n0\n"
+
+[[test]]
 name = "typedef"
 expected_stdout = "16\n100\n7\n"
 
@@ -257,6 +261,59 @@ expected_stdout = "10\n300\n"
 [[test]]
 name = "extern_malloc_free"
 expected_stdout = "42\n99\n"
+
+[[test]]
+name = "struct_multi_decl_field"
+expected_stdout = "1\n2\n100\n200\n7\n9\n"
+
+[[test]]
+name = "string_concat"
+expected_stdout = "104\n32\n119\n100\n"
+
+[[test]]
+name = "ptr_ptr_chained_index"
+expected_stdout = "97\n98\n99\n120\n121\n122\n"
+
+[[test]]
+name = "fnptr_struct_return"
+expected_stdout = "7\n70\n77\n"
+
+[[test]]
+name = "fnptr_i64_return"
+expected_stdout = "700\n2000\n"
+
+[[test]]
+name = "addr_of_struct_field_index"
+expected_stdout = "1\n10\n2\n20\n3\n30\n"
+
+[[test]]
+name = "null_ptr_init"
+expected_stdout = "1\n2\n3\n7\n"
+
+[[test]]
+name = "field_of_call_result"
+expected_stdout = "7\n11\n104\n"
+
+[[test]]
+name = "deref_index_pp"
+expected_stdout = "101\n102\n103\n"
+
+[[test]]
+name = "struct_call_in_short_circuit"
+expected_stdout = "109\n"
+
+[[test]]
+name = "null_arg_to_ptr_param"
+expected_stdout = "42\n"
+needs_libc = true
+
+[[test]]
+name = "struct_ternary"
+expected_stdout = "70\n15\n"
+
+[[test]]
+name = "struct_return_ternary"
+expected_stdout = "3\n17\n"
 
 [[test]]
 name = "define_malloc_free"
@@ -592,4 +649,16 @@ expected_stdout = """\
 long: 20 30 20
 int: 8 7
 chr: 98 97
+"""
+
+[[test]]
+name = "struct_zero_init_64bit"
+expected_stdout = """\
+0
+"""
+
+[[test]]
+name = "union_field_offset"
+expected_stdout = """\
+0
 """
