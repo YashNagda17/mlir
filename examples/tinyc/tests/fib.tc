@@ -9,6 +9,6 @@ int fib(int n) {
 }
 
 int main() {
-    print(fib(10));
+    _tinyc_print(fib(10));
     return 0;
 }

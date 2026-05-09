@@ -29,17 +29,17 @@ int main() {
     o.i.x = 10;
     o.i.y = 20;
     o.z = 30;
-    print(o.i.x);
-    print(o.i.y);
-    print(o.z);
-    print(sum(o));
-    print(sum_via_ptr(&o));
+    _tinyc_print(o.i.x);
+    _tinyc_print(o.i.y);
+    _tinyc_print(o.z);
+    _tinyc_print(sum(o));
+    _tinyc_print(sum_via_ptr(&o));
 
     struct Outer m;
     m = make();
-    print(m.i.x);
-    print(m.i.y);
-    print(m.z);
-    print(sum(m));
+    _tinyc_print(m.i.x);
+    _tinyc_print(m.i.y);
+    _tinyc_print(m.z);
+    _tinyc_print(sum(m));
     return 0;
 }

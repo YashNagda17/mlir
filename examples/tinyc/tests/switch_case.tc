@@ -22,12 +22,12 @@ int classify(int n) {
 }
 
 int main() {
-    print(classify(0));   // 100
-    print(classify(1));   // 200
-    print(classify(2));   // 200
-    print(classify(3));   // 301
-    print(classify(4));   // 0 (r starts -1, +1 = 0)
-    print(classify(7));   // 999
+    _tinyc_print(classify(0));   // 100
+    _tinyc_print(classify(1));   // 200
+    _tinyc_print(classify(2));   // 200
+    _tinyc_print(classify(3));   // 301
+    _tinyc_print(classify(4));   // 0 (r starts -1, +1 = 0)
+    _tinyc_print(classify(7));   // 999
 
     int i;
     int sum = 0;
@@ -43,6 +43,6 @@ int main() {
                 sum = sum + 10;
         }
     }
-    print(sum);           // i=0:+1, i=1:+1, i=2:continue, i=3:+10, i=4:+10 = 22
+    _tinyc_print(sum);           // i=0:+1, i=1:+1, i=2:continue, i=3:+10, i=4:+10 = 22
     return 0;
 }

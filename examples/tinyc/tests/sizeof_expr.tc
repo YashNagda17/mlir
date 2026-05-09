@@ -13,13 +13,13 @@ int main() {
     s = "hi";
     p.x = 0;
     p.y = 0;
-    print(sizeof(int));
-    print(sizeof(a));
-    print(sizeof(b));
-    print(sizeof(s));
-    print(sizeof(p));
-    print(sizeof(p.x));
-    print(sizeof(a + 1));
-    print(sizeof(a + b));
+    _tinyc_print(sizeof(int));
+    _tinyc_print(sizeof(a));
+    _tinyc_print(sizeof(b));
+    _tinyc_print(sizeof(s));
+    _tinyc_print(sizeof(p));
+    _tinyc_print(sizeof(p.x));
+    _tinyc_print(sizeof(a + 1));
+    _tinyc_print(sizeof(a + b));
     return 0;
 }

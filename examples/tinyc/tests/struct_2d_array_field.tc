@@ -13,12 +13,12 @@ int main() {
             M.m[i][j] = i * 10 + j;
         }
     }
-    print(M.m[0][0]);    // 0
-    print(M.m[0][2]);    // 2
-    print(M.m[1][0]);    // 10
-    print(M.m[1][2]);    // 12
+    _tinyc_print(M.m[0][0]);    // 0
+    _tinyc_print(M.m[0][2]);    // 2
+    _tinyc_print(M.m[1][0]);    // 10
+    _tinyc_print(M.m[1][2]);    // 12
 
     M.m[1][1] = M.m[0][2] + M.m[1][0] + 0.5;
-    print(M.m[1][1]);    // 12.5
+    _tinyc_print(M.m[1][1]);    // 12.5
     return 0;
 }

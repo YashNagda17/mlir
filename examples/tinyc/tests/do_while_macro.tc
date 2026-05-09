@@ -5,6 +5,6 @@ int main() {
     int x;
     x = 0;
     ONCE(x = 42);
-    print(x);  // 42
+    _tinyc_print(x);  // 42
     return 0;
 }

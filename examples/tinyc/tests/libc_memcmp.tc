@@ -18,8 +18,8 @@ int main() {
     pa = &a[0]; pb = &b[0]; pc = &c[0];
     long n;
     n = sizeof(int) * 3;
-    print(sign(memcmp(pa, pb, n)));
-    print(sign(memcmp(pa, pc, n)));
-    print(sign(memcmp(pc, pa, n)));
+    _tinyc_print(sign(memcmp(pa, pb, n)));
+    _tinyc_print(sign(memcmp(pa, pc, n)));
+    _tinyc_print(sign(memcmp(pc, pa, n)));
     return 0;
 }

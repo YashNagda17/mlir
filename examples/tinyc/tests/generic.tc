@@ -8,7 +8,7 @@ typedef struct Box {
 } Box;
 
 int side_effect(int x) {
-    print(999);  // must NOT be printed if controlling expr is not evaluated
+    _tinyc_print(999);  // must NOT be printed if controlling expr is not evaluated
     return x;
 }
 
@@ -21,27 +21,27 @@ int main() {
     Box *bp = &b;
 
     // Branch on int -> should print 1
-    print(_Generic((i), int: 1, long: 2, char*: 3, struct Box: 4, struct Box*: 5, default: 9));
+    _tinyc_print(_Generic((i), int: 1, long: 2, char*: 3, struct Box: 4, struct Box*: 5, default: 9));
     // Branch on long -> 2
-    print(_Generic((l), int: 1, long: 2, char*: 3, struct Box: 4, struct Box*: 5, default: 9));
+    _tinyc_print(_Generic((l), int: 1, long: 2, char*: 3, struct Box: 4, struct Box*: 5, default: 9));
     // Branch on char* -> 3
-    print(_Generic((s), int: 1, long: 2, char*: 3, struct Box: 4, struct Box*: 5, default: 9));
+    _tinyc_print(_Generic((s), int: 1, long: 2, char*: 3, struct Box: 4, struct Box*: 5, default: 9));
     // Branch on struct Box -> 4
-    print(_Generic((b), int: 1, long: 2, char*: 3, struct Box: 4, struct Box*: 5, default: 9));
+    _tinyc_print(_Generic((b), int: 1, long: 2, char*: 3, struct Box: 4, struct Box*: 5, default: 9));
     // Branch on struct Box* -> 5
-    print(_Generic((bp), int: 1, long: 2, char*: 3, struct Box: 4, struct Box*: 5, default: 9));
+    _tinyc_print(_Generic((bp), int: 1, long: 2, char*: 3, struct Box: 4, struct Box*: 5, default: 9));
     // Default branch (float not in list) -> 9
-    print(_Generic((1.5f), int: 1, long: 2, char*: 3, default: 9));
+    _tinyc_print(_Generic((1.5f), int: 1, long: 2, char*: 3, default: 9));
     // Controlling expr must not be evaluated.
-    print(_Generic((side_effect(0)), int: 100, default: 9));
+    _tinyc_print(_Generic((side_effect(0)), int: 100, default: 9));
     // Narrow-int discrimination via int_bits.
     {
         int8_t  i8  = 1;
         int16_t i16 = 2;
         int32_t i32 = 3;
-        print(_Generic((i8),  int8_t: 8,  int16_t: 16, int32_t: 32, default: 0));
-        print(_Generic((i16), int8_t: 8,  int16_t: 16, int32_t: 32, default: 0));
-        print(_Generic((i32), int8_t: 8,  int16_t: 16, int32_t: 32, default: 0));
+        _tinyc_print(_Generic((i8),  int8_t: 8,  int16_t: 16, int32_t: 32, default: 0));
+        _tinyc_print(_Generic((i16), int8_t: 8,  int16_t: 16, int32_t: 32, default: 0));
+        _tinyc_print(_Generic((i32), int8_t: 8,  int16_t: 16, int32_t: 32, default: 0));
     }
     return 0;
 }

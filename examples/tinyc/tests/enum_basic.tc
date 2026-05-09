@@ -18,22 +18,22 @@ int classify(int color) {
 }
 
 int main() {
-    print(RED);          // 0
-    print(GREEN);        // 1
-    print(BLUE);         // 2
-    print(A);            // 1
-    print(B);            // 2
-    print(C);            // 10
-    print(D);            // 11
-    print(ALPHA);        // 1
-    print(BETA);         // 2
-    print(GAMMA);        // 10
-    print(classify(RED));    // 100
-    print(classify(GREEN));  // 200
-    print(classify(BLUE));   // 300
+    _tinyc_print(RED);          // 0
+    _tinyc_print(GREEN);        // 1
+    _tinyc_print(BLUE);         // 2
+    _tinyc_print(A);            // 1
+    _tinyc_print(B);            // 2
+    _tinyc_print(C);            // 10
+    _tinyc_print(D);            // 11
+    _tinyc_print(ALPHA);        // 1
+    _tinyc_print(BETA);         // 2
+    _tinyc_print(GAMMA);        // 10
+    _tinyc_print(classify(RED));    // 100
+    _tinyc_print(classify(GREEN));  // 200
+    _tinyc_print(classify(BLUE));   // 300
 
     // Enumerators are usable in arbitrary integer contexts.
     int x = D + 5;
-    print(x);            // 16
+    _tinyc_print(x);            // 16
     return 0;
 }

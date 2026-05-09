@@ -10,8 +10,8 @@ int main() {
     Pt a = {1, 2, 3};
     Pt b = {.x = 10, .y = 20, .z = 30};
     Pt c = {.z = 700, .x = 100, .y = 400};
-    print(a.x); print(a.y); print(a.z);
-    print(b.x); print(b.y); print(b.z);
-    print(c.x); print(c.y); print(c.z);
+    _tinyc_print(a.x); _tinyc_print(a.y); _tinyc_print(a.z);
+    _tinyc_print(b.x); _tinyc_print(b.y); _tinyc_print(b.z);
+    _tinyc_print(c.x); _tinyc_print(c.y); _tinyc_print(c.z);
     return 0;
 }

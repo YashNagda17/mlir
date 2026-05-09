@@ -26,13 +26,13 @@ int main() {
     CInt a = 3;
     const int b = 4;
     int x = square(a) + square(b);
-    print(x);                       // 25
-    print(N);                       // 7
-    print(read_through(&b));        // 4
-    print(sizeof(const int));       // 4
+    _tinyc_print(x);                       // 25
+    _tinyc_print(N);                       // 7
+    _tinyc_print(read_through(&b));        // 4
+    _tinyc_print(sizeof(const int));       // 4
 
     struct Box bx;
     bx.v = 10;
-    print(bx.v);                    // 10
+    _tinyc_print(bx.v);                    // 10
     return 0;
 }

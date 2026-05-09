@@ -13,9 +13,9 @@ Pt make_pt(int a, int b) {
 }
 
 void show(Pt p, int tag) {
-    print(tag);
-    print(p.x);
-    print(p.y);
+    _tinyc_print(tag);
+    _tinyc_print(p.x);
+    _tinyc_print(p.y);
 }
 
 int main() {

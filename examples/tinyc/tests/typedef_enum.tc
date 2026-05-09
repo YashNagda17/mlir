@@ -15,8 +15,8 @@ int classify(Color c) {
 int main() {
     Color c;
     c = COLOR_GREEN;
-    print(c);            // 1
-    print(classify(c));  // 200
-    print(COLOR_BLUE);   // 2
+    _tinyc_print(c);            // 1
+    _tinyc_print(classify(c));  // 200
+    _tinyc_print(COLOR_BLUE);   // 2
     return 0;
 }

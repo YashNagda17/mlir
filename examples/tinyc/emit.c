@@ -503,6 +503,19 @@ static MLIR_ValueHandle emit_trunci_to_i8(E *e, MLIR_ValueHandle v) {
     return r;
 }
 
+// arith.constant <v> : i8 — used for char-array string-literal init.
+static MLIR_ValueHandle emit_const_i8(E *e, int64_t v) {
+    MLIR_ValueHandle r = MLIR_CreateValueOpResult(e->ctx, MLIR_INVALID_HANDLE, 0,
+                                                  e->i8, ssa_name(e), eloc(e, 0));
+    MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = e->i8;
+    MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = r;
+    MLIR_AttributeHandle val = MLIR_CreateAttributeInteger(e->ctx, str_lit("value"), v, e->i8);
+    MLIR_AttributeHandle *as = arena_new_array(e->arena, MLIR_AttributeHandle, 1); as[0] = val;
+    emit_op(e, OP_TYPE_ARITH_CONSTANT, str_lit("arith.constant"),
+            rts, 1, rs, 1, NULL, 0, as, 1, NULL, 0);
+    return r;
+}
+
 // Emit `llvm.mlir.addressof @<sym>` -> !llvm.ptr.
 static MLIR_ValueHandle emit_addressof(E *e, string sym) {
     MLIR_ValueHandle r = MLIR_CreateValueOpResult(e->ctx, MLIR_INVALID_HANDLE, 0,
@@ -2359,7 +2372,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 } else if (ex->kind == EX_INDEX) {
                     // Reading an element of a struct-field array of
                     // pointers: tag the result so downstream consumers
-                    // (print(), -> chains) see the right element kind.
+                    // (_tinyc_print(), -> chains) see the right element kind.
                     Expr *fe = NULL;
                     if (ex->lhs->kind == EX_FIELD) fe = ex->lhs;
                     else if (ex->lhs->kind == EX_INDEX &&
@@ -3401,6 +3414,37 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 }
                 sy->addr = emit_alloca(e, arr_ty);
                 if (st->decl_init) {
+                    // `char arr[N] = "string literal"` — copy the string
+                    // bytes (lexer already includes a trailing NUL) into
+                    // the local buffer, zero-padding any remaining bytes.
+                    if (st->decl_init->kind == EX_STR &&
+                        st->decl_type.array_elem_is_i8 &&
+                        st->decl_type.array_len2 == 0) {
+                        string lit = st->decl_init->name;
+                        int64_t alen = st->decl_type.array_len;
+                        if ((int64_t)lit.size > alen) {
+                            EMIT_ERR(e, "string initializer ({} bytes) too long for char[{}]",
+                                     (int64_t)lit.size, alen);
+                        }
+                        int64_t lim = (int64_t)lit.size < alen ? (int64_t)lit.size : alen;
+                        for (int64_t k = 0; k < lim; k++) {
+                            MLIR_ValueHandle bv = emit_const_i8(e, (int64_t)(uint8_t)lit.str[k]);
+                            int32_t path[2] = {0, (int32_t)k};
+                            MLIR_ValueHandle p = emit_gep(e, sy->addr, arr_ty, path, 2, NULL, 0);
+                            emit_store_v(e, bv, p);
+                        }
+                        if (lim < alen) {
+                            MLIR_ValueHandle z8 = emit_const_i8(e, 0);
+                            for (int64_t k = lim; k < alen; k++) {
+                                int32_t path[2] = {0, (int32_t)k};
+                                MLIR_ValueHandle p = emit_gep(e, sy->addr, arr_ty, path, 2, NULL, 0);
+                                emit_store_v(e, z8, p);
+                            }
+                        }
+                        sy->next = sc->head;
+                        sc->head = sy;
+                        return;
+                    }
                     // Support `= {0}` (zero-initialize) by zeroing every
                     // element. Also support a positional list `{v0,v1,...}`
                     // for 1-D arrays where each value is an int expression.
@@ -3747,7 +3791,7 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
         case ST_PRINT: {
             EVal v = emit_expr(e, sc, st->expr);
             if (v.is_str) {
-                // print(<string>) -> @printStr(!llvm.ptr)
+                // _tinyc_print(<string>) -> @printStr(!llvm.ptr)
                 e->use_print_str = true;
                 MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1);
                 ops[0] = v.val;
@@ -4354,7 +4398,10 @@ static int64_t type_size(E *e, Type t) {
     if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return 8;
     if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return 8;
     if (t.kind == TY_PTR_PTR) return 8;
-    if (t.kind == TY_ARRAY_I32) return 4 * t.array_len * (t.array_len2 ? t.array_len2 : 1);
+    if (t.kind == TY_ARRAY_I32) {
+        int64_t es = t.array_elem_is_i64 ? 8 : t.array_elem_is_i8 ? 1 : 4;
+        return es * t.array_len * (t.array_len2 ? t.array_len2 : 1);
+    }
     if (t.kind == TY_ARRAY_F32) return 4 * t.array_len * (t.array_len2 ? t.array_len2 : 1);
     if (t.kind == TY_ARRAY_PTR_STRUCT || t.kind == TY_ARRAY_PTR_CHAR)
         return 8 * t.array_len;
@@ -4468,6 +4515,7 @@ static void init_struct_types(E *e) {
             if (ft.kind == TY_I32) body[k] = e->i32;
             else if (ft.kind == TY_I64) body[k] = e->i64;
             else if (ft.kind == TY_F32) body[k] = e->f32;
+            else if (ft.kind == TY_F64) body[k] = e->f64;
             else if (ft.kind == TY_PTR_STRUCT || ft.kind == TY_PTR_I32 ||
                      ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID ||
                      ft.kind == TY_PTR_PTR || ft.kind == TY_FNPTR) body[k] = e->ptr;
@@ -4841,7 +4889,7 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
         MLIR_AppendBlockOp(ctx, mb, gop);
     }
 
-    // If any user-code path used print(<string>), declare @printStr.
+    // If any user-code path used _tinyc_print(<string>), declare @printStr.
     if (e.use_print_str) {
         MLIR_TypeHandle *ins = arena_new_array(arena, MLIR_TypeHandle, 1); ins[0] = e.ptr;
         MLIR_TypeHandle fty = MLIR_CreateTypeFunction(ctx, ins, 1, NULL, 0);

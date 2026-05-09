@@ -19,7 +19,7 @@ int total(int n, ...) {
 }
 
 int main() {
-    print(total(4, 1, 2, 3, 4));  // 10
-    print(total(2, 100, 200));    // 300
+    _tinyc_print(total(4, 1, 2, 3, 4));  // 10
+    _tinyc_print(total(2, 100, 200));    // 300
     return 0;
 }

@@ -27,7 +27,7 @@ int main() {
     a->value = 1; a->next = b;
     b->value = 2; b->next = c;
     c->value = 3; c->next = null;
-    print(sum_list(a));
+    _tinyc_print(sum_list(a));
     free(a); free(b); free(c);
     return 0;
 }

@@ -11,8 +11,8 @@ int main() {
     int (**pop)(int, int);
     op = &add;
     pop = &op;
-    print((*pop)(2, 3));
+    _tinyc_print((*pop)(2, 3));
     op = &sub;
-    print((*pop)(10, 3));
+    _tinyc_print((*pop)(10, 3));
     return 0;
 }

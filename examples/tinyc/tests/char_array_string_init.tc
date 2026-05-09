@@ -1,0 +1,20 @@
+// `char arr[] = "string literal"` and `char arr[N] = "literal"` —
+// initialize the local buffer by copying the bytes of the literal,
+// zero-padding any remainder.
+
+extern int printf(const char *fmt, ...);
+
+int main(void) {
+    char s[] = "hello";
+    printf("%s %d\n", s, (int)sizeof(s));   // hello 6
+
+    char t[10] = "abc";
+    printf("%s %d %d %d %d\n",
+           t, (int)sizeof(t), (int)t[3], (int)t[8], (int)t[9]);
+    // abc 10 0 0 0
+
+    // Mutate to confirm the bytes are in a writable local buffer.
+    s[0] = 'j';
+    printf("%s\n", s);  // jello
+    return 0;
+}

@@ -5,8 +5,8 @@ int main() {
     x = 41;
     p = &x;
     pp = &p;
-    print(**pp);
+    _tinyc_print(**pp);
     **pp = 42;
-    print(x);
+    _tinyc_print(x);
     return 0;
 }

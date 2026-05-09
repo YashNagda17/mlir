@@ -13,10 +13,10 @@ int main() {
     Long *p;
     p = (Long *)malloc(sizeof(long) * 4);
     fill(p, 4);
-    print(p[0]);
-    print(p[1]);
-    print(p[2]);
-    print(p[3]);
+    _tinyc_print(p[0]);
+    _tinyc_print(p[1]);
+    _tinyc_print(p[2]);
+    _tinyc_print(p[3]);
     free(p);
     return 0;
 }

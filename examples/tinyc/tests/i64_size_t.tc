@@ -11,8 +11,8 @@ size_t triangle(size_t n) {
 }
 
 int main() {
-    print(triangle(10LL));
-    print(triangle(100LL));
-    print(triangle(0LL));
+    _tinyc_print(triangle(10LL));
+    _tinyc_print(triangle(100LL));
+    _tinyc_print(triangle(0LL));
     return 0;
 }

@@ -5,8 +5,8 @@
 extern int counter;
 
 int main() {
-    print(counter);    // 10
+    _tinyc_print(counter);    // 10
     counter = counter + 5;
-    print(counter);    // 15
+    _tinyc_print(counter);    // 15
     return 0;
 }

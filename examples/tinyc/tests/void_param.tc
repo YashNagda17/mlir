@@ -5,11 +5,11 @@ int answer(void) {
 }
 
 void announce(int x) {
-    print(x);
+    _tinyc_print(x);
 }
 
 int main() {
-    print(answer());   // 42
+    _tinyc_print(answer());   // 42
     announce(7);       // 7
     announce(answer());// 42
     return 0;

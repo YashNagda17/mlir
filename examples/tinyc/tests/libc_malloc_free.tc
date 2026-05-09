@@ -13,7 +13,7 @@ int main() {
     p[3] = 44;
     int sum;
     sum = p[0] + p[1] + p[2] + p[3];
-    print(sum);
+    _tinyc_print(sum);
     free(p);
     return 0;
 }

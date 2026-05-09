@@ -9,8 +9,8 @@ int sub(int a, int b) {
 int main() {
     int (*op)(int, int);
     op = &add;
-    print(op(3, 4));
+    _tinyc_print(op(3, 4));
     op = sub;
-    print(op(10, 3));
+    _tinyc_print(op(10, 3));
     return 0;
 }

@@ -3,14 +3,14 @@ int abs_val(int n) {
 }
 
 int main() {
-    print(abs_val(-7));
-    print(abs_val(3));
+    _tinyc_print(abs_val(-7));
+    _tinyc_print(abs_val(3));
     int x = 5;
     int y = x > 0 ? x : 0;
-    print(y);
+    _tinyc_print(y);
     int z = x > 100 ? 1 : x > 10 ? 2 : 3;
-    print(z);
+    _tinyc_print(z);
     int big = 1000;
-    print(big > 500 ? 1 : 0);
+    _tinyc_print(big > 500 ? 1 : 0);
     return 0;
 }

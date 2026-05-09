@@ -21,10 +21,10 @@ int test_or(int n) {
 }
 
 int main() {
-    print(test_and(0));
-    print(test_and(5));
-    print(test_or(0));
-    print(test_or(5));
+    _tinyc_print(test_and(0));
+    _tinyc_print(test_and(5));
+    _tinyc_print(test_or(0));
+    _tinyc_print(test_or(5));
     return 0;
 }
 

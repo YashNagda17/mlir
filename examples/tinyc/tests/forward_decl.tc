@@ -18,9 +18,9 @@ int add3(int a, int b, int c) {
 }
 
 int main() {
-    print(is_even(10));    // 1
-    print(is_odd(7));      // 1
-    print(is_even(3));     // 0
-    print(add3(1, 2, 3));  // 6
+    _tinyc_print(is_even(10));    // 1
+    _tinyc_print(is_odd(7));      // 1
+    _tinyc_print(is_even(3));     // 0
+    _tinyc_print(add3(1, 2, 3));  // 6
     return 0;
 }

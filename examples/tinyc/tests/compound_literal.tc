@@ -13,10 +13,10 @@ int main() {
     struct Point p = (struct Point){3, 4};
     a = (int){42};
     b = (long long){7};
-    print(a);
-    print(b);
-    print(p.x);
-    print(p.y);
-    print(add_pt(&p));
+    _tinyc_print(a);
+    _tinyc_print(b);
+    _tinyc_print(p.x);
+    _tinyc_print(p.y);
+    _tinyc_print(add_pt(&p));
     return 0;
 }

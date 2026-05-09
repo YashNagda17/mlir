@@ -31,15 +31,15 @@ int main() {
     int total = 0;
     int i = 0;
     while (i < p.count) {
-        print(p.items[i]->v);
+        _tinyc_print(p.items[i]->v);
         total = total + p.items[i]->v;
         i = i + 1;
     }
-    print(total);                 // 100
+    _tinyc_print(total);                 // 100
 
     // Reassign one slot and verify.
     p.items[2] = &a;
-    print(p.items[2]->v);         // 10
+    _tinyc_print(p.items[2]->v);         // 10
 
     return 0;
 }

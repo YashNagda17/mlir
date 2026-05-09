@@ -16,12 +16,12 @@ static inline int squared(int n) {
 inline static int cubed(int n);  // forward decl with both, swapped
 
 int main() {
-    print(incr());
-    print(incr());
-    print(incr());
-    print(squared(5));
-    print(cubed(3));
-    print(kSeed + kSeed2);
+    _tinyc_print(incr());
+    _tinyc_print(incr());
+    _tinyc_print(incr());
+    _tinyc_print(squared(5));
+    _tinyc_print(cubed(3));
+    _tinyc_print(kSeed + kSeed2);
     return 0;
 }
 
