@@ -52,6 +52,7 @@
 
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
@@ -1127,9 +1128,32 @@ extern "C" bool MLIR_LowerToLLVMDialect(MLIR_Context *, MLIR_OpHandle module_h) 
         return false;
     }
     auto &ctx = globalCtx().mctx;
+    // Only run vector-to-LLVM if the module actually contains a vector op.
+    // The dialect-conversion infrastructure used by that pass performs
+    // identical-block merging that miscompiles deeply-nested if/else
+    // cascades over scalar code (LLVM 19 bug). Skipping the pass when
+    // there is no vector op to lower avoids the miscompile entirely.
+    bool has_vector_op = false;
+    module.walk([&](mlir::Operation *o) {
+        if (o->getDialect() && o->getDialect()->getNamespace() == "vector") {
+            has_vector_op = true;
+            return mlir::WalkResult::interrupt();
+        }
+        return mlir::WalkResult::advance();
+    });
+    // Drop unreachable blocks before lowering. The conversion driver used
+    // by createConvertVectorToLLVMPass performs this DCE as a side effect;
+    // when we skip that pass, convert-cf-to-llvm leaves unreachable
+    // `cf.br`s behind which then fail LLVM-IR translation.
+    {
+        mlir::IRRewriter rewriter(&ctx);
+        (void)mlir::eraseUnreachableBlocks(rewriter, module->getRegions());
+    }
     mlir::PassManager pm(&ctx);
     pm.addPass(mlir::createConvertSCFToCFPass());
-    pm.addPass(mlir::createConvertVectorToLLVMPass());
+    if (has_vector_op) {
+        pm.addPass(mlir::createConvertVectorToLLVMPass());
+    }
     pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
     pm.addPass(mlir::createConvertControlFlowToLLVMPass());
     pm.addPass(mlir::createArithToLLVMConversionPass());
