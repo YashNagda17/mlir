@@ -646,3 +646,9 @@ long: 20 30 20
 int: 8 7
 chr: 98 97
 """
+
+[[test]]
+name = "struct_zero_init_64bit"
+expected_stdout = """\
+0
+"""
