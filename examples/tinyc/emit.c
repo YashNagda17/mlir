@@ -127,6 +127,7 @@ typedef struct {
     MLIR_BlockHandle cur_block;
     MLIR_BlockHandle entry_block;    // function entry block, alloca insertion point
     MLIR_ValueHandle entry_const_one; // i64 constant 1 in entry_block, shared by all allocas
+    size_t entry_alloca_insert_idx;  // next position in entry_block for hoisted allocas
     bool terminated;
     MLIR_RegionHandle func_region;
     MLIR_LocationHandle loc;
@@ -595,8 +596,18 @@ static MLIR_ValueHandle emit_alloca(E *e, MLIR_TypeHandle elem_ty) {
     MLIR_OpHandle aop = emit_op(e, OP_TYPE_LLVM_ALLOCA, str_lit("llvm.alloca"),
                                 rts, 1, rs, 1, ops, 1, as, 1, NULL, 0);
     if (hoist) {
-        MLIR_InsertBlockOpBeforeTerminator(e->ctx, e->entry_block, aop);
+        // Insert at a stable position right after entry_const_one (and any
+        // previously-hoisted allocas) so the alloca dominates *all* uses,
+        // including ones nested inside scf.if / cf.cond_br regions whose
+        // ops were already appended to the entry block.
+        MLIR_InsertBlockOpAtIndex(e->ctx, e->entry_block, aop,
+                                  e->entry_alloca_insert_idx++);
         e->cur_block = saved;
+    } else if (e->cur_block == e->entry_block) {
+        // Alloca emitted directly into entry block: track that it sits
+        // before any later body ops so future hoisted allocas are inserted
+        // after it.
+        e->entry_alloca_insert_idx++;
     }
     return r;
 }
@@ -4322,6 +4333,9 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
     e->cur_block = entry;
     e->entry_block = entry;
     e->entry_const_one = emit_const_i64(e, 1);
+    // entry_const_one is op #0 in entry; allocas hoisted from inner blocks
+    // get inserted starting at index 1 to ensure they dominate all uses.
+    e->entry_alloca_insert_idx = 1;
     e->func_region = body_r;
     e->cur_sig = sig;
     e->cur_sret_ptr = MLIR_INVALID_HANDLE;
