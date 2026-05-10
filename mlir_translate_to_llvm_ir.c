@@ -144,11 +144,16 @@ static void print_llvm_type_text(Buf *out, const char *s, size_t n) {
 
     if (n == 0) { buf_cstr(out, "void"); return; }
 
-    // Integer: i<width>
-    if (s[0] == 'i' && n > 1) {
-        bool all_dig = true;
-        for (size_t i = 1; i < n; i++) if (s[i] < '0' || s[i] > '9') { all_dig = false; break; }
-        if (all_dig) { buf_append(out, s, n); return; }
+    // Integer: i<width> (or ui<width> / si<width> from the native printer
+    // — LLVM IR is signedness-agnostic so collapse them all to i<width>).
+    {
+        const char *p = s; size_t pn = n;
+        if (pn > 2 && (p[0] == 'u' || p[0] == 's') && p[1] == 'i') { p += 1; pn -= 1; }
+        if (p[0] == 'i' && pn > 1) {
+            bool all_dig = true;
+            for (size_t i = 1; i < pn; i++) if (p[i] < '0' || p[i] > '9') { all_dig = false; break; }
+            if (all_dig) { buf_append(out, p, pn); return; }
+        }
     }
     // Float keywords
     if (n == 3 && memcmp(s, "f16", 3) == 0) { buf_cstr(out, "half"); return; }
