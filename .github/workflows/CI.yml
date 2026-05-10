@@ -20,6 +20,8 @@ jobs:
               pixi run -e upstream test_cross
               pixi run -e upstream validate_refs
               pixi run -e upstream test_tinyc_upstream
+              TINYC_LOWERING=native pixi run -e upstream test_tinyc_upstream
+              pixi run -e upstream test_tinyc_native
           - platform: macos
             os: macos-latest
             pixi-command: |
@@ -28,6 +30,8 @@ jobs:
               pixi run -e upstream test_cross
               pixi run -e upstream validate_refs
               pixi run -e upstream test_tinyc_upstream
+              TINYC_LOWERING=native pixi run -e upstream test_tinyc_upstream
+              pixi run -e upstream test_tinyc_native
           - platform: windows
             os: windows-latest
             pixi-command: |
