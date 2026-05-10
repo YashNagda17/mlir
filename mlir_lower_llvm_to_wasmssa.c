@@ -65,6 +65,7 @@ static uint8_t wasm_vt(MLIR_Context *ctx, MLIR_TypeHandle ty) {
     string s = MLIR_GetTypeString(ctx, ty);
     if (s.size >= 9 && memcmp(s.str, "!llvm.ptr", 9) == 0) return WT_I32;
     if (s.size == 3 && memcmp(s.str, "ptr", 3) == 0) return WT_I32;
+    if (s.size == 5 && memcmp(s.str, "index", 5) == 0) return WT_I32;
     if (s.size == 3 && memcmp(s.str, "f32", 3) == 0) return WT_F32;
     if (s.size == 3 && memcmp(s.str, "f64", 3) == 0) return WT_F64;
     if (s.size > 1 && s.str[0] == 'i') {
@@ -554,15 +555,27 @@ fail:
 }
 
 // ---- scf.while -------------------------------------------------------------
+// General shape (with iter args / results):
+//   %res:R = scf.while (%a:T = %init:T) : (T...) -> (R...) {
+//     ^before(%a:T...): ...; scf.condition(%cond) %r:R...
+//   } do {
+//     ^after(%b:R...): ...; scf.yield %y:T...
+//   }
+//
+// Lowered to:
+//   (init: store %init[i] -> iter_c[i])
+//   block $exit
+//     loop $continue
+//       (bind before-args[i] = CARRIER_GET iter_c[i])
+//       <before-body>
+//       (scf.condition: store %r[i] -> tr_c[i]; br_if $exit on !cond)
+//       (bind after-args[i] = CARRIER_GET tr_c[i])
+//       <after-body>
+//       (scf.yield: store %y[i] -> iter_c[i]; br $continue)
+//     end
+//   end
+//   (bind scf.while results[i] = CARRIER_GET tr_c[i])
 static bool lower_scf_while(FnCtx *F, MLIR_OpHandle op) {
-    // Lifted IR shape: scf.while : () -> () {<before> ... scf.condition(%c)}
-    // do {<after> ... scf.yield}. No iter args / no carries across the
-    // before/after boundary.
-    if (MLIR_GetOpNumOperands(op) != 0 || MLIR_GetOpNumResults(op) != 0) {
-        fprintf(stderr,
-                "wasmssa-lower: scf.while with iter args / results not supported\n");
-        return false;
-    }
     if (MLIR_GetOpNumRegions(op) < 2) return false;
     MLIR_RegionHandle before_r = MLIR_GetOpRegion(op, 0);
     MLIR_RegionHandle after_r  = MLIR_GetOpRegion(op, 1);
@@ -571,8 +584,47 @@ static bool lower_scf_while(FnCtx *F, MLIR_OpHandle op) {
     MLIR_BlockHandle before_b = MLIR_GetRegionBlock(before_r, 0);
     MLIR_BlockHandle after_b  = MLIR_GetRegionBlock(after_r, 0);
 
+    size_t n_iter = MLIR_GetOpNumOperands(op);   // = #before-args = #after-yield
+    size_t n_res  = MLIR_GetOpNumResults(op);    // = #after-args  = #condition payload
+
+    if (n_iter != MLIR_GetBlockNumArgs(before_b)) return false;
+    if (n_res  != MLIR_GetBlockNumArgs(after_b))  return false;
+
+    // Allocate iter and transit carriers.
+    uint32_t *iter_c = NULL; uint8_t *iter_v = NULL;
+    uint32_t *tr_c   = NULL; uint8_t *tr_v   = NULL;
+    if (n_iter) {
+        iter_c = (uint32_t *)malloc(n_iter * sizeof(uint32_t));
+        iter_v = (uint8_t *)malloc(n_iter);
+        for (size_t i = 0; i < n_iter; i++) {
+            uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(MLIR_GetOpOperand(op, i)));
+            if (vt == 0) goto fail;
+            iter_v[i] = vt;
+            iter_c[i] = alloc_carrier(F, vt);
+            int v;
+            if (!vmap_get(F, MLIR_GetOpOperand(op, i), &v)) goto fail;
+            emit_carrier_set(F, iter_c[i], vt, v);
+        }
+    }
+    if (n_res) {
+        tr_c = (uint32_t *)malloc(n_res * sizeof(uint32_t));
+        tr_v = (uint8_t *)malloc(n_res);
+        for (size_t i = 0; i < n_res; i++) {
+            uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(MLIR_GetOpResult(op, i)));
+            if (vt == 0) goto fail;
+            tr_v[i] = vt;
+            tr_c[i] = alloc_carrier(F, vt);
+        }
+    }
+
     emit_marker(F, OP_TYPE_WASMSSA_BLOCK_BEGIN, 0x40, -1, 0);  // $exit
     emit_marker(F, OP_TYPE_WASMSSA_LOOP_BEGIN,  0x40, -1, 0);  // $continue
+
+    // Bind before-block args from iter carriers.
+    for (size_t i = 0; i < n_iter; i++) {
+        int g = emit_carrier_get(F, iter_c[i], iter_v[i]);
+        vmap_set(F, MLIR_GetBlockArg(before_b, i), g);
+    }
 
     // Walk before-block ops. Terminator is scf.condition.
     size_t nb = MLIR_GetBlockNumOps(before_b);
@@ -580,30 +632,165 @@ static bool lower_scf_while(FnCtx *F, MLIR_OpHandle op) {
         MLIR_OpHandle bop = MLIR_GetBlockOp(before_b, i);
         string n = MLIR_GetOpName(bop);
         if (name_eq(n, "scf.condition")) {
-            if (MLIR_GetOpNumOperands(bop) < 1) return false;
+            if (MLIR_GetOpNumOperands(bop) < 1) goto fail;
+            // Store condition payloads into transit carriers.
+            if (MLIR_GetOpNumOperands(bop) - 1 != n_res) goto fail;
+            for (size_t k = 0; k < n_res; k++) {
+                int v;
+                if (!vmap_get(F, MLIR_GetOpOperand(bop, k + 1), &v)) goto fail;
+                emit_carrier_set(F, tr_c[k], tr_v[k], v);
+            }
             int cidx;
-            if (!vmap_get(F, MLIR_GetOpOperand(bop, 0), &cidx)) return false;
+            if (!vmap_get(F, MLIR_GetOpOperand(bop, 0), &cidx)) goto fail;
             int z = emit_eqz(F, cidx);
             // If !cond, branch to $exit (depth 1 above the loop).
             emit_marker(F, OP_TYPE_WASMSSA_BR_IF, 0, z, 1);
         } else {
-            if (!lower_op(F, bop)) return false;
+            if (!lower_op(F, bop)) goto fail;
         }
     }
-    // Walk after-block ops. Terminator scf.yield -> br $continue (depth 0).
+
+    // Bind after-block args from transit carriers.
+    for (size_t i = 0; i < n_res; i++) {
+        int g = emit_carrier_get(F, tr_c[i], tr_v[i]);
+        vmap_set(F, MLIR_GetBlockArg(after_b, i), g);
+    }
+
+    // Walk after-block ops. Terminator scf.yield -> store iter + br $continue.
     size_t na = MLIR_GetBlockNumOps(after_b);
     for (size_t i = 0; i < na; i++) {
         MLIR_OpHandle aop = MLIR_GetBlockOp(after_b, i);
         string n = MLIR_GetOpName(aop);
         if (name_eq(n, "scf.yield")) {
+            if (MLIR_GetOpNumOperands(aop) != n_iter) goto fail;
+            for (size_t k = 0; k < n_iter; k++) {
+                int v;
+                if (!vmap_get(F, MLIR_GetOpOperand(aop, k), &v)) goto fail;
+                emit_carrier_set(F, iter_c[k], iter_v[k], v);
+            }
             emit_marker(F, OP_TYPE_WASMSSA_BR, 0, -1, 0);
         } else {
-            if (!lower_op(F, aop)) return false;
+            if (!lower_op(F, aop)) goto fail;
         }
     }
     emit_marker(F, OP_TYPE_WASMSSA_END, 0, -1, 0);  // close loop
     emit_marker(F, OP_TYPE_WASMSSA_END, 0, -1, 0);  // close block
+
+    // Bind scf.while results from transit carriers.
+    for (size_t i = 0; i < n_res; i++) {
+        int g = emit_carrier_get(F, tr_c[i], tr_v[i]);
+        vmap_set(F, MLIR_GetOpResult(op, i), g);
+    }
+
+    free(iter_c); free(iter_v); free(tr_c); free(tr_v);
     return true;
+fail:
+    free(iter_c); free(iter_v); free(tr_c); free(tr_v);
+    return false;
+}
+
+// ---- scf.index_switch ------------------------------------------------------
+// Lowered as a chain of (cond == case_i) ifs; default goes in the innermost
+// else. All cases / default share one set of result carriers.
+static bool lower_scf_index_switch(FnCtx *F, MLIR_OpHandle op) {
+    if (MLIR_GetOpNumOperands(op) != 1) return false;
+    MLIR_ValueHandle cond_v = MLIR_GetOpOperand(op, 0);
+    int cond_idx;
+    if (!vmap_get(F, cond_v, &cond_idx)) return false;
+    if (wasm_vt(F->ctx, MLIR_GetValueType(cond_v)) != WT_I32) return false;
+
+    size_t n_regions = MLIR_GetOpNumRegions(op);
+    if (n_regions < 1) return false;
+    size_t n_cases = n_regions - 1;  // region 0 = default
+
+    // Parse "cases" attribute: prints as "array<i64: 1, 2, 3>".
+    MLIR_AttributeHandle ca = find_attr(op, "cases");
+    if (ca == MLIR_INVALID_HANDLE) return false;
+    string cs = MLIR_GetAttributeAsString(F->ctx, ca);
+    int64_t *case_vals = NULL;
+    size_t   n_parsed = 0;
+    if (n_cases > 0) {
+        case_vals = (int64_t *)malloc(n_cases * sizeof(int64_t));
+        size_t p = 0;
+        while (p < cs.size && cs.str[p] != ':') p++;
+        if (p < cs.size) p++;
+        while (p < cs.size && n_parsed < n_cases) {
+            while (p < cs.size && (cs.str[p] == ' ' || cs.str[p] == ',')) p++;
+            if (p >= cs.size || cs.str[p] == '>') break;
+            int64_t sign = 1;
+            if (cs.str[p] == '-') { sign = -1; p++; }
+            int64_t v = 0;
+            while (p < cs.size && cs.str[p] >= '0' && cs.str[p] <= '9') {
+                v = v * 10 + (cs.str[p] - '0');
+                p++;
+            }
+            case_vals[n_parsed++] = sign * v;
+        }
+        if (n_parsed != n_cases) { free(case_vals); return false; }
+    }
+
+    // Allocate result carriers.
+    size_t n_results = MLIR_GetOpNumResults(op);
+    uint32_t *cids = NULL; uint8_t *cvts = NULL;
+    if (n_results) {
+        cids = (uint32_t *)malloc(n_results * sizeof(uint32_t));
+        cvts = (uint8_t *)malloc(n_results);
+        for (size_t i = 0; i < n_results; i++) {
+            uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(MLIR_GetOpResult(op, i)));
+            if (vt == 0) { free(cids); free(cvts); free(case_vals); return false; }
+            cvts[i] = vt;
+            cids[i] = alloc_carrier(F, vt);
+        }
+    }
+
+    YieldFrame yf = {0};
+    if (n_results) {
+        yf.carrier_ids = (uint32_t *)malloc(n_results * sizeof(uint32_t));
+        yf.carrier_vts = (uint8_t *)malloc(n_results);
+        memcpy(yf.carrier_ids, cids, n_results * sizeof(uint32_t));
+        memcpy(yf.carrier_vts, cvts, n_results);
+        yf.n = (int)n_results;
+    }
+    push_yield(F, yf);
+
+    // Emit nested IF/ELSE chain.
+    for (size_t i = 0; i < n_cases; i++) {
+        int kc = emit_const_i32(F, (int32_t)case_vals[i]);
+        // i32.eq = 0x46
+        wasmssa_op_t *o; int eq_idx = add_op(F, &o);
+        o->type = OP_TYPE_WASMSSA_BINOP;
+        o->valtype = WT_I32;
+        o->wasm_opcode = 0x46;
+        o->n_operands = 2;
+        o->operands = (int *)malloc(2 * sizeof(int));
+        o->operands[0] = cond_idx;
+        o->operands[1] = kc;
+        o->has_result = true;
+        emit_marker(F, OP_TYPE_WASMSSA_IF_BEGIN, 0x40, eq_idx, 0);
+        // Lower case-region body (region i+1).
+        MLIR_RegionHandle cr = MLIR_GetOpRegion(op, i + 1);
+        if (MLIR_GetRegionNumBlocks(cr) != 1) goto fail;
+        if (!lower_block(F, MLIR_GetRegionBlock(cr, 0))) goto fail;
+        emit_marker(F, OP_TYPE_WASMSSA_IF_ELSE, 0, -1, 0);
+    }
+    // Innermost else: default region.
+    MLIR_RegionHandle dr = MLIR_GetOpRegion(op, 0);
+    if (MLIR_GetRegionNumBlocks(dr) != 1) goto fail;
+    if (!lower_block(F, MLIR_GetRegionBlock(dr, 0))) goto fail;
+    for (size_t i = 0; i < n_cases; i++) {
+        emit_marker(F, OP_TYPE_WASMSSA_END, 0, -1, 0);
+    }
+    pop_yield(F);
+
+    for (size_t i = 0; i < n_results; i++) {
+        int g = emit_carrier_get(F, cids[i], cvts[i]);
+        vmap_set(F, MLIR_GetOpResult(op, i), g);
+    }
+    free(cids); free(cvts); free(case_vals);
+    return true;
+fail:
+    free(cids); free(cvts); free(case_vals);
+    return false;
 }
 
 static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op);
@@ -619,9 +806,10 @@ static bool lower_op(FnCtx *F, MLIR_OpHandle op) {
 static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
     string name = MLIR_GetOpName(op);
 
-    // ---- scf.if / scf.while ----------------------------------------------
+    // ---- scf.if / scf.while / scf.index_switch ---------------------------
     if (name_eq(name, "scf.if"))    return lower_scf_if(F, op);
     if (name_eq(name, "scf.while")) return lower_scf_while(F, op);
+    if (name_eq(name, "scf.index_switch")) return lower_scf_index_switch(F, op);
 
     // ---- scf.yield (operand-bearing): stash into the active yield ctx ----
     if (name_eq(name, "scf.yield")) {
@@ -675,6 +863,8 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
         o->valtype = vt;
         if (ak == MLIR_ATTR_KIND_INTEGER) {
             o->i_const = MLIR_GetAttributeInteger(va);
+        } else if (ak == MLIR_ATTR_KIND_BOOL) {
+            o->i_const = MLIR_GetAttributeBool(va) ? 1 : 0;
         } else if (ak == MLIR_ATTR_KIND_FLOAT) {
             double dv = MLIR_GetAttributeFloat(va);
             // Pack the bit pattern through an integer of matching width;
@@ -1128,6 +1318,36 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
         uint8_t opc;
         if (!is_zext && in_vt == WT_I64 && out_vt == WT_I32) opc = 0xa7;
         else if (is_zext && in_vt == WT_I32 && out_vt == WT_I64) opc = 0xad;
+        else return false;
+        wasmssa_op_t *o; int idx = add_op(F, &o);
+        o->type = OP_TYPE_WASMSSA_UNOP;
+        o->valtype = out_vt;
+        o->wasm_opcode = opc;
+        o->n_operands = 1;
+        o->operands = (int *)malloc(sizeof(int));
+        o->operands[0] = sa;
+        o->has_result = true;
+        vmap_set(F, r, idx);
+        return true;
+    }
+
+    // ---- builtin.unrealized_conversion_cast --------------------------------
+    // Treat as identity when wasm valtypes match (e.g. ptr<->i32, index<->i32).
+    // Otherwise emit a trunc/extend (i64<->i32 unsigned).
+    if (name_eq(name, "builtin.unrealized_conversion_cast")) {
+        if (MLIR_GetOpNumOperands(op) != 1 || MLIR_GetOpNumResults(op) != 1)
+            return false;
+        MLIR_ValueHandle s = MLIR_GetOpOperand(op, 0);
+        MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
+        uint8_t in_vt  = wasm_vt(F->ctx, MLIR_GetValueType(s));
+        uint8_t out_vt = wasm_vt(F->ctx, MLIR_GetValueType(r));
+        if (in_vt == 0 || out_vt == 0) return false;
+        int sa;
+        if (!vmap_get(F, s, &sa)) return false;
+        if (in_vt == out_vt) { vmap_set(F, r, sa); return true; }
+        uint8_t opc;
+        if (in_vt == WT_I64 && out_vt == WT_I32) opc = 0xa7;       // i32.wrap_i64
+        else if (in_vt == WT_I32 && out_vt == WT_I64) opc = 0xad;  // i64.extend_i32_u
         else return false;
         wasmssa_op_t *o; int idx = add_op(F, &o);
         o->type = OP_TYPE_WASMSSA_UNOP;

@@ -28,14 +28,17 @@ expected_stdout = "0\n1\n1\n1\n"
 [[test]]
 name = "return"
 expected_stdout = "3\n-1\n"
+wasm_native_run = true
 
 [[test]]
 name = "break_continue"
 expected_stdout = "17\n7\n"
+wasm_native_run = true
 
 [[test]]
 name = "for"
 expected_stdout = "55\n10\n"
+wasm_native_run = true
 
 [[test]]
 name = "float"
@@ -155,6 +158,7 @@ expected_stdout = "10\n30\n40\n50\n4\n150\n"
 [[test]]
 name = "switch_case"
 expected_stdout = "100\n200\n200\n301\n0\n999\n22\n"
+wasm_native_run = true
 
 [[test]]
 name = "fnptr_basic"
@@ -505,10 +509,12 @@ expected_stdout = "42\n7\n"
 [[test]]
 name = "do_while"
 expected_stdout = "10\n101\n7\n18\n"
+wasm_native_run = true
 
 [[test]]
 name = "do_while_macro"
 expected_stdout = "42\n"
+wasm_native_run = true
 
 [[test]]
 name = "braceless_if"
