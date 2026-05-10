@@ -1371,6 +1371,61 @@ extern "C" bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module_
     return true;
 }
 
+// For the native wasm backend, MLIR's `--lift-cf-to-scf` only walks
+// `func.func` ops, so any `llvm.func` body containing cf.br/cf.cond_br is
+// left unstructured and our wasmssa lowerer cannot handle it. tinyc emits
+// variadic functions (e.g. `int sum(int n, ...)`) as `llvm.func` because
+// `func.func` has no var-arg representation, which is exactly the case that
+// trips the wasm pipeline.
+//
+// Run the same CFG-to-SCF lifting that the stock pass applies to func.func,
+// but extend it to llvm.func by subclassing the transformation so it can
+// also emit an `llvm.return` (with poison operands) when an unreachable
+// terminator is needed.
+namespace {
+class CFGToSCFForWasm : public mlir::ControlFlowToSCFTransformation {
+public:
+    mlir::FailureOr<mlir::Operation *>
+    createUnreachableTerminator(mlir::Location loc, mlir::OpBuilder &builder,
+                                mlir::Region &region) override {
+        mlir::Operation *parentOp = region.getParentOp();
+        if (auto funcOp = llvm::dyn_cast<mlir::func::FuncOp>(parentOp)) {
+            return mlir::ControlFlowToSCFTransformation::
+                createUnreachableTerminator(loc, builder, region);
+        }
+        if (auto llvmFn = llvm::dyn_cast<mlir::LLVM::LLVMFuncOp>(parentOp)) {
+            auto fnTy = llvmFn.getFunctionType();
+            llvm::SmallVector<mlir::Value> operands;
+            mlir::Type retTy = fnTy.getReturnType();
+            if (!llvm::isa<mlir::LLVM::LLVMVoidType>(retTy))
+                operands.push_back(getUndefValue(loc, builder, retTy));
+            return builder.create<mlir::LLVM::ReturnOp>(loc, operands)
+                .getOperation();
+        }
+        return mlir::emitError(loc, "Cannot create unreachable terminator for '")
+               << parentOp->getName() << "'";
+    }
+};
+}
+
+static void liftLLVMFuncCFGToSCF(mlir::ModuleOp module) {
+    using namespace mlir;
+    CFGToSCFForWasm transformation;
+    llvm::SmallVector<LLVM::LLVMFuncOp> fns;
+    module.walk([&](LLVM::LLVMFuncOp fn) {
+        if (!fn.getBody().empty()) fns.push_back(fn);
+    });
+    for (auto fn : fns) {
+        DominanceInfo domInfo(fn);
+        // Post-order so nested regions are lifted first, matching the stock
+        // LiftControlFlowToSCF pass.
+        fn->walk<WalkOrder::PostOrder>([&](Operation *innerOp) {
+            for (Region &reg : innerOp->getRegions())
+                (void)transformCFGToSCF(reg, transformation, domInfo);
+        });
+    }
+}
+
 extern "C" bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx,
                                                MLIR_OpHandle module_h,
                                                MLIR_LoweringBackend backend) {
@@ -1404,9 +1459,12 @@ extern "C" bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx,
         mlir::IRRewriter rewriter(&mctx);
         (void)mlir::eraseUnreachableBlocks(rewriter, module->getRegions());
     }
+    // Lift CF to SCF on both func.func and llvm.func bodies. tinyc emits
+    // variadic functions as llvm.func (since func.func has no var-arg form),
+    // and the stock `LiftControlFlowToSCFPass` only walks func.func; do it
+    // ourselves so the wasm backend can see structured loops/ifs.
+    liftLLVMFuncCFGToSCF(module);
     mlir::PassManager pm(&mctx);
-    // Recover structured CF (scf.if/scf.while) from cf.br/cf.cond_br so
-    // the native wasm emitter can lower them to wasm block/loop/if.
     pm.addPass(mlir::createLiftControlFlowToSCFPass());
     if (has_vector_op) {
         pm.addPass(mlir::createConvertVectorToLLVMPass());

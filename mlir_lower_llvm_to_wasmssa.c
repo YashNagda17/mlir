@@ -215,6 +215,11 @@ typedef struct {
     uint32_t  frame_size;
     int       sp_def;       // ssa_def_idx of the post-decrement SP (-1 if no frame)
 
+    // Variadic ABI support.
+    int       va_list_param_idx;  // ssa_def_idx of the hidden trailing va_list i32 param, or -1
+    uint32_t  va_buf_size;        // max bytes needed for variadic call buffer
+    uint32_t  va_buf_offset;      // offset within shadow frame for the variadic buffer
+
     uint32_t  next_carrier;
     // Carrier valtypes: index by carrier_id.
     uint8_t  *carrier_vts; size_t n_cvt, c_cvt;
@@ -439,6 +444,8 @@ static bool extract_func_sig(MLIR_Context *ctx, MLIR_TypeHandle fty,
 // Per-op lowering.
 // =============================================================================
 static bool lower_op(FnCtx *F, MLIR_OpHandle op);
+static bool va_call_layout(FnCtx *F, MLIR_OpHandle op, uint32_t *total_size,
+                           size_t *n_fixed, uint32_t *out_offsets);
 static bool lower_block(FnCtx *F, MLIR_BlockHandle blk);
 
 // Append a structured-CF marker / br / select op.
@@ -1450,7 +1457,101 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
 
         if (var_callee_type != MLIR_INVALID_HANDLE) {
             MLIR_TypeHandle fty = MLIR_GetAttributeTypeValue(var_callee_type);
-            if (MLIR_GetTypeFunctionIsVarArg(fty)) return false;
+            if (MLIR_GetTypeFunctionIsVarArg(fty)) {
+                // Variadic direct call: pack variadic args into the
+                // function's variadic buffer (allocated in the shadow
+                // stack frame) and pass its address as a hidden trailing
+                // i32 arg in place of the `...` operands.
+                size_t nfixed = MLIR_GetTypeFunctionNumInputs(fty);
+                size_t no = MLIR_GetOpNumOperands(op);
+                size_t nvar = no - nfixed;
+                uint32_t total = 0; size_t nf2 = 0;
+                uint32_t *offs = (uint32_t *)malloc((nvar ? nvar : 1) * sizeof(uint32_t));
+                if (!va_call_layout(F, op, &total, &nf2, offs)) {
+                    free(offs);
+                    return false;
+                }
+                if (F->sp_def < 0) { free(offs); return false; }
+                // buf_addr = sp_def + va_buf_offset
+                int buf_addr;
+                if (F->va_buf_offset == 0) {
+                    buf_addr = F->sp_def;
+                } else {
+                    int koff = emit_const_i32(F, (int32_t)F->va_buf_offset);
+                    buf_addr = emit_add_i32(F, F->sp_def, koff);
+                }
+                // Emit a store for each variadic arg, then the call.
+                for (size_t i = 0; i < nvar; i++) {
+                    MLIR_ValueHandle av = MLIR_GetOpOperand(op, nfixed + i);
+                    MLIR_TypeHandle aty = MLIR_GetValueType(av);
+                    uint8_t vt = wasm_vt(F->ctx, aty);
+                    int va;
+                    if (!vmap_get(F, av, &va)) { free(offs); return false; }
+                    uint8_t st_vt = vt;
+                    unsigned sz, align_log2;
+                    if (vt == WT_I32)      { sz = 4; align_log2 = 2; }
+                    else if (vt == WT_I64) { sz = 8; align_log2 = 3; }
+                    else if (vt == WT_F32) {
+                        // Promote f32 -> f64.
+                        wasmssa_op_t *po; int pidx = add_op(F, &po);
+                        po->type = OP_TYPE_WASMSSA_UNOP;
+                        po->valtype = WT_F64;
+                        po->wasm_opcode = 0xbb; // f64.promote_f32
+                        po->n_operands = 1;
+                        po->operands = (int *)malloc(sizeof(int));
+                        po->operands[0] = va;
+                        po->has_result = true;
+                        va = pidx;
+                        st_vt = WT_F64;
+                        sz = 8; align_log2 = 3;
+                    }
+                    else if (vt == WT_F64) { sz = 8; align_log2 = 3; }
+                    else { free(offs); return false; }
+                    wasmssa_op_t *o2; (void)add_op(F, &o2);
+                    o2->type = OP_TYPE_WASMSSA_STORE;
+                    o2->valtype = st_vt;
+                    o2->mem_size_bytes = sz;
+                    o2->memory_align_log2 = align_log2;
+                    o2->memory_offset = offs[i];
+                    o2->n_operands = 2;
+                    o2->operands = (int *)malloc(2 * sizeof(int));
+                    o2->operands[0] = buf_addr;
+                    o2->operands[1] = va;
+                }
+                free(offs);
+
+                // Now emit the call with fixed args + buf_addr.
+                string nm = MLIR_GetAttributeAsString(F->ctx, callee);
+                const char *cname = nm.str; size_t cn = nm.size;
+                if (cn > 0 && cname[0] == '@') { cname++; cn--; }
+                char *cstr = xstrdupn(cname, cn);
+                size_t nout = nfixed + 1;
+                int *opnds = (int *)malloc(nout * sizeof(int));
+                for (size_t i = 0; i < nfixed; i++) {
+                    if (!vmap_get(F, MLIR_GetOpOperand(op, i), &opnds[i])) {
+                        free(opnds); free(cstr); return false;
+                    }
+                }
+                opnds[nfixed] = buf_addr;
+
+                wasmssa_op_t *oc; int idx = add_op(F, &oc);
+                oc->type = OP_TYPE_WASMSSA_CALL;
+                oc->call_target = cstr;
+                oc->n_operands = (int)nout;
+                oc->operands = opnds;
+                size_t nr = MLIR_GetOpNumResults(op);
+                if (nr == 1) {
+                    MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
+                    uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(r));
+                    if (vt == 0) return false;
+                    oc->valtype = vt;
+                    oc->has_result = true;
+                    vmap_set(F, r, idx);
+                } else if (nr != 0) {
+                    return false;
+                }
+                return true;
+            }
         }
         string nm = MLIR_GetAttributeAsString(F->ctx, callee);
         // SymbolRefAttr prints as `@name`.
@@ -1521,8 +1622,14 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
 
             if (i == 0) {
                 unsigned esz = type_size_bytes(F->ctx, elem_ty);
-                if (esz == 0) { free(cidx); return false; }
-                if (is_dyn) {
+                // `!llvm.array<0 x T>` (zero-length array) has size 0; it is
+                // used as the element type for addressof-based GEP into a
+                // global whose runtime size we don't model in the type. Any
+                // contribution from this index multiplied by 0 is 0, so just
+                // skip it.
+                if (esz == 0) {
+                    // no-op
+                } else if (is_dyn) {
                     int k = emit_const_i32(F, (int32_t)esz);
                     int m = emit_mul_i32(F, dyn_def, k);
                     addr = emit_add_i32(F, addr, m);
@@ -1628,6 +1735,58 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
         return true;
     }
 
+    // ---- llvm.intr.vastart / llvm.intr.vaend -------------------------------
+    if (name_eq(name, "llvm.intr.vastart")) {
+        // Store the function's hidden va_list i32 param into *%ap.
+        if (F->va_list_param_idx < 0) return false;
+        if (MLIR_GetOpNumOperands(op) != 1) return false;
+        int pa;
+        if (!vmap_get(F, MLIR_GetOpOperand(op, 0), &pa)) return false;
+        wasmssa_op_t *o; (void)add_op(F, &o);
+        o->type = OP_TYPE_WASMSSA_STORE;
+        o->valtype = WT_I32;
+        o->mem_size_bytes = 4;
+        o->memory_align_log2 = 2;
+        o->memory_offset = 0;
+        o->n_operands = 2;
+        o->operands = (int *)malloc(2 * sizeof(int));
+        o->operands[0] = pa;
+        o->operands[1] = F->va_list_param_idx;
+        return true;
+    }
+    if (name_eq(name, "llvm.intr.vaend")) {
+        // No-op under the wasm32 ABI.
+        return true;
+    }
+    if (name_eq(name, "llvm.intr.vacopy")) {
+        // Copy 4 bytes (a char*) from src to dst.
+        if (MLIR_GetOpNumOperands(op) != 2) return false;
+        int da, sa;
+        if (!vmap_get(F, MLIR_GetOpOperand(op, 0), &da)) return false;
+        if (!vmap_get(F, MLIR_GetOpOperand(op, 1), &sa)) return false;
+        wasmssa_op_t *ol; int lidx = add_op(F, &ol);
+        ol->type = OP_TYPE_WASMSSA_LOAD;
+        ol->valtype = WT_I32;
+        ol->mem_size_bytes = 4;
+        ol->memory_align_log2 = 2;
+        ol->memory_offset = 0;
+        ol->n_operands = 1;
+        ol->operands = (int *)malloc(sizeof(int));
+        ol->operands[0] = sa;
+        ol->has_result = true;
+        wasmssa_op_t *os; (void)add_op(F, &os);
+        os->type = OP_TYPE_WASMSSA_STORE;
+        os->valtype = WT_I32;
+        os->mem_size_bytes = 4;
+        os->memory_align_log2 = 2;
+        os->memory_offset = 0;
+        os->n_operands = 2;
+        os->operands = (int *)malloc(2 * sizeof(int));
+        os->operands[0] = da;
+        os->operands[1] = lidx;
+        return true;
+    }
+
     // ---- llvm.intr.sqrt ---------------------------------------------------
     if (name_eq(name, "llvm.intr.sqrt")) {
         if (MLIR_GetOpNumResults(op) != 1 ||
@@ -1660,6 +1819,53 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
 // =============================================================================
 static bool prewalk_block(FnCtx *F, MLIR_BlockHandle blk);
 
+// For a variadic llvm.call, compute the buffer size and per-arg offsets
+// needed to pack the variadic args under the wasm32 clang ABI. Returns
+// false if the call is not variadic or the variadic args have an
+// unsupported wasm value type. On success, *total_size receives the total
+// buffer size (in bytes), *n_fixed receives the number of fixed
+// (non-variadic) operands. If out_offsets is non-NULL, it must point to a
+// caller-provided array large enough for (n_variadic) entries and will be
+// filled with the per-variadic-arg buffer offsets (in operand order).
+static bool va_call_layout(FnCtx *F, MLIR_OpHandle op, uint32_t *total_size,
+                           size_t *n_fixed, uint32_t *out_offsets) {
+    MLIR_AttributeHandle vct = MLIR_GetOpAttributeByName(op, "var_callee_type");
+    if (vct == MLIR_INVALID_HANDLE) return false;
+    MLIR_TypeHandle fty = MLIR_GetAttributeTypeValue(vct);
+    if (!MLIR_GetTypeFunctionIsVarArg(fty)) return false;
+    size_t nf = MLIR_GetTypeFunctionNumInputs(fty);
+    size_t no = MLIR_GetOpNumOperands(op);
+    if (no < nf) return false;
+    uint32_t cur = 0;
+    for (size_t i = nf; i < no; i++) {
+        MLIR_TypeHandle aty = MLIR_GetValueType(MLIR_GetOpOperand(op, i));
+        uint8_t vt = wasm_vt(F->ctx, aty);
+        unsigned sz = type_size_bytes(F->ctx, aty);
+        unsigned al;
+        if (vt == WT_I32) {
+            // i8/i16 are widened to i32 in C variadic promotion; the
+            // frontend currently emits all small ints as i32 already.
+            sz = 4; al = 4;
+        } else if (vt == WT_I64) {
+            sz = 8; al = 8;
+        } else if (vt == WT_F32) {
+            // C variadic promotion: f32 -> f64. Pack as 8 bytes f64.
+            sz = 8; al = 8;
+        } else if (vt == WT_F64) {
+            sz = 8; al = 8;
+        } else {
+            return false;
+        }
+        cur = align_up(cur, al);
+        if (out_offsets) out_offsets[i - nf] = cur;
+        cur += sz;
+        (void)sz;
+    }
+    *total_size = cur;
+    *n_fixed = nf;
+    return true;
+}
+
 static bool prewalk_op(FnCtx *F, MLIR_OpHandle op) {
     string n = MLIR_GetOpName(op);
     if (name_eq(n, "llvm.br") || name_eq(n, "llvm.cond_br") ||
@@ -1670,6 +1876,12 @@ static bool prewalk_op(FnCtx *F, MLIR_OpHandle op) {
                 "wasmssa-lower: control flow not lifted to scf (%.*s)\n",
                 (int)n.size, n.str);
         return false;
+    }
+    if (name_eq(n, "llvm.call")) {
+        uint32_t sz = 0; size_t nfixed = 0;
+        if (va_call_layout(F, op, &sz, &nfixed, NULL)) {
+            if (sz > F->va_buf_size) F->va_buf_size = sz;
+        }
     }
     if (name_eq(n, "llvm.alloca")) {
         MLIR_TypeHandle et = MLIR_INVALID_HANDLE;
@@ -1724,6 +1936,11 @@ static bool prewalk_block(FnCtx *F, MLIR_BlockHandle blk) {
 
 static bool prewalk_func(FnCtx *F, MLIR_BlockHandle entry) {
     if (!prewalk_block(F, entry)) return false;
+    if (F->va_buf_size > 0) {
+        F->frame_size = align_up(F->frame_size, 8);
+        F->va_buf_offset = F->frame_size;
+        F->frame_size += F->va_buf_size;
+    }
     F->frame_size = (F->frame_size + 15) & ~15u;
     return true;
 }
@@ -1747,14 +1964,27 @@ static bool lower_function(MLIR_Context *ctx, wasmssa_module_t *out,
     F.m = out;
     F.n_params = n_params;
     F.sp_def = -1;
+    F.va_list_param_idx = -1;
+
+    // If this function is variadic, sig_for_func has appended a synthetic
+    // i32 va_list param at index n_params-1. The MLIR entry block only has
+    // the original (non-hidden) parameters as block args.
+    MLIR_AttributeHandle ftya = find_attr(fn, "function_type");
+    bool is_vararg = false;
+    if (ftya != MLIR_INVALID_HANDLE) {
+        MLIR_TypeHandle fty = MLIR_GetAttributeTypeValue(ftya);
+        is_vararg = MLIR_GetTypeFunctionIsVarArg(fty);
+    }
+    size_t orig_np = is_vararg ? n_params - 1 : n_params;
 
     MLIR_RegionHandle body = MLIR_GetOpRegion(fn, 0);
     MLIR_BlockHandle  entry = MLIR_GetRegionBlock(body, 0);
 
-    // Bind parameter SSA values to ssa_def_idx 0..n_params-1.
-    for (size_t i = 0; i < n_params; i++) {
+    // Bind parameter SSA values to ssa_def_idx 0..orig_np-1.
+    for (size_t i = 0; i < orig_np; i++) {
         vmap_set(&F, MLIR_GetBlockArg(entry, i), (int)i);
     }
+    if (is_vararg) F.va_list_param_idx = (int)(n_params - 1);
 
     if (!prewalk_func(&F, entry)) goto fail;
 
@@ -1799,19 +2029,22 @@ static bool sig_for_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     MLIR_TypeHandle fty = MLIR_GetAttributeTypeValue(ftya);
     size_t ni = MLIR_GetTypeFunctionNumInputs(fty);
     size_t no = MLIR_GetTypeFunctionNumResults(fty);
-    uint8_t *p = (uint8_t *)malloc(ni ? ni : 1);
+    bool is_vararg = MLIR_GetTypeFunctionIsVarArg(fty);
+    size_t pn = ni + (is_vararg ? 1 : 0);
+    uint8_t *p = (uint8_t *)malloc(pn ? pn : 1);
     for (size_t i = 0; i < ni; i++) {
         uint8_t v = wasm_vt(ctx, MLIR_GetTypeFunctionInput(fty, i));
         if (v == 0) { free(p); return false; }
         p[i] = v;
     }
+    if (is_vararg) p[ni] = WT_I32;  // hidden va_list pointer
     uint8_t *r = (uint8_t *)malloc(no ? no : 1);
     for (size_t i = 0; i < no; i++) {
         uint8_t v = wasm_vt(ctx, MLIR_GetTypeFunctionResult(fty, i));
         if (v == 0) { free(p); free(r); return false; }
         r[i] = v;
     }
-    *out_p = p; *out_np = ni;
+    *out_p = p; *out_np = pn;
     *out_r = r; *out_nr = no;
     return true;
 }
