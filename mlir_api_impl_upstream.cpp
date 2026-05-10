@@ -704,22 +704,46 @@ extern "C" bool MLIR_IsTypeOpaque(MLIR_TypeHandle h)  {
 }
 extern "C" bool MLIR_IsTypeFunction(MLIR_TypeHandle h) { return llvm::isa<mlir::FunctionType>(typeF(h)); }
 extern "C" size_t MLIR_GetTypeFunctionNumInputs(MLIR_TypeHandle h) {
-    auto ft = llvm::dyn_cast<mlir::FunctionType>(typeF(h));
-    return ft ? ft.getNumInputs() : 0;
+    auto t = typeF(h);
+    if (auto ft = llvm::dyn_cast<mlir::FunctionType>(t)) return ft.getNumInputs();
+    if (auto ft = llvm::dyn_cast<mlir::LLVM::LLVMFunctionType>(t)) return ft.getNumParams();
+    return 0;
 }
 extern "C" MLIR_TypeHandle MLIR_GetTypeFunctionInput(MLIR_TypeHandle h, size_t idx) {
-    auto ft = llvm::dyn_cast<mlir::FunctionType>(typeF(h));
-    if (!ft || idx >= ft.getNumInputs()) return MLIR_INVALID_HANDLE;
-    return typeH(ft.getInput(idx));
+    auto t = typeF(h);
+    if (auto ft = llvm::dyn_cast<mlir::FunctionType>(t)) {
+        if (idx >= ft.getNumInputs()) return MLIR_INVALID_HANDLE;
+        return typeH(ft.getInput(idx));
+    }
+    if (auto ft = llvm::dyn_cast<mlir::LLVM::LLVMFunctionType>(t)) {
+        if (idx >= ft.getNumParams()) return MLIR_INVALID_HANDLE;
+        return typeH(ft.getParamType(idx));
+    }
+    return MLIR_INVALID_HANDLE;
 }
 extern "C" size_t MLIR_GetTypeFunctionNumResults(MLIR_TypeHandle h) {
-    auto ft = llvm::dyn_cast<mlir::FunctionType>(typeF(h));
-    return ft ? ft.getNumResults() : 0;
+    auto t = typeF(h);
+    if (auto ft = llvm::dyn_cast<mlir::FunctionType>(t)) return ft.getNumResults();
+    if (auto ft = llvm::dyn_cast<mlir::LLVM::LLVMFunctionType>(t)) {
+        // LLVMFunctionType has exactly one return type; "void" counts as 0
+        // results to mirror mlir::FunctionType semantics for callers that
+        // want to spell `declare void` etc.
+        return llvm::isa<mlir::LLVM::LLVMVoidType>(ft.getReturnType()) ? 0 : 1;
+    }
+    return 0;
 }
 extern "C" MLIR_TypeHandle MLIR_GetTypeFunctionResult(MLIR_TypeHandle h, size_t idx) {
-    auto ft = llvm::dyn_cast<mlir::FunctionType>(typeF(h));
-    if (!ft || idx >= ft.getNumResults()) return MLIR_INVALID_HANDLE;
-    return typeH(ft.getResult(idx));
+    auto t = typeF(h);
+    if (auto ft = llvm::dyn_cast<mlir::FunctionType>(t)) {
+        if (idx >= ft.getNumResults()) return MLIR_INVALID_HANDLE;
+        return typeH(ft.getResult(idx));
+    }
+    if (auto ft = llvm::dyn_cast<mlir::LLVM::LLVMFunctionType>(t)) {
+        if (idx != 0) return MLIR_INVALID_HANDLE;
+        if (llvm::isa<mlir::LLVM::LLVMVoidType>(ft.getReturnType())) return MLIR_INVALID_HANDLE;
+        return typeH(ft.getReturnType());
+    }
+    return MLIR_INVALID_HANDLE;
 }
 
 extern "C" MLIR_TypeHandle MLIR_GetTypeShapedElement(MLIR_TypeHandle h) {
@@ -1251,7 +1275,10 @@ extern "C" string MLIR_TranslateModuleToLLVMIR(MLIR_Context *ctx, MLIR_OpHandle 
     }
     // For now, MLIR_LOWERING_NATIVE delegates to the upstream translator.
     // Stage C will replace this branch with a walk via mlir_api.h.
-    (void)backend;
+    if (backend == MLIR_LOWERING_NATIVE) {
+        extern string mlir_translate_to_llvm_ir_native(MLIR_Context *, MLIR_OpHandle);
+        return mlir_translate_to_llvm_ir_native(ctx, module_h);
+    }
     // Register the LLVM-IR translation interfaces (idempotent).
     mlir::registerBuiltinDialectTranslation(globalCtx().mctx);
     mlir::registerLLVMDialectTranslation(globalCtx().mctx);
