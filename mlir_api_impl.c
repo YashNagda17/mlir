@@ -1683,6 +1683,9 @@ void MLIR_MoveBlockToRegionEnd(MLIR_Context *ctx, MLIR_BlockHandle block,
 #define MLIR_NATIVE_LOWERING_WEAK
 #endif
 
+bool mlir_lower_to_llvm_native(MLIR_Context *ctx, MLIR_OpHandle module);
+string mlir_translate_to_llvm_ir_native(MLIR_Context *ctx, MLIR_OpHandle module);
+
 #ifndef MLIR_HAS_NATIVE_LOWERING
 MLIR_NATIVE_LOWERING_WEAK bool
 mlir_lower_to_llvm_native(MLIR_Context *ctx, MLIR_OpHandle module) {
