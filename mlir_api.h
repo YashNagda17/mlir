@@ -170,6 +170,11 @@ typedef enum {
     OP_TYPE_LLVM_MLIR_GLOBAL,
     OP_TYPE_LLVM_RETURN,
     OP_TYPE_LLVM_PTRTOINT,
+    OP_TYPE_LLVM_FUNC,
+    OP_TYPE_LLVM_CALL,
+    OP_TYPE_LLVM_SEXT,
+    OP_TYPE_LLVM_ADD,
+    OP_TYPE_LLVM_SUB,
     OP_TYPE_ARITH_XORI,
     OP_TYPE_ARITH_SHLI,
     OP_TYPE_ARITH_SHRSI,
@@ -177,6 +182,53 @@ typedef enum {
     // Return operations
     OP_TYPE_RETURN,
     OP_TYPE_TT_REDUCE_RETURN,
+
+    // -------------------------------------------------------------------------
+    // wasmssa dialect — high-level SSA-form WebAssembly ops. Produced by
+    // the LLVM-dialect -> wasmssa lowering pass and consumed by the
+    // wasmssa -> wasmstack stackification pass. All values are SSA;
+    // there are no explicit local.get / local.set / local.tee here.
+    //
+    // Op operand-order convention (non-commutative ops):
+    //   sub:   %r = wasmssa.sub %lhs, %rhs   ; emits "lhs rhs i32.sub"
+    //   load:  %r = wasmssa.load %addr       ; offset/align as attrs
+    //   store: wasmssa.store %addr, %val
+    // -------------------------------------------------------------------------
+    OP_TYPE_WASMSSA_FUNC,
+    OP_TYPE_WASMSSA_IMPORT_FUNC,
+    OP_TYPE_WASMSSA_IMPORT_GLOBAL,
+    OP_TYPE_WASMSSA_CONST,
+    OP_TYPE_WASMSSA_ADD,
+    OP_TYPE_WASMSSA_SUB,
+    OP_TYPE_WASMSSA_LOAD,
+    OP_TYPE_WASMSSA_STORE,
+    OP_TYPE_WASMSSA_GLOBAL_GET,
+    OP_TYPE_WASMSSA_GLOBAL_SET,
+    OP_TYPE_WASMSSA_EXTEND_I32_S,
+    OP_TYPE_WASMSSA_RETURN,
+    OP_TYPE_WASMSSA_CALL,
+
+    // -------------------------------------------------------------------------
+    // wasmstack dialect — low-level stack-machine WebAssembly ops. 1:1
+    // with the wasm bytecode opcodes. Produced by the wasmssa -> wasmstack
+    // stackification pass and consumed by the binary emitter.
+    // -------------------------------------------------------------------------
+    OP_TYPE_WASMSTACK_FUNC,
+    OP_TYPE_WASMSTACK_IMPORT_FUNC,
+    OP_TYPE_WASMSTACK_IMPORT_GLOBAL,
+    OP_TYPE_WASMSTACK_LOCAL_GET,
+    OP_TYPE_WASMSTACK_LOCAL_SET,
+    OP_TYPE_WASMSTACK_LOCAL_TEE,
+    OP_TYPE_WASMSTACK_CONST,
+    OP_TYPE_WASMSTACK_ADD,
+    OP_TYPE_WASMSTACK_SUB,
+    OP_TYPE_WASMSTACK_LOAD,
+    OP_TYPE_WASMSTACK_STORE,
+    OP_TYPE_WASMSTACK_GLOBAL_GET,
+    OP_TYPE_WASMSTACK_GLOBAL_SET,
+    OP_TYPE_WASMSTACK_EXTEND_I32_S,
+    OP_TYPE_WASMSTACK_RETURN,
+    OP_TYPE_WASMSTACK_CALL,
 
     OP_TYPE_COUNT
 } MLIR_OpType;

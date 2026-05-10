@@ -97,11 +97,47 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_LLVM_MLIR_GLOBAL: return str_lit("llvm.mlir.global");
         case OP_TYPE_LLVM_RETURN: return str_lit("llvm.return");
         case OP_TYPE_LLVM_PTRTOINT: return str_lit("llvm.ptrtoint");
+        case OP_TYPE_LLVM_FUNC: return str_lit("llvm.func");
+        case OP_TYPE_LLVM_CALL: return str_lit("llvm.call");
+        case OP_TYPE_LLVM_SEXT: return str_lit("llvm.sext");
+        case OP_TYPE_LLVM_ADD: return str_lit("llvm.add");
+        case OP_TYPE_LLVM_SUB: return str_lit("llvm.sub");
         case OP_TYPE_ARITH_XORI: return str_lit("arith.xori");
         case OP_TYPE_ARITH_SHLI: return str_lit("arith.shli");
         case OP_TYPE_ARITH_SHRSI: return str_lit("arith.shrsi");
         case OP_TYPE_RETURN: return str_lit("return");
         case OP_TYPE_TT_REDUCE_RETURN: return str_lit("tt.reduce.return");
+        // wasmssa dialect
+        case OP_TYPE_WASMSSA_FUNC: return str_lit("wasmssa.func");
+        case OP_TYPE_WASMSSA_IMPORT_FUNC: return str_lit("wasmssa.import_func");
+        case OP_TYPE_WASMSSA_IMPORT_GLOBAL: return str_lit("wasmssa.import_global");
+        case OP_TYPE_WASMSSA_CONST: return str_lit("wasmssa.const");
+        case OP_TYPE_WASMSSA_ADD: return str_lit("wasmssa.add");
+        case OP_TYPE_WASMSSA_SUB: return str_lit("wasmssa.sub");
+        case OP_TYPE_WASMSSA_LOAD: return str_lit("wasmssa.load");
+        case OP_TYPE_WASMSSA_STORE: return str_lit("wasmssa.store");
+        case OP_TYPE_WASMSSA_GLOBAL_GET: return str_lit("wasmssa.global_get");
+        case OP_TYPE_WASMSSA_GLOBAL_SET: return str_lit("wasmssa.global_set");
+        case OP_TYPE_WASMSSA_EXTEND_I32_S: return str_lit("wasmssa.extend_i32_s");
+        case OP_TYPE_WASMSSA_RETURN: return str_lit("wasmssa.return");
+        case OP_TYPE_WASMSSA_CALL: return str_lit("wasmssa.call");
+        // wasmstack dialect
+        case OP_TYPE_WASMSTACK_FUNC: return str_lit("wasmstack.func");
+        case OP_TYPE_WASMSTACK_IMPORT_FUNC: return str_lit("wasmstack.import_func");
+        case OP_TYPE_WASMSTACK_IMPORT_GLOBAL: return str_lit("wasmstack.import_global");
+        case OP_TYPE_WASMSTACK_LOCAL_GET: return str_lit("wasmstack.local.get");
+        case OP_TYPE_WASMSTACK_LOCAL_SET: return str_lit("wasmstack.local.set");
+        case OP_TYPE_WASMSTACK_LOCAL_TEE: return str_lit("wasmstack.local.tee");
+        case OP_TYPE_WASMSTACK_CONST: return str_lit("wasmstack.const");
+        case OP_TYPE_WASMSTACK_ADD: return str_lit("wasmstack.add");
+        case OP_TYPE_WASMSTACK_SUB: return str_lit("wasmstack.sub");
+        case OP_TYPE_WASMSTACK_LOAD: return str_lit("wasmstack.load");
+        case OP_TYPE_WASMSTACK_STORE: return str_lit("wasmstack.store");
+        case OP_TYPE_WASMSTACK_GLOBAL_GET: return str_lit("wasmstack.global.get");
+        case OP_TYPE_WASMSTACK_GLOBAL_SET: return str_lit("wasmstack.global.set");
+        case OP_TYPE_WASMSTACK_EXTEND_I32_S: return str_lit("wasmstack.extend_i32_s");
+        case OP_TYPE_WASMSTACK_RETURN: return str_lit("wasmstack.return");
+        case OP_TYPE_WASMSTACK_CALL: return str_lit("wasmstack.call");
         default: return str_lit("unknown");
     }
 }
