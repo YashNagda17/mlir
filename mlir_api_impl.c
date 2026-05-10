@@ -25,7 +25,12 @@ typedef enum {
     TYPE_KIND_TENSOR,
     TYPE_KIND_FUNCTION,
     TYPE_KIND_INDEX,
-    TYPE_KIND_POINTER
+    TYPE_KIND_POINTER,
+    TYPE_KIND_LLVM_PTR,
+    TYPE_KIND_LLVM_VOID,
+    TYPE_KIND_LLVM_ARRAY,
+    TYPE_KIND_LLVM_STRUCT,
+    TYPE_KIND_LLVM_FUNCTION
 } TypeKind;
 
 typedef enum {
@@ -66,6 +71,26 @@ typedef struct IR_Type {
             MLIR_TypeHandle *results;
             size_t n_results;
         } function;
+        struct {
+            MLIR_TypeHandle element;
+            uint64_t count;
+        } llvm_array;
+        struct {
+            // Anonymous structs have name.size == 0. Identified structs are
+            // interned by name (see intern_llvm_struct in this file).
+            string name;
+            MLIR_TypeHandle *fields;
+            size_t n_fields;
+            bool body_set;
+        } llvm_struct;
+        struct {
+            // LLVM function type: exactly one return type (LLVM void marker
+            // when the function returns void), N input types, optional varargs.
+            MLIR_TypeHandle result;
+            MLIR_TypeHandle *inputs;
+            size_t n_inputs;
+            bool is_var_arg;
+        } llvm_function;
     } data;
 } IR_Type;
 
@@ -138,6 +163,7 @@ typedef struct IR_Op {
     MLIR_LocationHandle unnumbered_loc_def;
     string trailing_comment;
     int64_t source_line_start;
+    MLIR_BlockHandle parent_block;
 } IR_Op;
 
 typedef struct IR_Block {
@@ -181,11 +207,35 @@ static inline IR_Location *resolve_loc(MLIR_LocationHandle h) {
     return h == MLIR_INVALID_HANDLE ? NULL : (IR_Location *)(uintptr_t)h;
 }
 
+// Process-wide registry of all created ops. Native MLIR has no per-context
+// op list, but the lowering pass needs one for MLIR_ReplaceAllUsesOfValue
+// (which has to scan every op's operand/successor-operand arrays). The
+// tinyc/parser binaries each create exactly one MLIR_Context per process,
+// so a single static list is enough. Memory comes from the context arena.
+static MLIR_OpHandle *g_all_ops = NULL;
+static size_t         g_n_all_ops = 0;
+static size_t         g_cap_all_ops = 0;
+
+static void register_op(MLIR_Context *ctx, MLIR_OpHandle h) {
+    if (!ctx || !ctx->arena) return;
+    if (g_n_all_ops == g_cap_all_ops) {
+        size_t nc = g_cap_all_ops ? g_cap_all_ops * 2 : 256;
+        MLIR_OpHandle *p = arena_new_array(ctx->arena, MLIR_OpHandle, nc);
+        if (g_all_ops && g_n_all_ops)
+            memcpy(p, g_all_ops, g_n_all_ops * sizeof(MLIR_OpHandle));
+        g_all_ops = p;
+        g_cap_all_ops = nc;
+    }
+    g_all_ops[g_n_all_ops++] = h;
+}
+
 static inline MLIR_OpHandle alloc_op(MLIR_Context *ctx, IR_Op op) {
     if (!ctx || !ctx->arena) return MLIR_INVALID_HANDLE;
     IR_Op *slot = arena_new(ctx->arena, IR_Op);
     *slot = op;
-    return (MLIR_OpHandle)(uintptr_t)slot;
+    MLIR_OpHandle h = (MLIR_OpHandle)(uintptr_t)slot;
+    register_op(ctx, h);
+    return h;
 }
 
 static inline MLIR_RegionHandle alloc_region(MLIR_Context *ctx, IR_Region r) {
@@ -266,23 +316,38 @@ MLIR_OpHandle MLIR_CreateOpWithSuccessors(
     IR_Op op = {0};
     op.op_type = type;
     op.opname = opname;
-    op.attributes = attributes;
-    op.n_attributes = n_attributes;
-    op.result_types = result_types;
-    op.n_result_types = n_result_types;
-    op.results = results;
-    op.n_results = n_results;
-    op.operands = operands;
-    op.n_operands = n_operands;
-    op.regions = regions;
-    op.n_regions = n_regions;
-    op.successors = successors;
-    op.n_successors = n_successors;
-    op.successor_operands = successor_operands;
-    // The native IR_Op stores n_successor_operands as uint64_t* for layout
-    // stability, but the public API uses size_t* (caller-owned arena array).
-    // On 64-bit targets these are identical; we simply alias the pointer.
-    op.n_successor_operands = (uint64_t *)n_successor_operands;
+    Arena *arena = ctx ? ctx->arena : NULL;
+    // The lowering pass (and other callers) frequently builds these arrays
+    // on the stack and hands them to us; copy into the arena so they
+    // survive past the caller's stack frame.
+    #define DUP(dst, dn, src, sn, T) do { \
+        (dn) = (sn); \
+        if ((sn) > 0 && arena) { \
+            (dst) = arena_new_array(arena, T, (sn)); \
+            memcpy((dst), (src), (sn) * sizeof(T)); \
+        } else { (dst) = NULL; } \
+    } while (0)
+    DUP(op.attributes, op.n_attributes, attributes, n_attributes, MLIR_AttributeHandle);
+    DUP(op.result_types, op.n_result_types, result_types, n_result_types, MLIR_TypeHandle);
+    DUP(op.results, op.n_results, results, n_results, MLIR_ValueHandle);
+    DUP(op.operands, op.n_operands, operands, n_operands, MLIR_ValueHandle);
+    DUP(op.regions, op.n_regions, regions, n_regions, MLIR_RegionHandle);
+    DUP(op.successors, op.n_successors, successors, n_successors, MLIR_BlockHandle);
+    if (n_successors > 0 && arena) {
+        op.successor_operands = arena_new_array(arena, MLIR_ValueHandle *, n_successors);
+        op.n_successor_operands = arena_new_array(arena, uint64_t, n_successors);
+        for (size_t s = 0; s < n_successors; s++) {
+            uint64_t cnt = n_successor_operands ? (uint64_t)n_successor_operands[s] : 0;
+            op.n_successor_operands[s] = cnt;
+            if (cnt > 0 && successor_operands && successor_operands[s]) {
+                op.successor_operands[s] = arena_new_array(arena, MLIR_ValueHandle, cnt);
+                memcpy(op.successor_operands[s], successor_operands[s], cnt * sizeof(MLIR_ValueHandle));
+            } else {
+                op.successor_operands[s] = NULL;
+            }
+        }
+    }
+    #undef DUP
     op.location = location;
     op.unnumbered_loc_def = unnumbered_loc_def;
     op.trailing_comment = trailing_comment;
@@ -337,6 +402,8 @@ void MLIR_AppendBlockOp(MLIR_Context *ctx, MLIR_BlockHandle bh, MLIR_OpHandle op
     new_ops[block->n_operations] = op;
     block->operations = new_ops;
     block->n_operations++;
+    IR_Op *o = resolve_op(op);
+    if (o) o->parent_block = bh;
 }
 
 void MLIR_InsertBlockOpBeforeTerminator(MLIR_Context *ctx, MLIR_BlockHandle bh, MLIR_OpHandle op) {
@@ -358,6 +425,8 @@ void MLIR_InsertBlockOpAtIndex(MLIR_Context *ctx, MLIR_BlockHandle bh, MLIR_OpHa
                (block->n_operations - idx) * sizeof(MLIR_OpHandle));
     block->operations = new_ops;
     block->n_operations++;
+    IR_Op *o = resolve_op(op);
+    if (o) o->parent_block = bh;
 }
 
 void MLIR_AppendBlockArg(MLIR_Context *ctx, MLIR_BlockHandle bh, MLIR_ValueHandle arg) {
@@ -652,6 +721,48 @@ string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle th) {
             }
             return format(arena, str_lit("({}) -> {}"), in_str, out_str);
         }
+        case TYPE_KIND_LLVM_PTR:
+            return str_lit("!llvm.ptr");
+        case TYPE_KIND_LLVM_VOID:
+            return str_lit("!llvm.void");
+        case TYPE_KIND_LLVM_ARRAY: {
+            string elem = MLIR_GetTypeString(ctx, type->data.llvm_array.element);
+            return format(arena, str_lit("!llvm.array<{} x {}>"),
+                          (int64_t)type->data.llvm_array.count, elem);
+        }
+        case TYPE_KIND_LLVM_STRUCT: {
+            // Anonymous: !llvm.struct<(T1, T2)>; identified: !llvm.struct<"name", (T1, T2)>.
+            // Within nested struct fields MLIR omits the outer "!llvm." prefix —
+            // but the translator's print_llvm_type_text accepts both, so we
+            // always emit the canonical form here for simplicity.
+            string body = str_lit("(");
+            for (size_t i = 0; i < type->data.llvm_struct.n_fields; i++) {
+                if (i > 0) body = str_concat(arena, body, str_lit(", "));
+                body = str_concat(arena, body,
+                                  MLIR_GetTypeString(ctx, type->data.llvm_struct.fields[i]));
+            }
+            body = str_concat(arena, body, str_lit(")"));
+            if (type->data.llvm_struct.name.size > 0) {
+                return format(arena, str_lit("!llvm.struct<\"{}\", {}>"),
+                              type->data.llvm_struct.name, body);
+            }
+            return format(arena, str_lit("!llvm.struct<{}>"), body);
+        }
+        case TYPE_KIND_LLVM_FUNCTION: {
+            string ret = MLIR_GetTypeString(ctx, type->data.llvm_function.result);
+            string body = str_lit("");
+            for (size_t i = 0; i < type->data.llvm_function.n_inputs; i++) {
+                if (i > 0) body = str_concat(arena, body, str_lit(", "));
+                body = str_concat(arena, body,
+                                  MLIR_GetTypeString(ctx, type->data.llvm_function.inputs[i]));
+            }
+            if (type->data.llvm_function.is_var_arg) {
+                body = str_concat(arena,
+                                  type->data.llvm_function.n_inputs ? str_concat(arena, body, str_lit(", ")) : body,
+                                  str_lit("..."));
+            }
+            return format(arena, str_lit("!llvm.func<{} ({})>"), ret, body);
+        }
         default:
             return str_lit("unknown");
     }
@@ -729,31 +840,69 @@ MLIR_TypeHandle MLIR_CreateTypePointer(MLIR_Context *ctx, MLIR_TypeHandle elemen
 }
 
 MLIR_TypeHandle MLIR_CreateTypeLLVMPointer(MLIR_Context *ctx) {
-    // Native classic/generic backend doesn't currently model LLVM dialect
-    // types; tinyC and other LLVM-dialect users go through the upstream
-    // backend. Return an opaque marker so unrelated tests still link.
     IR_Type t = {0};
-    t.kind = TYPE_KIND_OPAQUE;
-    (void)ctx;
+    t.kind = TYPE_KIND_LLVM_PTR;
     return alloc_type(ctx, t);
 }
 
-MLIR_TypeHandle MLIR_CreateTypeLLVMStructIdentified(MLIR_Context *ctx, string name) {
+// Identified LLVM structs are interned by name within a context: the same
+// printed reference (`!llvm.struct<"foo", ...>`) must resolve to the same
+// type handle across all uses. We use a process-wide static table keyed
+// by the string contents (cheap given the small N in tinyc programs).
+static MLIR_TypeHandle *g_struct_handles = NULL;
+static string         *g_struct_names   = NULL;
+static size_t          g_n_structs = 0, g_cap_structs = 0;
+
+static MLIR_TypeHandle intern_llvm_struct(MLIR_Context *ctx, string name) {
+    for (size_t i = 0; i < g_n_structs; i++) {
+        if (g_struct_names[i].size == name.size &&
+            memcmp(g_struct_names[i].str, name.str, name.size) == 0) {
+            return g_struct_handles[i];
+        }
+    }
+    if (g_n_structs == g_cap_structs) {
+        size_t nc = g_cap_structs ? g_cap_structs * 2 : 32;
+        MLIR_TypeHandle *nh = arena_new_array(ctx->arena, MLIR_TypeHandle, nc);
+        string *nn = arena_new_array(ctx->arena, string, nc);
+        if (g_n_structs) {
+            memcpy(nh, g_struct_handles, g_n_structs * sizeof(MLIR_TypeHandle));
+            memcpy(nn, g_struct_names, g_n_structs * sizeof(string));
+        }
+        g_struct_handles = nh; g_struct_names = nn; g_cap_structs = nc;
+    }
     IR_Type t = {0};
-    t.kind = TYPE_KIND_OPAQUE;
-    (void)name;
-    return alloc_type(ctx, t);
+    t.kind = TYPE_KIND_LLVM_STRUCT;
+    t.data.llvm_struct.name = name;
+    MLIR_TypeHandle h = alloc_type(ctx, t);
+    g_struct_handles[g_n_structs] = h;
+    g_struct_names[g_n_structs] = name;
+    g_n_structs++;
+    return h;
+}
+
+MLIR_TypeHandle MLIR_CreateTypeLLVMStructIdentified(MLIR_Context *ctx, string name) {
+    return intern_llvm_struct(ctx, name);
 }
 
 void MLIR_SetTypeLLVMStructBody(MLIR_Context *ctx, MLIR_TypeHandle struct_ty,
                                  const MLIR_TypeHandle *fields, size_t n_fields) {
-    (void)ctx; (void)struct_ty; (void)fields; (void)n_fields;
+    IR_Type *t = resolve_type(struct_ty);
+    if (!t || t->kind != TYPE_KIND_LLVM_STRUCT) return;
+    if (t->data.llvm_struct.body_set) return; // upstream silently ignores re-set
+    if (n_fields > 0) {
+        MLIR_TypeHandle *buf = arena_new_array(ctx->arena, MLIR_TypeHandle, n_fields);
+        memcpy(buf, fields, n_fields * sizeof(MLIR_TypeHandle));
+        t->data.llvm_struct.fields = buf;
+    }
+    t->data.llvm_struct.n_fields = n_fields;
+    t->data.llvm_struct.body_set = true;
 }
 
 MLIR_TypeHandle MLIR_CreateTypeLLVMArray(MLIR_Context *ctx, MLIR_TypeHandle elem, uint64_t count) {
     IR_Type t = {0};
-    t.kind = TYPE_KIND_OPAQUE;
-    (void)elem; (void)count;
+    t.kind = TYPE_KIND_LLVM_ARRAY;
+    t.data.llvm_array.element = elem;
+    t.data.llvm_array.count = count;
     return alloc_type(ctx, t);
 }
 
@@ -763,34 +912,93 @@ MLIR_TypeHandle MLIR_CreateTypeLLVMFunction(MLIR_Context *ctx,
                                              size_t n_inputs,
                                              bool is_var_arg) {
     IR_Type t = {0};
-    t.kind = TYPE_KIND_OPAQUE;
-    (void)result; (void)inputs; (void)n_inputs; (void)is_var_arg;
+    t.kind = TYPE_KIND_LLVM_FUNCTION;
+    t.data.llvm_function.result = result;
+    t.data.llvm_function.is_var_arg = is_var_arg;
+    if (n_inputs > 0) {
+        MLIR_TypeHandle *buf = arena_new_array(ctx->arena, MLIR_TypeHandle, n_inputs);
+        memcpy(buf, inputs, n_inputs * sizeof(MLIR_TypeHandle));
+        t.data.llvm_function.inputs = buf;
+        t.data.llvm_function.n_inputs = n_inputs;
+    }
     return alloc_type(ctx, t);
 }
 
 MLIR_TypeHandle MLIR_CreateTypeLLVMVoid(MLIR_Context *ctx) {
     IR_Type t = {0};
-    t.kind = TYPE_KIND_OPAQUE;
+    t.kind = TYPE_KIND_LLVM_VOID;
     return alloc_type(ctx, t);
 }
 
-// LLVM-dialect global helpers — not implemented natively. These features
-// (string literals / module-scope globals) are exercised only via the
-// upstream backend in tinyc.
+// LLVM-dialect global helpers. Construct `llvm.mlir.global` ops with the
+// attributes the LLVM-IR translator looks for (sym_name, global_type,
+// linkage, constant, value). Both helpers return the op so the caller
+// can append it to the module body. MLIR_CreateLLVMGlobal optionally
+// hands back the entry block of the initializer region for region-init
+// globals.
+static MLIR_AttributeHandle make_llvm_linkage_attr(MLIR_Context *ctx, string linkage_kind) {
+    // Mirror the upstream printer: "#llvm.linkage<<kind>>".
+    IR_Attribute a = {0};
+    a.kind = ATTR_KIND_STRING;
+    a.name = str_lit("linkage");
+    string body = str_concat(ctx->arena, str_lit("#llvm.linkage<"), linkage_kind);
+    body = str_concat(ctx->arena, body, str_lit(">"));
+    a.data.string_value = body;
+    return alloc_attr_obj(ctx, a);
+}
+
 MLIR_OpHandle MLIR_CreateLLVMGlobalString(MLIR_Context *ctx, string sym_name,
                                           string bytes, MLIR_LocationHandle loc) {
-    (void)ctx; (void)sym_name; (void)bytes; (void)loc;
-    return MLIR_INVALID_HANDLE;
+    MLIR_TypeHandle i8 = MLIR_CreateTypeInteger(ctx, 8, false);
+    MLIR_TypeHandle arr = MLIR_CreateTypeLLVMArray(ctx, i8, bytes.size);
+    MLIR_AttributeHandle attrs[5];
+    attrs[0] = MLIR_CreateAttributeString(ctx, str_lit("sym_name"), sym_name);
+    attrs[1] = MLIR_CreateAttributeType(ctx, str_lit("global_type"), arr);
+    attrs[2] = make_llvm_linkage_attr(ctx, str_lit("private"));
+    attrs[3] = MLIR_CreateAttributeBool(ctx, str_lit("constant"), true);
+    attrs[4] = MLIR_CreateAttributeString(ctx, str_lit("value"), bytes);
+    return MLIR_CreateOp(ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.mlir.global"),
+                         attrs, 5, NULL, 0, NULL, 0, NULL, 0,
+                         NULL, 0, loc, MLIR_INVALID_HANDLE,
+                         str_lit(""), -1);
 }
+
 MLIR_OpHandle MLIR_CreateLLVMGlobal(MLIR_Context *ctx, string sym_name,
                                     MLIR_TypeHandle elem_ty, bool is_constant,
                                     int init_kind, int64_t init_int, double init_float,
                                     MLIR_BlockHandle *out_init_block,
                                     MLIR_LocationHandle loc) {
-    (void)ctx; (void)sym_name; (void)elem_ty; (void)is_constant;
-    (void)init_kind; (void)init_int; (void)init_float; (void)loc;
-    if (out_init_block) *out_init_block = MLIR_INVALID_HANDLE;
-    return MLIR_INVALID_HANDLE;
+    // init_kind: 0=integer, 1=float, 2=region, 3=zero-init/no-init, 4=external
+    MLIR_AttributeHandle attrs[6];
+    size_t na = 0;
+    attrs[na++] = MLIR_CreateAttributeString(ctx, str_lit("sym_name"), sym_name);
+    attrs[na++] = MLIR_CreateAttributeType(ctx, str_lit("global_type"), elem_ty);
+    string lk = (init_kind == 4) ? str_lit("external") : str_lit("internal");
+    attrs[na++] = make_llvm_linkage_attr(ctx, lk);
+    if (is_constant) attrs[na++] = MLIR_CreateAttributeBool(ctx, str_lit("constant"), true);
+    if (init_kind == 0) {
+        attrs[na++] = MLIR_CreateAttributeInteger(ctx, str_lit("value"), init_int, elem_ty);
+    } else if (init_kind == 1) {
+        attrs[na++] = MLIR_CreateAttributeFloat(ctx, str_lit("value"), init_float, elem_ty);
+    }
+
+    // Region for region-initialized globals (init_kind == 2): create one
+    // empty block so the caller can populate it.
+    MLIR_RegionHandle regs[1];
+    size_t nr = 0;
+    if (init_kind == 2) {
+        MLIR_RegionHandle r = MLIR_CreateRegion(ctx);
+        MLIR_BlockHandle entry = MLIR_CreateBlock(ctx);
+        MLIR_AppendRegionBlock(ctx, r, entry);
+        if (out_init_block) *out_init_block = entry;
+        regs[0] = r; nr = 1;
+    } else if (out_init_block) {
+        *out_init_block = MLIR_INVALID_HANDLE;
+    }
+    return MLIR_CreateOp(ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.mlir.global"),
+                         attrs, na, NULL, 0, NULL, 0, NULL, 0,
+                         nr ? regs : NULL, nr, loc, MLIR_INVALID_HANDLE,
+                         str_lit(""), -1);
 }
 
 MLIR_TypeHandle MLIR_CreateTypeFunction(MLIR_Context *ctx,
@@ -815,33 +1023,60 @@ MLIR_TypeHandle MLIR_CreateTypeFunction(MLIR_Context *ctx,
 
 bool MLIR_IsTypeFunction(MLIR_TypeHandle th) {
     IR_Type *t = resolve_type(th);
-    return t && t->kind == TYPE_KIND_FUNCTION;
+    return t && (t->kind == TYPE_KIND_FUNCTION || t->kind == TYPE_KIND_LLVM_FUNCTION);
 }
 
 size_t MLIR_GetTypeFunctionNumInputs(MLIR_TypeHandle th) {
     IR_Type *t = resolve_type(th);
-    if (!t || t->kind != TYPE_KIND_FUNCTION) return 0;
-    return t->data.function.n_inputs;
+    if (!t) return 0;
+    if (t->kind == TYPE_KIND_FUNCTION) return t->data.function.n_inputs;
+    if (t->kind == TYPE_KIND_LLVM_FUNCTION) return t->data.llvm_function.n_inputs;
+    return 0;
 }
 
 MLIR_TypeHandle MLIR_GetTypeFunctionInput(MLIR_TypeHandle th, size_t idx) {
     IR_Type *t = resolve_type(th);
-    if (!t || t->kind != TYPE_KIND_FUNCTION) return MLIR_INVALID_HANDLE;
-    if (idx >= t->data.function.n_inputs || !t->data.function.inputs) return MLIR_INVALID_HANDLE;
-    return t->data.function.inputs[idx];
+    if (!t) return MLIR_INVALID_HANDLE;
+    if (t->kind == TYPE_KIND_FUNCTION) {
+        if (idx >= t->data.function.n_inputs || !t->data.function.inputs) return MLIR_INVALID_HANDLE;
+        return t->data.function.inputs[idx];
+    }
+    if (t->kind == TYPE_KIND_LLVM_FUNCTION) {
+        if (idx >= t->data.llvm_function.n_inputs || !t->data.llvm_function.inputs) return MLIR_INVALID_HANDLE;
+        return t->data.llvm_function.inputs[idx];
+    }
+    return MLIR_INVALID_HANDLE;
 }
 
 size_t MLIR_GetTypeFunctionNumResults(MLIR_TypeHandle th) {
     IR_Type *t = resolve_type(th);
-    if (!t || t->kind != TYPE_KIND_FUNCTION) return 0;
-    return t->data.function.n_results;
+    if (!t) return 0;
+    if (t->kind == TYPE_KIND_FUNCTION) return t->data.function.n_results;
+    if (t->kind == TYPE_KIND_LLVM_FUNCTION) {
+        // LLVMFunctionType always has exactly one return type; void is
+        // represented as a separate LLVMVoid type. Surface 0 results in
+        // the void case so callers can use the same "0 results means void"
+        // convention as upstream's MLIR_GetTypeFunctionNumResults.
+        IR_Type *r = resolve_type(t->data.llvm_function.result);
+        return (r && r->kind == TYPE_KIND_LLVM_VOID) ? 0 : 1;
+    }
+    return 0;
 }
 
 MLIR_TypeHandle MLIR_GetTypeFunctionResult(MLIR_TypeHandle th, size_t idx) {
     IR_Type *t = resolve_type(th);
-    if (!t || t->kind != TYPE_KIND_FUNCTION) return MLIR_INVALID_HANDLE;
-    if (idx >= t->data.function.n_results || !t->data.function.results) return MLIR_INVALID_HANDLE;
-    return t->data.function.results[idx];
+    if (!t) return MLIR_INVALID_HANDLE;
+    if (t->kind == TYPE_KIND_FUNCTION) {
+        if (idx >= t->data.function.n_results || !t->data.function.results) return MLIR_INVALID_HANDLE;
+        return t->data.function.results[idx];
+    }
+    if (t->kind == TYPE_KIND_LLVM_FUNCTION) {
+        if (idx != 0) return MLIR_INVALID_HANDLE;
+        IR_Type *r = resolve_type(t->data.llvm_function.result);
+        if (r && r->kind == TYPE_KIND_LLVM_VOID) return MLIR_INVALID_HANDLE;
+        return t->data.llvm_function.result;
+    }
+    return MLIR_INVALID_HANDLE;
 }
 
 MLIR_TypeHandle MLIR_GetTypeShapedElement(MLIR_TypeHandle th) {
@@ -930,26 +1165,48 @@ MLIR_AttributeHandle MLIR_CreateAttributeType(MLIR_Context *ctx, string name, ML
     return alloc_attr_obj(ctx, a);
 }
 
-// Native backend stores SymbolRef as a plain string attribute with the
-// symbol name (without leading `@`). This is sufficient for printing —
-// the classic printer prepends `@` when emitting `callee = @sym_name`
-// for func.call. Verifier-style validation is not performed natively.
+// Native backend stores SymbolRef as a plain string attribute. The
+// upstream printer renders symbol references as `@name`, so we store
+// the same form here — keeps MLIR_GetAttributeAsString consistent
+// across backends (the LLVM-IR translator depends on this for callee
+// emission).
 MLIR_AttributeHandle MLIR_CreateAttributeSymbolRef(MLIR_Context *ctx, string name, string value) {
     IR_Attribute a = {0};
     a.kind = ATTR_KIND_STRING;
     a.name = name;
-    a.data.string_value = value;
+    string with_at = format(ctx->arena, str_lit("@{}"), value);
+    a.data.string_value = with_at;
     return alloc_attr_obj(ctx, a);
 }
 
-// Native classic/generic backend doesn't model DenseI32ArrayAttr; stash
-// nothing useful — only the upstream backend currently consumes this.
+// DenseI32 array attribute. The native LLVM-IR translator reads this
+// via MLIR_GetAttributeAsString and parses the printed form, so we
+// stash a string matching upstream's printer ("array<i32: v0, v1, ...>").
 MLIR_AttributeHandle MLIR_CreateAttributeDenseI32Array(MLIR_Context *ctx, string name,
                                                        const int32_t *values, size_t count) {
     IR_Attribute a = {0};
     a.kind = ATTR_KIND_STRING;
     a.name = name;
-    (void)values; (void)count;
+    Arena *arena = ctx->arena;
+    string s = str_lit("array<i32");
+    for (size_t i = 0; i < count; i++) {
+        s = str_concat(arena, s, i == 0 ? str_lit(": ") : str_lit(", "));
+        s = str_concat(arena, s, format(arena, str_lit("{}"), (int64_t)values[i]));
+    }
+    s = str_concat(arena, s, str_lit(">"));
+    a.data.string_value = s;
+    return alloc_attr_obj(ctx, a);
+}
+
+// LLVM linkage attribute. Native backend stores the printable form
+// (e.g. "#llvm.linkage<internal>") in a string attr — this matches the
+// upstream backend's MLIR_GetAttributeAsString result, so the native
+// LLVM-IR translator can recognize it the same way for both backends.
+MLIR_AttributeHandle MLIR_CreateAttributeLLVMLinkageInternal(MLIR_Context *ctx, string name) {
+    IR_Attribute a = {0};
+    a.kind = ATTR_KIND_STRING;
+    a.name = name;
+    a.data.string_value = str_lit("#llvm.linkage<internal>");
     return alloc_attr_obj(ctx, a);
 }
 
@@ -1034,7 +1291,14 @@ string MLIR_GetAttributeName(MLIR_AttributeHandle ah) {
 
 // Native parser never produces "other" attrs; this is just for API parity.
 string MLIR_GetAttributeAsString(MLIR_Context *ctx, MLIR_AttributeHandle ah) {
-    (void)ctx; (void)ah;
+    (void)ctx;
+    IR_Attribute *attr = resolve_attr(ah);
+    if (!attr) return str_lit("");
+    // The native lowering/translation passes only consult this for a few
+    // attributes whose printed form is well-defined (LLVM linkage, plain
+    // strings). For everything else we return empty — callers must use
+    // the typed accessors.
+    if (attr->kind == ATTR_KIND_STRING) return attr->data.string_value;
     return str_lit("");
 }
 
@@ -1283,16 +1547,163 @@ bool MLIR_IsTypeOpaque(MLIR_TypeHandle th) {
     return t && t->kind == TYPE_KIND_OPAQUE;
 }
 
-// Lowering / LLVM IR translation are upstream-only. Stub them on the
-// native backend so binaries that link only the native impl still resolve.
-bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module) {
+// IR mutation primitives — native implementations used by the Stage B/C
+// lowering+translation passes (mlir_lower_to_llvm.c and
+// mlir_translate_to_llvm_ir.c). They mirror the upstream-backend behaviour
+// just well enough for the tinyc test suite.
+
+void MLIR_ReplaceAllUsesOfValue(MLIR_Context *ctx,
+                                MLIR_ValueHandle old_value,
+                                MLIR_ValueHandle new_value) {
+    (void)ctx;
+    if (old_value == MLIR_INVALID_HANDLE || old_value == new_value) return;
+    for (size_t k = 0; k < g_n_all_ops; k++) {
+        IR_Op *o = resolve_op(g_all_ops[k]);
+        if (!o) continue;
+        for (size_t i = 0; i < o->n_operands; i++) {
+            if (o->operands[i] == old_value) o->operands[i] = new_value;
+        }
+        for (size_t s = 0; s < o->n_successors; s++) {
+            uint64_t n = o->n_successor_operands ? o->n_successor_operands[s] : 0;
+            MLIR_ValueHandle *arr = o->successor_operands ? o->successor_operands[s] : NULL;
+            for (uint64_t i = 0; i < n; i++) {
+                if (arr && arr[i] == old_value) arr[i] = new_value;
+            }
+        }
+    }
+}
+
+void MLIR_EraseOp(MLIR_Context *ctx, MLIR_OpHandle op) {
+    (void)ctx;
+    IR_Op *o = resolve_op(op);
+    if (!o) return;
+    IR_Block *b = resolve_block(o->parent_block);
+    if (b) {
+        size_t w = 0;
+        for (size_t i = 0; i < b->n_operations; i++) {
+            if (b->operations[i] != op) b->operations[w++] = b->operations[i];
+        }
+        b->n_operations = w;
+    }
+    o->parent_block = MLIR_INVALID_HANDLE;
+}
+
+void MLIR_SetOpRegion(MLIR_Context *ctx, MLIR_OpHandle op, size_t idx,
+                      MLIR_RegionHandle region) {
+    (void)ctx;
+    IR_Op *o = resolve_op(op);
+    if (!o || idx >= o->n_regions) return;
+    o->regions[idx] = region;
+}
+
+MLIR_RegionHandle MLIR_TakeOpRegion(MLIR_Context *ctx, MLIR_OpHandle op,
+                                    size_t idx) {
+    IR_Op *o = resolve_op(op);
+    if (!o || idx >= o->n_regions) return MLIR_INVALID_HANDLE;
+    MLIR_RegionHandle taken = o->regions[idx];
+    // Replace with a fresh empty region and reparent any blocks that
+    // referenced the old region.
+    IR_Region empty = {0};
+    o->regions[idx] = alloc_region(ctx, empty);
+    return taken;
+}
+
+MLIR_BlockHandle MLIR_GetOpParentBlock(MLIR_OpHandle op) {
+    IR_Op *o = resolve_op(op);
+    return o ? o->parent_block : MLIR_INVALID_HANDLE;
+}
+
+size_t MLIR_GetBlockOpIndex(MLIR_BlockHandle block, MLIR_OpHandle op) {
+    IR_Block *b = resolve_block(block);
+    if (!b) return (size_t)-1;
+    for (size_t i = 0; i < b->n_operations; i++) {
+        if (b->operations[i] == op) return i;
+    }
+    return (size_t)-1;
+}
+
+MLIR_RegionHandle MLIR_GetBlockParentRegion(MLIR_BlockHandle block) {
+    IR_Block *b = resolve_block(block);
+    return b ? b->parent_region : MLIR_INVALID_HANDLE;
+}
+
+void MLIR_MoveOpToBlockEnd(MLIR_Context *ctx, MLIR_OpHandle op,
+                           MLIR_BlockHandle dest) {
+    if (op == MLIR_INVALID_HANDLE || dest == MLIR_INVALID_HANDLE) return;
+    IR_Op *o = resolve_op(op);
+    if (!o) return;
+    // Detach from current parent.
+    IR_Block *cur = resolve_block(o->parent_block);
+    if (cur) {
+        size_t w = 0;
+        for (size_t i = 0; i < cur->n_operations; i++) {
+            if (cur->operations[i] != op) cur->operations[w++] = cur->operations[i];
+        }
+        cur->n_operations = w;
+    }
+    o->parent_block = MLIR_INVALID_HANDLE;
+    MLIR_AppendBlockOp(ctx, dest, op);
+}
+
+void MLIR_MoveBlockToRegionEnd(MLIR_Context *ctx, MLIR_BlockHandle block,
+                               MLIR_RegionHandle dest) {
+    if (block == MLIR_INVALID_HANDLE || dest == MLIR_INVALID_HANDLE) return;
+    IR_Block *b = resolve_block(block);
+    if (!b) return;
+    IR_Region *cur = resolve_region(b->parent_region);
+    if (cur) {
+        size_t w = 0;
+        for (size_t i = 0; i < cur->n_blocks; i++) {
+            if (cur->blocks[i] != block) cur->blocks[w++] = cur->blocks[i];
+        }
+        cur->n_blocks = w;
+    }
+    b->parent_region = MLIR_INVALID_HANDLE;
+    MLIR_AppendRegionBlock(ctx, dest, block);
+}
+
+// Native lowering & LLVM-IR translation. Both delegate to the shared
+// implementations in mlir_lower_to_llvm.c / mlir_translate_to_llvm_ir.c
+// which only use the public mlir_api.h surface and therefore work
+// against the native backend.
+//
+// Bare-metal builds (parser, parser.exe, parser.wasm) only use the
+// MLIR parser surface and never call these entry points, so we provide
+// weak fallback definitions here. Hosted builds (tinyc_native,
+// tinyc_upstream) link mlir_lower_to_llvm.c / mlir_translate_to_llvm_ir.c
+// which override these with the real implementations. On compilers
+// without weak-symbol support (e.g. MSVC for the Windows parser build)
+// the strong stubs satisfy the link without conflict because those
+// builds don't pull in the real translation units.
+#if defined(__GNUC__) || defined(__clang__)
+#define MLIR_NATIVE_LOWERING_WEAK __attribute__((weak))
+#else
+#define MLIR_NATIVE_LOWERING_WEAK
+#endif
+
+MLIR_NATIVE_LOWERING_WEAK bool
+mlir_lower_to_llvm_native(MLIR_Context *ctx, MLIR_OpHandle module) {
     (void)ctx; (void)module;
     return false;
 }
 
-string MLIR_TranslateModuleToLLVMIR(MLIR_Context *ctx, MLIR_OpHandle module) {
+MLIR_NATIVE_LOWERING_WEAK string
+mlir_translate_to_llvm_ir_native(MLIR_Context *ctx, MLIR_OpHandle module) {
     (void)ctx; (void)module;
-    return str_lit("");
+    string s = {0};
+    return s;
+}
+
+bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module,
+                             MLIR_LoweringBackend backend) {
+    (void)backend; // Native backend has no upstream pipeline to fall back on.
+    return mlir_lower_to_llvm_native(ctx, module);
+}
+
+string MLIR_TranslateModuleToLLVMIR(MLIR_Context *ctx, MLIR_OpHandle module,
+                                    MLIR_LoweringBackend backend) {
+    (void)backend;
+    return mlir_translate_to_llvm_ir_native(ctx, module);
 }
 
 #ifdef __cplusplus

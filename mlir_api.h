@@ -245,18 +245,34 @@ string MLIR_PrintOperationGeneric(MLIR_Context *ctx, MLIR_OpHandle op);
 MLIR_OpHandle MLIR_ParseTextUpstream(MLIR_Context *ctx, string text);
 MLIR_OpHandle MLIR_ParseTextClassic(MLIR_Context *ctx, string text);
 
+// Backend selector for the lowering / LLVM-IR translation entry points.
+//
+// MLIR_LOWERING_UPSTREAM uses upstream MLIR's pass pipeline / translator
+// (only available when linked against mlir_api_impl_upstream.cpp).
+//
+// MLIR_LOWERING_NATIVE uses our own implementation, walking the IR
+// through mlir_api.h only. It is the path that makes the native build
+// (mlir_api_impl.c) self-contained.
+typedef enum {
+    MLIR_LOWERING_UPSTREAM = 0,
+    MLIR_LOWERING_NATIVE   = 1,
+} MLIR_LoweringBackend;
+
 // Lower a `builtin.module` op to the LLVM dialect by running the standard
 // conversion passes (scf -> cf, arith/memref/cf/func/vector -> llvm,
 // reconcile-unrealized-casts). Mutates `module` in place. Returns true on
-// success. Available with the upstream backend only; the native backend
-// returns false. Diagnostic messages from failed passes are printed to
+// success. With MLIR_LOWERING_UPSTREAM available only when linked against
+// the upstream backend; with MLIR_LOWERING_NATIVE this is the native
+// implementation. Diagnostic messages from failed passes are printed to
 // stderr.
-bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module);
+bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module,
+                             MLIR_LoweringBackend backend);
 
 // Translate a `builtin.module` op already lowered to the LLVM dialect into
 // LLVM IR text (`.ll`). Returns the IR text on success or an empty string
-// on failure. Available with the upstream backend only.
-string MLIR_TranslateModuleToLLVMIR(MLIR_Context *ctx, MLIR_OpHandle module);
+// on failure. See MLIR_LoweringBackend above for backend semantics.
+string MLIR_TranslateModuleToLLVMIR(MLIR_Context *ctx, MLIR_OpHandle module,
+                                    MLIR_LoweringBackend backend);
 
 // Accessors
 MLIR_OpType MLIR_GetOpType(MLIR_OpHandle op);
@@ -464,6 +480,67 @@ MLIR_AttributeHandle MLIR_CreateAttributeType(MLIR_Context *ctx, string name, ML
 // SymbolRef attribute (e.g. `callee = @foo` on func.call). The `value`
 // must be the bare symbol name (no leading `@`).
 MLIR_AttributeHandle MLIR_CreateAttributeSymbolRef(MLIR_Context *ctx, string name, string value);
+
+// -----------------------------------------------------------------------------
+// IR mutation primitives (used by lowering passes).
+// -----------------------------------------------------------------------------
+
+// Replace every use of `old_value` with `new_value` everywhere in the
+// module that contains it. Operand lists, successor operand lists, and
+// any other places the value appears are updated. Both values must have
+// compatible types (the API does not check). After this call the old
+// value is unused and the op that produced it can typically be erased
+// with MLIR_EraseOp.
+//
+// Implementation note: the upstream backend uses
+// mlir::Value::replaceAllUsesWith. The native backend walks the module
+// linearly. In both cases the op definitions and value handles
+// themselves remain valid; only operand references move.
+void MLIR_ReplaceAllUsesOfValue(MLIR_Context *ctx,
+                                MLIR_ValueHandle old_value,
+                                MLIR_ValueHandle new_value);
+
+// Remove `op` from its parent block (if any) and detach it. The op is
+// not freed (the API leaves storage to the arena/allocator). Operands
+// to and results from `op` are not touched; callers should typically
+// have already called MLIR_ReplaceAllUsesOfValue on each result.
+void MLIR_EraseOp(MLIR_Context *ctx, MLIR_OpHandle op);
+
+// Replace one of `op`'s regions with `region`. The previously attached
+// region (if any) is detached and abandoned. Used when a lowering
+// rebuilds a function body wholesale rather than mutating it in place.
+void MLIR_SetOpRegion(MLIR_Context *ctx, MLIR_OpHandle op, size_t idx,
+                      MLIR_RegionHandle region);
+
+// Detach `op`'s region at `idx` and return it as a fresh handle. After
+// this call, `op` has an empty region at `idx`. The returned handle can
+// be passed as part of a new MLIR_CreateOp call (or to MLIR_SetOpRegion)
+// to graft the body onto a replacement op without copying.
+MLIR_RegionHandle MLIR_TakeOpRegion(MLIR_Context *ctx, MLIR_OpHandle op,
+                                    size_t idx);
+
+// Returns the block that contains `op`, or MLIR_INVALID_HANDLE if the
+// op is not currently attached to a block.
+MLIR_BlockHandle MLIR_GetOpParentBlock(MLIR_OpHandle op);
+
+// Returns the 0-indexed position of `op` within `block`'s operations
+// list, or SIZE_MAX if `op` is not in `block`.
+size_t MLIR_GetBlockOpIndex(MLIR_BlockHandle block, MLIR_OpHandle op);
+
+// Returns the region that contains `block`, or MLIR_INVALID_HANDLE if
+// the block is not currently attached to a region.
+MLIR_RegionHandle MLIR_GetBlockParentRegion(MLIR_BlockHandle block);
+
+// Detaches `op` from its current parent block (if any) and appends it
+// to the end of `dest`. Operand/result handles, attributes, and regions
+// of `op` are unchanged.
+void MLIR_MoveOpToBlockEnd(MLIR_Context *ctx, MLIR_OpHandle op,
+                           MLIR_BlockHandle dest);
+
+// Detaches `block` from its current parent region (if any) and appends
+// it to the end of `dest`. The block's ops and arguments are preserved.
+void MLIR_MoveBlockToRegionEnd(MLIR_Context *ctx, MLIR_BlockHandle block,
+                               MLIR_RegionHandle dest);
 
 // Introspection
 typedef enum {
