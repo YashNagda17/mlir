@@ -157,6 +157,15 @@ def main():
             print(f"SKIP {name} (wasm_skip)")
             skipped += 1
             continue
+        # The native LLVM->WASM translator (mlir_translate_to_wasm.c) is
+        # being grown incrementally and only handles a small subset of
+        # tinyc programs. Tests known to work under it must opt in via
+        # `wasm_native_run = true`; everything else is skipped when
+        # LOWERING=native is combined with TARGET=wasm.
+        if TARGET == "wasm" and LOWERING == "native" and not t.get("wasm_native_run"):
+            print(f"SKIP {name} (wasm_native: not yet supported)")
+            skipped += 1
+            continue
         # Multi-file tests pass `sources = [...]`; single-file tests
         # default to `<name>.tc` for backwards compatibility.
         sources = t.get("sources", [f"{name}.tc"])

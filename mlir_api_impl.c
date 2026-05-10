@@ -1692,6 +1692,7 @@ void MLIR_MoveBlockToRegionEnd(MLIR_Context *ctx, MLIR_BlockHandle block,
 
 bool mlir_lower_to_llvm_native(MLIR_Context *ctx, MLIR_OpHandle module);
 string mlir_translate_to_llvm_ir_native(MLIR_Context *ctx, MLIR_OpHandle module);
+string mlir_translate_to_wasm_native(MLIR_Context *ctx, MLIR_OpHandle module);
 
 #ifndef MLIR_HAS_NATIVE_LOWERING
 MLIR_NATIVE_LOWERING_WEAK bool
@@ -1702,6 +1703,13 @@ mlir_lower_to_llvm_native(MLIR_Context *ctx, MLIR_OpHandle module) {
 
 MLIR_NATIVE_LOWERING_WEAK string
 mlir_translate_to_llvm_ir_native(MLIR_Context *ctx, MLIR_OpHandle module) {
+    (void)ctx; (void)module;
+    string s = {0};
+    return s;
+}
+
+MLIR_NATIVE_LOWERING_WEAK string
+mlir_translate_to_wasm_native(MLIR_Context *ctx, MLIR_OpHandle module) {
     (void)ctx; (void)module;
     string s = {0};
     return s;
@@ -1720,19 +1728,15 @@ string MLIR_TranslateModuleToLLVMIR(MLIR_Context *ctx, MLIR_OpHandle module,
     return mlir_translate_to_llvm_ir_native(ctx, module);
 }
 
-// MLIR_TranslateModuleToWasm: not yet implemented for the native backend.
-// Returns an empty string so callers can detect failure. The upstream
-// backend (mlir_api_impl_upstream.cpp) provides the real implementation
-// via LLVM's WebAssembly target.
+// MLIR_TranslateModuleToWasm: native backend goes through
+// mlir_translate_to_wasm.c (wired in via mlir_translate_to_wasm_native).
+// Bare-metal builds (parser only) get the weak stub above which returns
+// an empty string. The upstream backend is only available in the
+// upstream-backed build (mlir_api_impl_upstream.cpp).
 string MLIR_TranslateModuleToWasm(MLIR_Context *ctx, MLIR_OpHandle module,
                                   MLIR_LoweringBackend backend) {
-    (void)ctx; (void)module; (void)backend;
-    // Native backend is not yet implemented; callers should use
-    // MLIR_LOWERING_UPSTREAM. Return an empty string to signal failure.
-    // (Native parser builds with -nostdlib/-nostdinc, so we can't print
-    // a diagnostic via stdio here.)
-    string s = {0};
-    return s;
+    (void)backend;
+    return mlir_translate_to_wasm_native(ctx, module);
 }
 
 #ifdef __cplusplus

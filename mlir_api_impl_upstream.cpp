@@ -1367,30 +1367,17 @@ extern "C" string MLIR_TranslateModuleToWasm(MLIR_Context *ctx,
     // llvm::Module is then fed to LLVM's WebAssembly TargetMachine — so
     // "native lowering + upstream wasm emit" exercises our own translator
     // while still producing real wasm.
+    if (backend == MLIR_LOWERING_NATIVE) {
+        // Pure-C native LLVM-dialect-MLIR -> wasm32 relocatable object
+        // emitter (mlir_translate_to_wasm.c). Bypasses LLVM entirely.
+        extern string mlir_translate_to_wasm_native(MLIR_Context *,
+                                                    MLIR_OpHandle);
+        return mlir_translate_to_wasm_native(ctx, module_h);
+    }
+
     llvm::LLVMContext llctx;
     std::unique_ptr<llvm::Module> llmod;
-    if (backend == MLIR_LOWERING_NATIVE) {
-        extern string mlir_translate_to_llvm_ir_native(MLIR_Context *, MLIR_OpHandle);
-        string ir_text = mlir_translate_to_llvm_ir_native(ctx, module_h);
-        if (ir_text.size == 0) {
-            std::fprintf(stderr,
-                         "MLIR_TranslateModuleToWasm: native translator returned empty IR\n");
-            return mkRefString(llvm::StringRef());
-        }
-        llvm::SMDiagnostic err;
-        llvm::StringRef ir_ref(ir_text.str, ir_text.size);
-        llmod = llvm::parseAssemblyString(ir_ref, err, llctx);
-        if (!llmod) {
-            std::string msg;
-            llvm::raw_string_ostream os(msg);
-            err.print("native-llvm-ir", os);
-            os.flush();
-            std::fprintf(stderr,
-                         "MLIR_TranslateModuleToWasm: failed to parse native LLVM IR:\n%s\n",
-                         msg.c_str());
-            return mkRefString(llvm::StringRef());
-        }
-    } else {
+    {
         mlir::registerBuiltinDialectTranslation(globalCtx().mctx);
         mlir::registerLLVMDialectTranslation(globalCtx().mctx);
         llmod = mlir::translateModuleToLLVMIR(module, llctx);
