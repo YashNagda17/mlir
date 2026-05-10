@@ -1720,9 +1720,10 @@ string MLIR_TranslateModuleToLLVMIR(MLIR_Context *ctx, MLIR_OpHandle module,
 string MLIR_TranslateModuleToWasm(MLIR_Context *ctx, MLIR_OpHandle module,
                                   MLIR_LoweringBackend backend) {
     (void)ctx; (void)module; (void)backend;
-    fprintf(stderr,
-            "MLIR_TranslateModuleToWasm: native backend is not implemented; "
-            "use MLIR_LOWERING_UPSTREAM\n");
+    // Native backend is not yet implemented; callers should use
+    // MLIR_LOWERING_UPSTREAM. Return an empty string to signal failure.
+    // (Native parser builds with -nostdlib/-nostdinc, so we can't print
+    // a diagnostic via stdio here.)
     string s = {0};
     return s;
 }
