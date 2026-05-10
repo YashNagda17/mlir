@@ -54,9 +54,12 @@ SOURCES=(
     corec/base/numconv.c
     corec/base/assert.c
     corec/base/exit.c
-    corec/platform/platform_linux.c
 )
 
+# platform_linux.c uses GCC/Clang-specific features (__attribute__((weak)),
+# inline assembly for raw syscalls) that tinyc doesn't support, so compile
+# it directly with clang and link the resulting .o, mirroring how
+# examples/tinyc/runtime.c is handled below.
 LL_FILES=()
 for src in "${SOURCES[@]}"; do
     base="$(basename "$src")"
@@ -66,11 +69,16 @@ for src in "${SOURCES[@]}"; do
     LL_FILES+=("$lpath")
 done
 
+PLATFORM_OBJ="$OUT/platform_linux.o"
+printf '[clang   ] %s -> %s\n' "corec/platform/platform_linux.c" "$PLATFORM_OBJ"
+clang -c -nostdlib -fno-builtin -I corec -I corec-stdlib/stdlib -I . -DNDEBUG \
+    -o "$PLATFORM_OBJ" corec/platform/platform_linux.c
+
 printf '[clang   ] link -> %s\n' "$BIN"
 # Compile examples/tinyc/runtime.c with clang (it intentionally uses system
 # stdio.h for the print* helpers and stdarg.h for the va_arg helpers — see
 # scripts/build_macos_tinyc.sh for the same pattern). Only the va_arg
 # helpers are referenced by the mlir parser bootstrap.
-clang -nostdlib -fno-builtin -o "$BIN" "${LL_FILES[@]}" examples/tinyc/runtime.c
+clang -nostdlib -fno-builtin -o "$BIN" "${LL_FILES[@]}" "$PLATFORM_OBJ" examples/tinyc/runtime.c
 
 printf 'Built %s via tinyC.\n' "$BIN"
