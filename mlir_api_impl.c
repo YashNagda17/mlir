@@ -1283,6 +1283,56 @@ bool MLIR_IsTypeOpaque(MLIR_TypeHandle th) {
     return t && t->kind == TYPE_KIND_OPAQUE;
 }
 
+// IR mutation primitives — stubbed on the native backend until Stage D.
+// The Stage B/C lowering lives in mlir_lower_to_llvm.c, called from the
+// upstream backend's NATIVE arm. These stubs let mlir_api_impl.c keep
+// linking; the native build doesn't yet exercise them.
+void MLIR_ReplaceAllUsesOfValue(MLIR_Context *ctx,
+                                MLIR_ValueHandle old_value,
+                                MLIR_ValueHandle new_value) {
+    (void)ctx; (void)old_value; (void)new_value;
+}
+
+void MLIR_EraseOp(MLIR_Context *ctx, MLIR_OpHandle op) {
+    (void)ctx; (void)op;
+}
+
+void MLIR_SetOpRegion(MLIR_Context *ctx, MLIR_OpHandle op, size_t idx,
+                      MLIR_RegionHandle region) {
+    (void)ctx; (void)op; (void)idx; (void)region;
+}
+
+MLIR_RegionHandle MLIR_TakeOpRegion(MLIR_Context *ctx, MLIR_OpHandle op,
+                                    size_t idx) {
+    (void)ctx; (void)op; (void)idx;
+    return MLIR_INVALID_HANDLE;
+}
+
+MLIR_BlockHandle MLIR_GetOpParentBlock(MLIR_OpHandle op) {
+    (void)op;
+    return MLIR_INVALID_HANDLE;
+}
+
+size_t MLIR_GetBlockOpIndex(MLIR_BlockHandle block, MLIR_OpHandle op) {
+    (void)block; (void)op;
+    return (size_t)-1;
+}
+
+MLIR_RegionHandle MLIR_GetBlockParentRegion(MLIR_BlockHandle block) {
+    (void)block;
+    return MLIR_INVALID_HANDLE;
+}
+
+void MLIR_MoveOpToBlockEnd(MLIR_Context *ctx, MLIR_OpHandle op,
+                           MLIR_BlockHandle dest) {
+    (void)ctx; (void)op; (void)dest;
+}
+
+void MLIR_MoveBlockToRegionEnd(MLIR_Context *ctx, MLIR_BlockHandle block,
+                               MLIR_RegionHandle dest) {
+    (void)ctx; (void)block; (void)dest;
+}
+
 // Lowering / LLVM IR translation are upstream-only for now. Stub them on
 // the native backend so binaries that link only the native impl still
 // resolve. Stage D will replace these stubs with a real native lowering

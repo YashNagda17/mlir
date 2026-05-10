@@ -17,6 +17,7 @@
 // that surface are stubbed with UNIMPLEMENTED().
 
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -1116,21 +1117,114 @@ extern "C" string MLIR_MLIR_OpTypeToString(MLIR_OpType type) {
 }
 
 // -----------------------------------------------------------------------------
+// IR mutation primitives (Stage B / Stage C use only)
+// -----------------------------------------------------------------------------
+
+extern "C" void MLIR_ReplaceAllUsesOfValue(MLIR_Context *,
+                                           MLIR_ValueHandle old_h,
+                                           MLIR_ValueHandle new_h) {
+    if (old_h == MLIR_INVALID_HANDLE || new_h == MLIR_INVALID_HANDLE) return;
+    auto *oldBox = F<ValueBox>(old_h);
+    auto *newBox = F<ValueBox>(new_h);
+    if (!oldBox->v || !newBox->v) return;
+    oldBox->v.replaceAllUsesWith(newBox->v);
+}
+
+extern "C" void MLIR_EraseOp(MLIR_Context *, MLIR_OpHandle op_h) {
+    if (op_h == MLIR_INVALID_HANDLE) return;
+    auto *op = F<mlir::Operation>(op_h);
+    op->erase();
+}
+
+extern "C" void MLIR_SetOpRegion(MLIR_Context *, MLIR_OpHandle op_h,
+                                 size_t idx, MLIR_RegionHandle region_h) {
+    if (op_h == MLIR_INVALID_HANDLE) return;
+    auto *op = F<mlir::Operation>(op_h);
+    if (idx >= op->getNumRegions()) return;
+    auto *newRegion = F<mlir::Region>(region_h);
+    auto &dst = op->getRegion(idx);
+    dst.takeBody(*newRegion);
+    delete newRegion;
+}
+
+extern "C" MLIR_RegionHandle MLIR_TakeOpRegion(MLIR_Context *,
+                                                MLIR_OpHandle op_h,
+                                                size_t idx) {
+    if (op_h == MLIR_INVALID_HANDLE) return MLIR_INVALID_HANDLE;
+    auto *op = F<mlir::Operation>(op_h);
+    if (idx >= op->getNumRegions()) return MLIR_INVALID_HANDLE;
+    auto *out = new mlir::Region();
+    out->takeBody(op->getRegion(idx));
+    return H(out);
+}
+
+extern "C" MLIR_BlockHandle MLIR_GetOpParentBlock(MLIR_OpHandle op_h) {
+    if (op_h == MLIR_INVALID_HANDLE) return MLIR_INVALID_HANDLE;
+    auto *op = F<mlir::Operation>(op_h);
+    auto *blk = op->getBlock();
+    return blk ? H(blk) : MLIR_INVALID_HANDLE;
+}
+
+extern "C" size_t MLIR_GetBlockOpIndex(MLIR_BlockHandle blk_h,
+                                       MLIR_OpHandle op_h) {
+    if (blk_h == MLIR_INVALID_HANDLE || op_h == MLIR_INVALID_HANDLE)
+        return SIZE_MAX;
+    auto *blk = F<mlir::Block>(blk_h);
+    auto *op  = F<mlir::Operation>(op_h);
+    size_t i = 0;
+    for (auto &o : blk->getOperations()) {
+        if (&o == op) return i;
+        i++;
+    }
+    return SIZE_MAX;
+}
+
+extern "C" MLIR_RegionHandle MLIR_GetBlockParentRegion(MLIR_BlockHandle blk_h) {
+    if (blk_h == MLIR_INVALID_HANDLE) return MLIR_INVALID_HANDLE;
+    auto *blk = F<mlir::Block>(blk_h);
+    auto *r = blk->getParent();
+    return r ? H(r) : MLIR_INVALID_HANDLE;
+}
+
+extern "C" void MLIR_MoveOpToBlockEnd(MLIR_Context *, MLIR_OpHandle op_h,
+                                       MLIR_BlockHandle dest_h) {
+    if (op_h == MLIR_INVALID_HANDLE || dest_h == MLIR_INVALID_HANDLE) return;
+    auto *op = F<mlir::Operation>(op_h);
+    auto *dest = F<mlir::Block>(dest_h);
+    op->moveBefore(dest, dest->end());
+}
+
+extern "C" void MLIR_MoveBlockToRegionEnd(MLIR_Context *, MLIR_BlockHandle blk_h,
+                                          MLIR_RegionHandle dest_h) {
+    if (blk_h == MLIR_INVALID_HANDLE || dest_h == MLIR_INVALID_HANDLE) return;
+    auto *blk = F<mlir::Block>(blk_h);
+    auto *dest = F<mlir::Region>(dest_h);
+    // Block::moveBefore requires the block to already have a parent region;
+    // for blocks that don't, just splice into dest directly.
+    if (blk->getParent() == nullptr) {
+        dest->push_back(blk);
+    } else {
+        blk->moveBefore(dest, dest->end());
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Lowering to LLVM dialect + translation to LLVM IR text
 // -----------------------------------------------------------------------------
 
+extern "C" bool mlir_lower_to_llvm_native(MLIR_Context *ctx, MLIR_OpHandle module);
+
 extern "C" bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module_h,
                                         MLIR_LoweringBackend backend) {
-    (void)ctx;
     auto *op = F<mlir::Operation>(module_h);
     auto module = llvm::dyn_cast<mlir::ModuleOp>(op);
     if (!module) {
         std::fprintf(stderr, "MLIR_LowerToLLVMDialect: handle is not a ModuleOp\n");
         return false;
     }
-    // For now, MLIR_LOWERING_NATIVE delegates to the upstream pipeline.
-    // Stage B will replace this branch with a walk via mlir_api.h.
-    (void)backend;
+    if (backend == MLIR_LOWERING_NATIVE) {
+        return mlir_lower_to_llvm_native(ctx, module_h);
+    }
     auto &mctx = globalCtx().mctx;
     mlir::PassManager pm(&mctx);
     pm.addPass(mlir::createConvertSCFToCFPass());

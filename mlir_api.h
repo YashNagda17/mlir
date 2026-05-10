@@ -478,6 +478,67 @@ MLIR_AttributeHandle MLIR_CreateAttributeType(MLIR_Context *ctx, string name, ML
 // must be the bare symbol name (no leading `@`).
 MLIR_AttributeHandle MLIR_CreateAttributeSymbolRef(MLIR_Context *ctx, string name, string value);
 
+// -----------------------------------------------------------------------------
+// IR mutation primitives (used by lowering passes).
+// -----------------------------------------------------------------------------
+
+// Replace every use of `old_value` with `new_value` everywhere in the
+// module that contains it. Operand lists, successor operand lists, and
+// any other places the value appears are updated. Both values must have
+// compatible types (the API does not check). After this call the old
+// value is unused and the op that produced it can typically be erased
+// with MLIR_EraseOp.
+//
+// Implementation note: the upstream backend uses
+// mlir::Value::replaceAllUsesWith. The native backend walks the module
+// linearly. In both cases the op definitions and value handles
+// themselves remain valid; only operand references move.
+void MLIR_ReplaceAllUsesOfValue(MLIR_Context *ctx,
+                                MLIR_ValueHandle old_value,
+                                MLIR_ValueHandle new_value);
+
+// Remove `op` from its parent block (if any) and detach it. The op is
+// not freed (the API leaves storage to the arena/allocator). Operands
+// to and results from `op` are not touched; callers should typically
+// have already called MLIR_ReplaceAllUsesOfValue on each result.
+void MLIR_EraseOp(MLIR_Context *ctx, MLIR_OpHandle op);
+
+// Replace one of `op`'s regions with `region`. The previously attached
+// region (if any) is detached and abandoned. Used when a lowering
+// rebuilds a function body wholesale rather than mutating it in place.
+void MLIR_SetOpRegion(MLIR_Context *ctx, MLIR_OpHandle op, size_t idx,
+                      MLIR_RegionHandle region);
+
+// Detach `op`'s region at `idx` and return it as a fresh handle. After
+// this call, `op` has an empty region at `idx`. The returned handle can
+// be passed as part of a new MLIR_CreateOp call (or to MLIR_SetOpRegion)
+// to graft the body onto a replacement op without copying.
+MLIR_RegionHandle MLIR_TakeOpRegion(MLIR_Context *ctx, MLIR_OpHandle op,
+                                    size_t idx);
+
+// Returns the block that contains `op`, or MLIR_INVALID_HANDLE if the
+// op is not currently attached to a block.
+MLIR_BlockHandle MLIR_GetOpParentBlock(MLIR_OpHandle op);
+
+// Returns the 0-indexed position of `op` within `block`'s operations
+// list, or SIZE_MAX if `op` is not in `block`.
+size_t MLIR_GetBlockOpIndex(MLIR_BlockHandle block, MLIR_OpHandle op);
+
+// Returns the region that contains `block`, or MLIR_INVALID_HANDLE if
+// the block is not currently attached to a region.
+MLIR_RegionHandle MLIR_GetBlockParentRegion(MLIR_BlockHandle block);
+
+// Detaches `op` from its current parent block (if any) and appends it
+// to the end of `dest`. Operand/result handles, attributes, and regions
+// of `op` are unchanged.
+void MLIR_MoveOpToBlockEnd(MLIR_Context *ctx, MLIR_OpHandle op,
+                           MLIR_BlockHandle dest);
+
+// Detaches `block` from its current parent region (if any) and appends
+// it to the end of `dest`. The block's ops and arguments are preserved.
+void MLIR_MoveBlockToRegionEnd(MLIR_Context *ctx, MLIR_BlockHandle block,
+                               MLIR_RegionHandle dest);
+
 // Introspection
 typedef enum {
     MLIR_ATTR_KIND_INTEGER,
