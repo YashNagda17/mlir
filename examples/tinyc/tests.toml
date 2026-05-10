@@ -386,11 +386,15 @@ expected_stdout = "110\n"
 name = "libc_fputs_stdout"
 platforms = ["linux"]
 expected_stdout = "hello\nworld\n"
+# wasm_skip: needs fputs/stdout (not provided by runtime_wasm.c).
+wasm_skip = true
 
 [[test]]
 name = "libc_fputc_stdout"
 platforms = ["linux"]
 expected_stdout = "AB\n"
+# wasm_skip: needs fputc/stdout (not provided by runtime_wasm.c).
+wasm_skip = true
 
 [[test]]
 name = "libc_file_io"
