@@ -44,6 +44,7 @@ expected_stdout = "30\n9\n"
 
 [[test]]
 name = "pointer"
+wasm_native_run = true
 expected_stdout = "42\n42\n"
 
 [[test]]
@@ -80,6 +81,7 @@ expected_stdout = "1\n0\n1\n0\n0\n42\n99\n"
 
 [[test]]
 name = "sizeof_basic"
+wasm_native_run = true
 expected_stdout = "4\n4\n8\n16\n"
 
 [[test]]
@@ -100,6 +102,7 @@ expected_stdout = "15\n13\n39\n9\n4\n10\n2\n1\n"
 
 [[test]]
 name = "bitwise"
+wasm_native_run = true
 expected_stdout = "1\n7\n6\n-1\n8\n4\n8\n5\n2\n16\n4\n"
 
 [[test]]
@@ -170,6 +173,7 @@ expected_stdout = "1\n2\n3\n2\n1\n5\n"
 
 [[test]]
 name = "const_fold"
+wasm_native_run = true
 expected_stdout = "7\n19\n8\n2\n2\n-1\n1\n0\n15\n1\n0\n42\n99\n1\n0\n16\n"
 
 [[test]]
@@ -182,6 +186,7 @@ expected_stdout = "1\n2\n3\n2\n1\n10\n11\n12\n1\n7\n9\n"
 
 [[test]]
 name = "enum_shadow"
+wasm_native_run = true
 expected_stdout = "1\n2\n3\n1\n"
 
 [[test]]
@@ -190,18 +195,22 @@ expected_stdout = "42\n7\n25\n9\n42\n0\n30\n6\n0\n101\nhello\n"
 
 [[test]]
 name = "pp_ifdef"
+wasm_native_run = true
 expected_stdout = "1\n2\n3\n4\n5\n6\n"
 
 [[test]]
 name = "pp_include"
+wasm_native_run = true
 expected_stdout = "7\n25\n13\n"
 
 [[test]]
 name = "pp_pragma_once"
+wasm_native_run = true
 expected_stdout = "7\n7\n"
 
 [[test]]
 name = "pp_if_expr"
+wasm_native_run = true
 expected_stdout = "1\n2\n3\n4\n5\n6\n7\n8\n9\n"
 
 [[test]]
@@ -210,6 +219,7 @@ expected_stdout = "7\n-1\n42\n"
 
 [[test]]
 name = "void_param"
+wasm_native_run = true
 expected_stdout = "42\n7\n42\n"
 
 [[test]]
@@ -222,6 +232,7 @@ expected_stdout = "1\n2\n3\n25\n27\n30\n"
 
 [[test]]
 name = "ptr_to_ptr"
+wasm_native_run = true
 expected_stdout = "41\n42\n"
 
 [[test]]
@@ -230,10 +241,12 @@ expected_stdout = "5\n7\n"
 
 [[test]]
 name = "i64_basic"
+wasm_native_run = true
 expected_stdout = "300\n900\n"
 
 [[test]]
 name = "i64_mixed"
+wasm_native_run = true
 expected_stdout = "15\n5\n50\n"
 
 [[test]]
@@ -335,6 +348,7 @@ expected_stdout = "11\n12\n7\n8\n63\n11\n12\n7\n8\n63\n"
 
 [[test]]
 name = "multi_basic"
+wasm_native_run = true
 sources = ["multi_basic_a.tc", "multi_basic_b.tc"]
 expected_stdout = "5\n"
 
@@ -350,11 +364,13 @@ expected_stdout = "11\n"
 
 [[test]]
 name = "multi_pp_isolation"
+wasm_native_run = true
 sources = ["multi_pp_isolation_a.tc", "multi_pp_isolation_b.tc"]
 expected_stdout = "1\n2\n"
 
 [[test]]
 name = "multi_three_files"
+wasm_native_run = true
 sources = ["multi_three_files_a.tc", "multi_three_files_b.tc", "multi_three_files_c.tc"]
 expected_stdout = "20\n100\n8\n"
 
@@ -454,6 +470,7 @@ expected_stdout = "13\n7\n25\n15\n"
 
 [[test]]
 name = "cast_int"
+wasm_native_run = true
 expected_stdout = "100\n7000\n-1\n"
 
 [[test]]
@@ -486,10 +503,12 @@ expected_stdout = "1\n2\n3\n4\n5\n9\n100\n8\n16\n32\n"
 
 [[test]]
 name = "hex_int"
+wasm_native_run = true
 expected_stdout = "64\n100\n255\n43981\n"
 
 [[test]]
 name = "multi_decl"
+wasm_native_run = true
 expected_stdout = "1\n2\n3\n10\n5\n20\n1\n2\n100\n200\n"
 
 [[test]]
