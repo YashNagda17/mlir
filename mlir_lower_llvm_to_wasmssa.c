@@ -281,9 +281,7 @@ static void push_yield(FnCtx *F, YieldFrame fr) {
     F->yield_stack[F->n_ys++] = fr;
 }
 static void pop_yield(FnCtx *F) {
-    YieldFrame *top = &F->yield_stack[--F->n_ys];
-    free(top->carrier_ids);
-    free(top->carrier_vts);
+    --F->n_ys;
 }
 
 static void vmap_set(FnCtx *F, MLIR_ValueHandle k, MLIR_ValueHandle v) {
@@ -468,9 +466,9 @@ static MLIR_ValueHandle emit_wrap_i64_to_i32(FnCtx *F, MLIR_ValueHandle v) {
     return commit_op(F, &o);
 }
 
-// Parse a "array<i32: v0, v1, ...>" string into a heap-allocated int32_t
+// Parse a "array<i32: v0, v1, ...>" string into an arena-allocated int32_t
 // vector; returns NULL on parse failure. Sets *n_out.
-static int32_t *parse_dense_i32_array(string s, size_t *n_out) {
+static int32_t *parse_dense_i32_array(Arena *arena, string s, size_t *n_out) {
     *n_out = 0;
     const char *p = s.str;
     const char *end = s.str + s.size;
@@ -480,24 +478,29 @@ static int32_t *parse_dense_i32_array(string s, size_t *n_out) {
     p += plen;
     // Allow "array<i32>" (empty) or "array<i32: ...>".
     while (p < end && *p == ' ') p++;
-    if (p < end && *p == '>') { return (int32_t *)malloc(sizeof(int32_t)); }
+    if (p < end && *p == '>') {
+        return (int32_t *)arena_alloc(arena, sizeof(int32_t));
+    }
     if (p >= end || *p != ':') return NULL;
     p++;
-    int32_t *vs = NULL; size_t n = 0, c = 0;
+    // Upper bound the element count by counting commas + 1.
+    size_t cap = 1;
+    for (const char *q = p; q < end && *q != '>'; q++) if (*q == ',') cap++;
+    int32_t *vs = (int32_t *)arena_alloc(arena, cap * sizeof(int32_t));
+    size_t n = 0;
     while (p < end && *p != '>') {
         while (p < end && (*p == ' ' || *p == ',')) p++;
         if (p >= end || *p == '>') break;
         bool neg = false;
         if (*p == '-') { neg = true; p++; }
-        if (p >= end || *p < '0' || *p > '9') { free(vs); return NULL; }
+        if (p >= end || *p < '0' || *p > '9') return NULL;
         int64_t v = 0;
         while (p < end && *p >= '0' && *p <= '9') { v = v*10 + (*p - '0'); p++; }
         if (neg) v = -v;
-        if (n == c) { c = c ? c*2 : 4; vs = (int32_t *)realloc(vs, c * sizeof(int32_t)); }
         vs[n++] = (int32_t)v;
     }
     *n_out = n;
-    return vs ? vs : (int32_t *)malloc(sizeof(int32_t));
+    return vs;
 }
 
 // Look up a name as a function symbol in the module under construction
@@ -585,12 +588,12 @@ static bool lower_scf_if(FnCtx *F, MLIR_OpHandle op) {
     uint32_t *cids = NULL;
     uint8_t  *cvts = NULL;
     if (n_results) {
-        cids = (uint32_t *)malloc(n_results * sizeof(uint32_t));
-        cvts = (uint8_t *)malloc(n_results);
+        cids = (uint32_t *)arena_alloc(F->arena, n_results * sizeof(uint32_t));
+        cvts = (uint8_t *)arena_alloc(F->arena, n_results);
         for (size_t i = 0; i < n_results; i++) {
             MLIR_ValueHandle r = MLIR_GetOpResult(op, i);
             uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(r));
-            if (vt == 0) { free(cids); free(cvts); return false; }
+            if (vt == 0) return false;
             cvts[i] = vt;
             cids[i] = alloc_carrier(F, vt);
         }
@@ -600,8 +603,8 @@ static bool lower_scf_if(FnCtx *F, MLIR_OpHandle op) {
 
     YieldFrame yf = {0};
     if (n_results) {
-        yf.carrier_ids = (uint32_t *)malloc(n_results * sizeof(uint32_t));
-        yf.carrier_vts = (uint8_t *)malloc(n_results);
+        yf.carrier_ids = (uint32_t *)arena_alloc(F->arena, n_results * sizeof(uint32_t));
+        yf.carrier_vts = (uint8_t *)arena_alloc(F->arena, n_results);
         memcpy(yf.carrier_ids, cids, n_results * sizeof(uint32_t));
         memcpy(yf.carrier_vts, cvts, n_results);
         yf.n = (int)n_results;
@@ -634,14 +637,11 @@ static bool lower_scf_if(FnCtx *F, MLIR_OpHandle op) {
         MLIR_ValueHandle gidx = emit_carrier_get(F, cids[i], cvts[i]);
         vmap_set(F, MLIR_GetOpResult(op, i), gidx);
     }
-    free(cids); free(cvts);
     return true;
 fail:
     if (F->n_ys && F->yield_stack[F->n_ys-1].carrier_ids == yf.carrier_ids) {
-        // Fixed: avoid double free; pop properly.
         pop_yield(F);
     }
-    free(cids); free(cvts);
     return false;
 }
 
@@ -685,8 +685,8 @@ static bool lower_scf_while(FnCtx *F, MLIR_OpHandle op) {
     uint32_t *iter_c = NULL; uint8_t *iter_v = NULL;
     uint32_t *tr_c   = NULL; uint8_t *tr_v   = NULL;
     if (n_iter) {
-        iter_c = (uint32_t *)malloc(n_iter * sizeof(uint32_t));
-        iter_v = (uint8_t *)malloc(n_iter);
+        iter_c = (uint32_t *)arena_alloc(F->arena, n_iter * sizeof(uint32_t));
+        iter_v = (uint8_t *)arena_alloc(F->arena, n_iter);
         for (size_t i = 0; i < n_iter; i++) {
             uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(MLIR_GetOpOperand(op, i)));
             if (vt == 0) goto fail;
@@ -698,8 +698,8 @@ static bool lower_scf_while(FnCtx *F, MLIR_OpHandle op) {
         }
     }
     if (n_res) {
-        tr_c = (uint32_t *)malloc(n_res * sizeof(uint32_t));
-        tr_v = (uint8_t *)malloc(n_res);
+        tr_c = (uint32_t *)arena_alloc(F->arena, n_res * sizeof(uint32_t));
+        tr_v = (uint8_t *)arena_alloc(F->arena, n_res);
         for (size_t i = 0; i < n_res; i++) {
             uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(MLIR_GetOpResult(op, i)));
             if (vt == 0) goto fail;
@@ -773,10 +773,8 @@ static bool lower_scf_while(FnCtx *F, MLIR_OpHandle op) {
         vmap_set(F, MLIR_GetOpResult(op, i), g);
     }
 
-    free(iter_c); free(iter_v); free(tr_c); free(tr_v);
     return true;
 fail:
-    free(iter_c); free(iter_v); free(tr_c); free(tr_v);
     return false;
 }
 
@@ -801,7 +799,7 @@ static bool lower_scf_index_switch(FnCtx *F, MLIR_OpHandle op) {
     int64_t *case_vals = NULL;
     size_t   n_parsed = 0;
     if (n_cases > 0) {
-        case_vals = (int64_t *)malloc(n_cases * sizeof(int64_t));
+        case_vals = (int64_t *)arena_alloc(F->arena, n_cases * sizeof(int64_t));
         size_t p = 0;
         while (p < cs.size && cs.str[p] != ':') p++;
         if (p < cs.size) p++;
@@ -817,18 +815,18 @@ static bool lower_scf_index_switch(FnCtx *F, MLIR_OpHandle op) {
             }
             case_vals[n_parsed++] = sign * v;
         }
-        if (n_parsed != n_cases) { free(case_vals); return false; }
+        if (n_parsed != n_cases) return false;
     }
 
     // Allocate result carriers.
     size_t n_results = MLIR_GetOpNumResults(op);
     uint32_t *cids = NULL; uint8_t *cvts = NULL;
     if (n_results) {
-        cids = (uint32_t *)malloc(n_results * sizeof(uint32_t));
-        cvts = (uint8_t *)malloc(n_results);
+        cids = (uint32_t *)arena_alloc(F->arena, n_results * sizeof(uint32_t));
+        cvts = (uint8_t *)arena_alloc(F->arena, n_results);
         for (size_t i = 0; i < n_results; i++) {
             uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(MLIR_GetOpResult(op, i)));
-            if (vt == 0) { free(cids); free(cvts); free(case_vals); return false; }
+            if (vt == 0) return false;
             cvts[i] = vt;
             cids[i] = alloc_carrier(F, vt);
         }
@@ -836,8 +834,8 @@ static bool lower_scf_index_switch(FnCtx *F, MLIR_OpHandle op) {
 
     YieldFrame yf = {0};
     if (n_results) {
-        yf.carrier_ids = (uint32_t *)malloc(n_results * sizeof(uint32_t));
-        yf.carrier_vts = (uint8_t *)malloc(n_results);
+        yf.carrier_ids = (uint32_t *)arena_alloc(F->arena, n_results * sizeof(uint32_t));
+        yf.carrier_vts = (uint8_t *)arena_alloc(F->arena, n_results);
         memcpy(yf.carrier_ids, cids, n_results * sizeof(uint32_t));
         memcpy(yf.carrier_vts, cvts, n_results);
         yf.n = (int)n_results;
@@ -860,14 +858,14 @@ static bool lower_scf_index_switch(FnCtx *F, MLIR_OpHandle op) {
         emit_marker(F, OP_TYPE_WASMSSA_IF_BEGIN, 0x40, eq_idx, 0);
         // Lower case-region body (region i+1).
         MLIR_RegionHandle cr = MLIR_GetOpRegion(op, i + 1);
-        if (MLIR_GetRegionNumBlocks(cr) != 1) goto fail;
-        if (!lower_block(F, MLIR_GetRegionBlock(cr, 0))) goto fail;
+        if (MLIR_GetRegionNumBlocks(cr) != 1) return false;
+        if (!lower_block(F, MLIR_GetRegionBlock(cr, 0))) return false;
         emit_marker(F, OP_TYPE_WASMSSA_IF_ELSE, 0, MLIR_INVALID_HANDLE, 0);
     }
     // Innermost else: default region.
     MLIR_RegionHandle dr = MLIR_GetOpRegion(op, 0);
-    if (MLIR_GetRegionNumBlocks(dr) != 1) goto fail;
-    if (!lower_block(F, MLIR_GetRegionBlock(dr, 0))) goto fail;
+    if (MLIR_GetRegionNumBlocks(dr) != 1) return false;
+    if (!lower_block(F, MLIR_GetRegionBlock(dr, 0))) return false;
     for (size_t i = 0; i < n_cases; i++) {
         emit_marker(F, OP_TYPE_WASMSSA_END, 0, MLIR_INVALID_HANDLE, 0);
     }
@@ -877,11 +875,7 @@ static bool lower_scf_index_switch(FnCtx *F, MLIR_OpHandle op) {
         MLIR_ValueHandle g = emit_carrier_get(F, cids[i], cvts[i]);
         vmap_set(F, MLIR_GetOpResult(op, i), g);
     }
-    free(cids); free(cvts); free(case_vals);
     return true;
-fail:
-    free(cids); free(cvts); free(case_vals);
-    return false;
 }
 
 static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op);
@@ -1566,12 +1560,11 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
                 size_t no = MLIR_GetOpNumOperands(op);
                 size_t nvar = no - nfixed;
                 uint32_t total = 0; size_t nf2 = 0;
-                uint32_t *offs = (uint32_t *)malloc((nvar ? nvar : 1) * sizeof(uint32_t));
+                uint32_t *offs = (uint32_t *)arena_alloc(F->arena, (nvar ? nvar : 1) * sizeof(uint32_t));
                 if (!va_call_layout(F, op, &total, &nf2, offs)) {
-                    free(offs);
                     return false;
                 }
-                if (F->sp_value == MLIR_INVALID_HANDLE) { free(offs); return false; }
+                if (F->sp_value == MLIR_INVALID_HANDLE) { return false; }
                 // buf_addr = sp_def + va_buf_offset
                 MLIR_ValueHandle buf_addr;
                 if (F->va_buf_offset == 0) {
@@ -1586,7 +1579,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
                     MLIR_TypeHandle aty = MLIR_GetValueType(av);
                     uint8_t vt = wasm_vt(F->ctx, aty);
                     MLIR_ValueHandle va;
-                    if (!vmap_get(F, av, &va)) { free(offs); return false; }
+                    if (!vmap_get(F, av, &va)) { return false; }
                     uint8_t st_vt = vt;
                     unsigned sz, align_log2;
                     if (vt == WT_I32)      { sz = 4; align_log2 = 2; }
@@ -1607,7 +1600,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
                         sz = 8; align_log2 = 3;
                     }
                     else if (vt == WT_F64) { sz = 8; align_log2 = 3; }
-                    else { free(offs); return false; }
+                    else { return false; }
                     wasmssa_op_t o2 = {0};
                     o2.type = OP_TYPE_WASMSSA_STORE;
                     o2.valtype = st_vt;
@@ -1619,7 +1612,6 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
                     o2.operands = o2_ops;
                     (void)commit_op(F, &o2);
                 }
-                free(offs);
 
                 // Now emit the call with fixed args + buf_addr.
                 string nm = MLIR_GetAttributeAsString(F->ctx, callee);
@@ -1702,9 +1694,9 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
         MLIR_AttributeHandle ria = find_attr(op, "rawConstantIndices");
         if (ria == MLIR_INVALID_HANDLE) return false;
         size_t n_idx = 0;
-        int32_t *cidx = parse_dense_i32_array(
+        int32_t *cidx = parse_dense_i32_array(F->arena,
             MLIR_GetAttributeAsString(F->ctx, ria), &n_idx);
-        if (!cidx || n_idx == 0) { free(cidx); return false; }
+        if (!cidx || n_idx == 0) return false;
 
         size_t op_idx = 1;
         MLIR_TypeHandle cur_ty = elem_ty;
@@ -1712,12 +1704,12 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
             bool is_dyn = (cidx[i] == (int32_t)0x80000000);
             MLIR_ValueHandle dyn_def = MLIR_INVALID_HANDLE;
             if (is_dyn) {
-                if (op_idx >= MLIR_GetOpNumOperands(op)) { free(cidx); return false; }
+                if (op_idx >= MLIR_GetOpNumOperands(op)) return false;
                 MLIR_ValueHandle ov = MLIR_GetOpOperand(op, op_idx++);
-                if (!vmap_get(F, ov, &dyn_def)) { free(cidx); return false; }
+                if (!vmap_get(F, ov, &dyn_def)) return false;
                 uint8_t ovt = wasm_vt(F->ctx, MLIR_GetValueType(ov));
                 if (ovt == WT_I64) dyn_def = emit_wrap_i64_to_i32(F, dyn_def);
-                else if (ovt != WT_I32) { free(cidx); return false; }
+                else if (ovt != WT_I32) return false;
             }
 
             if (i == 0) {
@@ -1738,7 +1730,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
                     addr = emit_add_i32(F, addr, k);
                 }
             } else if (MLIR_IsTypeLLVMStruct(cur_ty)) {
-                if (is_dyn) { free(cidx); return false; }
+                if (is_dyn) return false;
                 unsigned off = struct_field_offset(F->ctx, cur_ty, (size_t)cidx[i]);
                 if (off != 0) {
                     MLIR_ValueHandle k = emit_const_i32(F, (int32_t)off);
@@ -1748,7 +1740,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
             } else if (MLIR_IsTypeLLVMArray(cur_ty)) {
                 MLIR_TypeHandle et = MLIR_GetTypeLLVMArrayElement(cur_ty);
                 unsigned esz = type_size_bytes(F->ctx, et);
-                if (esz == 0) { free(cidx); return false; }
+                if (esz == 0) return false;
                 if (is_dyn) {
                     MLIR_ValueHandle k = emit_const_i32(F, (int32_t)esz);
                     MLIR_ValueHandle m = emit_mul_i32(F, dyn_def, k);
@@ -1759,11 +1751,9 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
                 }
                 cur_ty = et;
             } else {
-                free(cidx);
                 return false;
             }
         }
-        free(cidx);
         vmap_set(F, r, addr);
         return true;
     }
@@ -2161,7 +2151,7 @@ fail:
 // =============================================================================
 // Module walker.
 // =============================================================================
-static bool sig_for_func(MLIR_Context *ctx, MLIR_OpHandle fn,
+static bool sig_for_func(MLIR_Context *ctx, Arena *arena, MLIR_OpHandle fn,
                          uint8_t **out_p, size_t *out_np,
                          uint8_t **out_r, size_t *out_nr) {
     MLIR_AttributeHandle ftya = find_attr(fn, "function_type");
@@ -2171,17 +2161,17 @@ static bool sig_for_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     size_t no = MLIR_GetTypeFunctionNumResults(fty);
     bool is_vararg = MLIR_GetTypeFunctionIsVarArg(fty);
     size_t pn = ni + (is_vararg ? 1 : 0);
-    uint8_t *p = (uint8_t *)malloc(pn ? pn : 1);
+    uint8_t *p = (uint8_t *)arena_alloc(arena, pn ? pn : 1);
     for (size_t i = 0; i < ni; i++) {
         uint8_t v = wasm_vt(ctx, MLIR_GetTypeFunctionInput(fty, i));
-        if (v == 0) { free(p); return false; }
+        if (v == 0) return false;
         p[i] = v;
     }
     if (is_vararg) p[ni] = WT_I32;  // hidden va_list pointer
-    uint8_t *r = (uint8_t *)malloc(no ? no : 1);
+    uint8_t *r = (uint8_t *)arena_alloc(arena, no ? no : 1);
     for (size_t i = 0; i < no; i++) {
         uint8_t v = wasm_vt(ctx, MLIR_GetTypeFunctionResult(fty, i));
-        if (v == 0) { free(p); free(r); return false; }
+        if (v == 0) return false;
         r[i] = v;
     }
     *out_p = p; *out_np = pn;
@@ -2474,14 +2464,13 @@ MLIR_OpHandle mlir_lower_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module
                         MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 0)) > 0;
         if (has_body) continue;
         uint8_t *p, *r; size_t np, nr;
-        if (!sig_for_func(ctx, op, &p, &np, &r, &nr)) {
+        if (!sig_for_func(ctx, arena, op, &p, &np, &r, &nr)) {
             return MLIR_INVALID_HANDLE;
         }
         MLIR_AttributeHandle sa = find_attr(op, "sym_name");
         string nm = MLIR_GetAttributeString(sa);
 
         emit_import_func(ctx, arena, body, nm, p, np, r, nr);
-        free(p); free(r);
     }
 
     // Pass 2: defined funcs in source order. `is_function_symbol`
@@ -2494,7 +2483,7 @@ MLIR_OpHandle mlir_lower_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module
                         MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 0)) > 0;
         if (!has_body) continue;
         uint8_t *p, *r; size_t np, nr;
-        if (!sig_for_func(ctx, op, &p, &np, &r, &nr)) {
+        if (!sig_for_func(ctx, arena, op, &p, &np, &r, &nr)) {
             return MLIR_INVALID_HANDLE;
         }
         MLIR_AttributeHandle sa = find_attr(op, "sym_name");
@@ -2504,10 +2493,8 @@ MLIR_OpHandle mlir_lower_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module
 
         if (!lower_function(ctx, arena, &mod, body, nm, is_main,
                             op, p, np, r, nr)) {
-            free(p); free(r);
             return MLIR_INVALID_HANDLE;
         }
-        free(p); free(r);
     }
 
     // Pass 3: globals last (matches the legacy emit ordering of
