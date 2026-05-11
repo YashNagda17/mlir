@@ -36,8 +36,8 @@ LOWERING = os.environ.get("TINYC_LOWERING", "upstream")
 # Code-generation/runtime target for the suite. "native" (default) emits
 # LLVM IR via tinyc, then llc + host CC + runtime.c. "wasm" emits a
 # wasm32 object via tinyc, then wasm-ld + runtime_wasm.c, and runs the
-# resulting .wasm via wasmtime. The wasm target requires
-# TINYC_LOWERING=upstream (the native lowering does not implement wasm).
+# resulting .wasm via wasmtime. Both TINYC_LOWERING values are valid
+# with the wasm target.
 TARGET = os.environ.get("TINYC_TARGET", "native")
 
 
@@ -157,9 +157,10 @@ def main():
             print(f"SKIP {name} (wasm_skip)")
             skipped += 1
             continue
-        # The native LLVM->WASM translator (mlir_translate_to_wasm.c) is
-        # being grown incrementally and only handles a small subset of
-        # tinyc programs. Tests known to work under it must opt in via
+        # The native LLVM->WASM pipeline (mlir_llvm_to_wasmssa.c +
+        # mlir_wasmssa_to_wasmstack.c + mlir_wasmstack_to_bin.c) covers
+        # the vast majority of tinyc programs but a handful still trip
+        # unimplemented corners. Such tests must opt in via
         # `wasm_native_run = true`; everything else is skipped when
         # LOWERING=native is combined with TARGET=wasm.
         if TARGET == "wasm" and LOWERING == "native" and not t.get("wasm_native_run"):
