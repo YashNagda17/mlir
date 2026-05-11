@@ -140,21 +140,22 @@ only; for that binary use `pixi run test_tinyc_native`.
 
 ### How the native pipeline is structured
 
-The native LLVM-dialect → wasm path lives in three MLIR-to-MLIR stages
-plus a thin façade:
+The native LLVM-dialect → wasm path lives in three MLIR-to-MLIR stages:
 
-- `mlir_lower_llvm_to_wasmssa.c` — Stage 1: LLVM dialect → wasmssa
+- `mlir_llvm_to_wasmssa.c` — Stage 1: LLVM dialect → wasmssa
   (also runs `lift-cf-to-scf` first to recover structured control
   flow from `cf.br`/`cf.cond_br`).
-- `mlir_stackify_wasmssa.c` — Stage 2: wasmssa → wasmstack (linearises
+- `mlir_wasmssa_to_wasmstack.c` — Stage 2: wasmssa → wasmstack (linearises
   SSA results onto the wasm value stack, inserts block/loop/if/end).
-- `mlir_translate_wasmstack_to_binary.c` — Stage 3: wasmstack → `.wasm.o`
+- `mlir_wasmstack_to_bin.c` — Stage 3: wasmstack → `.wasm.o`
   (emits the wasm binary including type/import/function/table/memory/
   global/export/element/code/data sections plus relocation metadata
   consumed by `wasm-ld`).
-- `mlir_wasm_print.c` — generic-MLIR printer used by `--emit=wasmssa`
-  and `--emit=wasmstack`.
-- `mlir_translate_to_wasm.c` — façade chaining the three stages.
+- `mlir_wasm_to_wat.c` — generic-MLIR printer used by `--emit=wasmssa`
+  and `--emit=wasmstack`, plus a `.wasm` → WAT disassembler.
+
+`MLIR_TranslateModuleToWasm` chains the three stages directly inside
+`mlir_api_impl.c` / `mlir_api_impl_upstream.cpp`.
 
 ## Why this exists
 

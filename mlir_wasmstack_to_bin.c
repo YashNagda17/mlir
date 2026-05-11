@@ -24,7 +24,8 @@
 
 #include "mlir_api.h"
 #include "mlir_op_names.h"
-#include "mlir_wasm_pipeline.h"
+#include "mlir_llvm_to_wasmssa.h"
+#include "mlir_wasmstack_to_bin.h"
 
 // =============================================================================
 // Growable byte buffer + LEB128 encoders.
@@ -705,8 +706,8 @@ static void build_reloc_code_section(EmFunc *funcs, size_t n_funcs,
 // =============================================================================
 // Top-level translator. Walks the input wasmstack-MLIR module directly.
 // =============================================================================
-string mlir_translate_wasmstack_to_binary(MLIR_Context *ctx,
-                                          MLIR_OpHandle stk_module) {
+string mlir_wasmstack_to_bin(MLIR_Context *ctx,
+                             MLIR_OpHandle stk_module) {
     string fail = {0};
     if (!stk_module) return fail;
 

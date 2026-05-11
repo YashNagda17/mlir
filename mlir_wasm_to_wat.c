@@ -17,7 +17,7 @@
 #include <base/string.h>
 
 #include "mlir_api.h"
-#include "mlir_wasm_pipeline.h"
+#include "mlir_wasm_to_wat.h"
 
 // =============================================================================
 // Growable byte buffer.

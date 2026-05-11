@@ -8,6 +8,11 @@
 #include "mlir_api.h"
 #include "mlir_op_names.h"
 #include "mlir_parser.h"
+#ifdef MLIR_HAS_NATIVE_LOWERING
+#include "mlir_llvm_to_wasmssa.h"
+#include "mlir_wasmssa_to_wasmstack.h"
+#include "mlir_wasmstack_to_bin.h"
+#endif
 #include <string.h>
 
 #ifdef __cplusplus
@@ -1734,7 +1739,6 @@ void MLIR_MoveBlockToRegionEnd(MLIR_Context *ctx, MLIR_BlockHandle block,
 
 bool mlir_lower_to_llvm_native(MLIR_Context *ctx, MLIR_OpHandle module);
 string mlir_translate_to_llvm_ir_native(MLIR_Context *ctx, MLIR_OpHandle module);
-string mlir_translate_to_wasm_native(MLIR_Context *ctx, MLIR_OpHandle module);
 
 #ifndef MLIR_HAS_NATIVE_LOWERING
 MLIR_NATIVE_LOWERING_WEAK bool
@@ -1745,13 +1749,6 @@ mlir_lower_to_llvm_native(MLIR_Context *ctx, MLIR_OpHandle module) {
 
 MLIR_NATIVE_LOWERING_WEAK string
 mlir_translate_to_llvm_ir_native(MLIR_Context *ctx, MLIR_OpHandle module) {
-    (void)ctx; (void)module;
-    string s = {0};
-    return s;
-}
-
-MLIR_NATIVE_LOWERING_WEAK string
-mlir_translate_to_wasm_native(MLIR_Context *ctx, MLIR_OpHandle module) {
     (void)ctx; (void)module;
     string s = {0};
     return s;
@@ -1779,15 +1776,26 @@ string MLIR_TranslateModuleToLLVMIR(MLIR_Context *ctx, MLIR_OpHandle module,
     return mlir_translate_to_llvm_ir_native(ctx, module);
 }
 
-// MLIR_TranslateModuleToWasm: native backend goes through
-// mlir_translate_to_wasm.c (wired in via mlir_translate_to_wasm_native).
-// Bare-metal builds (parser only) get the weak stub above which returns
-// an empty string. The upstream backend is only available in the
+// MLIR_TranslateModuleToWasm: native backend chains the three stages
+// (llvm->wasmssa, wasmssa->wasmstack, wasmstack->bin) directly. Bare-metal
+// builds (parser only) don't define MLIR_HAS_NATIVE_LOWERING and get an
+// empty-string fallback. The upstream backend is only available in the
 // upstream-backed build (mlir_api_impl_upstream.cpp).
 string MLIR_TranslateModuleToWasm(MLIR_Context *ctx, MLIR_OpHandle module,
                                   MLIR_LoweringBackend backend) {
     (void)backend;
-    return mlir_translate_to_wasm_native(ctx, module);
+#ifdef MLIR_HAS_NATIVE_LOWERING
+    string fail = {0};
+    MLIR_OpHandle ssa = mlir_llvm_to_wasmssa(ctx, module);
+    if (!ssa) return fail;
+    MLIR_OpHandle stk = mlir_wasmssa_to_wasmstack(ctx, ssa);
+    if (!stk) return fail;
+    return mlir_wasmstack_to_bin(ctx, stk);
+#else
+    (void)ctx; (void)module;
+    string s = {0};
+    return s;
+#endif
 }
 
 #ifdef __cplusplus

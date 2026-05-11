@@ -10,7 +10,9 @@
 #include <platform/platform.h>
 
 #include "mlir_api.h"
-#include "mlir_wasm_pipeline.h"
+#include "mlir_llvm_to_wasmssa.h"
+#include "mlir_wasmssa_to_wasmstack.h"
+#include "mlir_wasm_to_wat.h"
 #include "tinyc.h"
 
 extern string read_file_ok(Arena *arena, string path);
@@ -170,7 +172,7 @@ int app_main(void) {
     }
     string out;
     if (emit_wasmssa) {
-        MLIR_OpHandle ssa = mlir_lower_llvm_to_wasmssa(&ctx, module);
+        MLIR_OpHandle ssa = mlir_llvm_to_wasmssa(&ctx, module);
         if (ssa == MLIR_INVALID_HANDLE) {
             arena_destroy(arena);
             arena_destroy(boot_arena);
@@ -178,13 +180,13 @@ int app_main(void) {
         }
         out = MLIR_PrintOperationGeneric(&ctx, ssa);
     } else if (emit_wasmstack) {
-        MLIR_OpHandle ssa = mlir_lower_llvm_to_wasmssa(&ctx, module);
+        MLIR_OpHandle ssa = mlir_llvm_to_wasmssa(&ctx, module);
         if (ssa == MLIR_INVALID_HANDLE) {
             arena_destroy(arena);
             arena_destroy(boot_arena);
             return 1;
         }
-        MLIR_OpHandle stk = mlir_stackify_wasmssa(&ctx, ssa);
+        MLIR_OpHandle stk = mlir_wasmssa_to_wasmstack(&ctx, ssa);
         if (stk == MLIR_INVALID_HANDLE) {
             arena_destroy(arena);
             arena_destroy(boot_arena);

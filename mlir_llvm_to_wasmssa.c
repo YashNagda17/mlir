@@ -24,7 +24,7 @@
 
 #include "mlir_api.h"
 #include "mlir_op_names.h"
-#include "mlir_wasm_pipeline.h"
+#include "mlir_llvm_to_wasmssa.h"
 #include <base/vector.h>
 
 #include <base/arena.h>
@@ -2421,7 +2421,7 @@ static void emit_import_func(MLIR_Context *ctx, Arena *arena,
 // retained. Output ordering (matches the prior two-pass implementation
 // byte-for-byte): import_funcs, then defined funcs, then import_globals.
 // =============================================================================
-MLIR_OpHandle mlir_lower_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
+MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
     MLIR_RegionHandle mr = MLIR_GetOpRegion(module, 0);
     MLIR_BlockHandle  mb = MLIR_GetRegionBlock(mr, 0);
     size_t nops = MLIR_GetBlockNumOps(mb);

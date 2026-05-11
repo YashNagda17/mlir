@@ -6,7 +6,8 @@
 name = "simple"
 expected_stdout = "3\n"
 # Opt-in for the still-incomplete native LLVM->WASM translator
-# (mlir_translate_to_wasm.c). Other tests fall back to SKIP under
+# (mlir_llvm_to_wasmssa + mlir_wasmssa_to_wasmstack + mlir_wasmstack_to_bin).
+# Other tests fall back to SKIP under
 # LOWERING=native + TARGET=wasm until coverage grows.
 wasm_native_run = true
 

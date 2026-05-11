@@ -31,7 +31,8 @@
 
 #include "mlir_api.h"
 #include "mlir_op_names.h"
-#include "mlir_wasm_pipeline.h"
+#include "mlir_llvm_to_wasmssa.h"
+#include "mlir_wasmssa_to_wasmstack.h"
 
 // =============================================================================
 // MLIR builder helpers.
@@ -439,7 +440,7 @@ static MLIR_OpHandle convert_global(MLIR_Context *ctx, MLIR_OpHandle src) {
 // =============================================================================
 // Top-level: walk input module body, build output module body.
 // =============================================================================
-MLIR_OpHandle mlir_stackify_wasmssa(MLIR_Context *ctx, MLIR_OpHandle ssa_module) {
+MLIR_OpHandle mlir_wasmssa_to_wasmstack(MLIR_Context *ctx, MLIR_OpHandle ssa_module) {
     if (!ssa_module) return MLIR_INVALID_HANDLE;
     if (MLIR_GetOpNumRegions(ssa_module) < 1) return MLIR_INVALID_HANDLE;
     MLIR_RegionHandle mr = MLIR_GetOpRegion(ssa_module, 0);

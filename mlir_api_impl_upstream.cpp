@@ -1545,10 +1545,18 @@ extern "C" string MLIR_TranslateModuleToWasm(MLIR_Context *ctx,
     // while still producing real wasm.
     if (backend == MLIR_LOWERING_NATIVE) {
         // Pure-C native LLVM-dialect-MLIR -> wasm32 relocatable object
-        // emitter (mlir_translate_to_wasm.c). Bypasses LLVM entirely.
-        extern string mlir_translate_to_wasm_native(MLIR_Context *,
-                                                    MLIR_OpHandle);
-        return mlir_translate_to_wasm_native(ctx, module_h);
+        // emitter (three-stage pipeline). Bypasses LLVM entirely.
+        extern MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *,
+                                                 MLIR_OpHandle);
+        extern MLIR_OpHandle mlir_wasmssa_to_wasmstack(MLIR_Context *,
+                                                      MLIR_OpHandle);
+        extern string mlir_wasmstack_to_bin(MLIR_Context *, MLIR_OpHandle);
+        string fail = {0};
+        MLIR_OpHandle ssa = mlir_llvm_to_wasmssa(ctx, module_h);
+        if (!ssa) return fail;
+        MLIR_OpHandle stk = mlir_wasmssa_to_wasmstack(ctx, ssa);
+        if (!stk) return fail;
+        return mlir_wasmstack_to_bin(ctx, stk);
     }
 
     llvm::LLVMContext llctx;
