@@ -25,6 +25,7 @@
 #include "mlir_api.h"
 #include "mlir_op_names.h"
 #include "mlir_wasm_pipeline.h"
+#include <base/vector.h>
 
 #include <base/arena.h>
 #include <base/string.h>
@@ -232,6 +233,11 @@ typedef struct {
     uint32_t  br_depth;         // depth for that br
 } YieldFrame;
 
+DEFINE_VECTOR_FOR_TYPE(VMapEntry,  VecVMap)
+DEFINE_VECTOR_FOR_TYPE(AMapEntry,  VecAMap)
+DEFINE_VECTOR_FOR_TYPE(uint8_t,    VecU8)
+DEFINE_VECTOR_FOR_TYPE(YieldFrame, VecYieldFrame)
+
 typedef struct {
     MLIR_Context   *ctx;
     Arena          *arena;   // for hex-encoded attribute strings
@@ -242,10 +248,10 @@ typedef struct {
     MLIR_BlockHandle  body_block;
 
     // Map LLVM-dialect MLIR_ValueHandle -> wasmssa MLIR_ValueHandle.
-    VMapEntry *vmap; size_t n_vmap, c_vmap;
+    VecVMap vmap;
 
     // Map MLIR_ValueHandle (alloca result) -> shadow-stack frame offset.
-    AMapEntry *amap; size_t n_amap, c_amap;
+    VecAMap amap;
 
     uint32_t          frame_size;
     MLIR_ValueHandle  sp_value;        // post-decrement SP, or MLIR_INVALID_HANDLE
@@ -257,60 +263,41 @@ typedef struct {
 
     uint32_t  next_carrier;
     // Carrier valtypes: index by carrier_id.
-    uint8_t  *carrier_vts; size_t n_cvt, c_cvt;
+    VecU8 carrier_vts;
 
-    YieldFrame *yield_stack; size_t n_ys, c_ys;
+    VecYieldFrame yield_stack;
 } FnCtx;
 
 static uint32_t alloc_carrier(FnCtx *F, uint8_t vt) {
-    if (F->n_cvt == F->c_cvt) {
-        F->c_cvt = F->c_cvt ? F->c_cvt * 2 : 8;
-        F->carrier_vts = (uint8_t *)realloc(F->carrier_vts, F->c_cvt);
-    }
-    uint32_t id = (uint32_t)F->n_cvt;
-    F->carrier_vts[F->n_cvt++] = vt;
-    F->next_carrier = (uint32_t)F->n_cvt;
+    uint32_t id = (uint32_t)F->carrier_vts.size;
+    VecU8_push_back(F->arena, &F->carrier_vts, vt);
+    F->next_carrier = (uint32_t)F->carrier_vts.size;
     return id;
 }
 static void push_yield(FnCtx *F, YieldFrame fr) {
-    if (F->n_ys == F->c_ys) {
-        F->c_ys = F->c_ys ? F->c_ys * 2 : 4;
-        F->yield_stack = (YieldFrame *)realloc(F->yield_stack,
-                                              F->c_ys * sizeof(YieldFrame));
-    }
-    F->yield_stack[F->n_ys++] = fr;
+    VecYieldFrame_push_back(F->arena, &F->yield_stack, fr);
 }
 static void pop_yield(FnCtx *F) {
-    --F->n_ys;
+    --F->yield_stack.size;
 }
 
 static void vmap_set(FnCtx *F, MLIR_ValueHandle k, MLIR_ValueHandle v) {
-    if (F->n_vmap == F->c_vmap) {
-        F->c_vmap = F->c_vmap ? F->c_vmap * 2 : 16;
-        F->vmap = (VMapEntry *)realloc(F->vmap, F->c_vmap * sizeof(VMapEntry));
-    }
-    F->vmap[F->n_vmap].key = (uintptr_t)k;
-    F->vmap[F->n_vmap].val = v;
-    F->n_vmap++;
+    VMapEntry e = { (uintptr_t)k, v };
+    VecVMap_push_back(F->arena, &F->vmap, e);
 }
 static int vmap_get(FnCtx *F, MLIR_ValueHandle k, MLIR_ValueHandle *out) {
-    for (size_t i = 0; i < F->n_vmap; i++) {
-        if (F->vmap[i].key == (uintptr_t)k) { *out = F->vmap[i].val; return 1; }
+    for (size_t i = 0; i < F->vmap.size; i++) {
+        if (F->vmap.data[i].key == (uintptr_t)k) { *out = F->vmap.data[i].val; return 1; }
     }
     return 0;
 }
 static void amap_set(FnCtx *F, MLIR_ValueHandle v, uint32_t off) {
-    if (F->n_amap == F->c_amap) {
-        F->c_amap = F->c_amap ? F->c_amap * 2 : 8;
-        F->amap = (AMapEntry *)realloc(F->amap, F->c_amap * sizeof(AMapEntry));
-    }
-    F->amap[F->n_amap].key = (uintptr_t)v;
-    F->amap[F->n_amap].off = off;
-    F->n_amap++;
+    AMapEntry e = { (uintptr_t)v, off };
+    VecAMap_push_back(F->arena, &F->amap, e);
 }
 static int amap_get(FnCtx *F, MLIR_ValueHandle v, uint32_t *out) {
-    for (size_t i = 0; i < F->n_amap; i++) {
-        if (F->amap[i].key == (uintptr_t)v) { *out = F->amap[i].off; return 1; }
+    for (size_t i = 0; i < F->amap.size; i++) {
+        if (F->amap.data[i].key == (uintptr_t)v) { *out = F->amap.data[i].off; return 1; }
     }
     return 0;
 }
@@ -639,7 +626,7 @@ static bool lower_scf_if(FnCtx *F, MLIR_OpHandle op) {
     }
     return true;
 fail:
-    if (F->n_ys && F->yield_stack[F->n_ys-1].carrier_ids == yf.carrier_ids) {
+    if (F->yield_stack.size && F->yield_stack.data[F->yield_stack.size-1].carrier_ids == yf.carrier_ids) {
         pop_yield(F);
     }
     return false;
@@ -898,8 +885,8 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
 
     // ---- scf.yield (operand-bearing): stash into the active yield ctx ----
     if (name_eq(name, "scf.yield")) {
-        if (F->n_ys == 0) return false;
-        YieldFrame *yf = &F->yield_stack[F->n_ys - 1];
+        if (F->yield_stack.size == 0) return false;
+        YieldFrame *yf = &F->yield_stack.data[F->yield_stack.size - 1];
         size_t no = MLIR_GetOpNumOperands(op);
         if ((int)no != yf->n) return false;
         for (size_t i = 0; i < no; i++) {
@@ -2066,6 +2053,10 @@ static bool lower_function(MLIR_Context *ctx, Arena *arena, ModCtx *mod,
     F.n_params = n_params;
     F.sp_value = MLIR_INVALID_HANDLE;
     F.va_list_value = MLIR_INVALID_HANDLE;
+    VecVMap_reserve(arena, &F.vmap, 16);
+    VecAMap_reserve(arena, &F.amap, 8);
+    VecU8_reserve(arena, &F.carrier_vts, 8);
+    VecYieldFrame_reserve(arena, &F.yield_stack, 4);
 
     // If this function is variadic, sig_for_func has appended a synthetic
     // i32 va_list param at index n_params-1. The MLIR entry block only has
@@ -2126,7 +2117,7 @@ static bool lower_function(MLIR_Context *ctx, Arena *arena, ModCtx *mod,
         attrs[na++] = attr_s_hex(ctx, arena, "result_types", result_types, n_results);
         attrs[na++] = attr_b(ctx, "exported", exported);
         attrs[na++] = attr_s_hex(ctx, arena, "carrier_types",
-                                 F.carrier_vts, F.n_cvt);
+                                 F.carrier_vts.data, F.carrier_vts.size);
 
         MLIR_RegionHandle region = MLIR_CreateRegion(ctx);
         MLIR_AppendRegionBlock(ctx, region, F.body_block);
@@ -2139,12 +2130,8 @@ static bool lower_function(MLIR_Context *ctx, Arena *arena, ModCtx *mod,
         MLIR_AppendBlockOp(ctx, mod_body, op);
     }
 
-    free(F.vmap); free(F.amap);
-    free(F.carrier_vts); free(F.yield_stack);
     return true;
 fail:
-    free(F.vmap); free(F.amap);
-    free(F.carrier_vts); free(F.yield_stack);
     return false;
 }
 
