@@ -1330,6 +1330,76 @@ extern "C" void MLIR_MoveBlockToRegionEnd(MLIR_Context *, MLIR_BlockHandle blk_h
     }
 }
 
+extern "C" void MLIR_SetOpOperand(MLIR_Context *, MLIR_OpHandle op_h,
+                                  size_t idx, MLIR_ValueHandle v_h) {
+    if (op_h == MLIR_INVALID_HANDLE) return;
+    auto *op = F<mlir::Operation>(op_h);
+    if (idx >= op->getNumOperands()) return;
+    auto *box = F<ValueBox>(v_h);
+    if (!box || !box->v) return;
+    op->setOperand(static_cast<unsigned>(idx), box->v);
+}
+
+extern "C" void MLIR_SetOpSuccessor(MLIR_Context *, MLIR_OpHandle op_h,
+                                    size_t succ_idx, MLIR_BlockHandle blk_h) {
+    if (op_h == MLIR_INVALID_HANDLE) return;
+    auto *op = F<mlir::Operation>(op_h);
+    if (succ_idx >= op->getNumSuccessors()) return;
+    auto *blk = (blk_h == MLIR_INVALID_HANDLE) ? nullptr : F<mlir::Block>(blk_h);
+    op->setSuccessor(blk, static_cast<unsigned>(succ_idx));
+}
+
+extern "C" void MLIR_SetOpSuccessorOperands(MLIR_Context *, MLIR_OpHandle op_h,
+                                            size_t succ_idx,
+                                            const MLIR_ValueHandle *values, size_t n) {
+    if (op_h == MLIR_INVALID_HANDLE) return;
+    auto *op = F<mlir::Operation>(op_h);
+    auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(op);
+    if (!branch) return;
+    if (succ_idx >= op->getNumSuccessors()) return;
+    mlir::SuccessorOperands sops = branch.getSuccessorOperands(static_cast<unsigned>(succ_idx));
+    mlir::MutableOperandRange mut = sops.getMutableForwardedOperands();
+    llvm::SmallVector<mlir::Value, 8> vals;
+    vals.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        if (values && values[i] != MLIR_INVALID_HANDLE) {
+            auto *box = F<ValueBox>(values[i]);
+            vals.push_back(box ? box->v : mlir::Value());
+        } else {
+            vals.push_back(mlir::Value());
+        }
+    }
+    mut.assign(vals);
+}
+
+extern "C" void MLIR_EraseBlock(MLIR_Context *, MLIR_BlockHandle blk_h) {
+    if (blk_h == MLIR_INVALID_HANDLE) return;
+    auto *blk = F<mlir::Block>(blk_h);
+    if (blk->getParent() != nullptr) {
+        // Detach without freeing contained ops/args.
+        blk->getParent()->getBlocks().remove(blk);
+    }
+}
+
+extern "C" void MLIR_InsertRegionBlockAfter(MLIR_Context *, MLIR_RegionHandle region_h,
+                                            MLIR_BlockHandle blk_h,
+                                            MLIR_BlockHandle after_h) {
+    if (region_h == MLIR_INVALID_HANDLE || blk_h == MLIR_INVALID_HANDLE) return;
+    auto *region = F<mlir::Region>(region_h);
+    auto *blk = F<mlir::Block>(blk_h);
+    // Detach block from any current region first.
+    if (blk->getParent() != nullptr)
+        blk->getParent()->getBlocks().remove(blk);
+    if (after_h == MLIR_INVALID_HANDLE) {
+        region->getBlocks().push_front(blk);
+        return;
+    }
+    auto *after = F<mlir::Block>(after_h);
+    // Insert right after `after`.
+    auto it = std::next(after->getIterator());
+    region->getBlocks().insert(it, blk);
+}
+
 // -----------------------------------------------------------------------------
 // Upstream-only lowering / translation entry points (the *Upstream
 // siblings of the agnostic functions in mlir_lower_to_llvm.c,

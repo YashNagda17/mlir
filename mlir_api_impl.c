@@ -1719,6 +1719,99 @@ void MLIR_MoveBlockToRegionEnd(MLIR_Context *ctx, MLIR_BlockHandle block,
     MLIR_AppendRegionBlock(ctx, dest, block);
 }
 
+void MLIR_SetOpOperand(MLIR_Context *ctx, MLIR_OpHandle op,
+                       size_t idx, MLIR_ValueHandle value) {
+    (void)ctx;
+    IR_Op *o = resolve_op(op);
+    if (!o || idx >= o->n_operands) return;
+    o->operands[idx] = value;
+}
+
+void MLIR_SetOpSuccessor(MLIR_Context *ctx, MLIR_OpHandle op,
+                         size_t succ_idx, MLIR_BlockHandle block) {
+    (void)ctx;
+    IR_Op *o = resolve_op(op);
+    if (!o || succ_idx >= o->n_successors) return;
+    o->successors[succ_idx] = block;
+}
+
+void MLIR_SetOpSuccessorOperands(MLIR_Context *ctx, MLIR_OpHandle op,
+                                 size_t succ_idx,
+                                 const MLIR_ValueHandle *values, size_t n) {
+    IR_Op *o = resolve_op(op);
+    if (!o || succ_idx >= o->n_successors) return;
+    Arena *arena = MLIR_GetArenaAllocator(ctx);
+    if (!o->successor_operands) {
+        o->successor_operands = arena_new_array(arena, MLIR_ValueHandle *, o->n_successors);
+        for (size_t s = 0; s < o->n_successors; s++) o->successor_operands[s] = NULL;
+    }
+    if (!o->n_successor_operands) {
+        o->n_successor_operands = arena_new_array(arena, uint64_t, o->n_successors);
+        for (size_t s = 0; s < o->n_successors; s++) o->n_successor_operands[s] = 0;
+    }
+    if (n > 0) {
+        MLIR_ValueHandle *arr = arena_new_array(arena, MLIR_ValueHandle, n);
+        if (values) memcpy(arr, values, n * sizeof(MLIR_ValueHandle));
+        o->successor_operands[succ_idx] = arr;
+    } else {
+        o->successor_operands[succ_idx] = NULL;
+    }
+    o->n_successor_operands[succ_idx] = (uint64_t)n;
+}
+
+void MLIR_EraseBlock(MLIR_Context *ctx, MLIR_BlockHandle block) {
+    (void)ctx;
+    IR_Block *b = resolve_block(block);
+    if (!b) return;
+    IR_Region *r = resolve_region(b->parent_region);
+    if (r) {
+        size_t w = 0;
+        for (size_t i = 0; i < r->n_blocks; i++) {
+            if (r->blocks[i] != block) r->blocks[w++] = r->blocks[i];
+        }
+        r->n_blocks = w;
+    }
+    b->parent_region = MLIR_INVALID_HANDLE;
+}
+
+void MLIR_InsertRegionBlockAfter(MLIR_Context *ctx, MLIR_RegionHandle region,
+                                 MLIR_BlockHandle block, MLIR_BlockHandle after) {
+    if (region == MLIR_INVALID_HANDLE || block == MLIR_INVALID_HANDLE) return;
+    IR_Block *b = resolve_block(block);
+    if (!b) return;
+    // Detach from current region if any.
+    IR_Region *cur = resolve_region(b->parent_region);
+    if (cur) {
+        size_t w = 0;
+        for (size_t i = 0; i < cur->n_blocks; i++) {
+            if (cur->blocks[i] != block) cur->blocks[w++] = cur->blocks[i];
+        }
+        cur->n_blocks = w;
+    }
+    b->parent_region = MLIR_INVALID_HANDLE;
+
+    IR_Region *r = resolve_region(region);
+    if (!r) return;
+    Arena *arena = MLIR_GetArenaAllocator(ctx);
+    // Find insertion index. after == MLIR_INVALID_HANDLE means insert at front.
+    size_t insert_at = 0;
+    if (after != MLIR_INVALID_HANDLE) {
+        insert_at = r->n_blocks; // default: append if `after` not found
+        for (size_t i = 0; i < r->n_blocks; i++) {
+            if (r->blocks[i] == after) { insert_at = i + 1; break; }
+        }
+    }
+    // Grow.
+    MLIR_BlockHandle *nb = arena_new_array(arena, MLIR_BlockHandle, r->n_blocks + 1);
+    if (insert_at > 0) memcpy(nb, r->blocks, insert_at * sizeof(MLIR_BlockHandle));
+    nb[insert_at] = block;
+    if (insert_at < r->n_blocks)
+        memcpy(nb + insert_at + 1, r->blocks + insert_at, (r->n_blocks - insert_at) * sizeof(MLIR_BlockHandle));
+    r->blocks = nb;
+    r->n_blocks++;
+    b->parent_region = region;
+}
+
 // The lowering / LLVM-IR-translation / wasm-translation entry points
 // declared in mlir_api.h are implemented in dedicated agnostic
 // translation units (mlir_lower_to_llvm.c, mlir_translate_to_llvm_ir.c,

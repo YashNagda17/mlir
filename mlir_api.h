@@ -693,6 +693,41 @@ void MLIR_MoveOpToBlockEnd(MLIR_Context *ctx, MLIR_OpHandle op,
 void MLIR_MoveBlockToRegionEnd(MLIR_Context *ctx, MLIR_BlockHandle block,
                                MLIR_RegionHandle dest);
 
+// Replace operand `idx` of `op` with `value`. The previous operand
+// reference is dropped (use lists are updated transparently by the
+// upstream backend; the native backend simply overwrites the slot).
+void MLIR_SetOpOperand(MLIR_Context *ctx, MLIR_OpHandle op,
+                       size_t idx, MLIR_ValueHandle value);
+
+// Replace successor `succ_idx` of `op` with `block`. `op` must be a
+// terminator with at least `succ_idx + 1` successors. This does not
+// touch the successor operands; use MLIR_SetOpSuccessorOperands to
+// rewrite them.
+void MLIR_SetOpSuccessor(MLIR_Context *ctx, MLIR_OpHandle op,
+                         size_t succ_idx, MLIR_BlockHandle block);
+
+// Replace the entire successor-operand list at `succ_idx` of `op` with
+// the given `values[0..n)`. On the upstream backend, successor operands
+// share storage with regular operands via BranchOpInterface; this
+// function resizes that segment so the count after the call is exactly
+// `n`. On the native backend, the per-successor operand vector is
+// reallocated.
+void MLIR_SetOpSuccessorOperands(MLIR_Context *ctx, MLIR_OpHandle op,
+                                 size_t succ_idx,
+                                 const MLIR_ValueHandle *values, size_t n);
+
+// Detach `block` from its parent region (if any) and forget about it.
+// Ops contained in `block` are NOT erased; callers should detach or
+// erase them first to avoid dangling references.
+void MLIR_EraseBlock(MLIR_Context *ctx, MLIR_BlockHandle block);
+
+// Insert `block` into `region` immediately after `after`. If `after`
+// is MLIR_INVALID_HANDLE the block is inserted at the start of the
+// region. `block` must not already belong to a region; otherwise it is
+// detached from its current parent first.
+void MLIR_InsertRegionBlockAfter(MLIR_Context *ctx, MLIR_RegionHandle region,
+                                 MLIR_BlockHandle block, MLIR_BlockHandle after);
+
 // Introspection
 typedef enum {
     MLIR_ATTR_KIND_INTEGER,
