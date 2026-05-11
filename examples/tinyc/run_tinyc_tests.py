@@ -157,14 +157,14 @@ def main():
             print(f"SKIP {name} (wasm_skip)")
             skipped += 1
             continue
-        # The native LLVM->WASM pipeline (mlir_llvm_to_wasmssa.c +
-        # mlir_wasmssa_to_wasmstack.c + mlir_wasmstack_to_bin.c) covers
-        # the vast majority of tinyc programs but a handful still trip
-        # unimplemented corners. Such tests must opt in via
-        # `wasm_native_run = true`; everything else is skipped when
-        # LOWERING=native is combined with TARGET=wasm.
-        if TARGET == "wasm" and LOWERING == "native" and not t.get("wasm_native_run"):
-            print(f"SKIP {name} (wasm_native: not yet supported)")
+        # Optional opt-out for the native LLVM->WASM pipeline only
+        # (mlir_llvm_to_wasmssa.c + mlir_wasmssa_to_wasmstack.c +
+        # mlir_wasmstack_to_bin.c). Covers the few corners the in-tree
+        # pipeline doesn't implement yet; the upstream wasm path still
+        # runs the test.
+        if (TARGET == "wasm" and LOWERING == "native"
+                and t.get("wasm_native_skip")):
+            print(f"SKIP {name} (wasm_native_skip)")
             skipped += 1
             continue
         # Multi-file tests pass `sources = [...]`; single-file tests
