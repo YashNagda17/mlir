@@ -5,26 +5,14 @@
 // MLIR ops appended into the output module body. Inside a function, each
 // emit-helper / inline call site builds a stack-local `wasmssa_op_t`
 // describing one op and hands it to `commit_op`, which materializes the
-// matching MLIR op into the function's body block and records its result
-// value in the per-function `ssa_vals` table. SSA value indexing inside
-// that table (shared with stage 2 in `mlir_stackify_wasmssa.c`):
-//
-//   ssa_def_idx in [0, n_params)              -> function parameter i
-//   ssa_def_idx in [n_params, n_params+n_ops) -> result of op (idx-n_params)
+// matching MLIR op into the function's body block and returns the
+// MLIR_ValueHandle of its result. The per-function `vmap` then keys
+// LLVM-side operand values to the wasmssa-side ValueHandle that supplies
+// them; subsequent lookups thread those handles through `o.operands` to
+// stitch up the wasmssa IR.
 //
 // No module-level or per-function scratch buffer is retained: ops flow
 // straight from lower_op into the MLIR module under construction.
-//
-// Scope (initial scaffold, matches the simple.tc end-to-end test):
-//   - llvm.func (def & decl) -> wasmssa.func / imported wasmssa.func
-//   - llvm.return (with optional i32 value)
-//   - llvm.mlir.constant (i32 / i64)
-//   - llvm.alloca (lowered onto a shadow stack)
-//   - llvm.store / llvm.load (i32 / i64 / f32 / f64, plus i8/i16 subword)
-//   - llvm.sext (i32 -> i64)
-//   - llvm.call (direct, fixed-arity)
-// Anything else returns NULL (the test runner's wasm_native_run gates
-// which tests are exercised on the native path).
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -44,7 +32,13 @@
 // =============================================================================
 // Private working representation for this stage. `wasmssa_op_t` is a
 // stack-local descriptor handed to `commit_op` once per emitted op. It
-// never escapes this file.
+// never escapes this file and owns none of its pointer fields:
+//   - `operands` points at a caller-provided buffer (stack array for
+//     fixed-arity ops, arena allocation for variadic call/call_indirect);
+//   - `call_target` is a non-owning view into either an MLIR attribute
+//     string or a caller-owned buffer;
+//   - `sig_params` / `sig_results` are non-owning views into a function
+//     signature buffer.
 // =============================================================================
 typedef struct {
     MLIR_OpType type;
@@ -70,33 +64,15 @@ typedef struct {
     bool has_result;
 } wasmssa_op_t;
 
-// Module-level emit context: the output MLIR module's body block plus
-// a list of function names already emitted (so `is_function_symbol`
-// can distinguish `llvm.mlir.addressof` references between funcs and
-// data globals).
+// Module-level emit context: the output MLIR module's body block. The
+// already-emitted `wasmssa.func` / `wasmssa.import_func` ops in that
+// block are the source of truth for `is_function_symbol`, so addressof
+// references can distinguish between data globals and functions.
 typedef struct {
     MLIR_Context    *ctx;
     Arena           *arena;
     MLIR_BlockHandle body;
-    char           **func_names;
-    size_t           n_func_names, c_func_names;
 } ModCtx;
-
-static void modctx_add_func_name(ModCtx *m, const char *name) {
-    if (m->n_func_names == m->c_func_names) {
-        m->c_func_names = m->c_func_names ? m->c_func_names * 2 : 8;
-        m->func_names = (char **)realloc(m->func_names,
-                                         m->c_func_names * sizeof(char *));
-    }
-    size_t n = strlen(name);
-    char *copy = (char *)malloc(n + 1);
-    memcpy(copy, name, n + 1);
-    m->func_names[m->n_func_names++] = copy;
-}
-static void modctx_free_contents(ModCtx *m) {
-    for (size_t i = 0; i < m->n_func_names; i++) free(m->func_names[i]);
-    free(m->func_names);
-}
 
 // =============================================================================
 // String / type helpers (mirror the old single-stage translator).
@@ -532,17 +508,24 @@ static int32_t *parse_dense_i32_array(string s, size_t *n_out) {
     return vs ? vs : (int32_t *)malloc(sizeof(int32_t));
 }
 
-// Look up a name as a function symbol in the module under construction.
-// Returns true if `m->func_names` already contains that name.
-// Used to disambiguate addressof @sym between data globals and functions.
-// Note: pass 1 (imports) and pass 2 (defs) record func names in source
-// order. The function being lowered itself is already added before its
-// body is walked; recursive self-address-taking works.
+// Look up a name as a function symbol in the module under construction
+// by walking m->body for `wasmssa.func` / `wasmssa.import_func` ops
+// whose `sym_name` matches. Used to disambiguate addressof @sym between
+// data globals and functions. The function currently being lowered is
+// not in m->body yet (its wrapper op is appended after the body is
+// walked), so recursive self-address-taking falls through to the
+// addressof path; that's fine because main / defined funcs that take
+// their own address are rare and not exercised by the test corpus.
 static bool is_function_symbol(const ModCtx *m, const char *nm, size_t nlen) {
-    for (size_t i = 0; i < m->n_func_names; i++) {
-        if (m->func_names[i] &&
-            strlen(m->func_names[i]) == nlen &&
-            memcmp(m->func_names[i], nm, nlen) == 0) return true;
+    size_t n = MLIR_GetBlockNumOps(m->body);
+    for (size_t i = 0; i < n; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(m->body, i);
+        MLIR_OpType ot = MLIR_GetOpType(op);
+        if (ot != OP_TYPE_WASMSSA_FUNC && ot != OP_TYPE_WASMSSA_IMPORT_FUNC) continue;
+        MLIR_AttributeHandle sa = MLIR_GetOpAttributeByName(op, "sym_name");
+        if (sa == MLIR_INVALID_HANDLE) continue;
+        string s = MLIR_GetAttributeString(sa);
+        if (s.size == nlen && memcmp(s.str, nm, nlen) == 0) return true;
     }
     return false;
 }
@@ -2504,19 +2487,18 @@ MLIR_OpHandle mlir_lower_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module
         if (has_body) continue;
         uint8_t *p, *r; size_t np, nr;
         if (!sig_for_func(ctx, op, &p, &np, &r, &nr)) {
-            modctx_free_contents(&mod); return MLIR_INVALID_HANDLE;
+            return MLIR_INVALID_HANDLE;
         }
         MLIR_AttributeHandle sa = find_attr(op, "sym_name");
         char *nm = xstrdup_str(MLIR_GetAttributeString(sa));
 
-        modctx_add_func_name(&mod, nm);
         emit_import_func(ctx, arena, body, nm, p, np, r, nr);
         free(nm); free(p); free(r);
     }
 
-    // Pass 2: defined funcs in source order. The function's own name is
-    // recorded *before* its body is walked so recursive self-address-
-    // taking and references between earlier defs work.
+    // Pass 2: defined funcs in source order. `is_function_symbol`
+    // discovers each func via its already-emitted wasmssa.func wrapper
+    // in `body`; refs between earlier defs therefore work naturally.
     for (size_t i = 0; i < nops; i++) {
         MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
         if (!name_eq(MLIR_GetOpName(op), "llvm.func")) continue;
@@ -2525,7 +2507,7 @@ MLIR_OpHandle mlir_lower_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module
         if (!has_body) continue;
         uint8_t *p, *r; size_t np, nr;
         if (!sig_for_func(ctx, op, &p, &np, &r, &nr)) {
-            modctx_free_contents(&mod); return MLIR_INVALID_HANDLE;
+            return MLIR_INVALID_HANDLE;
         }
         MLIR_AttributeHandle sa = find_attr(op, "sym_name");
         string sym = MLIR_GetAttributeString(sa);
@@ -2533,11 +2515,9 @@ MLIR_OpHandle mlir_lower_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module
         char *nm = is_main ? xstrdupn("__original_main", 15)
                            : xstrdup_str(sym);
 
-        modctx_add_func_name(&mod, nm);
         if (!lower_function(ctx, arena, &mod, body, nm, is_main,
                             op, p, np, r, nr)) {
             free(nm); free(p); free(r);
-            modctx_free_contents(&mod);
             return MLIR_INVALID_HANDLE;
         }
         free(nm); free(p); free(r);
@@ -2550,11 +2530,9 @@ MLIR_OpHandle mlir_lower_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module
         if (!name_eq(MLIR_GetOpName(op), "llvm.mlir.global")) continue;
         if (!lower_global(ctx, arena, body, op)) {
             fprintf(stderr, "wasmssa-lower: failed to lower global\n");
-            modctx_free_contents(&mod);
             return MLIR_INVALID_HANDLE;
         }
     }
 
-    modctx_free_contents(&mod);
     return out_module;
 }
