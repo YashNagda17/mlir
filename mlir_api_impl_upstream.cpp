@@ -143,6 +143,23 @@ opUserAttrs() {
     return m;
 }
 
+// Separate stash for MLIR_GetOpAttributeByName, which sometimes needs to
+// materialise a NamedAttribute that doesn't live in `op->getAttrs()` (e.g.
+// LLVM::CallOp's inherent `callee` / `var_callee_type` properties). Using
+// unique_ptr keeps element addresses stable across subsequent push_backs
+// so previously-returned MLIR_AttributeHandle pointers stay valid.
+//
+// Keyed by op so it can be cleared alongside opUserAttrs() when ops are
+// erased by a conversion pass, avoiding the unbounded process-lifetime
+// growth a single thread_local stash would suffer in a long-running host.
+std::unordered_map<const mlir::Operation *,
+                   std::vector<std::unique_ptr<mlir::NamedAttribute>>> &
+opByNameAttrs() {
+    static std::unordered_map<const mlir::Operation *,
+                              std::vector<std::unique_ptr<mlir::NamedAttribute>>> m;
+    return m;
+}
+
 ValueBox *boxFor(mlir::Value v) {
     auto &m = valueIndex();
     auto it = m.find(v.getAsOpaquePointer());
@@ -469,7 +486,7 @@ extern "C" MLIR_AttributeHandle MLIR_GetOpAttribute(MLIR_OpHandle h, size_t i) {
 extern "C" MLIR_AttributeHandle MLIR_GetOpAttributeByName(MLIR_OpHandle h,
                                                           const char *name) {
     auto *op = F<mlir::Operation>(h);
-    static thread_local std::vector<std::unique_ptr<mlir::NamedAttribute>> keep;
+    auto &keep = opByNameAttrs()[op];
     auto stash = [&](mlir::Attribute a) -> MLIR_AttributeHandle {
         keep.emplace_back(std::make_unique<mlir::NamedAttribute>(
             mlir::StringAttr::get(op->getContext(), name), a));
@@ -1445,10 +1462,12 @@ extern "C" bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx,
         return MLIR_LowerToLLVMDialect(ctx, module_h, backend);
     }
     auto &mctx = globalCtx().mctx;
-    // The opUserAttrs cache is keyed by Operation* and may contain stale
-    // entries for ops about to be erased by the conversion passes below.
-    // Allocator reuse can produce false hits later; clear it before lowering.
+    // The opUserAttrs / opByNameAttrs caches are keyed by Operation* and
+    // may contain stale entries for ops about to be erased by the
+    // conversion passes below. Allocator reuse can produce false hits
+    // later; clear them before lowering.
     opUserAttrs().clear();
+    opByNameAttrs().clear();
     bool has_vector_op = false;
     module.walk([&](mlir::Operation *o) {
         if (o->getDialect() && o->getDialect()->getNamespace() == "vector") {
@@ -1483,6 +1502,7 @@ extern "C" bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx,
     // Drop any cached attrs from before / during the pipeline: the ops they
     // were keyed on may have been erased and the addresses recycled.
     opUserAttrs().clear();
+    opByNameAttrs().clear();
     return true;
 }
 
