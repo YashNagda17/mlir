@@ -1763,10 +1763,19 @@ bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module,
 
 bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx, MLIR_OpHandle module,
                                     MLIR_LoweringBackend backend) {
-    // Pure-native binary has no upstream lift-cf-to-scf pass available;
-    // the wasm translator on the native backend therefore can't go beyond
-    // the cf-free subset that its scaffold supports.
-    (void)backend;
+    // The pure-native binary only links the in-tree lowering; there is no
+    // upstream `lift-cf-to-scf` pass available here. We therefore ignore
+    // `backend` and always take the native path. Callers requesting
+    // MLIR_LOWERING_UPSTREAM in this build get the native lowering with a
+    // diagnostic printed via the API's existing fprintf-on-stderr style;
+    // the bare-metal parser build can't print and silently falls through.
+    if (backend == MLIR_LOWERING_UPSTREAM) {
+#ifdef MLIR_HAS_NATIVE_LOWERING
+        fprintf(stderr,
+                "MLIR_LowerToLLVMDialectForWasm: upstream backend is not "
+                "available in the native build; using native lowering\n");
+#endif
+    }
     return mlir_lower_to_llvm_native(ctx, module);
 }
 
