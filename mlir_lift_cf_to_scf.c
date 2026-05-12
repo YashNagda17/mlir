@@ -1025,15 +1025,29 @@ static bool try_lift_simple_while(MLIR_Context *ctx, Arena *arena,
 static bool fold_simple_loops_and_ifs(MLIR_Context *ctx, Arena *arena,
                                       MLIR_BlockHandle entry) {
     bool any = false;
+    MLIR_RegionHandle region = MLIR_GetBlockParentRegion(entry);
     while (true) {
         bool spliced = fold_linear_chain(ctx, arena, entry);
-        bool lifted_if    = try_lift_simple_if(ctx, arena, entry);
-        bool lifted_while = false;
-        if (!lifted_if) {
-            lifted_while = try_lift_simple_while(ctx, arena, entry);
+        bool lifted_any = false;
+        // Scan every block in the region: any block can be the "header"
+        // of a simple-if diamond or a simple-while loop. After a lift,
+        // block list mutates so we restart from the beginning.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            size_t nb = MLIR_GetRegionNumBlocks(region);
+            for (size_t bi = 0; bi < nb; ++bi) {
+                MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
+                if (try_lift_simple_if(ctx, arena, b)) {
+                    changed = true; lifted_any = true; break;
+                }
+                if (try_lift_simple_while(ctx, arena, b)) {
+                    changed = true; lifted_any = true; break;
+                }
+            }
         }
-        if (!spliced && !lifted_if && !lifted_while) break;
-        any = any || spliced || lifted_if || lifted_while;
+        if (!spliced && !lifted_any) break;
+        any = any || spliced || lifted_any;
     }
     return any;
 }
