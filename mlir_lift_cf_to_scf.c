@@ -24,6 +24,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <base/arena.h>
@@ -253,8 +254,210 @@ static MLIR_ValueHandle get_undef_value(LiftState *st, MLIR_TypeHandle ty);
 //      shared block, passing its operands through block arguments.
 // ============================================================================
 
+static bool string_eq(string a, const char *b);
+static bool string_eq_string(string a, string b);
+
 // ============================================================================
-// Helpers: walk every Region inside `module` that belongs to a func.func
+// Helper: append a fresh cf.br op to the end of `in_block` jumping to
+// `dst` with `args` as branch operands.
+// ============================================================================
+static MLIR_OpHandle create_cf_br_in_block(MLIR_Context *ctx, Arena *arena,
+                                           MLIR_BlockHandle in_block,
+                                           MLIR_BlockHandle dst,
+                                           MLIR_ValueHandle *args, size_t n_args,
+                                           MLIR_LocationHandle loc) {
+    MLIR_BlockHandle *succs = arena_new_array(arena, MLIR_BlockHandle, 1);
+    succs[0] = dst;
+    MLIR_ValueHandle **sops = arena_new_array(arena, MLIR_ValueHandle *, 1);
+    sops[0] = args;
+    size_t *snums = arena_new_array(arena, size_t, 1);
+    snums[0] = n_args;
+    MLIR_OpHandle op = MLIR_CreateOpWithSuccessors(
+        ctx, OP_TYPE_CF_BR, str_lit("cf.br"),
+        NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+        succs, 1, sops, snums,
+        loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_AppendBlockOp(ctx, in_block, op);
+    return op;
+}
+
+// ============================================================================
+// ReturnLikeExitCombiner port (CFGToSCF.cpp:417-466). Two return-like
+// terminators are "equivalent" if they have the same op name and the same
+// operand-type signature. (tinyc's universe: func.return / llvm.return,
+// where every return inside a function shares one operand-type
+// signature, so each function collapses to one shared exit block.)
+// ============================================================================
+typedef struct {
+    string            op_name;        // owned by the existing op
+    MLIR_TypeHandle  *operand_types;  // arena-owned
+    size_t            n_operand_types;
+    MLIR_BlockHandle  exit_block;
+    MLIR_OpHandle     exit_terminator; // the moved-in return op
+} CombinerEntry;
+
+typedef struct {
+    CombinerEntry *entries;
+    size_t         n_entries;
+    size_t         cap;
+    MLIR_RegionHandle region;
+    Arena         *arena;
+} Combiner;
+
+static bool string_eq_string(string a, string b) {
+    return a.size == b.size && (a.size == 0 || memcmp(a.str, b.str, a.size) == 0);
+}
+
+static bool combiner_signature_matches(const CombinerEntry *e,
+                                       MLIR_OpHandle op) {
+    if (!string_eq_string(e->op_name, MLIR_GetOpName(op))) return false;
+    size_t no = MLIR_GetOpNumOperands(op);
+    if (no != e->n_operand_types) return false;
+    for (size_t i = 0; i < no; ++i) {
+        MLIR_ValueHandle v = MLIR_GetOpOperand(op, i);
+        if (MLIR_GetValueType(v) != e->operand_types[i]) return false;
+    }
+    return true;
+}
+
+static CombinerEntry *combiner_find(Combiner *c, MLIR_OpHandle op) {
+    for (size_t i = 0; i < c->n_entries; ++i) {
+        if (combiner_signature_matches(&c->entries[i], op))
+            return &c->entries[i];
+    }
+    return NULL;
+}
+
+static CombinerEntry *combiner_add_new(MLIR_Context *ctx, Combiner *c,
+                                       MLIR_OpHandle return_op) {
+    if (c->n_entries == c->cap) {
+        size_t new_cap = c->cap ? c->cap * 2 : 4;
+        CombinerEntry *new_arr = arena_new_array(c->arena, CombinerEntry, new_cap);
+        if (c->entries)
+            memcpy(new_arr, c->entries, sizeof(CombinerEntry) * c->n_entries);
+        c->entries = new_arr;
+        c->cap = new_cap;
+    }
+    CombinerEntry *e = &c->entries[c->n_entries++];
+    e->op_name = MLIR_GetOpName(return_op);
+    e->n_operand_types = MLIR_GetOpNumOperands(return_op);
+    e->operand_types = e->n_operand_types
+        ? arena_new_array(c->arena, MLIR_TypeHandle, e->n_operand_types)
+        : NULL;
+    for (size_t i = 0; i < e->n_operand_types; ++i) {
+        e->operand_types[i] = MLIR_GetValueType(MLIR_GetOpOperand(return_op, i));
+    }
+    e->exit_block = MLIR_CreateBlock(ctx);
+    e->exit_terminator = MLIR_INVALID_HANDLE;
+    MLIR_LocationHandle loc = MLIR_GetOpLocation(return_op);
+    // Add a block argument for each operand type.
+    for (size_t i = 0; i < e->n_operand_types; ++i) {
+        MLIR_AddBlockArgument(ctx, e->exit_block, e->operand_types[i], loc);
+    }
+    MLIR_InsertRegionBlockBefore(ctx, c->region, e->exit_block, MLIR_INVALID_HANDLE);
+    return e;
+}
+
+// Replace `return_op` (located at the end of its block) with a cf.br to
+// the matching shared exit block, forwarding the original operands.
+// First occurrence of a signature creates the exit block and moves the
+// return op there; subsequent occurrences just create the cf.br and
+// erase the local return op.
+static void combiner_combine_exit(MLIR_Context *ctx, Combiner *c,
+                                  MLIR_OpHandle return_op) {
+    MLIR_BlockHandle from_block = MLIR_INVALID_HANDLE;
+    size_t nb = MLIR_GetRegionNumBlocks(c->region);
+    for (size_t bi = 0; bi < nb && from_block == MLIR_INVALID_HANDLE; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(c->region, bi);
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            if (MLIR_GetBlockOp(b, oi) == return_op) {
+                from_block = b;
+                break;
+            }
+        }
+    }
+    if (from_block == MLIR_INVALID_HANDLE) return;
+
+    MLIR_LocationHandle loc = MLIR_GetOpLocation(return_op);
+    size_t n_ops = MLIR_GetOpNumOperands(return_op);
+    MLIR_ValueHandle *operands = n_ops
+        ? arena_new_array(c->arena, MLIR_ValueHandle, n_ops) : NULL;
+    for (size_t i = 0; i < n_ops; ++i) {
+        operands[i] = MLIR_GetOpOperand(return_op, i);
+    }
+
+    CombinerEntry *e = combiner_find(c, return_op);
+    bool inserted = (e == NULL);
+    if (inserted) {
+        e = combiner_add_new(ctx, c, return_op);
+    }
+
+    // The return op is still at the end of `from_block`. Erase it, then
+    // append the cf.br.
+    MLIR_EraseOp(ctx, return_op);
+    create_cf_br_in_block(ctx, c->arena, from_block, e->exit_block,
+                          operands, n_ops, loc);
+
+    if (inserted) {
+        // First occurrence: install a fresh return op in the new exit
+        // block whose operands are the exit block's arguments. We don't
+        // need to "move" the original — we already erased it; just
+        // synthesize a new one with identical attributes and operand
+        // count using the same op type. For tinyc the universe is
+        // {func.return, llvm.return}, both of which take only operands
+        // and no attributes/results.
+        MLIR_ValueHandle *args = e->n_operand_types
+            ? arena_new_array(c->arena, MLIR_ValueHandle, e->n_operand_types)
+            : NULL;
+        for (size_t i = 0; i < e->n_operand_types; ++i) {
+            args[i] = MLIR_GetBlockArg(e->exit_block, i);
+        }
+        MLIR_OpType ot = string_eq(e->op_name, "llvm.return")
+            ? OP_TYPE_LLVM_RETURN : OP_TYPE_FUNC_RETURN;
+        MLIR_OpHandle new_ret = MLIR_CreateOp(
+            ctx, ot, e->op_name,
+            NULL, 0, NULL, 0, NULL, 0,
+            args, e->n_operand_types, NULL, 0,
+            loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+        MLIR_AppendBlockOp(ctx, e->exit_block, new_ret);
+        e->exit_terminator = new_ret;
+    }
+}
+
+// Top-level driver: scan every block of `region`; for each block with no
+// successors (block ending in a return-like op), funnel through the
+// combiner. Mirrors CFGToSCF.cpp:1221-1234.
+static void create_single_exit_blocks_for_return_like(MLIR_Context *ctx,
+                                                      Arena *arena,
+                                                      MLIR_RegionHandle region) {
+    Combiner c = {0};
+    c.region = region;
+    c.arena = arena;
+
+    // Snapshot blocks first (the loop mutates the region by appending
+    // new exit blocks at the end).
+    size_t snapshot_n = MLIR_GetRegionNumBlocks(region);
+    MLIR_BlockHandle *snapshot = arena_new_array(arena, MLIR_BlockHandle,
+                                                 snapshot_n ? snapshot_n : 1);
+    for (size_t i = 0; i < snapshot_n; ++i) {
+        snapshot[i] = MLIR_GetRegionBlock(region, i);
+    }
+
+    for (size_t i = 0; i < snapshot_n; ++i) {
+        MLIR_BlockHandle b = snapshot[i];
+        MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+        if (term == MLIR_INVALID_HANDLE) continue;
+        if (MLIR_GetOpNumSuccessors(term) != 0) continue;
+        // Only act on the recognized return-like ops; leave other
+        // zero-successor terminators (e.g. cf.assert, unreachable) alone.
+        string n = MLIR_GetOpName(term);
+        if (!string_eq_string(n, str_lit("func.return")) &&
+            !string_eq_string(n, str_lit("llvm.return"))) continue;
+        combiner_combine_exit(ctx, &c, term);
+    }
+}
+
 // or llvm.func body. The lift algorithm runs once per such region.
 // ============================================================================
 static bool string_eq(string a, const char *b) {
@@ -343,8 +546,17 @@ bool MLIR_LiftCfToScfNative(MLIR_Context *ctx, MLIR_OpHandle module) {
     (void)ctx;
     if (module == MLIR_INVALID_HANDLE) return false;
     if (MLIR_GetOpNumRegions(module) == 0) return true;
+    // Allow staged enablement of the partial port without touching IR
+    // on the default opt-in path. TINYC_LIFT_USE_NATIVE_PARTIAL=1 runs
+    // the return-like exit combiner on each function body before
+    // returning false so the upstream lift finishes the rest.
+    const char *partial_env = getenv("TINYC_LIFT_USE_NATIVE_PARTIAL");
+    bool run_partial = partial_env && partial_env[0] && partial_env[0] != '0';
+
+    Arena *scratch = arena_create(4096);
     MLIR_RegionHandle mod_body = MLIR_GetOpRegion(module, 0);
     size_t nb = MLIR_GetRegionNumBlocks(mod_body);
+    bool any_unsupported = false;
     for (size_t bi = 0; bi < nb; ++bi) {
         MLIR_BlockHandle b = MLIR_GetRegionBlock(mod_body, bi);
         size_t no = MLIR_GetBlockNumOps(b);
@@ -354,19 +566,20 @@ bool MLIR_LiftCfToScfNative(MLIR_Context *ctx, MLIR_OpHandle module) {
             if (MLIR_GetOpNumRegions(o) == 0) continue;
             MLIR_RegionHandle body = MLIR_GetOpRegion(o, 0);
             if (MLIR_GetRegionNumBlocks(body) == 0) continue;
-            // Validate preconditions before claiming the region.
-            if (!check_preconditions(body)) return false;
-            // Fast path: if there is no cf branch op anywhere in the
-            // function body (or any nested region the algorithm could
-            // recurse into), the lift is a no-op for this function.
+            if (!check_preconditions(body)) {
+                arena_destroy(scratch);
+                return false;
+            }
             if (!region_has_cf_branch(body)) continue;
-            // TODO: the heavy lifting (cycle lifting, branch lifting,
-            // return-like exit combining) is not yet ported. Signal
-            // partial failure so the caller falls back to upstream's
-            // transformCFGToSCF on regions we cannot yet handle.
-            return false;
+            if (run_partial) {
+                create_single_exit_blocks_for_return_like(ctx, scratch, body);
+            }
+            // Cycle/branch transforms are not yet ported.
+            any_unsupported = true;
         }
     }
+    arena_destroy(scratch);
+    if (any_unsupported) return false;
     return true;
 }
 
