@@ -2123,8 +2123,8 @@ void MLIR_SpliceBlockOps(MLIR_Context *ctx, MLIR_BlockHandle dst,
 // the patterns it understands and returns false otherwise; for native we
 // do not have an upstream fallback so callers (wasm lowering) will reject
 // any leftover cf ops at the wasmssa-lower stage.
+#include "mlir_lift_cf_to_scf.h"
 bool MLIR_LiftCfToScf(MLIR_Context *ctx, MLIR_OpHandle module) {
-    extern bool MLIR_LiftCfToScfNative(MLIR_Context *ctx, MLIR_OpHandle module);
     return MLIR_LiftCfToScfNative(ctx, module);
 }
 

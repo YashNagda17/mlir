@@ -110,6 +110,7 @@ clang \
     op_parsers.c \
     mlir_api_impl.c \
     mlir_op_names.c \
+    mlir_lift_cf_to_scf.c \
     corec-stdlib/stdlib/stdio.c \
     corec-stdlib/stdlib/stdlib.c \
     corec-stdlib/stdlib/printf.c \
@@ -158,6 +159,7 @@ clang \
     op_parsers.c \
     mlir_api_impl.c \
     mlir_op_names.c \
+    mlir_lift_cf_to_scf.c \
     corec-stdlib/stdlib/stdio.c \
     corec-stdlib/stdlib/stdlib.c \
     corec-stdlib/stdlib/printf.c \
@@ -197,6 +199,7 @@ clang \
     mlir_generic_printer.c \
     mlir_api_impl.c \
     mlir_op_names.c \
+    mlir_lift_cf_to_scf.c \
     corec-stdlib/stdlib/stdio.c \
     corec-stdlib/stdlib/stdlib.c \
     corec-stdlib/stdlib/printf.c \
@@ -244,6 +247,7 @@ cl \
     op_parsers.c \
     mlir_api_impl.c \
     mlir_op_names.c \
+    mlir_lift_cf_to_scf.c \
     corec-stdlib/stdlib/stdio.c \
     corec-stdlib/stdlib/stdlib.c \
     corec-stdlib/stdlib/printf.c \
@@ -277,6 +281,7 @@ link \
     op_parsers.obj \
     mlir_api_impl.obj \
     mlir_op_names.obj \
+    mlir_lift_cf_to_scf.obj \
     stdio.obj \
     stdlib.obj \
     printf.obj \

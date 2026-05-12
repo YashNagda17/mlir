@@ -23,8 +23,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include <base/arena.h>
@@ -38,6 +36,17 @@ typedef struct {
     MLIR_BlockHandle from_block;
     size_t           succ_idx;
 } Edge;
+
+// File-scope helper structs (tinyC parser does not support function-local
+// type declarations, so these are pulled up to translation-unit scope).
+typedef struct { size_t v; size_t next_succ; size_t n_succ; } SccFrame;
+typedef struct { MLIR_BlockHandle block; MLIR_OpHandle term; } ExitTermRec;
+typedef struct {
+    MLIR_BlockHandle block;
+    MLIR_ValueHandle *vals;
+    size_t n_vals;
+} EmptyBlockRec;
+typedef struct { MLIR_OpHandle op; size_t succ_idx; } PredRec;
 
 static MLIR_BlockHandle edge_successor(Edge e) {
     MLIR_OpHandle term = MLIR_GetBlockTerminator(e.from_block);
@@ -932,17 +941,13 @@ static bool region_has_cf_branch(MLIR_RegionHandle region) {
 
 // ============================================================================
 // Port of checkTransformationPreconditions (CFGToSCF.cpp:1237-1297).
-// Returns true on success, false on a violated precondition (with a
-// diagnostic printed on stderr).
+// Returns true on success, false on a violated precondition.
 // ============================================================================
 static bool check_preconditions(MLIR_RegionHandle region) {
     size_t nb = MLIR_GetRegionNumBlocks(region);
     for (size_t bi = 0; bi < nb; ++bi) {
         MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
         if (!MLIR_BlockIsEntry(b) && MLIR_GetBlockNumPredecessors(b) == 0) {
-            fprintf(stderr, "MLIR_LiftCfToScfNative: unreachable block "
-                            "encountered (block %zu has no predecessors)\n",
-                    bi);
             return false;
         }
         size_t no = MLIR_GetBlockNumOps(b);
@@ -952,11 +957,6 @@ static bool check_preconditions(MLIR_RegionHandle region) {
             // We accept only the cf.* branch ops as branch-op-interface
             // carriers. Anything else with successors is unsupported.
             if (!op_is_cf_branch(o)) {
-                string n = MLIR_GetOpName(o);
-                fprintf(stderr,
-                        "MLIR_LiftCfToScfNative: unsupported terminator "
-                        "with successors: %.*s\n",
-                        (int)n.size, n.str ? n.str : "");
                 return false;
             }
             // cf.* ops have no operation-produced successor operands.
@@ -1055,9 +1055,8 @@ static SccResult scc_compute(Arena *arena, MLIR_RegionHandle region) {
     size_t  n_sccs_out = 0;
     size_t  blocks_out = 0;
 
-    // Iterative DFS frame.
-    typedef struct { size_t v; size_t next_succ; size_t n_succ; } Frame;
-    Frame *frames = arena_new_array(arena, Frame, n);
+    // Iterative DFS frame (SccFrame is declared at file scope).
+    SccFrame *frames = arena_new_array(arena, SccFrame, n);
 
     for (size_t root = 0; root < n; ++root) {
         if (index_of[root]) continue;
@@ -1078,7 +1077,7 @@ static SccResult scc_compute(Arena *arena, MLIR_RegionHandle region) {
             fp++;
         }
         while (fp > 0) {
-            Frame *cur = &frames[fp - 1];
+            SccFrame *cur = &frames[fp - 1];
             if (cur->next_succ < cur->n_succ) {
                 MLIR_OpHandle term = MLIR_GetBlockTerminator(blocks[cur->v]);
                 MLIR_BlockHandle succ = MLIR_GetOpSuccessor(term, cur->next_succ);
@@ -1137,7 +1136,7 @@ static SccResult scc_compute(Arena *arena, MLIR_RegionHandle region) {
             }
             fp--;
             if (fp > 0) {
-                Frame *par = &frames[fp - 1];
+                SccFrame *par = &frames[fp - 1];
                 if (v_low < lowlink[par->v]) lowlink[par->v] = v_low;
             }
         }
@@ -1416,33 +1415,45 @@ static void dom_dfs_postorder(MLIR_BlockHandle root,
     // visited array
     size_t v_cap = 64, v_n = 0;
     MLIR_BlockHandle *v_arr = arena_new_array(arena, MLIR_BlockHandle, v_cap);
-    #define DOM_VISITED(b) ({ bool _f=false; for (size_t _i=0;_i<v_n;++_i) if (v_arr[_i]==(b)){_f=true;break;} _f; })
-    #define DOM_MARK(b) do { \
-        if (v_n == v_cap) { \
-            size_t nc = v_cap * 2; \
-            MLIR_BlockHandle *na = arena_new_array(arena, MLIR_BlockHandle, nc); \
-            memcpy(na, v_arr, sizeof(MLIR_BlockHandle) * v_n); \
-            v_arr = na; v_cap = nc; \
-        } \
-        v_arr[v_n++] = (b); \
-    } while (0)
+    // Helpers for the postorder walk; written as inline code rather
+    // than statement-expression macros so tinyC can parse them.
 
     if (root_is_virt) {
         // Root is the virtual exit. Push every real leaf as first level.
         for (size_t i = 0; i < n_leaves; ++i) {
-            if (DOM_VISITED(leaf_blocks[i])) continue;
-            DOM_MARK(leaf_blocks[i]);
+            bool seen = false;
+            for (size_t _i = 0; _i < v_n; ++_i) {
+                if (v_arr[_i] == leaf_blocks[i]) { seen = true; break; }
+            }
+            if (seen) continue;
+            if (v_n == v_cap) {
+                size_t nc = v_cap * 2;
+                MLIR_BlockHandle *na = arena_new_array(arena, MLIR_BlockHandle, nc);
+                memcpy(na, v_arr, sizeof(MLIR_BlockHandle) * v_n);
+                v_arr = na; v_cap = nc;
+            }
+            v_arr[v_n++] = leaf_blocks[i];
             if (sp == stack_cap) {
                 size_t nc = stack_cap * 2;
                 DomFrame *ns = arena_new_array(arena, DomFrame, nc);
                 memcpy(ns, stack, sizeof(DomFrame) * sp);
                 stack = ns; stack_cap = nc;
             }
-            stack[sp++] = (DomFrame){leaf_blocks[i], 0};
+            stack[sp].block = leaf_blocks[i];
+            stack[sp].next_child = 0;
+            sp++;
         }
     } else {
-        DOM_MARK(root);
-        stack[sp++] = (DomFrame){root, 0};
+        if (v_n == v_cap) {
+            size_t nc = v_cap * 2;
+            MLIR_BlockHandle *na = arena_new_array(arena, MLIR_BlockHandle, nc);
+            memcpy(na, v_arr, sizeof(MLIR_BlockHandle) * v_n);
+            v_arr = na; v_cap = nc;
+        }
+        v_arr[v_n++] = root;
+        stack[sp].block = root;
+        stack[sp].next_child = 0;
+        sp++;
     }
 
     size_t out_cap = 64;
@@ -1473,15 +1484,27 @@ static void dom_dfs_postorder(MLIR_BlockHandle root,
             }
             fr->next_child++;
             if (child == MLIR_INVALID_HANDLE) continue;
-            if (DOM_VISITED(child)) continue;
-            DOM_MARK(child);
+            bool seen = false;
+            for (size_t _i = 0; _i < v_n; ++_i) {
+                if (v_arr[_i] == child) { seen = true; break; }
+            }
+            if (seen) continue;
+            if (v_n == v_cap) {
+                size_t nc = v_cap * 2;
+                MLIR_BlockHandle *na = arena_new_array(arena, MLIR_BlockHandle, nc);
+                memcpy(na, v_arr, sizeof(MLIR_BlockHandle) * v_n);
+                v_arr = na; v_cap = nc;
+            }
+            v_arr[v_n++] = child;
             if (sp == stack_cap) {
                 size_t nc = stack_cap * 2;
                 DomFrame *ns = arena_new_array(arena, DomFrame, nc);
                 memcpy(ns, stack, sizeof(DomFrame) * sp);
                 stack = ns; stack_cap = nc;
             }
-            stack[sp++] = (DomFrame){child, 0};
+            stack[sp].block = child;
+            stack[sp].next_child = 0;
+            sp++;
         } else {
             // Done with this node; emit it in postorder.
             if (out_count == out_cap) {
@@ -1499,8 +1522,6 @@ static void dom_dfs_postorder(MLIR_BlockHandle root,
     *out_n = out_count;
     if (visited_arr) *visited_arr = v_arr;
     if (visited_n) *visited_n = v_n;
-    #undef DOM_VISITED
-    #undef DOM_MARK
 }
 
 static DomInfo dom_compute(Arena *arena, MLIR_RegionHandle region,
@@ -2425,10 +2446,10 @@ static BranchXformResult transform_to_structured_cf_branches(
     // with a real continuation in place, and the main lift path fires.
     if (no_succ_has_cont_edge) {
         // Collect (block, term) pairs for every exit terminator in
-        // every arm, and verify signature match.
-        struct ExitTerm { MLIR_BlockHandle block; MLIR_OpHandle term; };
+        // every arm, and verify signature match. ExitTermRec is
+        // declared at file scope (tinyC parser limitation).
         size_t cap_et = 0, n_et = 0;
-        struct ExitTerm *exit_terms = NULL;
+        ExitTermRec *exit_terms = NULL;
         string canon_name = {0};
         size_t canon_n_ops = 0;
         MLIR_TypeHandle *canon_types = NULL;
@@ -2461,11 +2482,13 @@ static BranchXformResult transform_to_structured_cf_branches(
                 }
                 if (n_et == cap_et) {
                     size_t nc = cap_et ? cap_et * 2 : 4;
-                    struct ExitTerm *na = arena_new_array(arena, struct ExitTerm, nc);
-                    if (n_et) memcpy(na, exit_terms, sizeof(struct ExitTerm) * n_et);
+                    ExitTermRec *na = arena_new_array(arena, ExitTermRec, nc);
+                    if (n_et) memcpy(na, exit_terms, sizeof(ExitTermRec) * n_et);
                     exit_terms = na; cap_et = nc;
                 }
-                exit_terms[n_et++] = (struct ExitTerm){ .block = b, .term = t };
+                exit_terms[n_et].block = b;
+                exit_terms[n_et].term = t;
+                n_et++;
             }
         }
 
@@ -2563,9 +2586,8 @@ static BranchXformResult transform_to_structured_cf_branches(
     MLIR_RegionHandle *regions = arena_new_array(arena, MLIR_RegionHandle, num_succ);
 
     // Empty blocks created by case logic: each carries the values it
-    // needs to yield to the structured op.
-    typedef struct { MLIR_BlockHandle block; MLIR_ValueHandle *vals; size_t n_vals; } EmptyBlock;
-    EmptyBlock *empty_blocks = NULL;
+    // needs to yield to the structured op (EmptyBlockRec at file scope).
+    EmptyBlockRec *empty_blocks = NULL;
     size_t n_eb = 0, cap_eb = 0;
 
     MLIR_BlockHandle *new_sub = arena_new_array(arena, MLIR_BlockHandle, num_succ + 1);
@@ -2576,8 +2598,7 @@ static BranchXformResult transform_to_structured_cf_branches(
     // scf.if op exists. We collect them here, *before* MoveBlockToRegionEnd
     // takes the blocks out of `continuation`'s region — afterwards
     // MLIR_GetBlockNumPredecessors(continuation) can no longer see them
-    // (predecessor lookup is region-scoped).
-    typedef struct { MLIR_OpHandle op; size_t succ_idx; } PredRec;
+    // (predecessor lookup is region-scoped). PredRec is at file scope.
     size_t max_preds = 0;
     for (size_t i = 0; i < num_succ; ++i) max_preds += n_br[i];
     PredRec *preds = max_preds
@@ -2612,8 +2633,8 @@ static BranchXformResult transform_to_structured_cf_branches(
             MLIR_AppendRegionBlock(st->ctx, regions[i], eb);
             if (n_eb == cap_eb) {
                 size_t nc = cap_eb ? cap_eb * 2 : 4;
-                EmptyBlock *na = arena_new_array(arena, EmptyBlock, nc);
-                if (n_eb) memcpy(na, empty_blocks, sizeof(EmptyBlock) * n_eb);
+                EmptyBlockRec *na = arena_new_array(arena, EmptyBlockRec, nc);
+                if (n_eb) memcpy(na, empty_blocks, sizeof(EmptyBlockRec) * n_eb);
                 empty_blocks = na; cap_eb = nc;
             }
             empty_blocks[n_eb].block = eb;
@@ -2657,8 +2678,8 @@ static BranchXformResult transform_to_structured_cf_branches(
                                   prev_succ_idx, single_exit);
                     if (n_eb == cap_eb) {
                         size_t nc = cap_eb ? cap_eb * 2 : 4;
-                        EmptyBlock *na = arena_new_array(arena, EmptyBlock, nc);
-                        if (n_eb) memcpy(na, empty_blocks, sizeof(EmptyBlock) * n_eb);
+                        EmptyBlockRec *na = arena_new_array(arena, EmptyBlockRec, nc);
+                        if (n_eb) memcpy(na, empty_blocks, sizeof(EmptyBlockRec) * n_eb);
                         empty_blocks = na; cap_eb = nc;
                     }
                     empty_blocks[n_eb].block = single_exit;
@@ -2920,13 +2941,10 @@ static MLIR_OpHandle create_scf_condition(MLIR_Context *ctx, Arena *arena,
 // ============================================================================
 static bool transform_cfg_to_scf_region(LiftState *st, Combiner *combiner,
                                         MLIR_RegionHandle region) {
-    const char *dbg = getenv("TINYC_LIFT_DBG");
     if (MLIR_GetRegionNumBlocks(region) == 0) return false;
     if (MLIR_GetRegionNumBlocks(region) == 1) return false;
 
     if (!check_preconditions(region)) return false;
-    if (dbg) fprintf(stderr, "[lift] region(%zu blocks): combine_exits\n",
-                     MLIR_GetRegionNumBlocks(region));
     create_single_exit_blocks_for_return_like_into(st->ctx, st->arena, region,
                                                    combiner);
 
@@ -2943,16 +2961,10 @@ static bool transform_cfg_to_scf_region(LiftState *st, Combiner *combiner,
         MLIR_RegionHandle cur_region = MLIR_GetBlockParentRegion(cur);
         if (MLIR_GetRegionNumBlocks(cur_region) <= 1) continue;
 
-        if (dbg) fprintf(stderr, "[lift] iter %zu: process block, region has %zu blocks\n",
-                         safety_iter, MLIR_GetRegionNumBlocks(cur_region));
-
         // M7: cycles -> scf.while.
         size_t n_new7 = 0;
         MLIR_BlockHandle *new7 = NULL;
-        if (!getenv("TINYC_LIFT_SKIP_M7")) {
-            new7 = transform_cycles_to_scf_loops(st, combiner, cur, &n_new7);
-        }
-        if (dbg) fprintf(stderr, "[lift]   cycles produced %zu sub-regions\n", n_new7);
+        new7 = transform_cycles_to_scf_loops(st, combiner, cur, &n_new7);
         for (size_t i = 0; i < n_new7; ++i) {
             if (wl_n == wl_cap) {
                 size_t nc = wl_cap * 2;
@@ -2964,13 +2976,9 @@ static bool transform_cfg_to_scf_region(LiftState *st, Combiner *combiner,
         }
         if (n_new7) changed_any = true;
 
-        if (getenv("TINYC_LIFT_SKIP_M8")) continue;
-
-        // M8: cond_br -> scf.if.
+        // M8: cond_br -> scf.if; cf.switch -> scf.index_switch.
         DomInfo dom = dom_compute(arena, cur_region, /*is_post=*/false);
         BranchXformResult r = transform_to_structured_cf_branches(st, cur, &dom);
-        if (dbg) fprintf(stderr, "[lift]   branches: ok=%d prog=%d new=%zu\n",
-                         (int)r.ok, (int)r.made_progress, r.n_new_sub_regions);
         if (!r.ok) continue;
         if (r.made_progress) changed_any = true;
         for (size_t i = 0; i < r.n_new_sub_regions; ++i) {
