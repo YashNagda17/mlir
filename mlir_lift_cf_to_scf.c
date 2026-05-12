@@ -254,7 +254,85 @@ static MLIR_ValueHandle get_undef_value(LiftState *st, MLIR_TypeHandle ty);
 // ============================================================================
 
 // ============================================================================
-// Public entry. Currently returns false to signal "not yet implemented".
+// Helpers: walk every Region inside `module` that belongs to a func.func
+// or llvm.func body. The lift algorithm runs once per such region.
+// ============================================================================
+static bool string_eq(string a, const char *b) {
+    if (!a.str || !b) return false;
+    size_t bn = strlen(b);
+    return a.size == bn && memcmp(a.str, b, bn) == 0;
+}
+
+static bool op_is_func_like(MLIR_OpHandle op) {
+    string n = MLIR_GetOpName(op);
+    return string_eq(n, "func.func") || string_eq(n, "llvm.func");
+}
+
+// Returns true iff `op` is one of the cf branch ops the algorithm cares
+// about (cf.br, cf.cond_br, cf.switch).
+static bool op_is_cf_branch(MLIR_OpHandle op) {
+    string n = MLIR_GetOpName(op);
+    return string_eq(n, "cf.br") || string_eq(n, "cf.cond_br") ||
+           string_eq(n, "cf.switch");
+}
+
+// Returns true iff the given region contains any cf.* branch op that we
+// would have to lift. Used by the fast path.
+static bool region_has_cf_branch(MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            MLIR_OpHandle o = MLIR_GetBlockOp(b, oi);
+            if (op_is_cf_branch(o)) return true;
+            // Recurse into nested regions (e.g. scf.if/scf.while produced
+            // by an earlier iteration of the algorithm).
+            size_t nr = MLIR_GetOpNumRegions(o);
+            for (size_t ri = 0; ri < nr; ++ri) {
+                if (region_has_cf_branch(MLIR_GetOpRegion(o, ri)))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Port of checkTransformationPreconditions (CFGToSCF.cpp:1237-1297).
+// Returns true on success, false on a violated precondition (with a
+// diagnostic printed on stderr).
+// ============================================================================
+static bool check_preconditions(MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
+        if (!MLIR_BlockIsEntry(b) && MLIR_GetBlockNumPredecessors(b) == 0) {
+            fprintf(stderr, "MLIR_LiftCfToScfNative: unreachable block "
+                            "encountered (block %zu has no predecessors)\n",
+                    bi);
+            return false;
+        }
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            MLIR_OpHandle o = MLIR_GetBlockOp(b, oi);
+            if (MLIR_GetOpNumSuccessors(o) == 0) continue;
+            // We accept only the cf.* branch ops as branch-op-interface
+            // carriers. Anything else with successors is unsupported.
+            if (!op_is_cf_branch(o)) {
+                string n = MLIR_GetOpName(o);
+                fprintf(stderr,
+                        "MLIR_LiftCfToScfNative: unsupported terminator "
+                        "with successors: %.*s\n",
+                        (int)n.size, n.str ? n.str : "");
+                return false;
+            }
+            // cf.* ops have no operation-produced successor operands.
+        }
+    }
+    return true;
+}
+
 // Once the TODOs above are filled in, this iterates the work list as in
 // transformCFGToSCF (CFGToSCF.cpp:1300-1376):
 //   - work-list seeded with region entry
@@ -262,12 +340,34 @@ static MLIR_ValueHandle get_undef_value(LiftState *st, MLIR_TypeHandle ty);
 //     any new sub-regions returned.
 // ============================================================================
 bool MLIR_LiftCfToScfNative(MLIR_Context *ctx, MLIR_OpHandle module) {
-    (void)ctx; (void)module;
-    // Stub. See TODOs above; the upstream backend's MLIR_LiftCfToScf
-    // still routes through transformCFGToSCF for now, so the
-    // upstream-binary test path (TINYC_LOWERING=native
-    // test_tinyc_upstream_wasm) remains green while this is built out.
-    return false;
+    (void)ctx;
+    if (module == MLIR_INVALID_HANDLE) return false;
+    if (MLIR_GetOpNumRegions(module) == 0) return true;
+    MLIR_RegionHandle mod_body = MLIR_GetOpRegion(module, 0);
+    size_t nb = MLIR_GetRegionNumBlocks(mod_body);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(mod_body, bi);
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            MLIR_OpHandle o = MLIR_GetBlockOp(b, oi);
+            if (!op_is_func_like(o)) continue;
+            if (MLIR_GetOpNumRegions(o) == 0) continue;
+            MLIR_RegionHandle body = MLIR_GetOpRegion(o, 0);
+            if (MLIR_GetRegionNumBlocks(body) == 0) continue;
+            // Validate preconditions before claiming the region.
+            if (!check_preconditions(body)) return false;
+            // Fast path: if there is no cf branch op anywhere in the
+            // function body (or any nested region the algorithm could
+            // recurse into), the lift is a no-op for this function.
+            if (!region_has_cf_branch(body)) continue;
+            // TODO: the heavy lifting (cycle lifting, branch lifting,
+            // return-like exit combining) is not yet ported. Signal
+            // partial failure so the caller falls back to upstream's
+            // transformCFGToSCF on regions we cannot yet handle.
+            return false;
+        }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

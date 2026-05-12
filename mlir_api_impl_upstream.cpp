@@ -1720,7 +1720,10 @@ static void liftLLVMFuncCFGToSCF(mlir::ModuleOp module) {
 // reusing upstream MLIR's `transformCFGToSCF` algorithm, applied to both
 // func.func bodies (via the stock `LiftControlFlowToSCFPass`) and
 // llvm.func bodies (via `liftLLVMFuncCFGToSCF`).
-extern "C" bool MLIR_LiftCfToScf(MLIR_Context *, MLIR_OpHandle module_h) {
+extern "C" bool MLIR_LiftCfToScfNative(MLIR_Context *ctx,
+                                       MLIR_OpHandle module);
+
+extern "C" bool MLIR_LiftCfToScf(MLIR_Context *ctx, MLIR_OpHandle module_h) {
     if (module_h == MLIR_INVALID_HANDLE) return false;
     auto *op = F<mlir::Operation>(module_h);
     auto module = llvm::dyn_cast<mlir::ModuleOp>(op);
@@ -1733,6 +1736,18 @@ extern "C" bool MLIR_LiftCfToScf(MLIR_Context *, MLIR_OpHandle module_h) {
     {
         mlir::IRRewriter rewriter(&mctx);
         (void)mlir::eraseUnreachableBlocks(rewriter, module->getRegions());
+    }
+    // Opt-in path for the agnostic C port. When TINYC_LIFT_USE_NATIVE is
+    // set, try the native port first; fall back to upstream's
+    // liftLLVMFuncCFGToSCF on any unhandled case (current default while
+    // the port is incremental). This lets us exercise the C port through
+    // the upstream binary without losing test coverage.
+    const char *opt_in = std::getenv("TINYC_LIFT_USE_NATIVE");
+    if (opt_in && opt_in[0] && opt_in[0] != '0') {
+        if (MLIR_LiftCfToScfNative(ctx, module_h)) {
+            return true;
+        }
+        // Fall through to the upstream algorithm on partial-port misses.
     }
     liftLLVMFuncCFGToSCF(module);
     return true;
