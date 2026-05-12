@@ -111,6 +111,17 @@ static MLIR_OpHandle create_cf_cond_br_in_block(MLIR_Context *ctx, Arena *arena,
                                                 MLIR_ValueHandle *f_args, size_t n_f_args,
                                                 MLIR_LocationHandle loc);
 
+static MLIR_OpHandle create_scf_yield(MLIR_Context *ctx, Arena *arena,
+                                      MLIR_BlockHandle in_block,
+                                      MLIR_ValueHandle *args, size_t n_args,
+                                      MLIR_LocationHandle loc);
+
+static MLIR_OpHandle create_scf_condition(MLIR_Context *ctx, Arena *arena,
+                                          MLIR_BlockHandle in_block,
+                                          MLIR_ValueHandle cond,
+                                          MLIR_ValueHandle *payload, size_t n_payload,
+                                          MLIR_LocationHandle loc);
+
 // ============================================================================
 // EdgeMultiplexer (port of CFGToSCF.cpp:212-387).
 //
@@ -2024,6 +2035,257 @@ static MLIR_ValueHandle *transform_to_reduce_loop(
 
     *out_n_lhso = r.n_lhso;
     return r.lhso;
+}
+
+// ============================================================================
+// arith.trunci helper (truncate i32 shouldRepeat -> i1 for scf.condition).
+// ============================================================================
+static MLIR_ValueHandle create_arith_trunci(LiftState *st, MLIR_BlockHandle in_block,
+                                            MLIR_ValueHandle src,
+                                            MLIR_TypeHandle dst_ty,
+                                            MLIR_LocationHandle loc) {
+    MLIR_TypeHandle *res_types = arena_new_array(st->arena, MLIR_TypeHandle, 1);
+    res_types[0] = dst_ty;
+    MLIR_ValueHandle *operands = arena_new_array(st->arena, MLIR_ValueHandle, 1);
+    operands[0] = src;
+    MLIR_ValueHandle *results = arena_new_array(st->arena, MLIR_ValueHandle, 1);
+    results[0] = MLIR_CreateValueOpResult(st->ctx, MLIR_INVALID_HANDLE, 0,
+                                          dst_ty, fresh_ssa_name(st->arena),
+                                          loc);
+    MLIR_OpHandle op = MLIR_CreateOp(
+        st->ctx, OP_TYPE_ARITH_TRUNCI, str_lit("arith.trunci"),
+        NULL, 0, res_types, 1, results, 1,
+        operands, 1, NULL, 0,
+        loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_AppendBlockOp(st->ctx, in_block, op);
+    return results[0];
+}
+
+// Replace every branch successor in `region` whose target is `old_block`
+// with `new_block`. Successor operand lists are left untouched. Used to
+// redirect entry edges from outside-the-loop to the new scf.while parent
+// block once the loop body has been moved into a fresh region.
+static void replace_block_successor_uses(MLIR_Context *ctx,
+                                         MLIR_RegionHandle region,
+                                         MLIR_BlockHandle old_block,
+                                         MLIR_BlockHandle new_block) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t i = 0; i < nb; ++i) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, i);
+        MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+        if (term == MLIR_INVALID_HANDLE) continue;
+        size_t ns = MLIR_GetOpNumSuccessors(term);
+        for (size_t s = 0; s < ns; ++s) {
+            if (MLIR_GetOpSuccessor(term, s) == old_block)
+                MLIR_SetOpSuccessor(ctx, term, s, new_block);
+        }
+    }
+}
+
+// ============================================================================
+// transformCyclesToSCFLoops  (CFGToSCF.cpp:797-893).
+//
+// Identifies every outermost cycle (Tarjan SCC with a back edge) in the
+// region rooted at `region_entry` and turns each one into an scf.while
+// in do-while form. Returns the list of entry blocks of the freshly-
+// created scf.while *body* regions (one per cycle) so the recursive
+// driver can structuralize them further. NULL on failure.
+//
+// For each non-trivial SCC:
+//   1. If multi-entry: build EdgeMultiplexer over entry+back edges so
+//      we get a single loop_header (the mux block).
+//   2. createSingleExitingLatch: multiplex back+exit edges through a
+//      latch carrying a shouldRepeat i32 discriminator; dispatch exits
+//      to a fresh exit_block.
+//   3. Compute forward dominance, then transformToReduceLoop for the
+//      LCSSA-like fixup so all values leaving the loop flow through
+//      exit_block args + loop_header args + back-edge succ operands.
+//   4. Make a newLoopParentBlock (replacement for loop_header), move
+//      header/body/latch into a fresh region, replace latch's cf.cond_br
+//      with arith.trunci+scf.condition, wrap everything in scf.while
+//      attached to newLoopParentBlock with a trivial after-region.
+//   5. RAUW the exit_block's args with the scf.while results, splice
+//      the post-exit ops into newLoopParentBlock, erase the exit_block.
+//   6. Redirect outside-the-loop branches that targeted loop_header to
+//      target newLoopParentBlock instead.
+// ============================================================================
+static MLIR_BlockHandle *transform_cycles_to_scf_loops(
+    LiftState *st, Combiner *combiner, MLIR_BlockHandle region_entry,
+    size_t *out_n_new)
+{
+    *out_n_new = 0;
+    MLIR_RegionHandle region = MLIR_GetBlockParentRegion(region_entry);
+    Arena *arena = st->arena;
+
+    SccResult scc = scc_compute(arena, region);
+
+    MLIR_BlockHandle *new_sub_regions = NULL;
+    size_t n_new = 0, cap_new = 0;
+
+    MLIR_TypeHandle i1_ty = MLIR_CreateTypeInteger(st->ctx, 1, false);
+
+    for (size_t scc_id = 0; scc_id < scc.n_sccs; ++scc_id) {
+        if (!scc.scc_is_cycle[scc_id]) continue;
+
+        // Snapshot SCC's block set.
+        size_t s_start = scc.scc_starts[scc_id];
+        size_t s_end   = scc.scc_starts[scc_id + 1];
+        size_t s_n     = s_end - s_start;
+        size_t s_cap   = s_n + 4;
+        MLIR_BlockHandle *scc_blocks = arena_new_array(arena, MLIR_BlockHandle, s_cap);
+        for (size_t i = 0; i < s_n; ++i) {
+            scc_blocks[i] = scc.blocks[scc.blocks_in_sccs[s_start + i]];
+        }
+        #define SCC_INSERT(b_) do { \
+            bool _f = false; \
+            for (size_t _i = 0; _i < s_n; ++_i) if (scc_blocks[_i] == (b_)) { _f = true; break; } \
+            if (!_f) { \
+                if (s_n == s_cap) { \
+                    size_t _nc = s_cap * 2; \
+                    MLIR_BlockHandle *_nb = arena_new_array(arena, MLIR_BlockHandle, _nc); \
+                    memcpy(_nb, scc_blocks, sizeof(MLIR_BlockHandle) * s_n); \
+                    scc_blocks = _nb; s_cap = _nc; \
+                } \
+                scc_blocks[s_n++] = (b_); \
+            } \
+        } while (0)
+
+        CycleEdges edges = calculate_cycle_edges(arena, &scc, scc_id);
+        if (edges.n_entry == 0 || edges.n_back == 0) continue;
+
+        MLIR_BlockHandle loop_header = edge_successor(edges.entry[0]);
+        MLIR_LocationHandle hdr_loc =
+            MLIR_GetOpLocation(MLIR_GetBlockTerminator(loop_header));
+
+        // (1) Single entry block via multiplexer if needed.
+        if (edges.n_entry > 1) {
+            size_t n_edges = edges.n_entry + edges.n_back;
+            Edge *combined = arena_new_array(arena, Edge, n_edges);
+            memcpy(combined, edges.entry, sizeof(Edge) * edges.n_entry);
+            memcpy(combined + edges.n_entry, edges.back, sizeof(Edge) * edges.n_back);
+            EdgeMultiplexer mux = create_single_entry_block(st, combined, n_edges, hdr_loc);
+            loop_header = mux.mux_block;
+        }
+        SCC_INSERT(loop_header);
+
+        // (2) Single exiting latch.
+        MLIR_LocationHandle back_loc =
+            MLIR_GetOpLocation(MLIR_GetBlockTerminator(edges.back[0].from_block));
+        StructuredLoopProps props = create_single_exiting_latch(
+            st, combiner, edges.back, edges.n_back, edges.exit, edges.n_exit, back_loc);
+        if (!props.ok) return NULL;
+        MLIR_BlockHandle latch = props.latch_block;
+        MLIR_BlockHandle exit_block = props.exit_block;
+        SCC_INSERT(latch);
+        SCC_INSERT(loop_header);
+
+        // (3) Forward dominance + transformToReduceLoop.
+        DomInfo dom = dom_compute(arena, region, /*is_post=*/false);
+        size_t n_iter = 0;
+        MLIR_ValueHandle *iter_vals = transform_to_reduce_loop(
+            st, &dom, loop_header, exit_block, scc_blocks, s_n,
+            &n_iter, hdr_loc);
+        if (iter_vals == NULL && n_iter > 0) return NULL;
+
+        // (4) newLoopParentBlock with copies of loop_header's args; insert
+        //     before loop_header (still in region at this point).
+        size_t n_lh_args = MLIR_GetBlockNumArgs(loop_header);
+        MLIR_BlockHandle newLPB = MLIR_CreateBlock(st->ctx);
+        MLIR_InsertRegionBlockBefore(st->ctx, region, newLPB, loop_header);
+        MLIR_ValueHandle *lpb_args = n_lh_args
+            ? arena_new_array(arena, MLIR_ValueHandle, n_lh_args) : NULL;
+        MLIR_TypeHandle *iter_arg_types = n_lh_args
+            ? arena_new_array(arena, MLIR_TypeHandle, n_lh_args) : NULL;
+        for (size_t i = 0; i < n_lh_args; ++i) {
+            iter_arg_types[i] = MLIR_GetValueType(MLIR_GetBlockArg(loop_header, i));
+            lpb_args[i] = MLIR_AddBlockArgument(st->ctx, newLPB,
+                                                iter_arg_types[i], hdr_loc);
+        }
+
+        // Move blocks (header first, others, latch last) into the body region.
+        MLIR_RegionHandle body_region = MLIR_CreateRegion(st->ctx);
+        MLIR_MoveBlockToRegionEnd(st->ctx, latch == loop_header ? latch : loop_header, body_region);
+        for (size_t i = 0; i < s_n; ++i) {
+            MLIR_BlockHandle b = scc_blocks[i];
+            if (b == loop_header || b == latch) continue;
+            MLIR_MoveBlockToRegionEnd(st->ctx, b, body_region);
+        }
+        if (latch != loop_header) {
+            MLIR_MoveBlockToRegionEnd(st->ctx, latch, body_region);
+        }
+
+        // (5) Replace latch's terminator with scf.condition.
+        MLIR_OpHandle old_latch_term = MLIR_GetBlockTerminator(latch);
+        MLIR_LocationHandle latch_loc = MLIR_GetOpLocation(old_latch_term);
+        MLIR_EraseOp(st->ctx, old_latch_term);
+
+        MLIR_ValueHandle should_repeat_i1 =
+            create_arith_trunci(st, latch, props.condition, i1_ty, latch_loc);
+        create_scf_condition(st->ctx, arena, latch, should_repeat_i1,
+                             iter_vals, n_iter, latch_loc);
+
+        // (6) Build the after-region: single block with same arg types as
+        //     init args, terminated by scf.yield args.
+        MLIR_RegionHandle after_region = MLIR_CreateRegion(st->ctx);
+        MLIR_BlockHandle after_block = MLIR_CreateBlock(st->ctx);
+        MLIR_AppendRegionBlock(st->ctx, after_region, after_block);
+        MLIR_ValueHandle *after_args = n_lh_args
+            ? arena_new_array(arena, MLIR_ValueHandle, n_lh_args) : NULL;
+        for (size_t i = 0; i < n_lh_args; ++i) {
+            after_args[i] = MLIR_AddBlockArgument(st->ctx, after_block,
+                                                  iter_arg_types[i], hdr_loc);
+        }
+        create_scf_yield(st->ctx, arena, after_block, after_args, n_lh_args,
+                         hdr_loc);
+
+        // (7) Build scf.while in newLPB. Results match iter args types.
+        MLIR_ValueHandle *results = n_lh_args
+            ? arena_new_array(arena, MLIR_ValueHandle, n_lh_args) : NULL;
+        for (size_t i = 0; i < n_lh_args; ++i) {
+            results[i] = MLIR_CreateValueOpResult(
+                st->ctx, MLIR_INVALID_HANDLE, (uint32_t)i, iter_arg_types[i],
+                fresh_ssa_name(arena), hdr_loc);
+        }
+        MLIR_RegionHandle *regions = arena_new_array(arena, MLIR_RegionHandle, 2);
+        regions[0] = body_region;
+        regions[1] = after_region;
+        MLIR_OpHandle scf_while = MLIR_CreateOp(
+            st->ctx, OP_TYPE_SCF_WHILE, str_lit("scf.while"),
+            NULL, 0, iter_arg_types, n_lh_args, results, n_lh_args,
+            lpb_args, n_lh_args, regions, 2,
+            hdr_loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+        MLIR_AppendBlockOp(st->ctx, newLPB, scf_while);
+
+        // (8) RAUW exit_block's args with scf.while results.
+        size_t n_exit_args = MLIR_GetBlockNumArgs(exit_block);
+        size_t n_share = n_exit_args < n_lh_args ? n_exit_args : n_lh_args;
+        for (size_t i = 0; i < n_share; ++i) {
+            MLIR_ReplaceAllUsesOfValue(st->ctx, MLIR_GetBlockArg(exit_block, i),
+                                       results[i]);
+        }
+
+        // (9) Redirect predecessors of loop_header (now in scf.while body)
+        //     that are still in `region` to target newLPB instead.
+        replace_block_successor_uses(st->ctx, region, loop_header, newLPB);
+
+        // (10) Splice exit_block's ops into newLPB, erase exit_block.
+        MLIR_SpliceBlockOps(st->ctx, newLPB, exit_block);
+        MLIR_EraseBlock(st->ctx, exit_block);
+
+        // Record the body's entry block for the recursive driver.
+        if (n_new == cap_new) {
+            size_t nc = cap_new ? cap_new * 2 : 4;
+            MLIR_BlockHandle *na = arena_new_array(arena, MLIR_BlockHandle, nc);
+            if (n_new) memcpy(na, new_sub_regions, sizeof(MLIR_BlockHandle) * n_new);
+            new_sub_regions = na; cap_new = nc;
+        }
+        new_sub_regions[n_new++] = loop_header;
+
+        #undef SCC_INSERT
+    }
+
+    *out_n_new = n_new;
+    return new_sub_regions;
 }
 
 static bool try_lift_simple_if(MLIR_Context *ctx, Arena *arena,
