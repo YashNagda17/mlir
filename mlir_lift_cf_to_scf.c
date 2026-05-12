@@ -671,8 +671,10 @@ static void combiner_combine_exit(MLIR_Context *ctx, Combiner *c,
         for (size_t i = 0; i < e->n_operand_types; ++i) {
             args[i] = MLIR_GetBlockArg(e->exit_block, i);
         }
-        MLIR_OpType ot = string_eq(e->op_name, "llvm.return")
-            ? OP_TYPE_LLVM_RETURN : OP_TYPE_FUNC_RETURN;
+        MLIR_OpType ot;
+        if (string_eq(e->op_name, "llvm.return")) ot = OP_TYPE_LLVM_RETURN;
+        else if (string_eq(e->op_name, "scf.yield")) ot = OP_TYPE_SCF_YIELD;
+        else ot = OP_TYPE_FUNC_RETURN;
         MLIR_OpHandle new_ret = MLIR_CreateOp(
             ctx, ot, e->op_name,
             NULL, 0, NULL, 0, NULL, 0,
@@ -709,9 +711,12 @@ static void create_single_exit_blocks_for_return_like_into(MLIR_Context *ctx,
         if (MLIR_GetOpNumSuccessors(term) != 0) continue;
         // Only act on the recognized return-like ops; leave other
         // zero-successor terminators (e.g. cf.assert, unreachable) alone.
+        // We also funnel scf.yield for sub-regions (else of scf.if etc.)
+        // so the inner cf.cond_br chain has a single continuation block.
         string n = MLIR_GetOpName(term);
         if (!string_eq_string(n, str_lit("func.return")) &&
-            !string_eq_string(n, str_lit("llvm.return"))) continue;
+            !string_eq_string(n, str_lit("llvm.return")) &&
+            !string_eq_string(n, str_lit("scf.yield"))) continue;
         combiner_combine_exit(ctx, c, term);
     }
 }
@@ -2508,9 +2513,113 @@ static BranchXformResult transform_to_structured_cf_branches(
         }
     }
 
-    // Case 2: no continuation edge — branches all end in return-likes.
-    // Recurse into each successor as a single-entry single-exit subregion.
+    // Case 2: no continuation edge — branches all end in return-likes
+    // (e.g. scf.yield in a sub-region created by a previous lift, or
+    // func.return at the top level if M5 didn't run).
+    //
+    // If every region-exit terminator in every branch arm has the same
+    // op name and operand signature, we can synthesize a common
+    // continuation: a fresh block taking those operand types as block
+    // args and emitting the same terminator op using them. Each exit
+    // terminator gets rewritten to `cf.br(operands) -> continuation`.
+    // After this rewrite the worklist will re-enter M8 on `region_entry`
+    // with a real continuation in place, and the main lift path fires.
     if (no_succ_has_cont_edge) {
+        // Collect (block, term) pairs for every exit terminator in
+        // every arm, and verify signature match.
+        struct ExitTerm { MLIR_BlockHandle block; MLIR_OpHandle term; };
+        size_t cap_et = 0, n_et = 0;
+        struct ExitTerm *exit_terms = NULL;
+        string canon_name = {0};
+        size_t canon_n_ops = 0;
+        MLIR_TypeHandle *canon_types = NULL;
+        bool all_match = true;
+        bool any_exit = false;
+        for (size_t i = 0; i < num_succ && all_match; ++i) {
+            for (size_t k = 0; k < n_br[i] && all_match; ++k) {
+                MLIR_BlockHandle b = branch_regions[i][k];
+                if (!is_region_exit_block(b)) continue;
+                MLIR_OpHandle t = MLIR_GetBlockTerminator(b);
+                if (t == MLIR_INVALID_HANDLE) { all_match = false; break; }
+                string nm = MLIR_GetOpName(t);
+                size_t no = MLIR_GetOpNumOperands(t);
+                if (!any_exit) {
+                    canon_name = nm;
+                    canon_n_ops = no;
+                    canon_types = no ? arena_new_array(arena, MLIR_TypeHandle, no) : NULL;
+                    for (size_t a = 0; a < no; ++a)
+                        canon_types[a] = MLIR_GetValueType(MLIR_GetOpOperand(t, a));
+                    any_exit = true;
+                } else {
+                    if (!string_eq_string(canon_name, nm) || canon_n_ops != no) {
+                        all_match = false; break;
+                    }
+                    for (size_t a = 0; a < no; ++a) {
+                        if (canon_types[a] != MLIR_GetValueType(MLIR_GetOpOperand(t, a))) {
+                            all_match = false; break;
+                        }
+                    }
+                }
+                if (n_et == cap_et) {
+                    size_t nc = cap_et ? cap_et * 2 : 4;
+                    struct ExitTerm *na = arena_new_array(arena, struct ExitTerm, nc);
+                    if (n_et) memcpy(na, exit_terms, sizeof(struct ExitTerm) * n_et);
+                    exit_terms = na; cap_et = nc;
+                }
+                exit_terms[n_et++] = (struct ExitTerm){ .block = b, .term = t };
+            }
+        }
+
+        if (all_match && any_exit) {
+            // Synthesize the continuation.
+            MLIR_LocationHandle loc = MLIR_GetOpLocation(exit_terms[0].term);
+            MLIR_BlockHandle cont = MLIR_CreateBlock(st->ctx);
+            for (size_t a = 0; a < canon_n_ops; ++a)
+                MLIR_AddBlockArgument(st->ctx, cont, canon_types[a], loc);
+            MLIR_RegionHandle parent_region = MLIR_GetBlockParentRegion(region_entry);
+            MLIR_InsertRegionBlockBefore(st->ctx, parent_region, cont,
+                                         MLIR_INVALID_HANDLE);
+            MLIR_ValueHandle *cargs = canon_n_ops
+                ? arena_new_array(arena, MLIR_ValueHandle, canon_n_ops) : NULL;
+            for (size_t a = 0; a < canon_n_ops; ++a)
+                cargs[a] = MLIR_GetBlockArg(cont, a);
+            MLIR_OpType cot;
+            if (string_eq_string(canon_name, str_lit("scf.yield")))
+                cot = OP_TYPE_SCF_YIELD;
+            else if (string_eq_string(canon_name, str_lit("llvm.return")))
+                cot = OP_TYPE_LLVM_RETURN;
+            else
+                cot = OP_TYPE_FUNC_RETURN;
+            MLIR_OpHandle cterm = MLIR_CreateOp(
+                st->ctx, cot, canon_name,
+                NULL, 0, NULL, 0, NULL, 0,
+                cargs, canon_n_ops, NULL, 0,
+                loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+            MLIR_AppendBlockOp(st->ctx, cont, cterm);
+
+            // Replace each exit terminator with cf.br(operands) -> cont.
+            for (size_t i = 0; i < n_et; ++i) {
+                MLIR_OpHandle t = exit_terms[i].term;
+                size_t no = MLIR_GetOpNumOperands(t);
+                MLIR_ValueHandle *ops = no
+                    ? arena_new_array(arena, MLIR_ValueHandle, no) : NULL;
+                for (size_t a = 0; a < no; ++a)
+                    ops[a] = MLIR_GetOpOperand(t, a);
+                MLIR_LocationHandle tloc = MLIR_GetOpLocation(t);
+                MLIR_BlockHandle bb = exit_terms[i].block;
+                MLIR_EraseOp(st->ctx, t);
+                create_cf_br_in_block(st->ctx, arena, bb, cont, ops, no, tloc);
+            }
+
+            // Re-queue region_entry; next pass will lift normally.
+            res.new_sub_regions = arena_new_array(arena, MLIR_BlockHandle, 1);
+            res.new_sub_regions[0] = region_entry;
+            res.n_new_sub_regions = 1;
+            return res;
+        }
+
+        // Fallback: recurse into each successor as a single-entry
+        // single-exit subregion (unchanged from before).
         MLIR_BlockHandle *out = arena_new_array(arena, MLIR_BlockHandle, num_succ);
         for (size_t i = 0; i < num_succ; ++i) out[i] = MLIR_GetOpSuccessor(term, i);
         res.new_sub_regions = out;
@@ -2562,6 +2671,34 @@ static BranchXformResult transform_to_structured_cf_branches(
 
     MLIR_BlockHandle *new_sub = arena_new_array(arena, MLIR_BlockHandle, num_succ + 1);
     size_t n_new = 0;
+
+    // Snapshot the cf.br terminators of branch_regions[i][k] that point to
+    // `continuation`. These need their cf.br → scf.yield rewrite once the
+    // scf.if op exists. We collect them here, *before* MoveBlockToRegionEnd
+    // takes the blocks out of `continuation`'s region — afterwards
+    // MLIR_GetBlockNumPredecessors(continuation) can no longer see them
+    // (predecessor lookup is region-scoped).
+    typedef struct { MLIR_OpHandle op; size_t succ_idx; } PredRec;
+    size_t max_preds = 0;
+    for (size_t i = 0; i < num_succ; ++i) max_preds += n_br[i];
+    PredRec *preds = max_preds
+        ? arena_new_array(arena, PredRec, max_preds) : NULL;
+    size_t n_preds = 0;
+    for (size_t i = 0; i < num_succ; ++i) {
+        for (size_t k = 0; k < n_br[i]; ++k) {
+            MLIR_BlockHandle b = branch_regions[i][k];
+            MLIR_OpHandle bterm = MLIR_GetBlockTerminator(b);
+            if (bterm == MLIR_INVALID_HANDLE) continue;
+            size_t bns = MLIR_GetOpNumSuccessors(bterm);
+            for (size_t s = 0; s < bns; ++s) {
+                if (MLIR_GetOpSuccessor(bterm, s) == continuation) {
+                    preds[n_preds].op = bterm;
+                    preds[n_preds].succ_idx = s;
+                    n_preds++;
+                }
+            }
+        }
+    }
 
     for (size_t i = 0; i < num_succ; ++i) {
         regions[i] = MLIR_CreateRegion(st->ctx);
@@ -2696,19 +2833,10 @@ static BranchXformResult transform_to_structured_cf_branches(
 
     // Any remaining users of `continuation` (cf.br from branch-region
     // tails that flow into the continuation) must be replaced with
-    // scf.yield carrying their successor-operands.
-    size_t n_preds_cont = MLIR_GetBlockNumPredecessors(continuation);
-    // Snapshot — we'll mutate.
-    typedef struct { MLIR_OpHandle op; size_t succ_idx; } PredRec;
-    PredRec *preds = n_preds_cont
-        ? arena_new_array(arena, PredRec, n_preds_cont) : NULL;
-    for (size_t i = 0; i < n_preds_cont; ++i) {
-        size_t sidx = 0;
-        MLIR_BlockHandle pb = MLIR_GetBlockPredecessor(continuation, i, &sidx);
-        preds[i].op = MLIR_GetBlockTerminator(pb);
-        preds[i].succ_idx = sidx;
-    }
-    for (size_t i = 0; i < n_preds_cont; ++i) {
+    // scf.yield carrying their successor-operands. We use the pred
+    // snapshot taken before MoveBlockToRegionEnd dragged these tails
+    // out of `continuation`'s region.
+    for (size_t i = 0; i < n_preds; ++i) {
         MLIR_OpHandle u = preds[i].op;
         size_t n_so = MLIR_GetOpNumSuccessorOperands(u, preds[i].succ_idx);
         MLIR_ValueHandle *vals = n_so

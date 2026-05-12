@@ -963,10 +963,13 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
         return true;
     }
 
-    // ---- ub.poison ---------------------------------------------------------
+    // ---- ub.poison / llvm.mlir.undef ---------------------------------------
     // Inserted by --lift-cf-to-scf for "doesn't-matter" yield values on
-    // unreachable / pre-break paths. Lower to a typed zero constant.
-    if (name_eq(name, "ub.poison")) {
+    // unreachable / pre-break paths. Lower either name to a typed zero
+    // constant. Upstream's CFGToSCF uses ub.poison; the native port uses
+    // llvm.mlir.undef (no UB dialect in the agnostic op table) — both are
+    // semantically equivalent here.
+    if (name_eq(name, "ub.poison") || name_eq(name, "llvm.mlir.undef")) {
         if (MLIR_GetOpNumResults(op) != 1) return false;
         MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
         uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(r));
