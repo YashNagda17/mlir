@@ -537,14 +537,200 @@ static bool check_preconditions(MLIR_RegionHandle region) {
     return true;
 }
 
-// Once the TODOs above are filled in, this iterates the work list as in
-// transformCFGToSCF (CFGToSCF.cpp:1300-1376):
-//   - work-list seeded with region entry
-//   - for each: run cycle-to-loop pass, then branch-to-if pass; push
-//     any new sub-regions returned.
 // ============================================================================
+// Tarjan SCC (analysis only; no IR mutation).
+//
+// Computes strongly-connected components of the cf graph rooted at the
+// region's entry block. The result is a dense per-block SCC id and, for
+// each SCC, the list of blocks comprising it (in reverse-topological
+// order, the standard Tarjan output order). SCCs of size 1 with no
+// self-edge are still returned (with `is_cycle=false`); only those are
+// "non-cycle" SCCs.
+//
+// Iterative implementation (no recursion) so deep CFGs don't blow the
+// host stack.
 // ============================================================================
-// Single-successor splice (CFGToSCF.cpp:955-967): if `region_entry` has
+typedef struct {
+    size_t            n_blocks;     // number of reachable blocks
+    MLIR_BlockHandle *blocks;       // dense list, indexed by per-block id
+    size_t           *scc_of;       // per-block: scc index this block belongs to
+    size_t            n_sccs;
+    size_t           *scc_starts;   // length n_sccs+1; scc i = blocks_in_sccs[scc_starts[i]..scc_starts[i+1]]
+    size_t           *blocks_in_sccs; // permutation of [0..n_blocks)
+    bool             *scc_is_cycle; // length n_sccs; true if SCC has size>=2 OR has a self-edge
+} SccResult;
+
+// Look up the dense index of a block in `blocks[0..n)`. Returns SIZE_MAX if not found.
+static size_t scc_block_index(MLIR_BlockHandle *blocks, size_t n, MLIR_BlockHandle b) {
+    for (size_t i = 0; i < n; ++i) if (blocks[i] == b) return i;
+    return SIZE_MAX;
+}
+
+// Walks the cf graph from the region's entry, collecting all reachable
+// blocks in `out_blocks` and returning their count.
+static size_t scc_collect_reachable(Arena *arena, MLIR_RegionHandle region,
+                                    MLIR_BlockHandle **out_blocks) {
+    size_t cap = MLIR_GetRegionNumBlocks(region);
+    if (cap == 0) { *out_blocks = NULL; return 0; }
+    MLIR_BlockHandle *list = arena_new_array(arena, MLIR_BlockHandle, cap);
+    size_t n = 0;
+    // BFS from entry.
+    MLIR_BlockHandle entry = MLIR_GetRegionBlock(region, 0);
+    list[n++] = entry;
+    for (size_t head = 0; head < n; ++head) {
+        MLIR_BlockHandle b = list[head];
+        MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+        if (term == MLIR_INVALID_HANDLE) continue;
+        size_t ns = MLIR_GetOpNumSuccessors(term);
+        for (size_t i = 0; i < ns; ++i) {
+            MLIR_BlockHandle s = MLIR_GetOpSuccessor(term, i);
+            if (s == MLIR_INVALID_HANDLE) continue;
+            if (scc_block_index(list, n, s) != SIZE_MAX) continue;
+            if (n >= cap) return n; // shouldn't happen — region has cap blocks
+            list[n++] = s;
+        }
+    }
+    *out_blocks = list;
+    return n;
+}
+
+// Iterative Tarjan SCC. Returns the reverse-topological order of SCCs
+// (i.e. SCC[0] is a "leaf" with no out-edges to other SCCs).
+static SccResult scc_compute(Arena *arena, MLIR_RegionHandle region) {
+    SccResult r = {0};
+    MLIR_BlockHandle *blocks = NULL;
+    size_t n = scc_collect_reachable(arena, region, &blocks);
+    r.n_blocks = n;
+    r.blocks = blocks;
+    if (n == 0) return r;
+
+    size_t *index_of    = arena_new_array(arena, size_t, n);
+    size_t *lowlink     = arena_new_array(arena, size_t, n);
+    bool   *on_stack    = arena_new_array(arena, bool,   n);
+    size_t *tarjan_stk  = arena_new_array(arena, size_t, n);
+    size_t  tarjan_top  = 0;
+    size_t  next_index  = 1; // 0 means "undefined"
+    for (size_t i = 0; i < n; ++i) {
+        index_of[i] = 0;
+        lowlink[i]  = 0;
+        on_stack[i] = false;
+    }
+    r.scc_of         = arena_new_array(arena, size_t, n);
+    r.blocks_in_sccs = arena_new_array(arena, size_t, n);
+    // Upper bound on number of SCCs: n.
+    size_t *scc_starts_tmp = arena_new_array(arena, size_t, n + 1);
+    bool   *scc_is_cycle_tmp = arena_new_array(arena, bool, n);
+    size_t  n_sccs_out = 0;
+    size_t  blocks_out = 0;
+
+    // Iterative DFS frame.
+    typedef struct { size_t v; size_t next_succ; size_t n_succ; } Frame;
+    Frame *frames = arena_new_array(arena, Frame, n);
+
+    for (size_t root = 0; root < n; ++root) {
+        if (index_of[root]) continue;
+        // strongconnect(root) — iterative.
+        size_t fp = 0;
+        // Push initial frame.
+        index_of[root] = next_index;
+        lowlink[root]  = next_index;
+        next_index++;
+        tarjan_stk[tarjan_top++] = root;
+        on_stack[root] = true;
+        {
+            MLIR_OpHandle term = MLIR_GetBlockTerminator(blocks[root]);
+            size_t ns = (term == MLIR_INVALID_HANDLE) ? 0 : MLIR_GetOpNumSuccessors(term);
+            frames[fp].v = root;
+            frames[fp].next_succ = 0;
+            frames[fp].n_succ = ns;
+            fp++;
+        }
+        while (fp > 0) {
+            Frame *cur = &frames[fp - 1];
+            if (cur->next_succ < cur->n_succ) {
+                MLIR_OpHandle term = MLIR_GetBlockTerminator(blocks[cur->v]);
+                MLIR_BlockHandle succ = MLIR_GetOpSuccessor(term, cur->next_succ);
+                cur->next_succ++;
+                size_t w = scc_block_index(blocks, n, succ);
+                if (w == SIZE_MAX) continue; // unreachable from entry — skip
+                if (index_of[w] == 0) {
+                    // Recurse into w.
+                    index_of[w] = next_index;
+                    lowlink[w]  = next_index;
+                    next_index++;
+                    tarjan_stk[tarjan_top++] = w;
+                    on_stack[w] = true;
+                    MLIR_OpHandle wterm = MLIR_GetBlockTerminator(blocks[w]);
+                    size_t wns = (wterm == MLIR_INVALID_HANDLE) ? 0 : MLIR_GetOpNumSuccessors(wterm);
+                    frames[fp].v = w;
+                    frames[fp].next_succ = 0;
+                    frames[fp].n_succ = wns;
+                    fp++;
+                } else if (on_stack[w]) {
+                    if (index_of[w] < lowlink[cur->v]) {
+                        lowlink[cur->v] = index_of[w];
+                    }
+                }
+                continue;
+            }
+            // All successors visited. Update parent's lowlink with ours.
+            size_t v = cur->v;
+            size_t v_low = lowlink[v];
+            // If v is the root of an SCC, pop it.
+            if (lowlink[v] == index_of[v]) {
+                size_t scc_id = n_sccs_out;
+                scc_starts_tmp[n_sccs_out] = blocks_out;
+                size_t scc_size = 0;
+                while (tarjan_top > 0) {
+                    size_t w = tarjan_stk[--tarjan_top];
+                    on_stack[w] = false;
+                    r.scc_of[w] = scc_id;
+                    r.blocks_in_sccs[blocks_out++] = w;
+                    scc_size++;
+                    if (w == v) break;
+                }
+                // Mark cyclic if size >= 2 OR contains a self-edge.
+                bool cyclic = (scc_size >= 2);
+                if (!cyclic) {
+                    MLIR_OpHandle term = MLIR_GetBlockTerminator(blocks[v]);
+                    size_t ns = (term == MLIR_INVALID_HANDLE) ? 0 : MLIR_GetOpNumSuccessors(term);
+                    for (size_t i = 0; i < ns; ++i) {
+                        if (MLIR_GetOpSuccessor(term, i) == blocks[v]) {
+                            cyclic = true; break;
+                        }
+                    }
+                }
+                scc_is_cycle_tmp[n_sccs_out] = cyclic;
+                n_sccs_out++;
+            }
+            fp--;
+            if (fp > 0) {
+                Frame *par = &frames[fp - 1];
+                if (v_low < lowlink[par->v]) lowlink[par->v] = v_low;
+            }
+        }
+    }
+    scc_starts_tmp[n_sccs_out] = blocks_out;
+
+    r.n_sccs        = n_sccs_out;
+    r.scc_starts    = arena_new_array(arena, size_t, n_sccs_out + 1);
+    r.scc_is_cycle  = arena_new_array(arena, bool,   n_sccs_out);
+    for (size_t i = 0; i < n_sccs_out; ++i) {
+        r.scc_starts[i]   = scc_starts_tmp[i];
+        r.scc_is_cycle[i] = scc_is_cycle_tmp[i];
+    }
+    r.scc_starts[n_sccs_out] = scc_starts_tmp[n_sccs_out];
+    return r;
+}
+
+// Returns true iff `block` is in the SCC `scc_id`.
+static bool scc_contains(const SccResult *r, size_t scc_id, MLIR_BlockHandle block) {
+    size_t bi = scc_block_index(r->blocks, r->n_blocks, block);
+    if (bi == SIZE_MAX) return false;
+    return r->scc_of[bi] == scc_id;
+}
+
+
 // exactly one successor reached via cf.br, replace that successor's
 // block-arg uses with the cf.br's branch operands, splice the
 // successor's ops into `region_entry`, drop the cf.br, and erase the
