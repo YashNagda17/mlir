@@ -809,6 +809,235 @@ static bool fold_simple_ifs(MLIR_Context *ctx, Arena *arena,
     return any;
 }
 
+// ============================================================================
+// Lift the simplest cf-style structured while loop into scf.while.
+//
+// Pattern recognized (after return-like combining + linear folding):
+//
+//   ^entry: ...
+//     cf.br ^header(init...)
+//   ^header(iter...):                  (preds = {entry, body})
+//     ...
+//     cf.cond_br %cond, ^body(then...), ^exit(else...)
+//   ^body(after...):                   (sole pred = ^header)
+//     ...
+//     cf.br ^header(yield...)
+//   ^exit(res...):                     (sole pred = ^header)
+//     ...
+//
+// Constraints (intentionally narrow for the first cut, matching the
+// shape tinyc emits where everything flows through alloca/load):
+//   - entry's terminator is cf.br with single successor = ^header.
+//   - ^header's terminator is cf.cond_br with successors {^body, ^exit},
+//     ^body and ^exit distinct, neither equal to ^header or ^entry.
+//   - ^body's sole predecessor is ^header; ^body's terminator is cf.br
+//     to ^header (the back-edge).
+//   - ^exit's sole predecessor is ^header.
+//   - ^header has exactly two predecessors (entry + body).
+//   - All operand list arities (init, iter, then, after, yield) match
+//     the corresponding block arg counts; ^body's args (R) and ^exit's
+//     args (R) must have matching types (because scf.condition's
+//     payload is shared between scf.while results and after-block args).
+//
+// Lifting:
+//   - Move ^header into a fresh `before` region; replace its cf.cond_br
+//     with scf.condition(%cond, exit_args...).
+//   - Move ^body into a fresh `after` region; replace its cf.br back-edge
+//     with scf.yield(yield_args...).
+//   - Build scf.while(init...) -> (R...) with the two regions, append it
+//     to ^entry, RAUW ^exit's block args with scf.while's results, splice
+//     ^exit's ops into ^entry, erase the entry's old cf.br and ^exit.
+// ============================================================================
+
+static MLIR_OpHandle create_scf_condition(MLIR_Context *ctx, Arena *arena,
+                                          MLIR_BlockHandle in_block,
+                                          MLIR_ValueHandle cond,
+                                          MLIR_ValueHandle *payload, size_t n_payload,
+                                          MLIR_LocationHandle loc) {
+    size_t n_ops = 1 + n_payload;
+    MLIR_ValueHandle *operands = arena_new_array(arena, MLIR_ValueHandle, n_ops);
+    operands[0] = cond;
+    for (size_t i = 0; i < n_payload; ++i) operands[1 + i] = payload[i];
+    MLIR_OpHandle c = MLIR_CreateOp(
+        ctx, OP_TYPE_SCF_CONDITION, str_lit("scf.condition"),
+        NULL, 0, NULL, 0, NULL, 0,
+        operands, n_ops, NULL, 0,
+        loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_AppendBlockOp(ctx, in_block, c);
+    return c;
+}
+
+static bool try_lift_simple_while(MLIR_Context *ctx, Arena *arena,
+                                  MLIR_BlockHandle entry) {
+    // entry's terminator must be cf.br with single successor.
+    MLIR_OpHandle entry_br = MLIR_GetBlockTerminator(entry);
+    if (entry_br == MLIR_INVALID_HANDLE) return false;
+    if (!string_eq_string(MLIR_GetOpName(entry_br), str_lit("cf.br"))) return false;
+    if (MLIR_GetOpNumSuccessors(entry_br) != 1) return false;
+    MLIR_BlockHandle header = MLIR_GetOpSuccessor(entry_br, 0);
+    if (header == MLIR_INVALID_HANDLE || header == entry) return false;
+    if (MLIR_GetBlockNumPredecessors(header) != 2) return false;
+
+    // header terminator must be cf.cond_br to {body, exit}.
+    MLIR_OpHandle cond_br = MLIR_GetBlockTerminator(header);
+    if (cond_br == MLIR_INVALID_HANDLE) return false;
+    if (!string_eq_string(MLIR_GetOpName(cond_br), str_lit("cf.cond_br"))) return false;
+    if (MLIR_GetOpNumSuccessors(cond_br) != 2) return false;
+    MLIR_BlockHandle body = MLIR_GetOpSuccessor(cond_br, 0);
+    MLIR_BlockHandle exit_b = MLIR_GetOpSuccessor(cond_br, 1);
+    if (body == MLIR_INVALID_HANDLE || exit_b == MLIR_INVALID_HANDLE) return false;
+    if (body == exit_b || body == header || body == entry) return false;
+    if (exit_b == header || exit_b == entry) return false;
+    if (MLIR_GetBlockNumPredecessors(body) != 1) return false;
+    if (MLIR_GetBlockNumPredecessors(exit_b) != 1) return false;
+
+    // body's terminator must be cf.br back-edge to header.
+    MLIR_OpHandle body_br = MLIR_GetBlockTerminator(body);
+    if (body_br == MLIR_INVALID_HANDLE) return false;
+    if (!string_eq_string(MLIR_GetOpName(body_br), str_lit("cf.br"))) return false;
+    if (MLIR_GetOpSuccessor(body_br, 0) != header) return false;
+
+    // Arity sanity: cf.br's successor operands must match header's args.
+    size_t n_iter = MLIR_GetBlockNumArgs(header);
+    if (MLIR_GetOpNumSuccessorOperands(entry_br, 0) != n_iter) return false;
+    if (MLIR_GetOpNumSuccessorOperands(body_br, 0) != n_iter) return false;
+
+    // cond_br's true-operands → body's args (R = after types).
+    // cond_br's false-operands → exit's args (must match types of R).
+    size_t n_after = MLIR_GetBlockNumArgs(body);
+    size_t n_res   = MLIR_GetBlockNumArgs(exit_b);
+    if (MLIR_GetOpNumSuccessorOperands(cond_br, 0) != n_after) return false;
+    if (MLIR_GetOpNumSuccessorOperands(cond_br, 1) != n_res)   return false;
+    if (n_after != n_res) return false;
+    // Types must match (R is shared between after-args and scf.while results).
+    for (size_t i = 0; i < n_res; ++i) {
+        MLIR_TypeHandle t1 = MLIR_GetValueType(MLIR_GetBlockArg(body, i));
+        MLIR_TypeHandle t2 = MLIR_GetValueType(MLIR_GetBlockArg(exit_b, i));
+        if (t1 != t2) return false;
+    }
+
+    // ---- Snapshot all the values we need before mutating IR. ----
+    MLIR_LocationHandle entry_loc = MLIR_GetOpLocation(entry_br);
+    MLIR_LocationHandle cond_loc  = MLIR_GetOpLocation(cond_br);
+    MLIR_LocationHandle body_loc  = MLIR_GetOpLocation(body_br);
+
+    MLIR_ValueHandle cond_v = MLIR_GetOpOperand(cond_br, 0);
+
+    MLIR_ValueHandle *init_args = n_iter
+        ? arena_new_array(arena, MLIR_ValueHandle, n_iter) : NULL;
+    for (size_t i = 0; i < n_iter; ++i)
+        init_args[i] = MLIR_GetOpSuccessorOperand(entry_br, 0, i);
+
+    MLIR_ValueHandle *yield_args = n_iter
+        ? arena_new_array(arena, MLIR_ValueHandle, n_iter) : NULL;
+    for (size_t i = 0; i < n_iter; ++i)
+        yield_args[i] = MLIR_GetOpSuccessorOperand(body_br, 0, i);
+
+    MLIR_ValueHandle *body_args = n_after
+        ? arena_new_array(arena, MLIR_ValueHandle, n_after) : NULL;
+    for (size_t i = 0; i < n_after; ++i)
+        body_args[i] = MLIR_GetOpSuccessorOperand(cond_br, 0, i);
+
+    MLIR_ValueHandle *exit_args = n_res
+        ? arena_new_array(arena, MLIR_ValueHandle, n_res) : NULL;
+    for (size_t i = 0; i < n_res; ++i)
+        exit_args[i] = MLIR_GetOpSuccessorOperand(cond_br, 1, i);
+
+    MLIR_TypeHandle *iter_types = n_iter
+        ? arena_new_array(arena, MLIR_TypeHandle, n_iter) : NULL;
+    for (size_t i = 0; i < n_iter; ++i)
+        iter_types[i] = MLIR_GetValueType(MLIR_GetBlockArg(header, i));
+
+    MLIR_TypeHandle *res_types = n_res
+        ? arena_new_array(arena, MLIR_TypeHandle, n_res) : NULL;
+    for (size_t i = 0; i < n_res; ++i)
+        res_types[i] = MLIR_GetValueType(MLIR_GetBlockArg(exit_b, i));
+
+    // ---- Replace body's block args with cond_br's true-payload. ----
+    // (body_args become the scf.condition payload after rewrite, which
+    // becomes the after-block args == header's body's block args. So
+    // RAUW the existing body args with body_args BEFORE moving body
+    // into the after region — we need to keep the body block's args
+    // in place to receive the payload, but their values must match
+    // what was passed via cond_br.)
+    //
+    // Actually, in scf.while, the after-block args ARE the new values
+    // produced by scf.condition's payload. Inside the body block, uses
+    // of the old block args should be replaced by the new args of the
+    // moved block. We keep the args in place and just need to RAUW
+    // any references that came from outside; since body has sole pred
+    // = header, all uses are inside body itself, and the args remain
+    // valid by construction. So no RAUW needed for body args.
+
+    // ---- Replace cond_br with scf.condition in header. ----
+    MLIR_EraseOp(ctx, cond_br);
+    create_scf_condition(ctx, arena, header, cond_v, body_args, n_after, cond_loc);
+
+    // ---- Replace body's back-edge cf.br with scf.yield. ----
+    MLIR_EraseOp(ctx, body_br);
+    create_scf_yield(ctx, arena, body, yield_args, n_iter, body_loc);
+
+    // ---- Move header / body into fresh regions. ----
+    MLIR_RegionHandle before_region = MLIR_CreateRegion(ctx);
+    MLIR_RegionHandle after_region  = MLIR_CreateRegion(ctx);
+    MLIR_MoveBlockToRegionEnd(ctx, header, before_region);
+    MLIR_MoveBlockToRegionEnd(ctx, body, after_region);
+
+    // ---- Build scf.while op + result handles. ----
+    MLIR_ValueHandle *result_vs = n_res
+        ? arena_new_array(arena, MLIR_ValueHandle, n_res) : NULL;
+    for (size_t i = 0; i < n_res; ++i) {
+        result_vs[i] = MLIR_CreateValueOpResult(
+            ctx, MLIR_INVALID_HANDLE, (uint32_t)i, res_types[i],
+            fresh_ssa_name(arena), entry_loc);
+    }
+    MLIR_RegionHandle *regions = arena_new_array(arena, MLIR_RegionHandle, 2);
+    regions[0] = before_region; regions[1] = after_region;
+    MLIR_ValueHandle *operands = n_iter
+        ? arena_new_array(arena, MLIR_ValueHandle, n_iter) : NULL;
+    for (size_t i = 0; i < n_iter; ++i) operands[i] = init_args[i];
+
+    // Erase the entry's cf.br first so the terminator slot is free.
+    MLIR_EraseOp(ctx, entry_br);
+
+    MLIR_OpHandle scf_while = MLIR_CreateOp(
+        ctx, OP_TYPE_SCF_WHILE, str_lit("scf.while"),
+        NULL, 0,
+        res_types, n_res,
+        result_vs, n_res,
+        operands, n_iter,
+        regions, 2,
+        entry_loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_AppendBlockOp(ctx, entry, scf_while);
+
+    // ---- RAUW exit's block args with scf.while's results. ----
+    for (size_t i = 0; i < n_res; ++i) {
+        MLIR_ReplaceAllUsesOfValue(ctx, MLIR_GetBlockArg(exit_b, i), result_vs[i]);
+    }
+    if (n_res) MLIR_EraseBlockArguments(ctx, exit_b, 0, n_res);
+
+    // ---- Splice exit's ops into entry, erase exit. ----
+    MLIR_SpliceBlockOps(ctx, entry, exit_b);
+    MLIR_EraseBlock(ctx, exit_b);
+    return true;
+}
+
+static bool fold_simple_loops_and_ifs(MLIR_Context *ctx, Arena *arena,
+                                      MLIR_BlockHandle entry) {
+    bool any = false;
+    while (true) {
+        bool spliced = fold_linear_chain(ctx, arena, entry);
+        bool lifted_if    = try_lift_simple_if(ctx, arena, entry);
+        bool lifted_while = false;
+        if (!lifted_if) {
+            lifted_while = try_lift_simple_while(ctx, arena, entry);
+        }
+        if (!spliced && !lifted_if && !lifted_while) break;
+        any = any || spliced || lifted_if || lifted_while;
+    }
+    return any;
+}
+
 // Erase non-entry blocks with no predecessors, iterating to fixed point
 // (erasing one may leave another unreachable). Mirrors upstream's
 // `eraseUnreachableBlocks`.
@@ -863,7 +1092,7 @@ bool MLIR_LiftCfToScfNative(MLIR_Context *ctx, MLIR_OpHandle module) {
             if (!region_has_cf_branch(body)) continue;
             create_single_exit_blocks_for_return_like(ctx, scratch, body);
             MLIR_BlockHandle entry = MLIR_GetRegionBlock(body, 0);
-            fold_simple_ifs(ctx, scratch, entry);
+            fold_simple_loops_and_ifs(ctx, scratch, entry);
         }
     }
     arena_destroy(scratch);

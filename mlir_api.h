@@ -114,6 +114,7 @@ typedef enum {
     OP_TYPE_SCF_WHILE,
     OP_TYPE_SCF_IF,
     OP_TYPE_SCF_YIELD,
+    OP_TYPE_SCF_CONDITION,
 
     // Triton dialect
     OP_TYPE_TT_GET_PROGRAM_ID,
