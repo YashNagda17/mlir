@@ -730,6 +730,114 @@ static bool scc_contains(const SccResult *r, size_t scc_id, MLIR_BlockHandle blo
     return r->scc_of[bi] == scc_id;
 }
 
+// ============================================================================
+// Cycle edges (port of CFGToSCF.cpp:475-511 calculateCycleEdges).
+//
+//   entry_edges:  src ∉ SCC, dst ∈ SCC. Each represents an external
+//                 predecessor entering the loop.
+//   back_edges:   src ∈ SCC, dst is one of the entry-targets (header).
+//                 Each represents an iteration restart.
+//   exit_edges:   src ∈ SCC, dst ∉ SCC. Each represents a way to leave
+//                 the loop.
+//
+// All edges are stored as (from_block, succ_idx) so we can mutate them
+// later via MLIR_SetOpSuccessor.
+// ============================================================================
+typedef struct {
+    Edge   *entry;   size_t n_entry;
+    Edge   *back;    size_t n_back;
+    Edge   *exit;    size_t n_exit;
+    // Distinct destination blocks of entry edges. The "header set"
+    // upstream uses to identify back-edges.
+    MLIR_BlockHandle *entry_dsts; size_t n_entry_dsts;
+} CycleEdges;
+
+static bool ce_contains_block(MLIR_BlockHandle *list, size_t n, MLIR_BlockHandle b) {
+    for (size_t i = 0; i < n; ++i) if (list[i] == b) return true;
+    return false;
+}
+
+static CycleEdges calculate_cycle_edges(Arena *arena, const SccResult *r,
+                                        size_t scc_id) {
+    CycleEdges out = {0};
+    size_t cap = 0;
+    for (size_t i = r->scc_starts[scc_id]; i < r->scc_starts[scc_id + 1]; ++i) {
+        MLIR_BlockHandle b = r->blocks[r->blocks_in_sccs[i]];
+        cap += MLIR_GetBlockNumPredecessors(b);
+        MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+        if (term != MLIR_INVALID_HANDLE) cap += MLIR_GetOpNumSuccessors(term);
+    }
+    if (cap == 0) cap = 1;
+    out.entry = arena_new_array(arena, Edge, cap);
+    out.back  = arena_new_array(arena, Edge, cap);
+    out.exit  = arena_new_array(arena, Edge, cap);
+    out.entry_dsts = arena_new_array(arena, MLIR_BlockHandle, cap);
+
+    // First pass: entry + exit edges.
+    for (size_t i = r->scc_starts[scc_id]; i < r->scc_starts[scc_id + 1]; ++i) {
+        MLIR_BlockHandle b = r->blocks[r->blocks_in_sccs[i]];
+        // Entry: predecessors of b not in this SCC.
+        size_t np = MLIR_GetBlockNumPredecessors(b);
+        for (size_t pi = 0; pi < np; ++pi) {
+            size_t succ_idx = 0;
+            MLIR_BlockHandle p = MLIR_GetBlockPredecessor(b, pi, &succ_idx);
+            if (p == MLIR_INVALID_HANDLE) continue;
+            if (scc_contains(r, scc_id, p)) continue;
+            out.entry[out.n_entry++] = (Edge){p, succ_idx};
+            if (!ce_contains_block(out.entry_dsts, out.n_entry_dsts, b)) {
+                out.entry_dsts[out.n_entry_dsts++] = b;
+            }
+        }
+        // Exit: successors of b not in this SCC.
+        MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+        if (term == MLIR_INVALID_HANDLE) continue;
+        size_t ns = MLIR_GetOpNumSuccessors(term);
+        for (size_t si = 0; si < ns; ++si) {
+            MLIR_BlockHandle s = MLIR_GetOpSuccessor(term, si);
+            if (s == MLIR_INVALID_HANDLE) continue;
+            if (scc_contains(r, scc_id, s)) continue;
+            out.exit[out.n_exit++] = (Edge){b, si};
+        }
+    }
+
+    // Second pass: back edges. An edge (src in SCC, dst in SCC) is a
+    // back-edge iff dst is one of the entry-targets (header set).
+    for (size_t i = r->scc_starts[scc_id]; i < r->scc_starts[scc_id + 1]; ++i) {
+        MLIR_BlockHandle b = r->blocks[r->blocks_in_sccs[i]];
+        MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+        if (term == MLIR_INVALID_HANDLE) continue;
+        size_t ns = MLIR_GetOpNumSuccessors(term);
+        for (size_t si = 0; si < ns; ++si) {
+            MLIR_BlockHandle s = MLIR_GetOpSuccessor(term, si);
+            if (s == MLIR_INVALID_HANDLE) continue;
+            if (!ce_contains_block(out.entry_dsts, out.n_entry_dsts, s)) continue;
+            out.back[out.n_back++] = (Edge){b, si};
+        }
+    }
+    // If the SCC has NO external entry edges (e.g. an entire region
+    // that is itself a loop reached only through its "entry block"
+    // which is in the SCC), treat the first block of the SCC as the
+    // synthetic header so we still find back-edges and can do
+    // multiplexing. This matches how upstream's scc_iterator returns
+    // such SCCs.
+    if (out.n_entry == 0 && out.n_entry_dsts == 0) {
+        // Use the SCC's first block as header.
+        MLIR_BlockHandle hdr = r->blocks[r->blocks_in_sccs[r->scc_starts[scc_id]]];
+        out.entry_dsts[out.n_entry_dsts++] = hdr;
+        for (size_t i = r->scc_starts[scc_id]; i < r->scc_starts[scc_id + 1]; ++i) {
+            MLIR_BlockHandle b = r->blocks[r->blocks_in_sccs[i]];
+            MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+            if (term == MLIR_INVALID_HANDLE) continue;
+            size_t ns = MLIR_GetOpNumSuccessors(term);
+            for (size_t si = 0; si < ns; ++si) {
+                MLIR_BlockHandle s = MLIR_GetOpSuccessor(term, si);
+                if (s == hdr) out.back[out.n_back++] = (Edge){b, si};
+            }
+        }
+    }
+    return out;
+}
+
 
 // exactly one successor reached via cf.br, replace that successor's
 // block-arg uses with the cf.br's branch operands, splice the
