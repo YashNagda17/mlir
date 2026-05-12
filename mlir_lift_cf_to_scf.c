@@ -1382,6 +1382,340 @@ static MLIR_OpHandle create_scf_yield(MLIR_Context *ctx, Arena *arena,
     return y;
 }
 
+// ============================================================================
+// DominanceInfo (Cooper-Harvey-Kennedy iterative algorithm, "A Simple,
+// Fast Dominance Algorithm", SPLP 2001).
+//
+// Supports both forward dominance and post-dominance over a single
+// region's block CFG. Used by transformToReduceLoop (forward dom) and
+// transformToStructuredCFBranches (post-dom). All node indices in the
+// returned struct are *postorder* indices: a node's postorder index is
+// always smaller than its dominator's postorder index, so intersect()
+// walks toward the root by repeatedly stepping b = idom[b].
+//
+// Post-dominance is computed on the reverse CFG. When the original CFG
+// has multiple "leaf" blocks (no successors), we synthesize a single
+// virtual exit at postorder index n_real that is the artificial post-
+// dom root; otherwise the unique leaf is the root.
+// ============================================================================
+typedef struct {
+    Arena            *arena;
+    bool              is_post;
+    MLIR_BlockHandle *po_blocks;     // [n_total] real blocks first (in postorder), then virtual exit if any
+    size_t            n_total;       // n_real + (virt? 1 : 0)
+    size_t            n_real;        // count of real blocks
+    size_t            root_po;       // postorder index of root (entry for fwd, virt/leaf for post)
+    size_t           *idom;          // [n_total] -> postorder index of immediate dominator
+    size_t          **neighbors;     // [n_total] predecessor lists (in postdom these are successors-in-original)
+    size_t           *n_neighbors;   // [n_total]
+    bool              has_virt;      // true if a virtual exit was added (post-dom only)
+} DomInfo;
+
+// Returns SIZE_MAX if `b` is not in the region (or is the virtual exit
+// pseudo-block).
+static size_t dom_po_index_of(const DomInfo *d, MLIR_BlockHandle b) {
+    for (size_t i = 0; i < d->n_real; ++i) {
+        if (d->po_blocks[i] == b) return i;
+    }
+    return SIZE_MAX;
+}
+
+// Intersect two postorder indices on the dominator tree. Both must have
+// idom set (!= SIZE_MAX). Returns their nearest common ancestor.
+static size_t dom_intersect(const DomInfo *d, size_t b1, size_t b2) {
+    while (b1 != b2) {
+        while (b1 < b2) b1 = d->idom[b1];
+        while (b2 < b1) b2 = d->idom[b2];
+    }
+    return b1;
+}
+
+// True if `a` dominates `b`. Walks b's idom chain looking for a.
+static bool dom_dominates(const DomInfo *d, MLIR_BlockHandle a,
+                          MLIR_BlockHandle b) {
+    size_t ai = dom_po_index_of(d, a);
+    size_t bi = dom_po_index_of(d, b);
+    if (ai == SIZE_MAX || bi == SIZE_MAX) return false;
+    while (bi != d->root_po) {
+        if (bi == ai) return true;
+        bi = d->idom[bi];
+        if (bi == SIZE_MAX) return false;
+    }
+    return bi == ai;
+}
+
+// Common (post-)dominator. Returns MLIR_INVALID_HANDLE if either input is
+// unknown to the analysis.
+static MLIR_BlockHandle dom_common(const DomInfo *d, MLIR_BlockHandle a,
+                                   MLIR_BlockHandle b) {
+    size_t ai = dom_po_index_of(d, a);
+    size_t bi = dom_po_index_of(d, b);
+    if (ai == SIZE_MAX || bi == SIZE_MAX) return MLIR_INVALID_HANDLE;
+    if (d->idom[ai] == SIZE_MAX || d->idom[bi] == SIZE_MAX)
+        return MLIR_INVALID_HANDLE;
+    size_t ci = dom_intersect(d, ai, bi);
+    return d->po_blocks[ci];
+}
+
+// DFS post-order traversal helper. Frame-based, iterative.
+typedef struct {
+    MLIR_BlockHandle block;
+    size_t           next_child;     // next neighbor index to recurse into
+} DomFrame;
+
+// Collect blocks in DFS-post-order starting from `root`. `is_post`
+// controls neighbor direction (postdom uses original successors of the
+// reverse CFG = original predecessors, but we're computing dom on the
+// reverse graph so we walk from the post-dom root which is virt/leaf...).
+//
+// Concretely:
+//   - forward dom: walk from entry following SUCCESSORS.
+//   - postdom:     walk from virt/leaf following PREDECESSORS-in-original
+//                  (which are SUCCESSORS in the reverse graph).
+static void dom_dfs_postorder(MLIR_BlockHandle root,
+                              const MLIR_BlockHandle *leaf_blocks,
+                              size_t n_leaves,
+                              bool is_post,
+                              bool root_is_virt,
+                              MLIR_BlockHandle *out_blocks, size_t *out_n,
+                              MLIR_BlockHandle **visited_arr, size_t *visited_n,
+                              Arena *arena) {
+    // Bounded stack: in practice tinyc regions are <100 blocks. Resize
+    // dynamically just in case.
+    size_t stack_cap = 64;
+    DomFrame *stack = arena_new_array(arena, DomFrame, stack_cap);
+    size_t sp = 0;
+
+    // visited array
+    size_t v_cap = 64, v_n = 0;
+    MLIR_BlockHandle *v_arr = arena_new_array(arena, MLIR_BlockHandle, v_cap);
+    #define DOM_VISITED(b) ({ bool _f=false; for (size_t _i=0;_i<v_n;++_i) if (v_arr[_i]==(b)){_f=true;break;} _f; })
+    #define DOM_MARK(b) do { \
+        if (v_n == v_cap) { \
+            size_t nc = v_cap * 2; \
+            MLIR_BlockHandle *na = arena_new_array(arena, MLIR_BlockHandle, nc); \
+            memcpy(na, v_arr, sizeof(MLIR_BlockHandle) * v_n); \
+            v_arr = na; v_cap = nc; \
+        } \
+        v_arr[v_n++] = (b); \
+    } while (0)
+
+    if (root_is_virt) {
+        // Root is the virtual exit. Push every real leaf as first level.
+        for (size_t i = 0; i < n_leaves; ++i) {
+            if (DOM_VISITED(leaf_blocks[i])) continue;
+            DOM_MARK(leaf_blocks[i]);
+            if (sp == stack_cap) {
+                size_t nc = stack_cap * 2;
+                DomFrame *ns = arena_new_array(arena, DomFrame, nc);
+                memcpy(ns, stack, sizeof(DomFrame) * sp);
+                stack = ns; stack_cap = nc;
+            }
+            stack[sp++] = (DomFrame){leaf_blocks[i], 0};
+        }
+    } else {
+        DOM_MARK(root);
+        stack[sp++] = (DomFrame){root, 0};
+    }
+
+    size_t out_cap = 64;
+    MLIR_BlockHandle *out = arena_new_array(arena, MLIR_BlockHandle, out_cap);
+    size_t out_count = 0;
+
+    while (sp > 0) {
+        DomFrame *fr = &stack[sp - 1];
+        MLIR_BlockHandle b = fr->block;
+
+        // Neighbor count + accessor: forward dom uses successors;
+        // postdom uses predecessors.
+        size_t nn;
+        if (!is_post) {
+            MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+            nn = (term == MLIR_INVALID_HANDLE) ? 0 : MLIR_GetOpNumSuccessors(term);
+        } else {
+            nn = MLIR_GetBlockNumPredecessors(b);
+        }
+
+        if (fr->next_child < nn) {
+            MLIR_BlockHandle child;
+            if (!is_post) {
+                MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+                child = MLIR_GetOpSuccessor(term, fr->next_child);
+            } else {
+                child = MLIR_GetBlockPredecessor(b, fr->next_child, NULL);
+            }
+            fr->next_child++;
+            if (child == MLIR_INVALID_HANDLE) continue;
+            if (DOM_VISITED(child)) continue;
+            DOM_MARK(child);
+            if (sp == stack_cap) {
+                size_t nc = stack_cap * 2;
+                DomFrame *ns = arena_new_array(arena, DomFrame, nc);
+                memcpy(ns, stack, sizeof(DomFrame) * sp);
+                stack = ns; stack_cap = nc;
+            }
+            stack[sp++] = (DomFrame){child, 0};
+        } else {
+            // Done with this node; emit it in postorder.
+            if (out_count == out_cap) {
+                size_t nc = out_cap * 2;
+                MLIR_BlockHandle *na = arena_new_array(arena, MLIR_BlockHandle, nc);
+                memcpy(na, out, sizeof(MLIR_BlockHandle) * out_count);
+                out = na; out_cap = nc;
+            }
+            out[out_count++] = b;
+            sp--;
+        }
+    }
+
+    for (size_t i = 0; i < out_count; ++i) out_blocks[i] = out[i];
+    *out_n = out_count;
+    if (visited_arr) *visited_arr = v_arr;
+    if (visited_n) *visited_n = v_n;
+    #undef DOM_VISITED
+    #undef DOM_MARK
+}
+
+static DomInfo dom_compute(Arena *arena, MLIR_RegionHandle region,
+                           bool is_post) {
+    DomInfo d = {0};
+    d.arena = arena;
+    d.is_post = is_post;
+
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    if (nb == 0) {
+        return d;
+    }
+
+    // Identify the root.
+    //   forward dom: region's entry block (block 0).
+    //   postdom:     the unique block with no successors, or a virtual
+    //                exit if there are zero or multiple such blocks.
+    MLIR_BlockHandle entry = MLIR_GetRegionBlock(region, 0);
+    MLIR_BlockHandle *leaves = arena_new_array(arena, MLIR_BlockHandle, nb);
+    size_t n_leaves = 0;
+    if (is_post) {
+        for (size_t i = 0; i < nb; ++i) {
+            MLIR_BlockHandle b = MLIR_GetRegionBlock(region, i);
+            MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+            size_t ns = (term == MLIR_INVALID_HANDLE) ? 0 : MLIR_GetOpNumSuccessors(term);
+            if (ns == 0) leaves[n_leaves++] = b;
+        }
+    }
+    bool need_virt = is_post && n_leaves != 1;
+
+    // Worst-case capacity for postorder result = all real blocks.
+    MLIR_BlockHandle *po = arena_new_array(arena, MLIR_BlockHandle, nb + 1);
+    size_t po_n = 0;
+    MLIR_BlockHandle root_for_dfs = is_post ? (need_virt ? MLIR_INVALID_HANDLE : leaves[0]) : entry;
+    dom_dfs_postorder(root_for_dfs, leaves, n_leaves, is_post, need_virt,
+                      po, &po_n, NULL, NULL, arena);
+
+    d.n_real = po_n;
+    d.has_virt = need_virt;
+    d.n_total = po_n + (need_virt ? 1 : 0);
+    d.po_blocks = arena_new_array(arena, MLIR_BlockHandle, d.n_total);
+    for (size_t i = 0; i < po_n; ++i) d.po_blocks[i] = po[i];
+    if (need_virt) {
+        d.po_blocks[po_n] = MLIR_INVALID_HANDLE;
+        d.root_po = po_n;
+    } else {
+        // Root is the LAST node in postorder (postorder visits root last).
+        d.root_po = po_n - 1;
+    }
+
+    // Build neighbor lists.
+    //   forward dom: neighbors = predecessors-in-original-CFG.
+    //   postdom:     neighbors = successors-in-original-CFG (= predecessors-
+    //                in-reverse-CFG). Additionally, each leaf gets a virt
+    //                neighbor when has_virt is true.
+    d.neighbors   = arena_new_array(arena, size_t *, d.n_total);
+    d.n_neighbors = arena_new_array(arena, size_t,   d.n_total);
+    for (size_t i = 0; i < d.n_real; ++i) {
+        MLIR_BlockHandle b = d.po_blocks[i];
+        size_t cap = 8;
+        size_t *buf = arena_new_array(arena, size_t, cap);
+        size_t cnt = 0;
+        if (!is_post) {
+            size_t np = MLIR_GetBlockNumPredecessors(b);
+            for (size_t k = 0; k < np; ++k) {
+                MLIR_BlockHandle p = MLIR_GetBlockPredecessor(b, k, NULL);
+                size_t pi = SIZE_MAX;
+                for (size_t j = 0; j < d.n_real; ++j) if (d.po_blocks[j] == p) { pi = j; break; }
+                if (pi == SIZE_MAX) continue;
+                if (cnt == cap) {
+                    size_t nc = cap * 2;
+                    size_t *nb2 = arena_new_array(arena, size_t, nc);
+                    memcpy(nb2, buf, sizeof(size_t) * cnt);
+                    buf = nb2; cap = nc;
+                }
+                buf[cnt++] = pi;
+            }
+        } else {
+            MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+            size_t ns = (term == MLIR_INVALID_HANDLE) ? 0 : MLIR_GetOpNumSuccessors(term);
+            for (size_t k = 0; k < ns; ++k) {
+                MLIR_BlockHandle s = MLIR_GetOpSuccessor(term, k);
+                size_t si = SIZE_MAX;
+                for (size_t j = 0; j < d.n_real; ++j) if (d.po_blocks[j] == s) { si = j; break; }
+                if (si == SIZE_MAX) continue;
+                if (cnt == cap) {
+                    size_t nc = cap * 2;
+                    size_t *nb2 = arena_new_array(arena, size_t, nc);
+                    memcpy(nb2, buf, sizeof(size_t) * cnt);
+                    buf = nb2; cap = nc;
+                }
+                buf[cnt++] = si;
+            }
+            // If this is a leaf and we have a virtual exit, add it.
+            if (ns == 0 && need_virt) {
+                if (cnt == cap) {
+                    size_t nc = cap * 2;
+                    size_t *nb2 = arena_new_array(arena, size_t, nc);
+                    memcpy(nb2, buf, sizeof(size_t) * cnt);
+                    buf = nb2; cap = nc;
+                }
+                buf[cnt++] = po_n;  // virt index
+            }
+        }
+        d.neighbors[i] = buf;
+        d.n_neighbors[i] = cnt;
+    }
+    if (need_virt) {
+        d.neighbors[po_n] = NULL;
+        d.n_neighbors[po_n] = 0;
+    }
+
+    // Initialize idom.
+    d.idom = arena_new_array(arena, size_t, d.n_total);
+    for (size_t i = 0; i < d.n_total; ++i) d.idom[i] = SIZE_MAX;
+    d.idom[d.root_po] = d.root_po;
+
+    // Iterate in reverse-postorder (highest po first), skipping root.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        // Iterate i from d.n_total-1 down to 0, but skip root_po.
+        for (size_t k = 0; k < d.n_total; ++k) {
+            size_t i = d.n_total - 1 - k;
+            if (i == d.root_po) continue;
+            size_t new_id = SIZE_MAX;
+            for (size_t j = 0; j < d.n_neighbors[i]; ++j) {
+                size_t p = d.neighbors[i][j];
+                if (d.idom[p] == SIZE_MAX) continue;
+                if (new_id == SIZE_MAX) new_id = p;
+                else new_id = dom_intersect(&d, new_id, p);
+            }
+            if (new_id != SIZE_MAX && d.idom[i] != new_id) {
+                d.idom[i] = new_id;
+                changed = true;
+            }
+        }
+    }
+
+    return d;
+}
+
 static bool try_lift_simple_if(MLIR_Context *ctx, Arena *arena,
                                MLIR_BlockHandle entry) {
     MLIR_OpHandle cond_br = MLIR_GetBlockTerminator(entry);
