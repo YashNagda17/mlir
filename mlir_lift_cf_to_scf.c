@@ -2288,6 +2288,440 @@ static MLIR_BlockHandle *transform_cycles_to_scf_loops(
     return new_sub_regions;
 }
 
+// ============================================================================
+// transformToStructuredCFBranches  (CFGToSCF.cpp:944-1216).
+//
+// Transforms the first occurrence of conditional control flow at
+// `region_entry` into structured scf.if / scf.index_switch ops.
+// Returns the list of new sub-region entry blocks the recursive driver
+// needs to descend into. NULL on failure. When *out_n_new == SIZE_MAX
+// the caller should treat that as "no progress / not lifted" (we did not
+// recognize this branch op shape — switch).
+// ============================================================================
+static bool is_region_exit_block(MLIR_BlockHandle b) {
+    MLIR_OpHandle term = MLIR_GetBlockTerminator(b);
+    if (term == MLIR_INVALID_HANDLE) return true;
+    return MLIR_GetOpNumSuccessors(term) == 0;
+}
+
+// `parent_block` and `to_redirect_idx` together describe an edge in the
+// successor list of `parent_term`. Mutate to point at `new_succ`.
+static void edge_set_succ(MLIR_Context *ctx, MLIR_OpHandle parent_term,
+                          size_t succ_idx, MLIR_BlockHandle new_succ) {
+    MLIR_SetOpSuccessor(ctx, parent_term, succ_idx, new_succ);
+}
+
+// Append a block to a dynamic block set if not already present. Returns
+// new size.
+static size_t block_set_insert(Arena *arena, MLIR_BlockHandle **set,
+                               size_t n, size_t *cap, MLIR_BlockHandle b) {
+    if (block_set_contains(*set, n, b)) return n;
+    if (n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 8;
+        MLIR_BlockHandle *nb = arena_new_array(arena, MLIR_BlockHandle, nc);
+        if (n) memcpy(nb, *set, sizeof(MLIR_BlockHandle) * n);
+        *set = nb; *cap = nc;
+    }
+    (*set)[n++] = b;
+    return n;
+}
+
+// DFS-collect all blocks dominated by `root` in the forward dominance
+// tree. `dom` must be forward dominance over the parent region of `root`.
+// Output is appended to *out (arena-allocated, grows dynamically).
+static size_t collect_dominated_blocks(Arena *arena, const DomInfo *dom,
+                                       MLIR_BlockHandle root,
+                                       MLIR_BlockHandle **out,
+                                       size_t n, size_t *cap) {
+    size_t n_in = dom->n_real;
+    size_t r_idx = dom_po_index_of(dom, root);
+    if (r_idx == SIZE_MAX) return n;
+    size_t *stack = arena_new_array(arena, size_t, n_in ? n_in : 1);
+    size_t sp = 0;
+    stack[sp++] = r_idx;
+    while (sp > 0) {
+        size_t cur = stack[--sp];
+        MLIR_BlockHandle b = dom->po_blocks[cur];
+        n = block_set_insert(arena, out, n, cap, b);
+        for (size_t i = 0; i < n_in; ++i) {
+            if (i == cur) continue;
+            if (dom->idom[i] == cur) stack[sp++] = i;
+        }
+    }
+    return n;
+}
+
+// Holds the result of transform_to_structured_cf_branches.
+typedef struct {
+    MLIR_BlockHandle *new_sub_regions;
+    size_t            n_new_sub_regions;
+    bool              ok;
+    bool              made_progress;   // false: branch shape unhandled, no IR change
+} BranchXformResult;
+
+static BranchXformResult transform_to_structured_cf_branches(
+    LiftState *st, MLIR_BlockHandle region_entry, const DomInfo *dom)
+{
+    BranchXformResult res = {0};
+    res.ok = true;
+    res.made_progress = true;
+
+    Arena *arena = st->arena;
+    MLIR_OpHandle term = MLIR_GetBlockTerminator(region_entry);
+    if (term == MLIR_INVALID_HANDLE) { res.ok = false; return res; }
+    size_t num_succ = MLIR_GetOpNumSuccessors(term);
+
+    // Trivial: 0 successors (return-like).
+    if (num_succ == 0) return res;
+
+    // Single successor: splice and replace successor args with operands.
+    if (num_succ == 1) {
+        MLIR_BlockHandle succ = MLIR_GetOpSuccessor(term, 0);
+        if (succ == region_entry) { res.ok = false; return res; }  // self-loop
+        size_t n_args = MLIR_GetBlockNumArgs(succ);
+        size_t n_so   = MLIR_GetOpNumSuccessorOperands(term, 0);
+        size_t n_share = n_args < n_so ? n_args : n_so;
+        for (size_t i = 0; i < n_share; ++i) {
+            MLIR_ValueHandle old_v = MLIR_GetBlockArg(succ, i);
+            MLIR_ValueHandle new_v = MLIR_GetOpSuccessorOperand(term, 0, i);
+            MLIR_ReplaceAllUsesOfValue(st->ctx, old_v, new_v);
+        }
+        MLIR_EraseOp(st->ctx, term);
+        MLIR_SpliceBlockOps(st->ctx, region_entry, succ);
+        // succ must have no remaining preds now (was uniquely entered).
+        if (MLIR_GetBlockNumPredecessors(succ) == 0) {
+            MLIR_EraseBlock(st->ctx, succ);
+        }
+        res.new_sub_regions = arena_new_array(arena, MLIR_BlockHandle, 1);
+        res.new_sub_regions[0] = region_entry;
+        res.n_new_sub_regions = 1;
+        return res;
+    }
+
+    // Multi-successor. Only cf.cond_br is supported for now (cf.switch
+    // would need arith.index_castui + scf.index_switch; left as TODO).
+    string term_name = MLIR_GetOpName(term);
+    bool is_cond_br = string_eq_string(term_name, str_lit("cf.cond_br"));
+    if (!is_cond_br) {
+        // Not lifted; caller's worklist should still try children.
+        res.made_progress = false;
+        MLIR_BlockHandle *succs = arena_new_array(arena, MLIR_BlockHandle, num_succ);
+        for (size_t i = 0; i < num_succ; ++i) succs[i] = MLIR_GetOpSuccessor(term, i);
+        res.new_sub_regions = succs;
+        res.n_new_sub_regions = num_succ;
+        return res;
+    }
+
+    // Compute branch regions: blocks dominated by each successor edge.
+    // Edge dominates iff region_entry is the unique predecessor of succ.
+    MLIR_BlockHandle *not_continuation = NULL;
+    size_t n_nc = 0, cap_nc = 0;
+    n_nc = block_set_insert(arena, &not_continuation, n_nc, &cap_nc, region_entry);
+
+    MLIR_BlockHandle **branch_regions = arena_new_array(arena, MLIR_BlockHandle*, num_succ);
+    size_t *n_br = arena_new_array(arena, size_t, num_succ);
+    size_t *cap_br = arena_new_array(arena, size_t, num_succ);
+    memset(branch_regions, 0, sizeof(MLIR_BlockHandle*) * num_succ);
+    memset(n_br, 0, sizeof(size_t) * num_succ);
+    memset(cap_br, 0, sizeof(size_t) * num_succ);
+
+    for (size_t i = 0; i < num_succ; ++i) {
+        MLIR_BlockHandle succ = MLIR_GetOpSuccessor(term, i);
+        if (MLIR_GetBlockNumPredecessors(succ) != 1) continue;
+        // succ is solely dominated by region_entry; collect dom-subtree.
+        n_br[i] = collect_dominated_blocks(arena, dom, succ,
+                                           &branch_regions[i], n_br[i], &cap_br[i]);
+        for (size_t k = 0; k < n_br[i]; ++k) {
+            n_nc = block_set_insert(arena, &not_continuation, n_nc, &cap_nc,
+                                    branch_regions[i][k]);
+        }
+    }
+
+    // Collect continuation edges. Each entry: (from_block, succ_idx).
+    Edge *cont_edges = NULL;
+    size_t n_ce = 0, cap_ce = 0;
+    bool cont_post_dom_all = true;
+    bool no_succ_has_cont_edge = true;
+
+    for (size_t i = 0; i < num_succ; ++i) {
+        if (n_br[i] == 0) {
+            // Empty branch region: succ itself is in continuation.
+            if (n_ce == cap_ce) {
+                size_t nc = cap_ce ? cap_ce * 2 : 4;
+                Edge *na = arena_new_array(arena, Edge, nc);
+                if (n_ce) memcpy(na, cont_edges, sizeof(Edge) * n_ce);
+                cont_edges = na; cap_ce = nc;
+            }
+            cont_edges[n_ce++] = (Edge){ .from_block = region_entry, .succ_idx = i };
+            no_succ_has_cont_edge = false;
+            continue;
+        }
+        for (size_t k = 0; k < n_br[i]; ++k) {
+            MLIR_BlockHandle b = branch_regions[i][k];
+            if (is_region_exit_block(b)) {
+                cont_post_dom_all = false;
+                // Add all incoming edges from outside the branch region
+                // as continuation edges (we'll join return-likes through mux).
+                size_t np = MLIR_GetBlockNumPredecessors(b);
+                for (size_t p = 0; p < np; ++p) {
+                    size_t pred_succ_idx = 0;
+                    MLIR_BlockHandle pred = MLIR_GetBlockPredecessor(b, p, &pred_succ_idx);
+                    if (n_ce == cap_ce) {
+                        size_t nc = cap_ce ? cap_ce * 2 : 4;
+                        Edge *na = arena_new_array(arena, Edge, nc);
+                        if (n_ce) memcpy(na, cont_edges, sizeof(Edge) * n_ce);
+                        cont_edges = na; cap_ce = nc;
+                    }
+                    cont_edges[n_ce++] = (Edge){ .from_block = pred, .succ_idx = pred_succ_idx };
+                }
+                continue;
+            }
+            MLIR_OpHandle bterm = MLIR_GetBlockTerminator(b);
+            if (bterm == MLIR_INVALID_HANDLE) continue;
+            size_t bns = MLIR_GetOpNumSuccessors(bterm);
+            for (size_t s = 0; s < bns; ++s) {
+                MLIR_BlockHandle bs = MLIR_GetOpSuccessor(bterm, s);
+                if (block_set_contains(not_continuation, n_nc, bs)) continue;
+                if (n_ce == cap_ce) {
+                    size_t nc = cap_ce ? cap_ce * 2 : 4;
+                    Edge *na = arena_new_array(arena, Edge, nc);
+                    if (n_ce) memcpy(na, cont_edges, sizeof(Edge) * n_ce);
+                    cont_edges = na; cap_ce = nc;
+                }
+                cont_edges[n_ce++] = (Edge){ .from_block = b, .succ_idx = s };
+                no_succ_has_cont_edge = false;
+            }
+        }
+    }
+
+    // Case 2: no continuation edge — branches all end in return-likes.
+    // Recurse into each successor as a single-entry single-exit subregion.
+    if (no_succ_has_cont_edge) {
+        MLIR_BlockHandle *out = arena_new_array(arena, MLIR_BlockHandle, num_succ);
+        for (size_t i = 0; i < num_succ; ++i) out[i] = MLIR_GetOpSuccessor(term, i);
+        res.new_sub_regions = out;
+        res.n_new_sub_regions = num_succ;
+        return res;
+    }
+
+    // Find unique continuation block (or NULL).
+    MLIR_BlockHandle continuation = MLIR_INVALID_HANDLE;
+    bool single = true;
+    for (size_t i = 0; i < n_ce; ++i) {
+        MLIR_BlockHandle s = MLIR_GetOpSuccessor(
+            MLIR_GetBlockTerminator(cont_edges[i].from_block), cont_edges[i].succ_idx);
+        if (continuation == MLIR_INVALID_HANDLE) continuation = s;
+        else if (continuation != s) { single = false; break; }
+    }
+
+    if (!single || !cont_post_dom_all) {
+        MLIR_LocationHandle loc = MLIR_GetOpLocation(
+            MLIR_GetBlockTerminator(cont_edges[0].from_block));
+        EdgeMultiplexer mux = create_single_entry_block(st, cont_edges, n_ce, loc);
+        continuation = mux.mux_block;
+    }
+
+    // Case 3: not fully post-dominated — re-process this same region_entry
+    // after the mux block is in place.
+    if (!cont_post_dom_all) {
+        res.new_sub_regions = arena_new_array(arena, MLIR_BlockHandle, 1);
+        res.new_sub_regions[0] = region_entry;
+        res.n_new_sub_regions = 1;
+        return res;
+    }
+
+    // Build conditional regions. For each successor:
+    //   - empty branch region: a single dummy block carrying entry-edge operands.
+    //   - non-empty:           run createSingleExitBranchRegion logic.
+    //
+    // Each region's entry block carries args matching the entry-edge's
+    // successor operands. We RAUW those args with the operand values and
+    // erase the args (they are "redundant" since the dominating entry
+    // edge supplies a specific value).
+    MLIR_RegionHandle *regions = arena_new_array(arena, MLIR_RegionHandle, num_succ);
+
+    // Empty blocks created by case logic: each carries the values it
+    // needs to yield to the structured op.
+    typedef struct { MLIR_BlockHandle block; MLIR_ValueHandle *vals; size_t n_vals; } EmptyBlock;
+    EmptyBlock *empty_blocks = NULL;
+    size_t n_eb = 0, cap_eb = 0;
+
+    MLIR_BlockHandle *new_sub = arena_new_array(arena, MLIR_BlockHandle, num_succ + 1);
+    size_t n_new = 0;
+
+    for (size_t i = 0; i < num_succ; ++i) {
+        regions[i] = MLIR_CreateRegion(st->ctx);
+        if (n_br[i] == 0) {
+            // Dummy block carrying entry-edge operands.
+            size_t n_eop = MLIR_GetOpNumSuccessorOperands(term, i);
+            MLIR_ValueHandle *vals = n_eop
+                ? arena_new_array(arena, MLIR_ValueHandle, n_eop) : NULL;
+            for (size_t k = 0; k < n_eop; ++k)
+                vals[k] = MLIR_GetOpSuccessorOperand(term, i, k);
+            MLIR_BlockHandle eb = MLIR_CreateBlock(st->ctx);
+            MLIR_AppendRegionBlock(st->ctx, regions[i], eb);
+            if (n_eb == cap_eb) {
+                size_t nc = cap_eb ? cap_eb * 2 : 4;
+                EmptyBlock *na = arena_new_array(arena, EmptyBlock, nc);
+                if (n_eb) memcpy(na, empty_blocks, sizeof(EmptyBlock) * n_eb);
+                empty_blocks = na; cap_eb = nc;
+            }
+            empty_blocks[n_eb].block = eb;
+            empty_blocks[n_eb].vals = vals;
+            empty_blocks[n_eb].n_vals = n_eop;
+            n_eb++;
+            continue;
+        }
+
+        // createSingleExitBranchRegion: find blocks-with-edge-to-continuation,
+        // and if more than one such edge exists, route them through a fresh
+        // exit block.
+        MLIR_BlockHandle single_exit = MLIR_INVALID_HANDLE;
+        bool have_prev = false;
+        size_t prev_blk_idx = 0; size_t prev_succ_idx = 0;
+        for (size_t k = 0; k < n_br[i]; ++k) {
+            MLIR_BlockHandle b = branch_regions[i][k];
+            MLIR_OpHandle bterm = MLIR_GetBlockTerminator(b);
+            if (bterm == MLIR_INVALID_HANDLE) continue;
+            size_t bns = MLIR_GetOpNumSuccessors(bterm);
+            for (size_t s = 0; s < bns; ++s) {
+                if (MLIR_GetOpSuccessor(bterm, s) != continuation) continue;
+                if (!have_prev) {
+                    have_prev = true;
+                    prev_blk_idx = k; prev_succ_idx = s;
+                    continue;
+                }
+                if (single_exit == MLIR_INVALID_HANDLE) {
+                    single_exit = MLIR_CreateBlock(st->ctx);
+                    size_t n_cont_args = MLIR_GetBlockNumArgs(continuation);
+                    MLIR_ValueHandle *seb_args = n_cont_args
+                        ? arena_new_array(arena, MLIR_ValueHandle, n_cont_args) : NULL;
+                    for (size_t a = 0; a < n_cont_args; ++a) {
+                        MLIR_TypeHandle ty = MLIR_GetValueType(MLIR_GetBlockArg(continuation, a));
+                        seb_args[a] = MLIR_AddBlockArgument(st->ctx, single_exit, ty,
+                                                            MLIR_GetOpLocation(bterm));
+                    }
+                    // Redirect the first matching edge to single_exit.
+                    MLIR_BlockHandle prev_b = branch_regions[i][prev_blk_idx];
+                    edge_set_succ(st->ctx, MLIR_GetBlockTerminator(prev_b),
+                                  prev_succ_idx, single_exit);
+                    if (n_eb == cap_eb) {
+                        size_t nc = cap_eb ? cap_eb * 2 : 4;
+                        EmptyBlock *na = arena_new_array(arena, EmptyBlock, nc);
+                        if (n_eb) memcpy(na, empty_blocks, sizeof(EmptyBlock) * n_eb);
+                        empty_blocks = na; cap_eb = nc;
+                    }
+                    empty_blocks[n_eb].block = single_exit;
+                    empty_blocks[n_eb].vals = seb_args;
+                    empty_blocks[n_eb].n_vals = n_cont_args;
+                    n_eb++;
+                }
+                edge_set_succ(st->ctx, bterm, s, single_exit);
+            }
+        }
+
+        // Move branch region's blocks into `regions[i]`.
+        for (size_t k = 0; k < n_br[i]; ++k) {
+            MLIR_MoveBlockToRegionEnd(st->ctx, branch_regions[i][k], regions[i]);
+        }
+        if (single_exit != MLIR_INVALID_HANDLE) {
+            MLIR_MoveBlockToRegionEnd(st->ctx, single_exit, regions[i]);
+        }
+
+        // The first block in regions[i] is the entry. Replace its args
+        // with the entry-edge operands and erase them.
+        MLIR_BlockHandle entry_b = MLIR_GetRegionBlock(regions[i], 0);
+        size_t n_eargs = MLIR_GetBlockNumArgs(entry_b);
+        size_t n_eop   = MLIR_GetOpNumSuccessorOperands(term, i);
+        size_t n_share = n_eargs < n_eop ? n_eargs : n_eop;
+        for (size_t a = 0; a < n_share; ++a) {
+            MLIR_ValueHandle nv = MLIR_GetOpSuccessorOperand(term, i, a);
+            MLIR_ReplaceAllUsesOfValue(st->ctx, MLIR_GetBlockArg(entry_b, a), nv);
+        }
+        if (n_eargs) MLIR_EraseBlockArguments(st->ctx, entry_b, 0, n_eargs);
+
+        new_sub[n_new++] = entry_b;
+    }
+
+    // Build the structured branch op (scf.if for 2-successor cond_br).
+    size_t n_cont_args = MLIR_GetBlockNumArgs(continuation);
+    MLIR_TypeHandle *result_types = n_cont_args
+        ? arena_new_array(arena, MLIR_TypeHandle, n_cont_args) : NULL;
+    for (size_t i = 0; i < n_cont_args; ++i)
+        result_types[i] = MLIR_GetValueType(MLIR_GetBlockArg(continuation, i));
+
+    MLIR_LocationHandle term_loc = MLIR_GetOpLocation(term);
+
+    // cf.cond_br operand 0 is the i1 condition; cf.cond_br has 2 succs:
+    // successor 0 is then, successor 1 is else.
+    // scf.if wants (cond, then_region, else_region) and result types.
+    MLIR_ValueHandle cond_v = MLIR_GetOpOperand(term, 0);
+    MLIR_ValueHandle *if_results = n_cont_args
+        ? arena_new_array(arena, MLIR_ValueHandle, n_cont_args) : NULL;
+    for (size_t i = 0; i < n_cont_args; ++i) {
+        if_results[i] = MLIR_CreateValueOpResult(
+            st->ctx, MLIR_INVALID_HANDLE, (uint32_t)i, result_types[i],
+            fresh_ssa_name(arena), term_loc);
+    }
+    MLIR_OpHandle if_op = MLIR_CreateOp(
+        st->ctx, OP_TYPE_SCF_IF, str_lit("scf.if"),
+        NULL, 0, result_types, n_cont_args, if_results, n_cont_args,
+        &cond_v, 1, regions, 2,
+        term_loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_AppendBlockOp(st->ctx, region_entry, if_op);
+
+    // Erase the original cf.cond_br.
+    MLIR_EraseOp(st->ctx, term);
+
+    // Emit scf.yield in each empty block. We do this for both
+    // newly-created exit blocks and dummy blocks for empty branch regions.
+    for (size_t i = 0; i < n_eb; ++i) {
+        create_scf_yield(st->ctx, arena, empty_blocks[i].block,
+                         empty_blocks[i].vals, empty_blocks[i].n_vals, term_loc);
+    }
+
+    // Any remaining users of `continuation` (cf.br from branch-region
+    // tails that flow into the continuation) must be replaced with
+    // scf.yield carrying their successor-operands.
+    size_t n_preds_cont = MLIR_GetBlockNumPredecessors(continuation);
+    // Snapshot — we'll mutate.
+    typedef struct { MLIR_OpHandle op; size_t succ_idx; } PredRec;
+    PredRec *preds = n_preds_cont
+        ? arena_new_array(arena, PredRec, n_preds_cont) : NULL;
+    for (size_t i = 0; i < n_preds_cont; ++i) {
+        size_t sidx = 0;
+        MLIR_BlockHandle pb = MLIR_GetBlockPredecessor(continuation, i, &sidx);
+        preds[i].op = MLIR_GetBlockTerminator(pb);
+        preds[i].succ_idx = sidx;
+    }
+    for (size_t i = 0; i < n_preds_cont; ++i) {
+        MLIR_OpHandle u = preds[i].op;
+        size_t n_so = MLIR_GetOpNumSuccessorOperands(u, preds[i].succ_idx);
+        MLIR_ValueHandle *vals = n_so
+            ? arena_new_array(arena, MLIR_ValueHandle, n_so) : NULL;
+        for (size_t k = 0; k < n_so; ++k)
+            vals[k] = MLIR_GetOpSuccessorOperand(u, preds[i].succ_idx, k);
+        MLIR_BlockHandle ub = MLIR_GetOpParentBlock(u);
+        MLIR_LocationHandle uloc = MLIR_GetOpLocation(u);
+        MLIR_EraseOp(st->ctx, u);
+        create_scf_yield(st->ctx, arena, ub, vals, n_so, uloc);
+    }
+
+    // RAUW continuation's block args with scf.if's results, then splice
+    // continuation into region_entry and erase it.
+    for (size_t i = 0; i < n_cont_args; ++i) {
+        MLIR_ReplaceAllUsesOfValue(st->ctx, MLIR_GetBlockArg(continuation, i),
+                                   if_results[i]);
+    }
+    MLIR_SpliceBlockOps(st->ctx, region_entry, continuation);
+    MLIR_EraseBlock(st->ctx, continuation);
+
+    new_sub[n_new++] = region_entry;
+    res.new_sub_regions = new_sub;
+    res.n_new_sub_regions = n_new;
+    return res;
+}
+
 static bool try_lift_simple_if(MLIR_Context *ctx, Arena *arena,
                                MLIR_BlockHandle entry) {
     MLIR_OpHandle cond_br = MLIR_GetBlockTerminator(entry);
