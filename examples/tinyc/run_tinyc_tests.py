@@ -41,6 +41,13 @@ LOWERING_FLAG = [f"--lowering={LOWERING}"] if LOWERING else []
 # resulting .wasm via wasmtime. Both TINYC_LOWERING values are valid
 # with the wasm target.
 TARGET = os.environ.get("TINYC_TARGET", "native")
+# When TINYC_LIFT_USE_NATIVE=1, the upstream tinyc binary first runs the
+# (partial) native cf->scf lifter and then finishes any leftover cf ops
+# with upstream's CFGToSCF pass. That fallback handles all the patterns
+# the native lifter doesn't yet cover (loops with break/continue/early-
+# return, switch cascades, etc), so wasm_native_skip should NOT skip in
+# this configuration.
+LIFT_USE_NATIVE = os.environ.get("TINYC_LIFT_USE_NATIVE") == "1"
 
 
 def run(cmd, **kw):
@@ -165,6 +172,7 @@ def main():
         # pipeline doesn't implement yet; the upstream wasm path still
         # runs the test.
         if (TARGET == "wasm" and LOWERING == "native"
+                and not LIFT_USE_NATIVE
                 and t.get("wasm_native_skip")):
             print(f"SKIP {name} (wasm_native_skip)")
             skipped += 1
