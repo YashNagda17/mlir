@@ -1417,6 +1417,39 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
         return true;
     }
 
+    // ---- arith.index_cast / arith.index_castui -----------------------------
+    // index <-> i32/i64. On wasm32, `index` is i32, so casts to/from i32 are
+    // identity; i64<->index becomes a wrap/extend.
+    if (name_eq(name, "arith.index_cast") || name_eq(name, "arith.index_castui")) {
+        bool is_unsigned = name_eq(name, "arith.index_castui");
+        if (MLIR_GetOpNumOperands(op) != 1 || MLIR_GetOpNumResults(op) != 1)
+            return false;
+        MLIR_ValueHandle s = MLIR_GetOpOperand(op, 0);
+        MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
+        uint8_t in_vt  = wasm_vt(F->ctx, MLIR_GetValueType(s));
+        uint8_t out_vt = wasm_vt(F->ctx, MLIR_GetValueType(r));
+        if (in_vt == 0 || out_vt == 0) return false;
+        MLIR_ValueHandle sa;
+        if (!vmap_get(F, s, &sa)) return false;
+        if (in_vt == out_vt) { vmap_set(F, r, sa); return true; }
+        uint8_t opc;
+        if (in_vt == WT_I64 && out_vt == WT_I32) opc = 0xa7;            // wrap
+        else if (in_vt == WT_I32 && out_vt == WT_I64)
+            opc = is_unsigned ? 0xad : 0xac;                             // extend_u/s
+        else return false;
+        wasmssa_op_t o = {0};
+        o.type = OP_TYPE_WASMSSA_UNOP;
+        o.valtype = out_vt;
+        o.wasm_opcode = opc;
+        o.n_operands = 1;
+        MLIR_ValueHandle o_ops[1] = { sa };
+        o.operands = o_ops;
+        o.has_result = true;
+        MLIR_ValueHandle idx = commit_op(F, &o);
+        vmap_set(F, r, idx);
+        return true;
+    }
+
     // ---- builtin.unrealized_conversion_cast --------------------------------
     // Treat as identity when wasm valtypes match (e.g. ptr<->i32, index<->i32).
     // Otherwise emit a trunc/extend (i64<->i32 unsigned).

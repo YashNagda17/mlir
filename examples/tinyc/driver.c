@@ -2,6 +2,7 @@
 // MLIR module, print to stdout (or to -o <path>).
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <base/arena.h>
@@ -224,6 +225,10 @@ int app_main(void) {
             arena_destroy(arena);
             arena_destroy(boot_arena);
             return 1;
+        }
+        if (getenv("TINYC_DUMP_LOWERED")) {
+            string s = MLIR_PrintOperationGeneric(&ctx, module);
+            println(str_lit("{}"), s);
         }
     }
     string out;

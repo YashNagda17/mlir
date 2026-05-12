@@ -1471,6 +1471,30 @@ extern "C" bool MLIR_LowerToLLVMDialectUpstream(MLIR_Context *ctx,
 namespace {
 class CFGToSCFForWasm : public mlir::ControlFlowToSCFTransformation {
 public:
+    // Override switch-flag generation to use i32 instead of `index`. The
+    // wasm backend has no native `index` type and rejects
+    // arith.index_cast(ui), which the stock implementation introduces to
+    // bridge the index discriminator with cf.switch's i32-typed cases.
+    // Using i32 throughout side-steps the cast entirely.
+    mlir::Value getCFGSwitchValue(mlir::Location loc, mlir::OpBuilder &builder,
+                                  unsigned value) override {
+        return builder.create<mlir::arith::ConstantOp>(
+            loc, builder.getI32IntegerAttr(static_cast<int32_t>(value)));
+    }
+
+    void createCFGSwitchOp(mlir::Location loc, mlir::OpBuilder &builder,
+                           mlir::Value flag,
+                           llvm::ArrayRef<unsigned> caseValues,
+                           mlir::BlockRange caseDestinations,
+                           llvm::ArrayRef<mlir::ValueRange> caseArguments,
+                           mlir::Block *defaultDest,
+                           mlir::ValueRange defaultArgs) override {
+        builder.create<mlir::cf::SwitchOp>(
+            loc, flag, defaultDest, defaultArgs,
+            llvm::to_vector_of<int32_t>(caseValues),
+            caseDestinations, caseArguments);
+    }
+
     mlir::FailureOr<mlir::Operation *>
     createUnreachableTerminator(mlir::Location loc, mlir::OpBuilder &builder,
                                 mlir::Region &region) override {
@@ -1497,11 +1521,20 @@ public:
 static void liftLLVMFuncCFGToSCF(mlir::ModuleOp module) {
     using namespace mlir;
     CFGToSCFForWasm transformation;
-    llvm::SmallVector<LLVM::LLVMFuncOp> fns;
-    module.walk([&](LLVM::LLVMFuncOp fn) {
-        if (!fn.getBody().empty()) fns.push_back(fn);
+    // Walk both func.func and llvm.func bodies so the wasm-flavored
+    // overrides (i32 switch values, llvm.return for unreachable) are
+    // applied uniformly. The stock LiftControlFlowToSCF pass only
+    // visits func.func, and would otherwise lift those bodies with
+    // index-typed switch values that the wasm backend rejects.
+    llvm::SmallVector<Operation *> fns;
+    module.walk([&](Operation *fn) {
+        if (auto fOp = llvm::dyn_cast<func::FuncOp>(fn)) {
+            if (!fOp.getBody().empty()) fns.push_back(fn);
+        } else if (auto lOp = llvm::dyn_cast<LLVM::LLVMFuncOp>(fn)) {
+            if (!lOp.getBody().empty()) fns.push_back(fn);
+        }
     });
-    for (auto fn : fns) {
+    for (auto *fn : fns) {
         DominanceInfo domInfo(fn);
         // Post-order so nested regions are lifted first, matching the stock
         // LiftControlFlowToSCF pass.
@@ -1532,13 +1565,6 @@ extern "C" bool MLIR_LiftCfToScf(MLIR_Context *, MLIR_OpHandle module_h) {
         (void)mlir::eraseUnreachableBlocks(rewriter, module->getRegions());
     }
     liftLLVMFuncCFGToSCF(module);
-    mlir::PassManager pm(&mctx);
-    pm.addPass(mlir::createLiftControlFlowToSCFPass());
-    if (mlir::failed(pm.run(module))) {
-        std::fprintf(stderr,
-                     "MLIR_LiftCfToScf: pass pipeline failed\n");
-        return false;
-    }
     return true;
 }
 
