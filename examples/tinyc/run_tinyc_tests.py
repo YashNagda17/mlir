@@ -207,6 +207,18 @@ def main():
             print(f"SKIP {name} (wasm_native_skip)")
             skipped += 1
             continue
+        # Inverse opt-out: tests that exercise wasm-specific custom
+        # function attributes (e.g.
+        # `__attribute__((__import_module__("...")))`) which are
+        # honored by the in-tree native LLVM->WASM pipeline but not
+        # by the upstream LLVM WebAssembly backend (which would need
+        # a separate `passthrough = ...` attribute plumbing to forward
+        # them through MLIR's `convert-func-to-llvm` pass).
+        if (TARGET == "wasm" and LOWERING != "native"
+                and t.get("wasm_upstream_skip")):
+            print(f"SKIP {name} (wasm_upstream_skip)")
+            skipped += 1
+            continue
         # Multi-file tests pass `sources = [...]`; single-file tests
         # default to `<name>.tc` for backwards compatibility.
         sources = t.get("sources", [f"{name}.tc"])

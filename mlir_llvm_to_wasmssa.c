@@ -2212,6 +2212,14 @@ static bool lower_function(MLIR_Context *ctx, Arena *arena, ModCtx *mod,
             }
         }
         attrs[na++] = attr_b(ctx, "internal", internal);
+        // Forward `wasm.export_name` (from `__attribute__((__export_name__("...")))`)
+        // so the binary emitter can publish the function under the
+        // user-requested export name.
+        MLIR_AttributeHandle exa = find_attr(fn, "wasm.export_name");
+        if (exa != MLIR_INVALID_HANDLE) {
+            string es = MLIR_GetAttributeString(exa);
+            attrs[na++] = attr_s(ctx, "export_name", es.str, es.size);
+        }
         attrs[na++] = attr_s_hex(ctx, arena, "carrier_types",
                                  F.carrier_vts.data, F.carrier_vts.size);
 
@@ -2495,6 +2503,7 @@ static MLIR_OpHandle make_op(MLIR_Context *ctx, MLIR_OpType type,
 // Emit an imported (body-less) wasmssa.func op directly into the module body.
 static void emit_import_func(MLIR_Context *ctx, Arena *arena,
                              MLIR_BlockHandle body, string sym_name,
+                             string import_module, string import_name,
                              const uint8_t *param_types, size_t n_params,
                              const uint8_t *result_types, size_t n_results) {
     MLIR_AttributeHandle attrs[8];
@@ -2505,6 +2514,12 @@ static void emit_import_func(MLIR_Context *ctx, Arena *arena,
     attrs[na++] = attr_s_hex(ctx, arena, "param_types", param_types, n_params);
     attrs[na++] = attr_s_hex(ctx, arena, "result_types", result_types, n_results);
     attrs[na++] = attr_b(ctx, "exported", false);
+    if (import_module.size > 0) {
+        attrs[na++] = attr_s(ctx, "import_module", import_module.str, import_module.size);
+    }
+    if (import_name.size > 0) {
+        attrs[na++] = attr_s(ctx, "import_name", import_name.str, import_name.size);
+    }
     MLIR_OpHandle op = make_op(ctx, OP_TYPE_WASMSSA_IMPORT_FUNC,
                                attrs, na, NULL, 0, NULL, 0, 0, NULL);
     MLIR_AppendBlockOp(ctx, body, op);
@@ -2553,7 +2568,18 @@ MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
         MLIR_AttributeHandle sa = find_attr(op, "sym_name");
         string nm = MLIR_GetAttributeString(sa);
 
-        emit_import_func(ctx, arena, body, nm, p, np, r, nr);
+        // Forward `wasm.import_module` / `wasm.import_name` annotations
+        // (from `__attribute__((__import_module__("...")))`) so the
+        // binary emitter can place this import in the requested module
+        // (e.g. WASI's `wasi_snapshot_preview1`) instead of the default
+        // `env`.
+        string imod = {0}, iname = {0};
+        MLIR_AttributeHandle iam = find_attr(op, "wasm.import_module");
+        if (iam != MLIR_INVALID_HANDLE) imod = MLIR_GetAttributeString(iam);
+        MLIR_AttributeHandle ian = find_attr(op, "wasm.import_name");
+        if (ian != MLIR_INVALID_HANDLE) iname = MLIR_GetAttributeString(ian);
+
+        emit_import_func(ctx, arena, body, nm, imod, iname, p, np, r, nr);
     }
 
     // Pass 2: defined funcs in source order. `is_function_symbol`

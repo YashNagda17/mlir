@@ -5041,12 +5041,19 @@ static MLIR_OpHandle emit_func(E *e, Func *f) {
     // LLVM IR through convert-func-to-llvm.
     MLIR_TypeHandle ft = sig->is_variadic ? sig->llvm_fn_ty : sig->fn_ty;
     MLIR_AttributeHandle fn_ty_attr = MLIR_CreateAttributeType(e->ctx, str_lit("function_type"), ft);
-    int n_attrs = 2;
-    MLIR_AttributeHandle *attrs = arena_new_array(e->arena, MLIR_AttributeHandle, 3);
+    // Up to 4 attrs: sym_name, function_type, llvm.linkage, wasm.export_name.
+    MLIR_AttributeHandle *attrs = arena_new_array(e->arena, MLIR_AttributeHandle, 4);
     attrs[0] = sym_name; attrs[1] = fn_ty_attr;
+    int n_attrs = 2;
     if (f->is_static) {
-        attrs[2] = MLIR_CreateAttributeLLVMLinkageInternal(e->ctx, str_lit("llvm.linkage"));
-        n_attrs = 3;
+        attrs[n_attrs++] = MLIR_CreateAttributeLLVMLinkageInternal(e->ctx, str_lit("llvm.linkage"));
+    }
+    // `__attribute__((__export_name__("foo")))` on a function definition
+    // re-exports the function under a different wasm export name (used
+    // e.g. by corec's wasm_buddy_alloc / wasm_buddy_free helpers).
+    if (f->wasm_export_name.size > 0) {
+        attrs[n_attrs++] = MLIR_CreateAttributeString(e->ctx, str_lit("wasm.export_name"),
+                                                      f->wasm_export_name);
     }
     MLIR_RegionHandle *regs = arena_new_array(e->arena, MLIR_RegionHandle, 1); regs[0] = body_r;
     MLIR_OpHandle fn;
@@ -5583,18 +5590,34 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
         MLIR_TypeHandle ft = sig->is_variadic ? sig->llvm_fn_ty : sig->fn_ty;
         MLIR_AttributeHandle a1 = MLIR_CreateAttributeType(ctx, str_lit("function_type"), ft);
         MLIR_AttributeHandle a2 = MLIR_CreateAttributeString(ctx, str_lit("sym_visibility"), str_lit("private"));
-        MLIR_AttributeHandle *attrs = arena_new_array(arena, MLIR_AttributeHandle, 3);
+        // Forward the `__attribute__((__import_module__("...")))` /
+        // `__import_name__("...")` annotations onto the MLIR func op
+        // so the wasm binary emitter can place this import into the
+        // requested module (e.g. WASI's `wasi_snapshot_preview1`).
+        size_t n_xtra = 0;
+        if (fwd->wasm_import_module.size > 0) n_xtra++;
+        if (fwd->wasm_import_name.size > 0) n_xtra++;
+        MLIR_AttributeHandle *attrs = arena_new_array(arena, MLIR_AttributeHandle, 3 + n_xtra);
         attrs[0] = a0; attrs[1] = a1; attrs[2] = a2;
+        size_t na = 3;
+        if (fwd->wasm_import_module.size > 0) {
+            attrs[na++] = MLIR_CreateAttributeString(ctx, str_lit("wasm.import_module"),
+                                                    fwd->wasm_import_module);
+        }
+        if (fwd->wasm_import_name.size > 0) {
+            attrs[na++] = MLIR_CreateAttributeString(ctx, str_lit("wasm.import_name"),
+                                                    fwd->wasm_import_name);
+        }
         MLIR_RegionHandle body = MLIR_CreateRegion(ctx);
         MLIR_RegionHandle *regs = arena_new_array(arena, MLIR_RegionHandle, 1); regs[0] = body;
         MLIR_OpHandle decl;
         if (sig->is_variadic) {
             decl = MLIR_CreateOp(ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.func"),
-                                 attrs, 3, NULL, 0, NULL, 0, NULL, 0,
+                                 attrs, na, NULL, 0, NULL, 0, NULL, 0,
                                  regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
         } else {
             decl = MLIR_CreateOp(ctx, OP_TYPE_FUNC_FUNC, str_lit("func.func"),
-                                 attrs, 3, NULL, 0, NULL, 0, NULL, 0,
+                                 attrs, na, NULL, 0, NULL, 0, NULL, 0,
                                  regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
         }
         MLIR_AppendBlockOp(ctx, mb, decl);

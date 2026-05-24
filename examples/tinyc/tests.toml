@@ -816,3 +816,14 @@ name = "unused_extern_decl"
 # at codegen time. Previously the resulting wasm contained spurious
 # imports for these names, which the linker couldn't resolve.
 expected_stdout = "42\n"
+
+[[test]]
+name = "wasm_import_attr"
+# Verifies that `__attribute__((__import_module__("..."),
+# __import_name__("...")))` on a forward declaration makes its way
+# all the way into the wasm import section. Without this, every
+# import lands in `env` and wasmtime fails to instantiate the
+# module with `unknown import: env::fd_write`.
+native_skip = true
+wasm_upstream_skip = true
+expected_stdout = "hi\n"

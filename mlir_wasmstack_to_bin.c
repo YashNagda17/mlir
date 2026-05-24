@@ -255,6 +255,12 @@ typedef struct {
     MLIR_OpHandle src_op;
     // Locals layout (decoded from local_types attr).
     uint8_t *local_types; size_t n_locals;
+    // Optional wasm.* attribute overrides (from
+    // `__attribute__((__import_module__("...")))` etc.). NULL means
+    // "use the default" (env / sym name).
+    char *import_module;
+    char *import_name;
+    char *export_name;
 } EmFunc;
 
 typedef struct {
@@ -760,6 +766,10 @@ string mlir_wasmstack_to_bin(MLIR_Context *ctx,
         funcs[n_funcs].sig = sig_intern(&sigs, p, np, r, nr);
         funcs[n_funcs].imported = true;
         funcs[n_funcs].func_index = (uint32_t)n_funcs;
+        string imod = at_s(op, "import_module");
+        if (imod.size) funcs[n_funcs].import_module = strdup_str(imod);
+        string inm = at_s(op, "import_name");
+        if (inm.size) funcs[n_funcs].import_name = strdup_str(inm);
         free(p); free(r);
         n_funcs++;
     }
@@ -783,6 +793,8 @@ string mlir_wasmstack_to_bin(MLIR_Context *ctx,
         funcs[n_funcs].src_op = op;
         funcs[n_funcs].local_types = ll;
         funcs[n_funcs].n_locals = nl;
+        string en = at_s(op, "export_name");
+        if (en.size) funcs[n_funcs].export_name = strdup_str(en);
         free(p); free(r);
         n_funcs++;
     }
@@ -885,8 +897,12 @@ string mlir_wasmstack_to_bin(MLIR_Context *ctx,
 
         for (size_t i = 0; i < n_funcs; i++) {
             if (!funcs[i].imported) continue;
-            emit_string(&import_payload, "env");
-            emit_string(&import_payload, funcs[i].name);
+            // Default to "env" but honor `__attribute__((__import_module__("...")))`
+            // (e.g. `wasi_snapshot_preview1` for WASI imports).
+            const char *mod = funcs[i].import_module ? funcs[i].import_module : "env";
+            const char *nm  = funcs[i].import_name   ? funcs[i].import_name   : funcs[i].name;
+            emit_string(&import_payload, mod);
+            emit_string(&import_payload, nm);
             buf_putc(&import_payload, IMP_FUNC);
             leb_u(&import_payload, funcs[i].sig);
         }

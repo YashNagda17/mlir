@@ -394,14 +394,22 @@ static MLIR_OpHandle convert_func(MLIR_Context *ctx, Arena *arena, MLIR_OpHandle
     string rt = at_s(src, "result_types");
     size_t n_params = pt.size / 2;
     uint8_t *param_types = hex_decode(pt, &n_params);
+    // Optional wasm-attribute forwarding: import_module/import_name on
+    // imports, export_name on definitions.
+    string imod = at_s(src, "import_module");
+    string iname = at_s(src, "import_name");
+    string ename = at_s(src, "export_name");
 
-    MLIR_AttributeHandle attrs[8];
+    MLIR_AttributeHandle attrs[12];
     size_t na = 0;
     attrs[na++] = attr_s(ctx, "sym_name", name.str, name.size);
     attrs[na++] = attr_s(ctx, "param_types", pt.str, pt.size);
     attrs[na++] = attr_s(ctx, "result_types", rt.str, rt.size);
     attrs[na++] = attr_b(ctx, "exported", exported);
     attrs[na++] = attr_b(ctx, "internal", internal);
+    if (imod.size > 0)  attrs[na++] = attr_s(ctx, "import_module", imod.str, imod.size);
+    if (iname.size > 0) attrs[na++] = attr_s(ctx, "import_name", iname.str, iname.size);
+    if (ename.size > 0) attrs[na++] = attr_s(ctx, "export_name", ename.str, ename.size);
 
     bool is_import = MLIR_GetOpType(src) == OP_TYPE_WASMSSA_IMPORT_FUNC;
     if (is_import) {
