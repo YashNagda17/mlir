@@ -326,7 +326,10 @@ struct Stmt {
     VecStmtPtr while_body;
     // ST_FOR
     Stmt *for_init;
-    Expr *for_step;
+    // Zero or more for-update expressions, lowered in order at the end
+    // of each iteration. Multiple entries arise from the C comma
+    // operator: `for (i = 0; i < n; ++i, ++j)` parses as two entries.
+    VecExprPtr for_steps;
     VecStmtPtr for_body;
     // ST_BLOCK / ST_SWITCH (body)
     VecStmtPtr block_body;

@@ -4800,7 +4800,9 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             emit_branch(e, step_b);
 
             e->cur_block = step_b; e->terminated = false;
-            if (st->for_step) (void)emit_expr(e, &inner, st->for_step);
+            for (size_t i = 0; i < st->for_steps.size; i++) {
+                (void)emit_expr(e, &inner, st->for_steps.data[i]);
+            }
             emit_branch(e, hdr_b);
 
             e->cur_block = exit_b; e->terminated = false;

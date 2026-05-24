@@ -158,6 +158,7 @@ static Stmt *new_stmt(P *p, StmtKind k, int line) {
     VecStmtPtr_reserve(p->arena, &s->else_body, 4);
     VecStmtPtr_reserve(p->arena, &s->while_body, 4);
     VecStmtPtr_reserve(p->arena, &s->for_body, 4);
+    VecExprPtr_reserve(p->arena, &s->for_steps, 2);
     VecStmtPtr_reserve(p->arena, &s->block_body, 4);
     return s;
 }
@@ -1690,8 +1691,15 @@ static Stmt *parse_stmt(P *p) {
         // cond: empty means "true"
         if (cur(p).kind != TC_TK_SEMI) s->cond = parse_expr(p);
         expect(p, TC_TK_SEMI, str_lit("expected ';' after for-cond"));
-        // step: empty allowed
-        if (cur(p).kind != TC_TK_RPAREN) s->for_step = parse_expr(p);
+        // step: empty allowed. Multiple comma-separated expressions are
+        // collected and emitted in order. C's comma operator: usually
+        // `++i, ++j`.
+        if (cur(p).kind != TC_TK_RPAREN) {
+            VecExprPtr_push_back(p->arena, &s->for_steps, parse_expr(p));
+            while (accept(p, TC_TK_COMMA)) {
+                VecExprPtr_push_back(p->arena, &s->for_steps, parse_expr(p));
+            }
+        }
         expect(p, TC_TK_RPAREN, str_lit("expected ')'"));
         parse_block(p, &s->for_body);
         return s;
