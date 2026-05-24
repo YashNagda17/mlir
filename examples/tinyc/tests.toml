@@ -19,6 +19,10 @@ name = "short_circuit"
 expected_stdout = "0\n1\n1\n1\n"
 
 [[test]]
+name = "logical_chain_in_loop"
+expected_stdout = "6\n0\n0\n3\n"
+
+[[test]]
 name = "return"
 expected_stdout = "3\n-1\n"
 

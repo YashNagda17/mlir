@@ -18,6 +18,7 @@ NATIVE_C_FILES="mlir_api_impl.c mlir_op_names.c mlir_lower_to_llvm.c mlir_transl
 clang \
     --target=wasm32-wasi \
     -Os \
+    -Wl,-z,stack-size=4194304 \
     -nostdlib \
     -nostdinc \
     -fno-builtin \
