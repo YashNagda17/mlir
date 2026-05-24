@@ -793,6 +793,11 @@ targets = ["native", "wasm", "macho"]
 expected_stdout = "23\n"
 
 [[test]]
+name = "for_comma_update"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "0 0\n1 4\n2 8\n3 12\n"
+
+[[test]]
 name = "inttoptr_cast"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "42\n"
