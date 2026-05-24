@@ -645,6 +645,12 @@ static uint32_t arm64_add_x_imm(uint32_t rd, uint32_t rn, uint16_t imm12) {
     return 0x91000000u | (((uint32_t)imm12 & 0xfffu) << 10)
          | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
 }
+// ADD Xd, Xn, #imm12, LSL #12.
+static uint32_t arm64_add_x_imm_lsl12(uint32_t rd, uint32_t rn,
+                                      uint16_t imm12) {
+    return 0x91400000u | (((uint32_t)imm12 & 0xfffu) << 10)
+         | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
+}
 // ADRP Xd, #rel_pages*4096  (rel_pages is a signed 21-bit value).
 static uint32_t arm64_adrp(uint32_t rd, int64_t rel_pages) {
     uint32_t immlo = (uint32_t)(rel_pages & 0x3);
@@ -793,6 +799,61 @@ static uint32_t arm64_strh_w_xn(uint32_t rt, uint32_t rn, uint32_t imm12) {
     return 0x79000000u | ((imm12 & 0xfffu) << 10) | ((rn & 0x1fu) << 5)
          | (rt & 0x1fu);
 }
+// LDRSB Wt, [Xn, #imm12]  (unsigned offset, scaled by 1, sign-extended
+// into Wt).
+static uint32_t arm64_ldrsb_w_xn(uint32_t rt, uint32_t rn, uint32_t imm12) {
+    return 0x39c00000u | ((imm12 & 0xfffu) << 10) | ((rn & 0x1fu) << 5)
+         | (rt & 0x1fu);
+}
+// LDRH Wt, [Xn, #imm12]  (unsigned offset, scaled by 2).
+static uint32_t arm64_ldrh_w_xn(uint32_t rt, uint32_t rn, uint32_t imm12) {
+    return 0x79400000u | ((imm12 & 0xfffu) << 10) | ((rn & 0x1fu) << 5)
+         | (rt & 0x1fu);
+}
+// LDRSH Wt, [Xn, #imm12]  (unsigned offset, scaled by 2,
+// sign-extended into Wt).
+static uint32_t arm64_ldrsh_w_xn(uint32_t rt, uint32_t rn, uint32_t imm12) {
+    return 0x79c00000u | ((imm12 & 0xfffu) << 10) | ((rn & 0x1fu) << 5)
+         | (rt & 0x1fu);
+}
+// LDRSW Xt, [Xn, #imm12]  (unsigned offset, scaled by 4,
+// sign-extended into Xt).
+static uint32_t arm64_ldrsw_x_xn(uint32_t rt, uint32_t rn, uint32_t imm12) {
+    return 0xb9800000u | (((imm12 >> 2) & 0xfffu) << 10)
+         | ((rn & 0x1fu) << 5) | (rt & 0x1fu);
+}
+// SXTB Wd, Wn   alias for SBFM Wd, Wn, #0, #7.
+static uint32_t arm64_sxtb_w(uint32_t rd, uint32_t rn) {
+    return 0x13001c00u | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
+}
+// SXTH Wd, Wn   alias for SBFM Wd, Wn, #0, #15.
+static uint32_t arm64_sxth_w(uint32_t rd, uint32_t rn) {
+    return 0x13003c00u | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
+}
+// SXTB Xd, Wn   alias for SBFM Xd, Xn, #0, #7 (with sf=1, N=1).
+static uint32_t arm64_sxtb_x(uint32_t rd, uint32_t rn) {
+    return 0x93401c00u | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
+}
+// SXTH Xd, Wn   alias for SBFM Xd, Xn, #0, #15.
+static uint32_t arm64_sxth_x(uint32_t rd, uint32_t rn) {
+    return 0x93403c00u | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
+}
+// MSUB Wd, Wn, Wm, Wa.
+static uint32_t arm64_msub_w(uint32_t rd, uint32_t rn, uint32_t rm,
+                             uint32_t ra) {
+    return 0x1b008000u | ((rm & 0x1fu) << 16) | ((ra & 0x1fu) << 10)
+         | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
+}
+// MSUB Xd, Xn, Xm, Xa.
+static uint32_t arm64_msub_x(uint32_t rd, uint32_t rn, uint32_t rm,
+                             uint32_t ra) {
+    return 0x9b008000u | ((rm & 0x1fu) << 16) | ((ra & 0x1fu) << 10)
+         | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
+}
+// BRK #imm16 — break (raises trap on macOS).
+static uint32_t arm64_brk(uint16_t imm16) {
+    return 0xd4200000u | ((uint32_t)imm16 << 5);
+}
 // bl <pc-relative byte offset>
 static uint32_t arm64_bl(int32_t off_bytes) {
     int32_t imm26 = off_bytes >> 2;
@@ -802,6 +863,30 @@ static uint32_t arm64_bl(int32_t off_bytes) {
 static uint32_t arm64_b(int32_t off_bytes) {
     int32_t imm26 = off_bytes >> 2;
     return 0x14000000u | ((uint32_t)imm26 & 0x03ffffffu);
+}
+
+// Materialize the effective address of a wasm load/store entirely into
+// x10. Assumes the popped wasm address (i32) is in w0. The caller then
+// uses #0 as the immediate offset on the LDR/STR.
+//
+// Handles offsets up to 16 MB (12-bit high + 12-bit low) by emitting one
+// or two ADD-imm instructions. Tinyc-emitted code keeps offsets well
+// below this — globals live in pages 1+ of linear memory (≤ a few MB).
+//
+// Returns false if `off` exceeds 16 MB; the caller surfaces a clear
+// diagnostic in that case.
+static bool emit_compute_mem_addr(Buf *buf, uint32_t off) {
+    // x10 = x28 + (uint32)w0  (linmem base + wasm addr).
+    emit_word(buf, arm64_add_x_xn_wm_uxtw(10, 28, 0));
+    if (off == 0) return true;
+    if (off > 0xffffffu) return false;
+    uint32_t hi = (off >> 12) & 0xfffu;
+    uint32_t lo = off & 0xfffu;
+    if (hi != 0)
+        emit_word(buf, arm64_add_x_imm_lsl12(10, 10, (uint16_t)hi));
+    if (lo != 0)
+        emit_word(buf, arm64_add_x_imm(10, 10, (uint16_t)lo));
+    return true;
 }
 
 // Patch a CBZ Wt at site_off so the imm19 field encodes
@@ -1585,51 +1670,137 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 value_depth -= 1;
                 break;
             }
-            case 0x28: {                                     // i32.load
-                (void)rd_uleb(&r);                            // align
-                uint32_t off = (uint32_t)rd_uleb(&r);         // offset
-                if (off > 16380u) {
-                    fprintf(stderr,
-                            "wasm->macho: i32.load offset %u too large "
-                            "in func %u\n", off, fidx);
-                    free(local_types); return false;
-                }
+            // --- Memory loads (1 pop addr, 1 push value).
+            //
+            // Every load goes through `emit_compute_mem_addr` so the
+            // final LDR uses #0 immediate offset. This sidesteps the
+            // per-opcode LDR scale limits and supports any wasm offset
+            // up to 16 MB, which covers all realistic data layouts.
+            case 0x28:   // i32.load    (zero-fill upper half of slot)
+            case 0x29:   // i64.load
+            case 0x2a:   // f32.load    (bit-identical to i32.load)
+            case 0x2b:   // f64.load    (bit-identical to i64.load)
+            case 0x2c:   // i32.load8_s
+            case 0x2d:   // i32.load8_u
+            case 0x2e:   // i32.load16_s
+            case 0x2f:   // i32.load16_u
+            case 0x30:   // i64.load8_s
+            case 0x31:   // i64.load8_u
+            case 0x32:   // i64.load16_s
+            case 0x33:   // i64.load16_u
+            case 0x34:   // i64.load32_s
+            case 0x35: { // i64.load32_u
+                (void)rd_uleb(&r);                       // align
+                uint32_t off = (uint32_t)rd_uleb(&r);    // offset
                 if (!wm->has_memory) {
                     fprintf(stderr,
-                            "wasm->macho: i32.load with no memory in "
-                            "func %u\n", fidx);
+                            "wasm->macho: load 0x%02x with no memory in "
+                            "func %u\n", op, fidx);
                     free(local_types); return false;
                 }
-                emit_word(&e->code, arm64_ldr_w_sp(0, 0));   // pop addr -> w0
-                emit_word(&e->code,
-                    arm64_add_x_xn_wm_uxtw(10, 28, 0));      // x10 = x28 + (u32)w0
-                emit_word(&e->code,
-                    arm64_ldr_w_xn(0, 10, off));             // ldr w0, [x10, #off]
-                emit_word(&e->code, arm64_str_w_sp(0, 0));   // write top of stack
+                emit_word(&e->code, arm64_ldr_w_sp(0, 0));   // addr -> w0
+                if (!emit_compute_mem_addr(&e->code, off)) {
+                    fprintf(stderr,
+                            "wasm->macho: load 0x%02x offset %u exceeds "
+                            "16 MB in func %u\n", op, off, fidx);
+                    free(local_types); return false;
+                }
+                // Issue the load; result -> w0 / x0.
+                switch (op) {
+                    case 0x28: case 0x2a:
+                        emit_word(&e->code, arm64_ldr_w_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_str_w_sp(0, 0));
+                        break;
+                    case 0x29: case 0x2b:
+                        emit_word(&e->code, arm64_ldr_x_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_str_x_sp(0, 0));
+                        break;
+                    case 0x2c:
+                        emit_word(&e->code, arm64_ldrsb_w_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_str_w_sp(0, 0));
+                        break;
+                    case 0x2d:
+                        emit_word(&e->code, arm64_ldrb_w_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_str_w_sp(0, 0));
+                        break;
+                    case 0x2e:
+                        emit_word(&e->code, arm64_ldrsh_w_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_str_w_sp(0, 0));
+                        break;
+                    case 0x2f:
+                        emit_word(&e->code, arm64_ldrh_w_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_str_w_sp(0, 0));
+                        break;
+                    case 0x30:
+                        // ldrsb w0; sxtb x0,w0; str x0 -> slot.
+                        emit_word(&e->code, arm64_ldrsb_w_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_sxtb_x(0, 0));
+                        emit_word(&e->code, arm64_str_x_sp(0, 0));
+                        break;
+                    case 0x31:
+                        emit_word(&e->code, arm64_ldrb_w_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_str_x_sp(0, 0));
+                        break;
+                    case 0x32:
+                        emit_word(&e->code, arm64_ldrsh_w_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_sxth_x(0, 0));
+                        emit_word(&e->code, arm64_str_x_sp(0, 0));
+                        break;
+                    case 0x33:
+                        emit_word(&e->code, arm64_ldrh_w_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_str_x_sp(0, 0));
+                        break;
+                    case 0x34:
+                        emit_word(&e->code, arm64_ldrsw_x_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_str_x_sp(0, 0));
+                        break;
+                    case 0x35:
+                        emit_word(&e->code, arm64_ldr_w_xn(0, 10, 0));
+                        emit_word(&e->code, arm64_str_x_sp(0, 0));
+                        break;
+                }
                 break;
             }
-            case 0x36: {                                     // i32.store
-                (void)rd_uleb(&r);                            // align
-                uint32_t off = (uint32_t)rd_uleb(&r);         // offset
-                if (off > 16380u) {
-                    fprintf(stderr,
-                            "wasm->macho: i32.store offset %u too large "
-                            "in func %u\n", off, fidx);
-                    free(local_types); return false;
-                }
+
+            // --- Memory stores (2 pop: addr below, value above).
+            case 0x36:   // i32.store
+            case 0x37:   // i64.store
+            case 0x38:   // f32.store    (bit-identical to i32.store)
+            case 0x39:   // f64.store    (bit-identical to i64.store)
+            case 0x3a:   // i32.store8
+            case 0x3b: { // i32.store16
+                (void)rd_uleb(&r);
+                uint32_t off = (uint32_t)rd_uleb(&r);
                 if (!wm->has_memory) {
                     fprintf(stderr,
-                            "wasm->macho: i32.store with no memory in "
-                            "func %u\n", fidx);
+                            "wasm->macho: store 0x%02x with no memory in "
+                            "func %u\n", op, fidx);
                     free(local_types); return false;
                 }
-                emit_word(&e->code, arm64_ldr_w_sp(1, 0));   // value -> w1
-                emit_word(&e->code, arm64_ldr_w_sp(0, 16));  // addr  -> w0
+                // Pop value (full 64-bit slot) into x1, addr into w0.
+                emit_word(&e->code, arm64_ldr_x_sp(1, 0));
+                emit_word(&e->code, arm64_ldr_w_sp(0, 16));
                 emit_word(&e->code, arm64_add_sp_imm(32));
-                emit_word(&e->code,
-                    arm64_add_x_xn_wm_uxtw(10, 28, 0));      // x10 = x28 + (u32)addr
-                emit_word(&e->code,
-                    arm64_str_w_xn(1, 10, off));             // str w1, [x10, #off]
+                if (!emit_compute_mem_addr(&e->code, off)) {
+                    fprintf(stderr,
+                            "wasm->macho: store 0x%02x offset %u exceeds "
+                            "16 MB in func %u\n", op, off, fidx);
+                    free(local_types); return false;
+                }
+                switch (op) {
+                    case 0x36: case 0x38:
+                        emit_word(&e->code, arm64_str_w_xn(1, 10, 0));
+                        break;
+                    case 0x37: case 0x39:
+                        emit_word(&e->code, arm64_str_x_xn(1, 10, 0));
+                        break;
+                    case 0x3a:
+                        emit_word(&e->code, arm64_strb_w_xn(1, 10, 0));
+                        break;
+                    case 0x3b:
+                        emit_word(&e->code, arm64_strh_w_xn(1, 10, 0));
+                        break;
+                }
                 value_depth -= 2;
                 break;
             }
@@ -1838,127 +2009,6 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 break;
             }
 
-            // --- i32.load8_u: 1 pop (addr), 1 push (zero-extended byte).
-            case 0x2d: {
-                (void)rd_uleb(&r);
-                uint32_t off = (uint32_t)rd_uleb(&r);
-                if (off > 4095u) {
-                    fprintf(stderr,
-                            "wasm->macho: i32.load8_u offset %u too large "
-                            "in func %u\n", off, fidx);
-                    free(local_types); return false;
-                }
-                if (!wm->has_memory) {
-                    fprintf(stderr,
-                            "wasm->macho: i32.load8_u with no memory in "
-                            "func %u\n", fidx);
-                    free(local_types); return false;
-                }
-                emit_word(&e->code, arm64_ldr_w_sp(0, 0));
-                emit_word(&e->code, arm64_add_x_xn_wm_uxtw(10, 28, 0));
-                emit_word(&e->code, arm64_ldrb_w_xn(0, 10, off));
-                emit_word(&e->code, arm64_str_w_sp(0, 0));
-                break;
-            }
-
-            // --- i32.store8: 2 pop (addr, value).
-            case 0x3a: {
-                (void)rd_uleb(&r);
-                uint32_t off = (uint32_t)rd_uleb(&r);
-                if (off > 4095u) {
-                    fprintf(stderr,
-                            "wasm->macho: i32.store8 offset %u too large "
-                            "in func %u\n", off, fidx);
-                    free(local_types); return false;
-                }
-                if (!wm->has_memory) {
-                    fprintf(stderr,
-                            "wasm->macho: i32.store8 with no memory in "
-                            "func %u\n", fidx);
-                    free(local_types); return false;
-                }
-                emit_word(&e->code, arm64_ldr_w_sp(1, 0));
-                emit_word(&e->code, arm64_ldr_w_sp(0, 16));
-                emit_word(&e->code, arm64_add_sp_imm(32));
-                emit_word(&e->code, arm64_add_x_xn_wm_uxtw(10, 28, 0));
-                emit_word(&e->code, arm64_strb_w_xn(1, 10, off));
-                value_depth -= 2;
-                break;
-            }
-
-            // --- i32.store16: 2 pop (addr, value).
-            case 0x3b: {
-                (void)rd_uleb(&r);
-                uint32_t off = (uint32_t)rd_uleb(&r);
-                if (off > 8190u || (off & 1) != 0) {
-                    fprintf(stderr,
-                            "wasm->macho: i32.store16 offset %u out of "
-                            "range or unaligned in func %u\n", off, fidx);
-                    free(local_types); return false;
-                }
-                if (!wm->has_memory) {
-                    fprintf(stderr,
-                            "wasm->macho: i32.store16 with no memory in "
-                            "func %u\n", fidx);
-                    free(local_types); return false;
-                }
-                emit_word(&e->code, arm64_ldr_w_sp(1, 0));
-                emit_word(&e->code, arm64_ldr_w_sp(0, 16));
-                emit_word(&e->code, arm64_add_sp_imm(32));
-                emit_word(&e->code, arm64_add_x_xn_wm_uxtw(10, 28, 0));
-                emit_word(&e->code, arm64_strh_w_xn(1, 10, off / 2));
-                value_depth -= 2;
-                break;
-            }
-
-            // --- i64.load: 1 pop (addr), 1 push (8 bytes).
-            case 0x29: {
-                (void)rd_uleb(&r);
-                uint32_t off = (uint32_t)rd_uleb(&r);
-                if (off > 32760u || (off & 7) != 0) {
-                    fprintf(stderr,
-                            "wasm->macho: i64.load offset %u out of range "
-                            "or unaligned in func %u\n", off, fidx);
-                    free(local_types); return false;
-                }
-                if (!wm->has_memory) {
-                    fprintf(stderr,
-                            "wasm->macho: i64.load with no memory in "
-                            "func %u\n", fidx);
-                    free(local_types); return false;
-                }
-                emit_word(&e->code, arm64_ldr_w_sp(0, 0));
-                emit_word(&e->code, arm64_add_x_xn_wm_uxtw(10, 28, 0));
-                emit_word(&e->code, arm64_ldr_x_xn(0, 10, off));
-                emit_word(&e->code, arm64_str_x_sp(0, 0));
-                break;
-            }
-
-            // --- i64.store: 2 pop (addr, value).
-            case 0x37: {
-                (void)rd_uleb(&r);
-                uint32_t off = (uint32_t)rd_uleb(&r);
-                if (off > 32760u || (off & 7) != 0) {
-                    fprintf(stderr,
-                            "wasm->macho: i64.store offset %u out of range "
-                            "or unaligned in func %u\n", off, fidx);
-                    free(local_types); return false;
-                }
-                if (!wm->has_memory) {
-                    fprintf(stderr,
-                            "wasm->macho: i64.store with no memory in "
-                            "func %u\n", fidx);
-                    free(local_types); return false;
-                }
-                emit_word(&e->code, arm64_ldr_x_sp(1, 0));
-                emit_word(&e->code, arm64_ldr_w_sp(0, 16));
-                emit_word(&e->code, arm64_add_sp_imm(32));
-                emit_word(&e->code, arm64_add_x_xn_wm_uxtw(10, 28, 0));
-                emit_word(&e->code, arm64_str_x_xn(1, 10, off));
-                value_depth -= 2;
-                break;
-            }
-
             // --- i32.wrap_i64: 1 pop (i64), 1 push (i32). The top slot
             // holds the i64; consumers that read it as i32 only look at
             // the low 32 bits, so codegen is effectively a no-op.
@@ -1978,6 +2028,82 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
             // already zero-extends into x0, so just rewrite the slot.
             case 0xad: {
                 emit_word(&e->code, arm64_ldr_w_sp(0, 0));
+                emit_word(&e->code, arm64_str_x_sp(0, 0));
+                break;
+            }
+
+            // --- unreachable: trap. Emitted by tinyc lowering for cases
+            // the producer believes cannot run (e.g. after a noreturn
+            // call). Use BRK to raise a debugger / kernel trap.
+            case 0x00: {
+                emit_word(&e->code, arm64_brk(0));
+                break;
+            }
+
+            // --- i32.rem_s / i32.rem_u: r = a - (a/b)*b   via sdiv/udiv
+            // + msub. ARM64 has no integer modulo instruction.
+            case 0x6f:   // i32.rem_s
+            case 0x70: { // i32.rem_u
+                emit_word(&e->code, arm64_ldr_w_sp(1, 0));      // b -> w1
+                emit_word(&e->code, arm64_ldr_w_sp(0, 16));     // a -> w0
+                uint32_t divisor = (op == 0x6f)
+                    ? arm64_sdiv_w(2, 0, 1)
+                    : arm64_udiv_w(2, 0, 1);
+                emit_word(&e->code, divisor);                   // w2 = a/b
+                emit_word(&e->code, arm64_msub_w(0, 2, 1, 0));  // w0 = a - w2*b
+                emit_word(&e->code, arm64_add_sp_imm(16));
+                emit_word(&e->code, arm64_str_w_sp(0, 0));
+                value_depth -= 1;
+                break;
+            }
+
+            // --- i64.rem_s / i64.rem_u: 64-bit version.
+            case 0x81:   // i64.rem_s
+            case 0x82: { // i64.rem_u
+                emit_word(&e->code, arm64_ldr_x_sp(1, 0));
+                emit_word(&e->code, arm64_ldr_x_sp(0, 16));
+                uint32_t divisor = (op == 0x81)
+                    ? arm64_sdiv_x(2, 0, 1)
+                    : arm64_udiv_x(2, 0, 1);
+                emit_word(&e->code, divisor);
+                emit_word(&e->code, arm64_msub_x(0, 2, 1, 0));
+                emit_word(&e->code, arm64_add_sp_imm(16));
+                emit_word(&e->code, arm64_str_x_sp(0, 0));
+                value_depth -= 1;
+                break;
+            }
+
+            // --- i32.extend8_s / i32.extend16_s: sign-extend low N bits
+            // into i32. One-instruction sxtb/sxth.
+            case 0xc0: {
+                emit_word(&e->code, arm64_ldr_w_sp(0, 0));
+                emit_word(&e->code, arm64_sxtb_w(0, 0));
+                emit_word(&e->code, arm64_str_w_sp(0, 0));
+                break;
+            }
+            case 0xc1: {
+                emit_word(&e->code, arm64_ldr_w_sp(0, 0));
+                emit_word(&e->code, arm64_sxth_w(0, 0));
+                emit_word(&e->code, arm64_str_w_sp(0, 0));
+                break;
+            }
+
+            // --- i64.extend8_s / extend16_s / extend32_s.
+            case 0xc2: {
+                emit_word(&e->code, arm64_ldr_w_sp(0, 0));
+                emit_word(&e->code, arm64_sxtb_x(0, 0));
+                emit_word(&e->code, arm64_str_x_sp(0, 0));
+                break;
+            }
+            case 0xc3: {
+                emit_word(&e->code, arm64_ldr_w_sp(0, 0));
+                emit_word(&e->code, arm64_sxth_x(0, 0));
+                emit_word(&e->code, arm64_str_x_sp(0, 0));
+                break;
+            }
+            case 0xc4: {
+                emit_word(&e->code, arm64_ldr_w_sp(0, 0));
+                emit_word(&e->code, arm64_sxtw(0, 0));
                 emit_word(&e->code, arm64_str_x_sp(0, 0));
                 break;
             }

@@ -201,7 +201,9 @@ def main():
             continue
         # Optional opt-out for the wasm target only (e.g. tests that
         # rely on host-libc behavior wasm32-wasi can't reproduce).
-        if TARGET == "wasm" and t.get("wasm_skip"):
+        # The macho backend consumes the same wasm pipeline output, so
+        # `wasm_skip` implies a macho skip too.
+        if TARGET in ("wasm", "macho") and t.get("wasm_skip"):
             print(f"SKIP {name} (wasm_skip)")
             skipped += 1
             continue

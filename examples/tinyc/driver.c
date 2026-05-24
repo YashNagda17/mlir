@@ -369,6 +369,14 @@ int app_main(void) {
             arena_destroy(boot_arena);
             return 1;
         }
+        // Optional debugging hook: dump the post-link wasm bytes that
+        // feed the macho translator. Useful when a test fails to
+        // identify which opcode/feature the backend is missing; pair
+        // with `wasm2wat $TINYC_DUMP_LINKED_WASM`.
+        if (getenv("TINYC_DUMP_LINKED_WASM")) {
+            FILE *df = fopen(getenv("TINYC_DUMP_LINKED_WASM"), "wb");
+            if (df) { fwrite(linked_data, 1, linked_size, df); fclose(df); }
+        }
 
         uint8_t *macho_data = NULL; size_t macho_size = 0;
         bool macho_ok = MLIR_WasmToMachoArm64(linked_data, linked_size,
