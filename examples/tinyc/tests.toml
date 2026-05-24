@@ -783,6 +783,36 @@ targets = ["native", "wasm", "macho"]
 expected_stdout = "0 0\n1 10\n2 20\n3 30\n24\n1000000005\n"
 
 [[test]]
+name = "global_array_int_init"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "100\n"
+
+[[test]]
+name = "typedef_array_in_multidecl"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "23\n"
+
+[[test]]
+name = "for_comma_update"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "0 0\n1 4\n2 8\n3 12\n"
+
+[[test]]
+name = "param_array_decay"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "7\n"
+
+[[test]]
+name = "struct_multi_ptr_field"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "3 9\n"
+
+[[test]]
+name = "struct_array_field_decay"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "200\n"
+
+[[test]]
 name = "inttoptr_cast"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "42\n"

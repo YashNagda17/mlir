@@ -158,6 +158,7 @@ static Stmt *new_stmt(P *p, StmtKind k, int line) {
     VecStmtPtr_reserve(p->arena, &s->else_body, 4);
     VecStmtPtr_reserve(p->arena, &s->while_body, 4);
     VecStmtPtr_reserve(p->arena, &s->for_body, 4);
+    VecExprPtr_reserve(p->arena, &s->for_steps, 2);
     VecStmtPtr_reserve(p->arena, &s->block_body, 4);
     return s;
 }
@@ -1255,6 +1256,45 @@ static Stmt *parse_decl(P *p, bool require_semi) {
                 Stmt *ds = new_stmt(p, ST_DECL, dname.line);
                 ds->decl_name = dname.text;
                 ds->decl_type = ty;
+                // Optional `[N]` (or `[N][M]`) suffix on this declarator
+                // — promote the per-declarator type into the matching
+                // array kind, mirroring the first-declarator branch
+                // above.
+                if (accept(p, TC_TK_LBRACK)) {
+                    int64_t alen = 0; Expr *aexpr = NULL;
+                    parse_array_len_bracket(p, &alen, &aexpr);
+                    if (ds->decl_type.kind == TY_STRUCT) {
+                        ds->decl_type.kind = TY_ARRAY_STRUCT;
+                        ds->decl_type.array_len = alen;
+                        ds->decl_type.array_len_expr = aexpr;
+                    } else if (ds->decl_type.kind == TY_PTR_I32 ||
+                               ds->decl_type.kind == TY_PTR_CHAR ||
+                               ds->decl_type.kind == TY_PTR_VOID ||
+                               ds->decl_type.kind == TY_PTR_STRUCT) {
+                        ds->decl_type = (Type){0};
+                        ds->decl_type.kind = TY_ARRAY_PTR_CHAR;
+                        ds->decl_type.array_len = alen;
+                        ds->decl_type.array_len_expr = aexpr;
+                    } else {
+                        bool is_i64 = (ds->decl_type.kind == TY_I64);
+                        bool is_i8  = (ds->decl_type.kind == TY_I32 &&
+                                       ds->decl_type.int_bits == 8);
+                        if (ds->decl_type.kind != TY_I32 && ds->decl_type.kind != TY_I64) {
+                            perror_at(p, line, str_lit("only int[N] / long long[N] arrays are supported"));
+                        }
+                        ds->decl_type.kind = TY_ARRAY_I32;
+                        ds->decl_type.array_elem_is_i64 = is_i64;
+                        ds->decl_type.array_elem_is_i8  = is_i8;
+                        ds->decl_type.array_len = alen;
+                        ds->decl_type.array_len_expr = aexpr;
+                        if (accept(p, TC_TK_LBRACK)) {
+                            int64_t alen2 = 0; Expr *aexpr2 = NULL;
+                            parse_array_len_bracket(p, &alen2, &aexpr2);
+                            ds->decl_type.array_len2 = alen2;
+                            if (aexpr2) perror_at(p, line, str_lit("2D array second dim must be a literal"));
+                        }
+                    }
+                }
                 if (accept(p, TC_TK_ASSIGN)) {
                     Expr *agg = parse_aggregate_init(p, ds->decl_type);
                     ds->decl_init = agg ? agg : parse_expr(p);
@@ -1651,8 +1691,15 @@ static Stmt *parse_stmt(P *p) {
         // cond: empty means "true"
         if (cur(p).kind != TC_TK_SEMI) s->cond = parse_expr(p);
         expect(p, TC_TK_SEMI, str_lit("expected ';' after for-cond"));
-        // step: empty allowed
-        if (cur(p).kind != TC_TK_RPAREN) s->for_step = parse_expr(p);
+        // step: empty allowed. Multiple comma-separated expressions are
+        // collected and emitted in order. C's comma operator: usually
+        // `++i, ++j`.
+        if (cur(p).kind != TC_TK_RPAREN) {
+            VecExprPtr_push_back(p->arena, &s->for_steps, parse_expr(p));
+            while (accept(p, TC_TK_COMMA)) {
+                VecExprPtr_push_back(p->arena, &s->for_steps, parse_expr(p));
+            }
+        }
         expect(p, TC_TK_RPAREN, str_lit("expected ')'"));
         parse_block(p, &s->for_body);
         return s;
@@ -2135,6 +2182,40 @@ static Func *parse_func(P *p) {
             } else if (cur(p).kind == TC_TK_IDENT) {
                 pname = cur(p).text;
                 p->i++;
+                // C function-parameter array decay: `T name[N]` is a synonym
+                // for `T *name`. Consume one or more `[expr?]` suffixes and
+                // promote the base type to the corresponding pointer kind.
+                // Multi-dimensional `T name[N1][N2]` is treated as a flat
+                // pointer (we don't carry the inner array shape).
+                while (accept(p, TC_TK_LBRACK)) {
+                    while (cur(p).kind != TC_TK_RBRACK &&
+                           cur(p).kind != TC_TK_EOF) {
+                        p->i++;
+                    }
+                    expect(p, TC_TK_RBRACK,
+                           str_lit("expected ']' in parameter array suffix"));
+                    if (pty.kind == TY_I32 && pty.int_bits == 8) {
+                        pty.kind = TY_PTR_CHAR;
+                        pty.int_bits = 0;
+                    } else if (pty.kind == TY_I32) {
+                        pty.kind = TY_PTR_I32;
+                    } else if (pty.kind == TY_I64) {
+                        pty.kind = TY_PTR_I32;
+                        pty.ptr_is_i64 = true;
+                    } else if (pty.kind == TY_F32) {
+                        pty.kind = TY_PTR_I32;
+                        pty.ptr_is_f32 = true;
+                    } else if (pty.kind == TY_F64) {
+                        pty.kind = TY_PTR_I32;
+                        pty.ptr_is_f64 = true;
+                    } else if (pty.kind == TY_STRUCT) {
+                        pty.kind = TY_PTR_STRUCT;
+                    }
+                    // For pointer / array / fnptr base types: leave the type
+                    // as-is (we'd need TY_PTR_PTR or a richer model to
+                    // represent `char *argv[]`); but consuming the suffix
+                    // at least lets the parser keep going.
+                }
             }
             VecParam_push_back(p->arena, &f->params,
                 ((Param){.name = pname, .type = pty, .line = cur(p).line}));
@@ -2329,10 +2410,24 @@ static StructDef *parse_struct_def(P *p) {
         }
         // One or more comma-separated declarators sharing the base type
         // `ft` parsed above. Each may add its own `[N]`/`[N][M]` suffix.
+        // We also accept (and tolerate) per-declarator pointer suffixes
+        // matching the one already applied to the base, e.g.
+        //   const uint8_t *p, *end;
+        // which is equivalent to two pointer fields. The first `*` was
+        // already consumed when the base type was parsed; the second
+        // `*` is redundant given how the base-type code already applies
+        // the pointer to all declarators in the list. We don't yet
+        // model the `int *a, b;` case where `b` is non-pointer.
         Type base_ft = ft;
         bool more_decls = true;
         while (more_decls) {
             Type ft = base_ft;
+            // Consume optional `*` (or `**`) leader on this declarator.
+            // The pointer kind was already applied to base_ft, so we
+            // just skip the tokens.
+            if (accept(p, TC_TK_STAR)) {
+                (void)accept(p, TC_TK_STAR);
+            }
             TcTok fn = cur(p);
             expect(p, TC_TK_IDENT, str_lit("expected field name"));
             // Optional array suffix `[N]` or `[N][M]`.
@@ -2883,17 +2978,51 @@ int tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks, bool target_was
                         g.has_init = true;
                         TcTok lit = cur(&p);
                         if (lit.kind == TC_TK_LBRACE) {
-                            // Aggregate initializer for global array.
-                            // Currently only supported when all elements are
-                            // 0 / NULL — emit as zero-init aggregate.
+                            // Aggregate initializer for a global array.
+                            // Each element must be an int/long literal
+                            // (optionally negated), NULL, or a `(cast)0`
+                            // sequence — i.e. constant-evaluable at
+                            // parse time. Pack the values little-endian
+                            // into init_array_data when at least one
+                            // non-zero value is present; otherwise fall
+                            // through to the existing zero-init path.
                             p.i++;
+                            size_t elem_size = 4;
+                            if (g.type.kind == TY_ARRAY_I32) {
+                                elem_size = g.type.array_elem_is_i64 ? 8
+                                          : g.type.array_elem_is_i8  ? 1
+                                          : 4;
+                            }
+                            int64_t alen = g.type.array_len;
+                            uint8_t *bytes = NULL;
+                            size_t   bcap  = 0;
+                            if (alen > 0 && (g.type.kind == TY_ARRAY_I32)) {
+                                bcap  = (size_t)alen * elem_size;
+                                bytes = (uint8_t *)arena_alloc(p.arena, bcap);
+                                for (size_t bi = 0; bi < bcap; bi++) bytes[bi] = 0;
+                            }
+                            size_t  ei = 0;
+                            bool    any_nonzero = false;
                             if (cur(&p).kind != TC_TK_RBRACE) {
                                 for (;;) {
                                     TcTok el = cur(&p);
                                     bool ok = false;
-                                    if (el.kind == TC_TK_INT_LIT && el.int_value == 0) ok = true;
-                                    else if (el.kind == TC_TK_KW_NULL) ok = true;
-                                    else if (el.kind == TC_TK_LPAREN) {
+                                    int64_t val = 0;
+                                    bool have_int_val = false;
+                                    if (el.kind == TC_TK_INT_LIT) {
+                                        val = el.int_value;
+                                        have_int_val = true;
+                                        ok = true;
+                                    } else if (el.kind == TC_TK_KW_NULL) {
+                                        val = 0; have_int_val = true; ok = true;
+                                    } else if (el.kind == TC_TK_MINUS &&
+                                               peek(&p, 1).kind == TC_TK_INT_LIT) {
+                                        val = -peek(&p, 1).int_value;
+                                        have_int_val = true;
+                                        ok = true;
+                                        p.i++;       // skip the '-'
+                                        el = cur(&p); // now the int lit
+                                    } else if (el.kind == TC_TK_LPAREN) {
                                         // tolerate `(void*)0`-style tokens by
                                         // skipping to matching ')'. Followed
                                         // by an int 0 constant.
@@ -2903,18 +3032,29 @@ int tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks, bool target_was
                                             else if (cur(&p).kind == TC_TK_RPAREN) depth--;
                                             p.i++;
                                         }
-                                        // optional int 0 after the cast
-                                        if (cur(&p).kind == TC_TK_INT_LIT &&
-                                            cur(&p).int_value == 0) p.i++;
+                                        // optional int after the cast
+                                        if (cur(&p).kind == TC_TK_INT_LIT) {
+                                            val = cur(&p).int_value;
+                                            have_int_val = true;
+                                            p.i++;
+                                        }
                                         ok = true;
                                     }
                                     if (!ok) {
                                         perror_at(&p, el.line,
-                                            str_lit("global array initializer element must be 0/NULL"));
+                                            str_lit("global array initializer element must be int/long literal or NULL"));
                                         p.i++;
                                     } else if (el.kind != TC_TK_LPAREN) {
                                         p.i++;
                                     }
+                                    if (have_int_val && bytes && ei < (size_t)alen) {
+                                        uint64_t uv = (uint64_t)val;
+                                        for (size_t b = 0; b < elem_size; b++) {
+                                            bytes[ei * elem_size + b] = (uint8_t)(uv >> (8 * b));
+                                        }
+                                        if (val != 0) any_nonzero = true;
+                                    }
+                                    if (have_int_val) ei++;
                                     if (cur(&p).kind == TC_TK_COMMA) {
                                         p.i++;
                                         if (cur(&p).kind == TC_TK_RBRACE) break;
@@ -2925,6 +3065,10 @@ int tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks, bool target_was
                             }
                             expect(&p, TC_TK_RBRACE,
                                    str_lit("expected '}' in global array initializer"));
+                            if (any_nonzero && bytes && bcap > 0) {
+                                g.init_array_data.str  = (char *)bytes;
+                                g.init_array_data.size = bcap;
+                            }
                         } else if (lit.kind == TC_TK_INT_LIT &&
                                    peek(&p, 1).kind == TC_TK_SHL &&
                                    peek(&p, 2).kind == TC_TK_INT_LIT) {

@@ -1,0 +1,32 @@
+// MRE: struct field of array type used as an rvalue (decays to a
+// pointer-to-element). From mlir_wasm_to_macho.c:144,146,155,160:
+//
+//     typedef struct { ... uint8_t data[64]; } Sha256;
+//     memcpy(s.data + s.datalen, data, take);   // <-- s.data decays
+//     sha256_xform(&s, s.data);
+//     memset(s.data, 0, 56);
+//
+// tinyc's EX_FIELD rvalue path called emit_lvalue, which rejects array
+// fields with "field <name> is not a scalar lvalue". clang accepts and
+// the test prints "200\n".
+//
+// This MRE uses `int data[8]` rather than the original `uint8_t
+// data[N]` to avoid a (separate) struct-char-array layout issue:
+// tinyc currently lays out `char arr[N]` struct fields as [N x i32],
+// which would confuse a memcpy-based test. See follow-up MRE for that.
+extern int printf(const char *fmt, ...);
+
+typedef struct {
+    int data[8];
+    int n;
+} Buf;
+
+int main() {
+    Buf b;
+    b.n = 4;
+    int *p = b.data + b.n;
+    *p = 200;
+    printf("%d\n", b.data[4]);
+    return 0;
+}
+

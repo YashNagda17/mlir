@@ -2660,6 +2660,55 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     return r;
                 }
             }
+            // Array-to-pointer decay for a struct field whose declared
+            // type is an array (e.g. `struct S { uint8_t data[64]; };
+            // ... s.data + i`). The rvalue is a pointer to the array's
+            // first element; carrying the right ptr_elem lets downstream
+            // pointer-arithmetic / indexing emit the correct stride.
+            if (ex->kind == EX_FIELD) {
+                SCtx parent = walk_struct_lhs(e, sc, ex->lhs);
+                if (parent.ok) {
+                    int fidx = struct_field_index(parent.sd, ex->name);
+                    if (fidx >= 0) {
+                        Type ft = parent.sd->fields.data[fidx].type;
+                        if (ft.kind == TY_ARRAY_I32 ||
+                            ft.kind == TY_ARRAY_F32 ||
+                            ft.kind == TY_ARRAY_STRUCT ||
+                            ft.kind == TY_ARRAY_PTR_STRUCT ||
+                            ft.kind == TY_ARRAY_PTR_CHAR) {
+                            sctx_push(e, &parent,
+                                      parent.sd->is_union ? 0 : fidx);
+                            MLIR_ValueHandle dyn[1];
+                            size_t n_dyn = 0;
+                            if (parent.dyn_index != MLIR_INVALID_HANDLE) {
+                                dyn[0] = parent.dyn_index;
+                                n_dyn = 1;
+                            }
+                            MLIR_ValueHandle p = emit_gep(e,
+                                parent.base_ptr, parent.source_elem,
+                                parent.const_path, parent.n_const_path,
+                                dyn, n_dyn);
+                            r.val = p;
+                            r.is_ptr = true;
+                            if (ft.kind == TY_ARRAY_F32) {
+                                r.ptr_elem = e->f32;
+                            } else if (ft.kind == TY_ARRAY_PTR_STRUCT ||
+                                       ft.kind == TY_ARRAY_PTR_CHAR) {
+                                r.ptr_elem = e->ptr;
+                            } else if (ft.kind == TY_ARRAY_I32 &&
+                                       ft.array_elem_is_i64) {
+                                r.ptr_elem = e->i64;
+                            } else if (ft.kind == TY_ARRAY_I32 &&
+                                       ft.array_elem_is_i8) {
+                                r.ptr_elem = e->i8;
+                            } else {
+                                r.ptr_elem = e->i32;
+                            }
+                            return r;
+                        }
+                    }
+                }
+            }
             LVal lv = emit_lvalue(e, sc, ex);
             EVal v = load_lvalue(e, lv);
             // Tag the resulting pointer with its target StructDef, when
@@ -4800,7 +4849,9 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             emit_branch(e, step_b);
 
             e->cur_block = step_b; e->terminated = false;
-            if (st->for_step) (void)emit_expr(e, &inner, st->for_step);
+            for (size_t i = 0; i < st->for_steps.size; i++) {
+                (void)emit_expr(e, &inner, st->for_steps.data[i]);
+            }
             emit_branch(e, hdr_b);
 
             e->cur_block = exit_b; e->terminated = false;
@@ -5635,27 +5686,39 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
             }
             MLIR_TypeHandle arr_ty = MLIR_CreateTypeLLVMArray(
                 ctx, elem, (uint64_t)g->type.array_len);
-            MLIR_BlockHandle init_blk = MLIR_INVALID_HANDLE;
-            MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, arr_ty,
-                /*is_constant=*/false,
-                /*init_kind=*/2, 0, 0.0, &init_blk, e.loc);
-            MLIR_BlockHandle save_blk = e.cur_block;
-            bool save_term = e.terminated;
-            e.cur_block = init_blk;
-            e.terminated = false;
-            // Materialize a zero of the array type.
-            MLIR_ValueHandle zv = MLIR_CreateValueOpResult(e.ctx, MLIR_INVALID_HANDLE, 0,
-                                                          arr_ty, ssa_name(&e), eloc(&e, 0));
-            MLIR_TypeHandle *zrts = arena_new_array(e.arena, MLIR_TypeHandle, 1); zrts[0] = arr_ty;
-            MLIR_ValueHandle *zrs = arena_new_array(e.arena, MLIR_ValueHandle, 1); zrs[0] = zv;
-            emit_op(&e, OP_TYPE_LLVM_MLIR_ZERO, str_lit("llvm.mlir.zero"),
-                    zrts, 1, zrs, 1, NULL, 0, NULL, 0, NULL, 0);
-            MLIR_ValueHandle *rops = arena_new_array(arena, MLIR_ValueHandle, 1);
-            rops[0] = zv;
-            emit_op(&e, OP_TYPE_LLVM_RETURN, str_lit("llvm.return"),
-                    NULL, 0, NULL, 0, rops, 1, NULL, 0, NULL, 0);
-            e.cur_block = save_blk;
-            e.terminated = save_term;
+            MLIR_OpHandle gop;
+            if (g->init_array_data.size > 0 &&
+                g->type.kind == TY_ARRAY_I32) {
+                // Non-zero aggregate initializer: emit the raw bytes
+                // as the global's `value` STRING attribute. lower_global
+                // (wasm) and emit_global (native) both interpret it as
+                // packed little-endian element bytes.
+                gop = MLIR_CreateLLVMGlobalArrayInit(ctx, g->name, arr_ty,
+                    /*is_constant=*/false,
+                    g->init_array_data, e.loc);
+            } else {
+                MLIR_BlockHandle init_blk = MLIR_INVALID_HANDLE;
+                gop = MLIR_CreateLLVMGlobal(ctx, g->name, arr_ty,
+                    /*is_constant=*/false,
+                    /*init_kind=*/2, 0, 0.0, &init_blk, e.loc);
+                MLIR_BlockHandle save_blk = e.cur_block;
+                bool save_term = e.terminated;
+                e.cur_block = init_blk;
+                e.terminated = false;
+                // Materialize a zero of the array type.
+                MLIR_ValueHandle zv = MLIR_CreateValueOpResult(e.ctx, MLIR_INVALID_HANDLE, 0,
+                                                              arr_ty, ssa_name(&e), eloc(&e, 0));
+                MLIR_TypeHandle *zrts = arena_new_array(e.arena, MLIR_TypeHandle, 1); zrts[0] = arr_ty;
+                MLIR_ValueHandle *zrs = arena_new_array(e.arena, MLIR_ValueHandle, 1); zrs[0] = zv;
+                emit_op(&e, OP_TYPE_LLVM_MLIR_ZERO, str_lit("llvm.mlir.zero"),
+                        zrts, 1, zrs, 1, NULL, 0, NULL, 0, NULL, 0);
+                MLIR_ValueHandle *rops = arena_new_array(arena, MLIR_ValueHandle, 1);
+                rops[0] = zv;
+                emit_op(&e, OP_TYPE_LLVM_RETURN, str_lit("llvm.return"),
+                        NULL, 0, NULL, 0, rops, 1, NULL, 0, NULL, 0);
+                e.cur_block = save_blk;
+                e.terminated = save_term;
+            }
             // Record the struct sdef on the symbol for indexed access.
             if (g->type.kind == TY_ARRAY_STRUCT) {
                 sy->sdef = find_struct(&e, g->type.struct_name);
