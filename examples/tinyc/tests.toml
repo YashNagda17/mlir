@@ -275,6 +275,7 @@ expected_stdout = "41\n42\n"
 
 [[test]]
 name = "ptr_to_fnptr"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "5\n7\n"
 
 [[test]]
@@ -833,6 +834,7 @@ expected_stdout = """\
 
 [[test]]
 name = "re2c_keyword_longest_match"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "OK\n"
 
 [[test]]

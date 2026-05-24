@@ -650,6 +650,12 @@ static uint32_t arm64_add_sp_imm(uint16_t imm12) {
 static uint32_t arm64_sub_sp_imm(uint16_t imm12) {
     return 0xd10003ffu | (((uint32_t)imm12 & 0xfffu) << 10);
 }
+// SUB SP, SP, #imm12, LSL #12.   Combined with arm64_sub_sp_imm this lets
+// us shrink SP by up to 0xffffff bytes in two instructions (high 12 bits
+// shifted left 12, then low 12 bits).
+static uint32_t arm64_sub_sp_imm_lsl12(uint16_t imm12) {
+    return 0xd14003ffu | (((uint32_t)imm12 & 0xfffu) << 10);
+}
 static uint32_t arm64_str_w_sp(uint32_t rt, uint32_t imm) {
     return 0xb90003e0u | ((imm >> 2) << 10) | (rt & 0x1fu);
 }
@@ -1596,8 +1602,20 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
     // we skip the x25 dance entirely.
     if (n_locals_total > 0) {
         uint32_t reserved_slots = n_locals_total + 1;
-        emit_word(&e->code, arm64_sub_sp_imm(
-                (uint16_t)(reserved_slots * 16)));
+        uint64_t bytes = (uint64_t)reserved_slots * 16ULL;
+        if (bytes > 0xffffffULL) {
+            fprintf(stderr,
+                    "wasm->macho: function %u local frame too large "
+                    "(%llu bytes)\n",
+                    fidx, (unsigned long long)bytes);
+            free(local_types); return false;
+        }
+        uint32_t hi = (uint32_t)((bytes >> 12) & 0xfffu);
+        uint32_t lo = (uint32_t)(bytes & 0xfffu);
+        if (hi != 0)
+            emit_word(&e->code, arm64_sub_sp_imm_lsl12((uint16_t)hi));
+        if (lo != 0)
+            emit_word(&e->code, arm64_sub_sp_imm((uint16_t)lo));
         // str x25, [sp, #0]   (save caller's x25 at lowest slot)
         emit_word(&e->code, arm64_str_x_xn(25, 31 /* SP */, 0));
         // mov x25, sp
