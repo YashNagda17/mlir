@@ -128,6 +128,28 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
                         case '\'': ch = '\''; break;
                         case '?': ch = '?'; break;
                         case '0': ch = '\0'; break;
+                        case 'x': {
+                            // Hex escape: \xHH... — consume hex digits until
+                            // a non-hex byte. Result is the low 8 bits.
+                            int v = 0;
+                            int nh = 0;
+                            while (j < src.size) {
+                                char h = src.str[j];
+                                int dv;
+                                if (h >= '0' && h <= '9') dv = h - '0';
+                                else if (h >= 'a' && h <= 'f') dv = 10 + (h - 'a');
+                                else if (h >= 'A' && h <= 'F') dv = 10 + (h - 'A');
+                                else break;
+                                v = v * 16 + dv;
+                                j++; nh++;
+                            }
+                            if (nh == 0) {
+                                println(str_lit("tinyc lex error at line {}: \\x with no hex digits"),
+                                        (int64_t)line);
+                            }
+                            ch = (char)(v & 0xff);
+                            break;
+                        }
                         default:
                             println(str_lit("tinyc lex error at line {}: unknown escape '\\{}'"),
                                     (int64_t)line, str_substr(src, j - 1, 1));
@@ -170,6 +192,28 @@ VecTcTok tinyc_lex(Arena *arena, string src) {
                     case '"': v = '"'; break;
                     case '?': v = '?'; break;
                     case '0': v = '\0'; break;
+                    case 'x': {
+                        // Hex char escape: '\xHH...' — accept as many hex
+                        // digits as appear; result is the low 8 bits.
+                        int hv = 0;
+                        int nh = 0;
+                        while (j < src.size) {
+                            char h = src.str[j];
+                            int dv;
+                            if (h >= '0' && h <= '9') dv = h - '0';
+                            else if (h >= 'a' && h <= 'f') dv = 10 + (h - 'a');
+                            else if (h >= 'A' && h <= 'F') dv = 10 + (h - 'A');
+                            else break;
+                            hv = hv * 16 + dv;
+                            j++; nh++;
+                        }
+                        if (nh == 0) {
+                            println(str_lit("tinyc lex error at line {}: \\x with no hex digits"),
+                                    (int64_t)line);
+                        }
+                        v = (int64_t)(hv & 0xff);
+                        break;
+                    }
                     default:
                         println(str_lit("tinyc lex error at line {}: unknown char escape"),
                                 (int64_t)line);
