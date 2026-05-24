@@ -1004,6 +1004,17 @@ static bool is_env_placeholder(const char *module, const char *name) {
         || strcmp(name, "__data_end") == 0;
 }
 
+// Synthetic data symbols that LLVM/wasm-ld expect the linker to
+// materialise as linear-memory addresses (rather than as imports). Our
+// native pipeline emits __heap_base directly as a hidden DATA symbol in
+// the platform object, but LLVM-emitted .wasm.o leaves them as
+// undefined SYM_DATA entries to be filled in at link time.
+static bool is_synthetic_data_symbol(const char *name) {
+    if (!name) return false;
+    return strcmp(name, "__heap_base") == 0
+        || strcmp(name, "__data_end") == 0;
+}
+
 static bool merge_symbols(Obj *objs, uint32_t n_objs, GlobalSymTab *gst,
                           bool *need_indirect_table) {
     // Pass 1: add every defined non-local symbol to the global table.
@@ -1115,6 +1126,20 @@ static bool merge_symbols(Obj *objs, uint32_t n_objs, GlobalSymTab *gst,
                     gst->e[egi].def_obj = (int32_t)oi;
                     gst->e[egi].def_sym = si;
                     gst->e[egi].final_idx = 0;
+                }
+                s->global_sym = egi;
+                continue;
+            } else if (s->kind == SYM_DATA
+                       && is_synthetic_data_symbol(s->name)) {
+                // LLVM-emitted objects reference __heap_base / __data_end
+                // as undefined SYM_DATA entries; we materialise these
+                // ourselves with addresses computed during layout.
+                int egi = gst_find(gst, s->name);
+                if (egi < 0) {
+                    egi = gst_add(gst, s->name, SYM_DATA);
+                    gst->e[egi].def_obj = (int32_t)oi;
+                    gst->e[egi].def_sym = si;
+                    gst->e[egi].is_host_import = false;
                 }
                 s->global_sym = egi;
                 continue;
@@ -1547,6 +1572,21 @@ bool MLIR_WasmLink(const MLIR_WasmLinkInput *inputs, size_t n_inputs,
     uint32_t heap_base = (data_end + 15u) & ~15u;
     uint32_t total_pages = ((heap_base + PAGE_SIZE - 1u) / PAGE_SIZE) + 1u;
     if (total_pages < INITIAL_PAGES) total_pages = INITIAL_PAGES;
+
+    // Materialise linker-synthesised data symbols (e.g. __heap_base,
+    // __data_end) requested by LLVM-emitted objects via undefined
+    // SYM_DATA entries. Their addresses are only known now, after
+    // layout.
+    for (uint32_t gi = 0; gi < gst.n; gi++) {
+        GlobalSym *gs = &gst.e[gi];
+        if (gs->kind != SYM_DATA) continue;
+        if (!gs->name) continue;
+        if (strcmp(gs->name, "__heap_base") == 0) {
+            gs->final_addr = heap_base;
+        } else if (strcmp(gs->name, "__data_end") == 0) {
+            gs->final_addr = data_end;
+        }
+    }
 
     // ---- Assign indirect-function-table slots --------------------------
     // Each function referenced by any input element segment gets a

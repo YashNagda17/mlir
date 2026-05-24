@@ -466,6 +466,16 @@ extern "C" MLIR_TypeHandle MLIR_GetOpResult_type(MLIR_OpHandle h, size_t i) {
 // in inline property storage and the dictionary view is rebuilt on demand).
 // Cache a stable copy on first access so MLIR_AttributeHandle pointers stay
 // valid for the rest of the lowering pass.
+//
+// The cache is also seeded by MLIR_CreateOp with the exact user-passed
+// attribute list, which is what we want to expose to consumers of the
+// classic-form text printer: they should see only attrs the user wrote, not
+// every default-valued inherent property MLIR keeps in typed storage (e.g.
+// arith.addi's `overflowFlags = #arith.overflow<none>`).
+//
+// The MLIR_EraseOp path invalidates this cache, so the seeded snapshot can
+// never be shadowed by a freshly-allocated op reusing a stale Operation*
+// slab address.
 static std::vector<mlir::NamedAttribute> &
 ensureCachedAttrs(mlir::Operation *op) {
     auto &m = opUserAttrs();
@@ -1281,6 +1291,12 @@ extern "C" void MLIR_ReplaceAllUsesOfValue(MLIR_Context *,
 extern "C" void MLIR_EraseOp(MLIR_Context *, MLIR_OpHandle op_h) {
     if (op_h == MLIR_INVALID_HANDLE) return;
     auto *op = F<mlir::Operation>(op_h);
+    // Drop any cached attribute snapshot for this Operation* — once the
+    // op is erased the MLIR allocator may reuse the same address for a
+    // freshly-constructed op (potentially of a different kind), and the
+    // stale userAttrs snapshot would shadow the new op's real attrs.
+    opUserAttrs().erase(op);
+    opByNameAttrs().erase(op);
     op->erase();
 }
 
@@ -1646,7 +1662,11 @@ static void rewriteWasmMemoryIntrinsicsForUpstream(mlir::ModuleOp module) {
         op->getResult(0).replaceAllUsesWith(call.getResult(0));
         to_erase.push_back(op);
     });
-    for (Operation *op : to_erase) op->erase();
+    for (Operation *op : to_erase) {
+        opUserAttrs().erase(op);
+        opByNameAttrs().erase(op);
+        op->erase();
+    }
 }
 
 extern "C" bool MLIR_LowerToLLVMDialectUpstream(MLIR_Context *ctx,

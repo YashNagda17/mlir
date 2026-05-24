@@ -27,3 +27,8 @@ _libc_io_tmp.txt
 parser_tinyc
 build_tinyc/
 examples/tinyc/tests/*.macho
+/tinyc_native_opt
+/tinyc_upstream_opt
+/build_opt_native/
+/build_opt_upstream/
+/bench_tinyc_out/
