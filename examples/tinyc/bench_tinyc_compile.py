@@ -323,7 +323,7 @@ def print_speedup(
     if base not in compile_totals:
         return
     print()
-    print("speedup vs upstream_full:")
+    print(f"relative to {base} (lower = faster):")
     base_lt = link_times.get(base, 0.0)
     base_total = compile_totals[base] + (0.0 if base_lt == float("inf") else base_lt)
     for c in configs:
@@ -331,9 +331,13 @@ def print_speedup(
             continue
         lt = link_times.get(c.name, 0.0)
         total = compile_totals[c.name] + (0.0 if lt == float("inf") else lt)
-        if total <= 0:
+        if total <= 0 or base_total <= 0:
             continue
-        print(f"  {c.name:18s} {base_total / total:6.2f}x faster")
+        ratio = total / base_total
+        label = "slower" if ratio >= 1.0 else "faster"
+        # If the other config is faster, print speedup as base/other.
+        magnitude = ratio if ratio >= 1.0 else (base_total / total)
+        print(f"  {c.name:18s} {magnitude:6.2f}x {label}")
 
 
 def write_csv(
