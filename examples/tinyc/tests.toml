@@ -39,6 +39,10 @@ name = "compound_literal_struct_field"
 expected_stdout = "12\n7\n99\n33\n50\n7\n99\n77\n99\n4\n5\n1\n"
 
 [[test]]
+name = "nested_struct_pointer_field"
+expected_stdout = "100\n200\n1\n7\n2\n"
+
+[[test]]
 name = "return"
 expected_stdout = "3\n-1\n"
 

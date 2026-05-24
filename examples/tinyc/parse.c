@@ -1793,6 +1793,14 @@ static StructDef *parse_struct_def(P *p) {
             ft.kind = TY_STRUCT;
             ft.struct_name = nested->name;
             is_struct_kind = true;
+            // Optional pointer suffix: `struct Tag { ... } *name;`
+            // promotes the field type to TY_PTR_STRUCT. Used for
+            // self-referential / forward-list-style fields in tinyc itself
+            // (e.g. `struct LabelBlock { ...; struct LabelBlock *next; } *labels;`).
+            if (accept(p, TC_TK_STAR)) {
+                is_ptr = true;
+                ft.kind = TY_PTR_STRUCT;
+            }
         } else if (cur(p).kind == TC_TK_KW_STRUCT || cur(p).kind == TC_TK_KW_UNION) {
             // Nested struct field: `struct Inner name;` (by-value),
             // `struct Inner* name;` (pointer to struct), or
