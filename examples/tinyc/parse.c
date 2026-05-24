@@ -2182,6 +2182,40 @@ static Func *parse_func(P *p) {
             } else if (cur(p).kind == TC_TK_IDENT) {
                 pname = cur(p).text;
                 p->i++;
+                // C function-parameter array decay: `T name[N]` is a synonym
+                // for `T *name`. Consume one or more `[expr?]` suffixes and
+                // promote the base type to the corresponding pointer kind.
+                // Multi-dimensional `T name[N1][N2]` is treated as a flat
+                // pointer (we don't carry the inner array shape).
+                while (accept(p, TC_TK_LBRACK)) {
+                    while (cur(p).kind != TC_TK_RBRACK &&
+                           cur(p).kind != TC_TK_EOF) {
+                        p->i++;
+                    }
+                    expect(p, TC_TK_RBRACK,
+                           str_lit("expected ']' in parameter array suffix"));
+                    if (pty.kind == TY_I32 && pty.int_bits == 8) {
+                        pty.kind = TY_PTR_CHAR;
+                        pty.int_bits = 0;
+                    } else if (pty.kind == TY_I32) {
+                        pty.kind = TY_PTR_I32;
+                    } else if (pty.kind == TY_I64) {
+                        pty.kind = TY_PTR_I32;
+                        pty.ptr_is_i64 = true;
+                    } else if (pty.kind == TY_F32) {
+                        pty.kind = TY_PTR_I32;
+                        pty.ptr_is_f32 = true;
+                    } else if (pty.kind == TY_F64) {
+                        pty.kind = TY_PTR_I32;
+                        pty.ptr_is_f64 = true;
+                    } else if (pty.kind == TY_STRUCT) {
+                        pty.kind = TY_PTR_STRUCT;
+                    }
+                    // For pointer / array / fnptr base types: leave the type
+                    // as-is (we'd need TY_PTR_PTR or a richer model to
+                    // represent `char *argv[]`); but consuming the suffix
+                    // at least lets the parser keep going.
+                }
             }
             VecParam_push_back(p->arena, &f->params,
                 ((Param){.name = pname, .type = pty, .line = cur(p).line}));
