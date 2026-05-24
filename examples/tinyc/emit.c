@@ -2660,6 +2660,55 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     return r;
                 }
             }
+            // Array-to-pointer decay for a struct field whose declared
+            // type is an array (e.g. `struct S { uint8_t data[64]; };
+            // ... s.data + i`). The rvalue is a pointer to the array's
+            // first element; carrying the right ptr_elem lets downstream
+            // pointer-arithmetic / indexing emit the correct stride.
+            if (ex->kind == EX_FIELD) {
+                SCtx parent = walk_struct_lhs(e, sc, ex->lhs);
+                if (parent.ok) {
+                    int fidx = struct_field_index(parent.sd, ex->name);
+                    if (fidx >= 0) {
+                        Type ft = parent.sd->fields.data[fidx].type;
+                        if (ft.kind == TY_ARRAY_I32 ||
+                            ft.kind == TY_ARRAY_F32 ||
+                            ft.kind == TY_ARRAY_STRUCT ||
+                            ft.kind == TY_ARRAY_PTR_STRUCT ||
+                            ft.kind == TY_ARRAY_PTR_CHAR) {
+                            sctx_push(e, &parent,
+                                      parent.sd->is_union ? 0 : fidx);
+                            MLIR_ValueHandle dyn[1];
+                            size_t n_dyn = 0;
+                            if (parent.dyn_index != MLIR_INVALID_HANDLE) {
+                                dyn[0] = parent.dyn_index;
+                                n_dyn = 1;
+                            }
+                            MLIR_ValueHandle p = emit_gep(e,
+                                parent.base_ptr, parent.source_elem,
+                                parent.const_path, parent.n_const_path,
+                                dyn, n_dyn);
+                            r.val = p;
+                            r.is_ptr = true;
+                            if (ft.kind == TY_ARRAY_F32) {
+                                r.ptr_elem = e->f32;
+                            } else if (ft.kind == TY_ARRAY_PTR_STRUCT ||
+                                       ft.kind == TY_ARRAY_PTR_CHAR) {
+                                r.ptr_elem = e->ptr;
+                            } else if (ft.kind == TY_ARRAY_I32 &&
+                                       ft.array_elem_is_i64) {
+                                r.ptr_elem = e->i64;
+                            } else if (ft.kind == TY_ARRAY_I32 &&
+                                       ft.array_elem_is_i8) {
+                                r.ptr_elem = e->i8;
+                            } else {
+                                r.ptr_elem = e->i32;
+                            }
+                            return r;
+                        }
+                    }
+                }
+            }
             LVal lv = emit_lvalue(e, sc, ex);
             EVal v = load_lvalue(e, lv);
             // Tag the resulting pointer with its target StructDef, when

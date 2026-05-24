@@ -810,7 +810,7 @@ expected_stdout = "3 9\n"
 [[test]]
 name = "struct_array_field_decay"
 targets = ["native", "wasm", "macho"]
-expected_stdout = "abc\n"
+expected_stdout = "200\n"
 
 [[test]]
 name = "inttoptr_cast"

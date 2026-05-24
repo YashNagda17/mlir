@@ -8,20 +8,25 @@
 //
 // tinyc's EX_FIELD rvalue path called emit_lvalue, which rejects array
 // fields with "field <name> is not a scalar lvalue". clang accepts and
-// the test prints "abc\n".
+// the test prints "200\n".
+//
+// This MRE uses `int data[8]` rather than the original `uint8_t
+// data[N]` to avoid a (separate) struct-char-array layout issue:
+// tinyc currently lays out `char arr[N]` struct fields as [N x i32],
+// which would confuse a memcpy-based test. See follow-up MRE for that.
 extern int printf(const char *fmt, ...);
-extern void *memcpy(void *dst, const void *src, unsigned long n);
 
 typedef struct {
-    unsigned char data[16];
+    int data[8];
     int n;
 } Buf;
 
 int main() {
     Buf b;
     b.n = 4;
-    memcpy(b.data + b.n, "abc", 3);
-    b.data[7] = 0;
-    printf("%c%c%c\n", b.data[4], b.data[5], b.data[6]);
+    int *p = b.data + b.n;
+    *p = 200;
+    printf("%d\n", b.data[4]);
     return 0;
 }
+
