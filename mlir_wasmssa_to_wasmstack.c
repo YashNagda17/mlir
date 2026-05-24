@@ -146,6 +146,8 @@ static MLIR_OpType ssa_to_stack(MLIR_OpType t) {
     case OP_TYPE_WASMSSA_ADDRESSOF:    return OP_TYPE_WASMSTACK_ADDRESSOF;
     case OP_TYPE_WASMSSA_FUNC_ADDR:    return OP_TYPE_WASMSTACK_FUNC_ADDR;
     case OP_TYPE_WASMSSA_CALL_INDIRECT: return OP_TYPE_WASMSTACK_CALL_INDIRECT;
+    case OP_TYPE_WASMSSA_MEMORY_SIZE:   return OP_TYPE_WASMSTACK_MEMORY_SIZE;
+    case OP_TYPE_WASMSSA_MEMORY_GROW:   return OP_TYPE_WASMSTACK_MEMORY_GROW;
     default: return (MLIR_OpType)0;
     }
 }
@@ -166,6 +168,8 @@ static bool ssa_op_has_result(MLIR_OpType t) {
     case OP_TYPE_WASMSSA_ADDRESSOF:
     case OP_TYPE_WASMSSA_FUNC_ADDR:
     case OP_TYPE_WASMSSA_CARRIER_GET:
+    case OP_TYPE_WASMSSA_MEMORY_SIZE:
+    case OP_TYPE_WASMSSA_MEMORY_GROW:
         return true;
     default:
         return false;

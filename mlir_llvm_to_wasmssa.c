@@ -1927,6 +1927,48 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
         return true;
     }
 
+    // ---- llvm.intr.wasm.memory.size ---------------------------------------
+    // `__builtin_wasm_memory_size(0)` lowers to this. No operands (the
+    // memory index byte is hard-coded to 0 in the binary encoder); the
+    // single i32 result is the current memory size in 64KiB pages.
+    if (name_eq(name, "llvm.intr.wasm.memory.size")) {
+        if (MLIR_GetOpNumResults(op) != 1) return false;
+        MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
+        uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(r));
+        if (vt != WT_I32) return false;
+        wasmssa_op_t o = {0};
+        o.type = OP_TYPE_WASMSSA_MEMORY_SIZE;
+        o.valtype = vt;
+        o.n_operands = 0;
+        o.has_result = true;
+        MLIR_ValueHandle idx = commit_op(F, &o);
+        vmap_set(F, r, idx);
+        return true;
+    }
+
+    // ---- llvm.intr.wasm.memory.grow ---------------------------------------
+    // `__builtin_wasm_memory_grow(0, n)` lowers to this. One i32 operand
+    // (pages to grow by) and one i32 result (previous size in pages or -1).
+    if (name_eq(name, "llvm.intr.wasm.memory.grow")) {
+        if (MLIR_GetOpNumResults(op) != 1 ||
+            MLIR_GetOpNumOperands(op) != 1) return false;
+        MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
+        uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(r));
+        if (vt != WT_I32) return false;
+        MLIR_ValueHandle sa;
+        if (!vmap_get(F, MLIR_GetOpOperand(op, 0), &sa)) return false;
+        wasmssa_op_t o = {0};
+        o.type = OP_TYPE_WASMSSA_MEMORY_GROW;
+        o.valtype = vt;
+        o.n_operands = 1;
+        MLIR_ValueHandle o_ops[1] = { sa };
+        o.operands = o_ops;
+        o.has_result = true;
+        MLIR_ValueHandle idx = commit_op(F, &o);
+        vmap_set(F, r, idx);
+        return true;
+    }
+
     fprintf(stderr, "wasmssa-lower: unsupported op '%.*s'\n",
             (int)name.size, name.str);
     return false;

@@ -496,6 +496,17 @@ static bool encode_op(EmFunc *F, MLIR_OpHandle op, uint32_t sp_sym_idx,
         return true;
     }
 
+    case OP_TYPE_WASMSTACK_MEMORY_SIZE:
+        // wasm `memory.size` (0x3F) takes a single immediate memory
+        // index byte (always 0 for the default memory) and returns
+        // the current size in pages on the stack.
+        buf_putc(b, 0x3f); buf_putc(b, 0x00); return true;
+
+    case OP_TYPE_WASMSTACK_MEMORY_GROW:
+        // wasm `memory.grow` (0x40) pops a page count and pushes
+        // either the previous size in pages or -1.
+        buf_putc(b, 0x40); buf_putc(b, 0x00); return true;
+
     default: {
         string nm = MLIR_GetOpName(op);
         fprintf(stderr, "wasm-emit: unsupported wasmstack op '%.*s' (enum=%d)\n",

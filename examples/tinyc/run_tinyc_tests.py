@@ -183,6 +183,14 @@ def main():
             print(f"SKIP {name} (wasm_skip)")
             skipped += 1
             continue
+        # Inverse opt-out: tests that exercise wasm-only builtins
+        # (e.g. `__builtin_wasm_memory_size`) cannot be run on the
+        # native (LLVM-IR / llc) target — those intrinsics aren't
+        # valid for x86/aarch64 codegen.
+        if TARGET == "native" and t.get("native_skip"):
+            print(f"SKIP {name} (native_skip)")
+            skipped += 1
+            continue
         # Optional opt-out for the native LLVM->WASM pipeline only
         # (mlir_llvm_to_wasmssa.c + mlir_wasmssa_to_wasmstack.c +
         # mlir_wasmstack_to_bin.c). Covers the few corners the in-tree

@@ -784,3 +784,8 @@ expected_stdout = "824\n"
 [[test]]
 name = "attribute_basic"
 expected_stdout = "50\n"
+
+[[test]]
+name = "builtin_wasm_memory"
+native_skip = true
+expected_stdout = "42\n"

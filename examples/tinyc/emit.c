@@ -3309,6 +3309,47 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                         rts, 1, rs, 1, ops, 1, NULL, 0, NULL, 0);
                 r.val = res; r.is_float = true; r.is_f64 = !is_f32; return r;
             }
+            // Built-in __builtin_wasm_memory_size(0) and
+            // __builtin_wasm_memory_grow(0, n): lower to the
+            // LLVM-style wasm intrinsics that the
+            // llvm-dialect -> wasmssa pass recognizes. The first
+            // argument (memory index) must be the integer literal 0;
+            // we don't model multi-memory wasm yet so we just verify
+            // and drop it. Both intrinsics produce i32 results.
+            if (!indirect_fnty &&
+                (str_eq(ex->callee, str_lit("__builtin_wasm_memory_size")) ||
+                 str_eq(ex->callee, str_lit("__builtin_wasm_memory_grow")))) {
+                bool is_grow = str_eq(ex->callee, str_lit("__builtin_wasm_memory_grow"));
+                size_t want = is_grow ? 2 : 1;
+                if (ex->args.size != want) {
+                    EMIT_ERR(e, "{} expects {} argument(s)", ex->callee,
+                             want == 1 ? str_lit("1") : str_lit("2"));
+                    r.val = emit_const_i32(e, 0); return r;
+                }
+                // Argument 0 must be the immediate memory index. Only
+                // 0 (default linear memory) is supported.
+                Expr *aidx = ex->args.data[0];
+                if (aidx->kind != EX_INT || aidx->int_value != 0) {
+                    EMIT_ERR(e, "{}: first arg must be the constant 0",
+                             ex->callee);
+                }
+                MLIR_TypeHandle rty = e->i32;
+                MLIR_ValueHandle res = MLIR_CreateValueOpResult(
+                    e->ctx, MLIR_INVALID_HANDLE, 0, rty, ssa_name(e), eloc(e, 0));
+                MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = rty;
+                MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = res;
+                if (is_grow) {
+                    EVal pages = emit_expr(e, sc, ex->args.data[1]);
+                    MLIR_ValueHandle p32 = coerce_eval(e, pages, e->i32);
+                    MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = p32;
+                    emit_op(e, OP_TYPE_UNREGISTERED, str_lit("llvm.intr.wasm.memory.grow"),
+                            rts, 1, rs, 1, ops, 1, NULL, 0, NULL, 0);
+                } else {
+                    emit_op(e, OP_TYPE_UNREGISTERED, str_lit("llvm.intr.wasm.memory.size"),
+                            rts, 1, rs, 1, NULL, 0, NULL, 0, NULL, 0);
+                }
+                r.val = res; return r;
+            }
             // Built-in malloc(size) -> !llvm.ptr. The libc signature
             // takes i64, so accept any integer expression (i32, i64,
             // pointer-sized) and coerce up to i64. Using emit_expr +
