@@ -301,6 +301,7 @@ expected_stdout = "42\n7\n3\n4\n7\n"
 
 [[test]]
 name = "variadic_call_printf"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "1 2 3\nanswer = 42\n"
 
 [[test]]
@@ -310,6 +311,7 @@ expected_stdout = "60\n15\n99\n"
 
 [[test]]
 name = "variadic_mixed_types"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "int=7\nlong=1234567890123\nstr=hi\n"
 
 [[test]]
@@ -489,10 +491,12 @@ wasm_skip = true
 
 [[test]]
 name = "struct_field_double"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "42 3.5 97\n-1.25\n"
 
 [[test]]
 name = "char_array_string_init"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "hello 6\nabc 10 0 0 0\njello\n"
 
 [[test]]
@@ -612,6 +616,7 @@ expected_stdout = "3.75\n3.375\n-1.5\n2\n7\n3.5\n1\n"
 
 [[test]]
 name = "double_va_arg"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "2.5\n3.75\n1.5\n"
 
 [[test]]
@@ -631,86 +636,107 @@ expected_stdout = "8\n5\n16\n"
 
 [[test]]
 name = "func_macro"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "greet\nsquare=16\nmain\n"
 
 [[test]]
 name = "builtin_va"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "10\n20\n30\n"
 
 [[test]]
 name = "va_list_pass"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "7\n8\n9\n"
 
 [[test]]
 name = "addr_of_struct_index"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "333\n330\n"
 
 [[test]]
 name = "int_suffix_ul"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "4096\n4096\n4096\n4096\n7\n"
 
 [[test]]
 name = "compound_literal_array"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "2\n6\n"
 
 [[test]]
 name = "global_array"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "0 0\n1 10\n2 20\n3 30\n24\n1000000005\n"
 
 [[test]]
 name = "inttoptr_cast"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "42\n"
 
 [[test]]
 name = "struct_fwd_then_def"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "16\n"
 
 [[test]]
 name = "goto_label"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "10\n"
 
 [[test]]
 name = "compound_designated"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "3 7 10 20\n"
 
 [[test]]
 name = "bnot_i64"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "-16\n"
 
 [[test]]
 name = "global_ptr_array"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "1\n"
 
 [[test]]
 name = "va_arg_struct"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "33\n"
 
 [[test]]
 name = "float_ptr"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "4 6\n"
 
 [[test]]
 name = "float_exp_lit"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "1000 200 150\n"
 
 [[test]]
 name = "empty_stmt"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "3\n"
 
 [[test]]
 name = "neg_i64"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "-1000000000000\n"
 
 [[test]]
 name = "global_cast_null_shift"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "1 256\n"
 
 [[test]]
 name = "builtin_sqrt"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "4 9\n"
 
 [[test]]
 name = "static_func"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "21\n"
 [[test]]
 name = "struct_ptr_arith"
@@ -720,10 +746,12 @@ wasm_skip = true
 
 [[test]]
 name = "loop_local_alloca"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "40000200000\n"
 
 [[test]]
 name = "postfix_inc"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "a=5\nb=6\nx=5\nbuf=hi len=2\nn=786432 nlen=6\n"
 
 [[test]]
@@ -734,18 +762,22 @@ wasm_skip = true
 
 [[test]]
 name = "typedef_u8_ptr"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "a=ABCDEF\nb=abcdef\nc=012345\n"
 
 [[test]]
 name = "struct_field_char_ptr"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "buf=ABCDE\n"
 
 [[test]]
 name = "compound_struct_field"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "tag=7 x=11 y=22\ntag=1 x=0 y=0\n"
 
 [[test]]
 name = "sizeof_string_lit"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "hi=3 empty=1 hello=6 ptr=8\n"
 
 [[test]]
@@ -756,6 +788,7 @@ wasm_skip = true
 
 [[test]]
 name = "struct_param_memchr"
+targets = ["native", "wasm", "macho"]
 expected_stdout = """\
 n=11
 found=1
@@ -763,6 +796,7 @@ offset=9
 """
 [[test]]
 name = "unsigned_char_ptr_local"
+targets = ["native", "wasm", "macho"]
 expected_stdout = """\
 sum=476
 found_at=9
@@ -798,14 +832,17 @@ expected_stdout = "OK\n"
 
 [[test]]
 name = "float_literal_0_75"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "OK\n"
 
 [[test]]
 name = "unsigned_modulo"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "1\n"
 
 [[test]]
 name = "struct_field_designated_init"
+targets = ["native", "wasm", "macho"]
 expected_stdout = "3\n"
 
 # Mach-O backend tests. Only run under `TINYC_TARGET=macho`

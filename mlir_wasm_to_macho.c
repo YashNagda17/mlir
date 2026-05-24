@@ -641,6 +641,12 @@ static uint32_t arm64_csel_w(uint32_t rd, uint32_t rn, uint32_t rm,
     return 0x1a800000u | ((rm & 0x1fu) << 16) | ((cond & 0xfu) << 12)
          | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
 }
+// CSEL Xd, Xn, Xm, cond (64-bit variant).
+static uint32_t arm64_csel_x(uint32_t rd, uint32_t rn, uint32_t rm,
+                             uint32_t cond) {
+    return 0x9a800000u | ((rm & 0x1fu) << 16) | ((cond & 0xfu) << 12)
+         | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
+}
 // CMP Wn, #0   alias for SUBS WZR, Wn, #0 (32-bit sub immediate).
 static uint32_t arm64_cmp_w_imm0(uint32_t rn) {
     return 0x7100001fu | ((rn & 0x1fu) << 5);
@@ -1492,7 +1498,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
         uint32_t cond_branch_site; // for if: CBZ over the `then` body
         uint32_t else_jump_site;   // for if-with-else: B over the `else` body
         uint32_t loop_header_off;  // for loop: code offset to branch back to
-        uint32_t fixups[32];       // for block/if: br/br_if B sites to patch
+        uint32_t fixups[256];      // for block/if: br/br_if/br_table B sites
         uint32_t n_fixups;
     } BlockFrame;
     BlockFrame block_stack[64];
@@ -1696,7 +1702,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                     emit_word(&e->code, arm64_b(off));
                 } else {
                     // Forward branch to matching end; record fixup.
-                    if (target->n_fixups >= 32) {
+                    if (target->n_fixups >= 256) {
                         fprintf(stderr,
                                 "wasm->macho: too many br fixups in "
                                 "func %u\n", fidx);
@@ -1714,6 +1720,132 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 // value_depth tracking will resync at `end`.
                 break;
             }
+            case 0x0e: {                              // br_table
+                // Layout: u32_leb N, then N+1 u32_leb labels:
+                //   N case labels followed by the default label.
+                uint32_t n = (uint32_t)rd_uleb(&r);
+                // We support up to 256 cases per br_table (matches
+                // BlockFrame::fixups[256]). The dispatch is a linear
+                // cmp/b.eq chain; each case has its own per-target
+                // drop-and-branch trampoline emitted right after the
+                // chain, so the trampoline body is reached only via
+                // the chain branch and falls through never (each
+                // trampoline ends in an unconditional B).
+                if (n > 256) {
+                    fprintf(stderr,
+                            "wasm->macho: br_table N=%u too large in "
+                            "func %u (max 256)\n", n, fidx);
+                    free(local_types); return false;
+                }
+                uint32_t labels[257];
+                for (uint32_t i = 0; i <= n; i++) {
+                    uint32_t labelidx = (uint32_t)rd_uleb(&r);
+                    if (labelidx >= block_depth) {
+                        fprintf(stderr,
+                                "wasm->macho: br_table label %u out of "
+                                "range (depth=%u) in func %u\n",
+                                labelidx, block_depth, fidx);
+                        free(local_types); return false;
+                    }
+                    labels[i] = labelidx;
+                }
+
+                // Pop index into w0.
+                emit_word(&e->code, arm64_ldr_w_sp(0, 0));
+                emit_word(&e->code, arm64_add_sp_imm(16));
+                value_depth -= 1;
+
+                // For i in [0, N): cmp w0, #i; b.eq case_trampoline[i].
+                // Use cmp_w_imm for i < 4096; for larger i materialise
+                // i into w1 and compare register-register.
+                uint32_t case_branch_site[257];
+                for (uint32_t i = 0; i < n; i++) {
+                    if (i < 4096u) {
+                        // CMP w0, #i  (SUBS wzr, w0, #imm, LSL 0).
+                        emit_word(&e->code,
+                            0x7100001fu | (i << 10));
+                    } else {
+                        // mov w1, #i ; cmp w0, w1.
+                        emit_mov_w_imm32(&e->code, 1, i);
+                        // CMP w0, w1  (SUBS wzr, w0, w1).
+                        emit_word(&e->code,
+                            0x6b00001fu | (1u << 16) | (0u << 5));
+                    }
+                    case_branch_site[i] = (uint32_t)e->code.len;
+                    // B.EQ #0 (imm19 patched after we emit the
+                    // matching trampoline below).
+                    emit_word(&e->code, 0x54000000u);
+                }
+                // Unconditional branch to the default trampoline,
+                // emitted last after all the case trampolines.
+                case_branch_site[n] = (uint32_t)e->code.len;
+                emit_word(&e->code, arm64_b(0));
+
+                // Emit one trampoline per label (cases first, then
+                // default). Each trampoline: patch the corresponding
+                // case_branch_site, emit drop-of-extra-slots, then
+                // branch to the target (concrete back-edge for loop,
+                // fixup record for block/if).
+                for (uint32_t i = 0; i <= n; i++) {
+                    uint32_t here = (uint32_t)e->code.len;
+                    if (i < n) {
+                        // Patch B.EQ imm19. patch_cbz_local works
+                        // because B.cond shares imm19 layout with CBZ.
+                        patch_cbz_local(e->code.data,
+                                        case_branch_site[i], here);
+                    } else {
+                        // Patch unconditional B imm26.
+                        patch_b_local(e->code.data,
+                                      case_branch_site[i], here);
+                    }
+                    uint32_t labelidx = labels[i];
+                    BlockFrame *target =
+                        &block_stack[block_depth - 1 - labelidx];
+                    uint32_t branch_arity = target->arity;
+                    int32_t drop = (int32_t)value_depth
+                                 - (int32_t)target->entry_depth
+                                 - (int32_t)branch_arity;
+                    if (drop < 0) {
+                        fprintf(stderr,
+                                "wasm->macho: br_table case %u "
+                                "underflow drop=%d in func %u "
+                                "(depth=%u target_entry=%u)\n",
+                                labelidx, drop, fidx,
+                                value_depth, target->entry_depth);
+                        free(local_types); return false;
+                    }
+                    if (drop > 0) {
+                        uint32_t bytes = (uint32_t)drop * 16u;
+                        if (bytes > 4095) {
+                            fprintf(stderr,
+                                    "wasm->macho: br_table drop %d "
+                                    "slots exceeds 12-bit imm in "
+                                    "func %u\n", drop, fidx);
+                            free(local_types); return false;
+                        }
+                        emit_word(&e->code,
+                            arm64_add_sp_imm((uint16_t)bytes));
+                    }
+                    uint32_t b_site = (uint32_t)e->code.len;
+                    if (target->kind == 2) {
+                        int32_t off = (int32_t)target->loop_header_off
+                                    - (int32_t)b_site;
+                        emit_word(&e->code, arm64_b(off));
+                    } else {
+                        if (target->n_fixups >= 256) {
+                            fprintf(stderr,
+                                    "wasm->macho: too many br fixups "
+                                    "in func %u\n", fidx);
+                            free(local_types); return false;
+                        }
+                        target->fixups[target->n_fixups++] = b_site;
+                        emit_word(&e->code, arm64_b(0));
+                    }
+                }
+                // Everything after a br_table is unreachable until
+                // the matching `end`; we let value_depth resync there.
+                break;
+            }
             case 0x0f: {                              // return
                 EMIT_EPILOGUE();
                 break;
@@ -1728,13 +1860,19 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 // top). Result is val_true when cond != 0, else
                 // val_false. We pop cond and val_false, then
                 // overwrite the (now-top) val_true slot.
+                //
+                // Use 8-byte loads/stores so f64/i64 operands aren't
+                // truncated. For i32 operands the upper bytes of a
+                // slot may hold garbage, but downstream consumers
+                // only read the low 4 bytes via `ldr w`, so widening
+                // here is safe.
                 emit_word(&e->code, arm64_ldr_w_sp(0, 0));   // cond -> w0
-                emit_word(&e->code, arm64_ldr_w_sp(1, 16));  // false -> w1
-                emit_word(&e->code, arm64_ldr_w_sp(2, 32));  // true  -> w2
+                emit_word(&e->code, arm64_ldr_x_sp(1, 16));  // false -> x1
+                emit_word(&e->code, arm64_ldr_x_sp(2, 32));  // true  -> x2
                 emit_word(&e->code, arm64_add_sp_imm(32));   // pop 2 slots
                 emit_word(&e->code, arm64_cmp_w_imm0(0));
-                emit_word(&e->code, arm64_csel_w(2, 2, 1, 1)); // NE
-                emit_word(&e->code, arm64_str_w_sp(2, 0));
+                emit_word(&e->code, arm64_csel_x(2, 2, 1, 1)); // NE
+                emit_word(&e->code, arm64_str_x_sp(2, 0));
                 value_depth -= 2;
                 break;
             }
