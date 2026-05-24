@@ -2009,15 +2009,20 @@ MLIR_ValueHandle MLIR_AddBlockArgument(MLIR_Context *ctx, MLIR_BlockHandle block
     v->register_name = (string){0};
     v->location = loc;
     MLIR_ValueHandle vh = (MLIR_ValueHandle)(uintptr_t)v;
-    // Append to block->arguments.
-    MLIR_ValueHandle *na = arena_new_array(arena, MLIR_ValueHandle,
-                                            b->n_arguments + 1);
-    if (b->n_arguments > 0)
-        memcpy(na, b->arguments, b->n_arguments * sizeof(MLIR_ValueHandle));
-    na[b->n_arguments] = vh;
-    b->arguments = na;
+    // Append to block->arguments, growing geometrically so repeated
+    // AddBlockArgument calls (e.g. when lift-cf-to-scf builds an
+    // EdgeMultiplexer with many entry blocks each contributing their
+    // args) don't cost O(N^2) memory in the arena.
+    if (b->n_arguments >= b->cap_arguments) {
+        uint64_t new_cap = b->cap_arguments ? b->cap_arguments * 2 : 4;
+        MLIR_ValueHandle *na = arena_new_array(arena, MLIR_ValueHandle, new_cap);
+        if (b->n_arguments > 0)
+            memcpy(na, b->arguments, b->n_arguments * sizeof(MLIR_ValueHandle));
+        b->arguments = na;
+        b->cap_arguments = new_cap;
+    }
+    b->arguments[b->n_arguments] = vh;
     b->n_arguments++;
-    b->cap_arguments = b->n_arguments;
     return vh;
 }
 
@@ -2145,19 +2150,25 @@ void MLIR_SpliceBlockOps(MLIR_Context *ctx, MLIR_BlockHandle dst,
     if (!d || !s || s->n_operations == 0) return;
     Arena *arena = MLIR_GetArenaAllocator(ctx);
     uint64_t new_n = d->n_operations + s->n_operations;
-    MLIR_OpHandle *no = arena_new_array(arena, MLIR_OpHandle, new_n);
-    if (d->n_operations > 0)
-        memcpy(no, d->operations, d->n_operations * sizeof(MLIR_OpHandle));
-    memcpy(no + d->n_operations, s->operations,
+    // Grow geometrically (matching AppendBlockOp) so repeated splices
+    // into the same dst block don't cost O(N^2) memory.
+    if (new_n > d->cap_operations) {
+        uint64_t new_cap = d->cap_operations ? d->cap_operations : 4;
+        while (new_cap < new_n) new_cap *= 2;
+        MLIR_OpHandle *no = arena_new_array(arena, MLIR_OpHandle, new_cap);
+        if (d->n_operations > 0)
+            memcpy(no, d->operations, d->n_operations * sizeof(MLIR_OpHandle));
+        d->operations = no;
+        d->cap_operations = new_cap;
+    }
+    memcpy(d->operations + d->n_operations, s->operations,
            s->n_operations * sizeof(MLIR_OpHandle));
     // Reparent moved ops.
     for (size_t i = 0; i < s->n_operations; i++) {
         IR_Op *op = resolve_op(s->operations[i]);
         if (op) op->parent_block = dst;
     }
-    d->operations = no;
     d->n_operations = new_n;
-    d->cap_operations = new_n;
     s->operations = NULL;
     s->n_operations = 0;
     s->cap_operations = 0;
