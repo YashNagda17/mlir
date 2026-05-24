@@ -313,6 +313,7 @@ link \
     format.obj \
     math.obj \
     string.obj \
+    strbuf.obj \
     mem.obj \
     numconv.obj \
     assert.obj \
