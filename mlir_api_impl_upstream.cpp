@@ -1139,7 +1139,24 @@ extern "C" string MLIR_GetAttributeString(MLIR_AttributeHandle h) {
         string out; out.str = const_cast<char *>(v.data()); out.size = v.size();
         return out;
     }
-    return mkRefString(llvm::cast<mlir::StringAttr>(value).getValue());
+    // Fallback: return the printed assembly form (e.g. `#llvm.linkage<internal>`
+    // for `LLVM_LinkageAttr`). The agnostic impl stores attribute payloads as
+    // strings and returns them verbatim, so callers expect the printed form
+    // for non-string attrs; this matches that contract. Intern the printed
+    // string so the storage outlives the call.
+    static thread_local std::unordered_map<std::string, std::string> printed_cache;
+    std::string buf;
+    {
+        llvm::raw_string_ostream os(buf);
+        value.print(os);
+    }
+    auto it = printed_cache.find(buf);
+    if (it == printed_cache.end()) {
+        it = printed_cache.emplace(buf, buf).first;
+    }
+    const std::string &v = it->second;
+    string out; out.str = const_cast<char *>(v.data()); out.size = v.size();
+    return out;
 }
 extern "C" string MLIR_GetAttributeAsString(MLIR_Context *ctx, MLIR_AttributeHandle h) {
     std::string buf;
@@ -1591,6 +1608,47 @@ extern "C" void MLIR_SpliceBlockOps(MLIR_Context *, MLIR_BlockHandle dst_h,
 // further down in this file.
 static void liftLLVMFuncCFGToSCF(mlir::ModuleOp module);
 
+// Rewrite tinyc's unregistered `llvm.intr.wasm.memory.size` /
+// `llvm.intr.wasm.memory.grow` ops into upstream LLVM dialect's
+// `llvm.call_intrinsic` form. tinyc emits these as unregistered ops (and
+// drops the memory-index argument, since only the default linear memory is
+// modeled); the native llvm->wasmssa pipeline recognizes the unregistered
+// names directly, but upstream's LLVM-IR translator only knows the
+// registered LLVM dialect ops. Rewriting to `llvm.call_intrinsic` lets
+// `translateModuleToLLVMIR` emit the actual `llvm.wasm.memory.size` /
+// `llvm.wasm.memory.grow` IR intrinsics.
+static void rewriteWasmMemoryIntrinsicsForUpstream(mlir::ModuleOp module) {
+    using namespace mlir;
+    llvm::SmallVector<Operation *> to_erase;
+    module.walk([&](Operation *op) {
+        llvm::StringRef name = op->getName().getStringRef();
+        bool is_size = (name == "llvm.intr.wasm.memory.size");
+        bool is_grow = (name == "llvm.intr.wasm.memory.grow");
+        if (!is_size && !is_grow) return;
+        if (op->getNumResults() != 1) return;
+        OpBuilder b(op);
+        Location loc = op->getLoc();
+        Type i32 = b.getI32Type();
+        // Both intrinsics take the memory index (always 0) as their first
+        // argument; tinyc dropped it, so prepend a fresh `llvm.mlir.constant
+        // 0 : i32` here.
+        Value zero = b.create<LLVM::ConstantOp>(
+            loc, i32, b.getI32IntegerAttr(0));
+        llvm::SmallVector<Value> args;
+        args.push_back(zero);
+        for (Value v : op->getOperands()) args.push_back(v);
+        llvm::StringRef intrin = is_size
+            ? llvm::StringRef("llvm.wasm.memory.size")
+            : llvm::StringRef("llvm.wasm.memory.grow");
+        auto call = b.create<LLVM::CallIntrinsicOp>(
+            loc, op->getResult(0).getType(), b.getStringAttr(intrin),
+            args, LLVM::FastmathFlagsAttr{});
+        op->getResult(0).replaceAllUsesWith(call.getResult(0));
+        to_erase.push_back(op);
+    });
+    for (Operation *op : to_erase) op->erase();
+}
+
 extern "C" bool MLIR_LowerToLLVMDialectUpstream(MLIR_Context *ctx,
                                                 MLIR_OpHandle module_h) {
     (void)ctx;
@@ -1632,6 +1690,11 @@ extern "C" bool MLIR_LowerToLLVMDialectUpstream(MLIR_Context *ctx,
     // Running the lift first rewrites the multi-block region into a nested
     // single-block `scf.if`, restoring `scf.if`'s invariant.
     liftLLVMFuncCFGToSCF(module);
+    // Rewrite tinyc's unregistered wasm memory intrinsics (used by the
+    // upstream wasm flow, which goes through this same upstream-llvm
+    // pipeline before handing off to LLVM's wasm target). Cheap walk on
+    // non-wasm builds since no such ops are present.
+    rewriteWasmMemoryIntrinsicsForUpstream(module);
     mlir::PassManager pm(&mctx);
     pm.addPass(mlir::createLiftControlFlowToSCFPass());
     pm.addPass(mlir::createConvertSCFToCFPass());
