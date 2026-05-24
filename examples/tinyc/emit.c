@@ -1221,9 +1221,12 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                             EMIT_ERR(e, "2D pointer-array fields are not supported");
                             return r;
                         }
-                        MLIR_TypeHandle elem = is_arr_f32 ? e->f32
-                                              : (is_arr_pst || is_arr_pch) ? e->ptr
-                                              : e->i32;
+                        MLIR_TypeHandle elem;
+                        if (is_arr_f32) elem = e->f32;
+                        else if (is_arr_pst || is_arr_pch) elem = e->ptr;
+                        else if (ft.array_elem_is_i64) elem = e->i64;
+                        else if (ft.array_elem_is_i8) elem = e->i8;
+                        else elem = e->i32;
                         MLIR_ValueHandle iv = emit_expr_i32(e, sc, idx_a);
                         MLIR_ValueHandle jv = is_2d ? emit_expr_i32(e, sc, idx_b)
                                                    : MLIR_INVALID_HANDLE;
@@ -1246,6 +1249,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                             parent.source_elem, path, total, dyn, n_dyn);
                         r.base_ptr = gep;
                         r.elem_ty = elem;
+                        r.is_unsigned = ft.int_unsigned;
                         return r;
                     }
                     // Pointer field indexed: `s.f[i]` / `p->f[i]` where
@@ -1660,6 +1664,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                      ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID ||
                      ft.kind == TY_FNPTR || ft.kind == TY_PTR_PTR) r.elem_ty = e->ptr;
             else r.elem_ty = e->i32;
+            r.is_unsigned = ft.int_unsigned;
             return r;
         }
         default:
@@ -1904,6 +1909,8 @@ static void emit_struct_copy_path(E *e, MLIR_ValueHandle dst, MLIR_ValueHandle s
             MLIR_TypeHandle elem;
             if (ft.kind == TY_ARRAY_F32) elem = e->f32;
             else if (ft.kind == TY_ARRAY_PTR_STRUCT || ft.kind == TY_ARRAY_PTR_CHAR) elem = e->ptr;
+            else if (ft.array_elem_is_i64) elem = e->i64;
+            else if (ft.array_elem_is_i8) elem = e->i8;
             else elem = e->i32;
             for (int64_t a = 0; a < n1; a++) {
                 for (int64_t b = 0; b < n2; b++) {
@@ -3947,7 +3954,9 @@ static void emit_struct_zero(E *e, MLIR_ValueHandle base, MLIR_TypeHandle source
             if (ft.kind == TY_ARRAY_F32) { z = emit_const_f32(e, 0.0); }
             else if (ft.kind == TY_ARRAY_PTR_STRUCT || ft.kind == TY_ARRAY_PTR_CHAR) {
                 z = emit_null_ptr(e);
-            } else { z = emit_const_i32(e, 0); }
+            } else if (ft.array_elem_is_i64) { z = emit_const_i64(e, 0); }
+            else if (ft.array_elem_is_i8) { z = emit_const_i8(e, 0); }
+            else { z = emit_const_i32(e, 0); }
             for (int64_t a = 0; a < n1; a++) {
                 for (int64_t b = 0; b < n2; b++) {
                     size_t inner_n = is_2d ? 2 : 1;
@@ -5521,7 +5530,11 @@ static void init_struct_types(E *e) {
                 MLIR_TypeHandle t = find_struct_type(e, inner);
                 body[k] = t;
             } else if (ft.kind == TY_ARRAY_I32 || ft.kind == TY_ARRAY_F32) {
-                MLIR_TypeHandle elem = (ft.kind == TY_ARRAY_F32) ? e->f32 : e->i32;
+                MLIR_TypeHandle elem;
+                if (ft.kind == TY_ARRAY_F32) elem = e->f32;
+                else if (ft.array_elem_is_i64) elem = e->i64;
+                else if (ft.array_elem_is_i8) elem = e->i8;
+                else elem = e->i32;
                 MLIR_TypeHandle inner;
                 if (ft.array_len2 != 0) {
                     MLIR_TypeHandle in2 = MLIR_CreateTypeLLVMArray(
