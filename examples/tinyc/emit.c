@@ -238,7 +238,20 @@ static string ssa_name(E *e) {
 
 static MLIR_BlockHandle new_cfg_block(E *e) {
     MLIR_BlockHandle b = MLIR_CreateBlock(e->ctx);
-    MLIR_AppendRegionBlock(e->ctx, e->func_region, b);
+    // Append the new block to the region that currently owns
+    // `e->cur_block`, not blindly to the function body. The CFG-based
+    // emitters (if, while, ternary, ...) can run while emit_expr is
+    // recursing inside another op's region (e.g. an scf.if then-block
+    // emitted by &&/||): the ternary's new blocks must live in that
+    // inner region, otherwise the resulting IR has cf.cond_br ops
+    // pointing at successors outside their own region and downstream
+    // passes (cf->scf lift, wasmssa lower, ...) reject it.
+    MLIR_RegionHandle target = e->func_region;
+    if (e->cur_block != MLIR_INVALID_HANDLE) {
+        MLIR_RegionHandle r = MLIR_GetBlockParentRegion(e->cur_block);
+        if (r != MLIR_INVALID_HANDLE) target = r;
+    }
+    MLIR_AppendRegionBlock(e->ctx, target, b);
     return b;
 }
 
