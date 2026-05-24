@@ -3554,6 +3554,13 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                             // Already zero-initialized by emit_struct_zero above.
                             continue;
                         }
+                        // Nested aggregate `{ ... }` with no explicit
+                        // cast_type: propagate the surrounding field's
+                        // struct type so emit_expr resolves it.
+                        if (ae->kind == EX_COMPOUND &&
+                            ae->cast_type.kind == TY_VOID) {
+                            ae->cast_type = ft;
+                        }
                         EVal vv = emit_expr(e, sc, ae);
                         if (vv.is_ptr && vv.val != MLIR_INVALID_HANDLE) {
                             emit_struct_copy(e, p, vv.val, fsd);
@@ -4077,6 +4084,15 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                                 Expr *ae = st->decl_init->args.data[i];
                                 if (ae->kind == EX_INT && ae->int_value == 0) {
                                     continue; // already zero-initialised
+                                }
+                                // Nested aggregate `{ ... }` for this
+                                // struct field: parser leaves cast_type
+                                // unset (TY_VOID); fill it in here so
+                                // emit_expr's EX_COMPOUND path resolves
+                                // the field's struct type.
+                                if (ae->kind == EX_COMPOUND &&
+                                    ae->cast_type.kind == TY_VOID) {
+                                    ae->cast_type = ft;
                                 }
                                 StructDef *src_sd = NULL;
                                 MLIR_ValueHandle src = resolve_struct_source(

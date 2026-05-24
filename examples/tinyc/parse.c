@@ -148,7 +148,22 @@ static Expr *parse_aggregate_init(P *p, Type decl_type) {
                 fname = ft.text;
                 any_designated = true;
             }
-            Expr *v = parse_expr(p);
+            Expr *v;
+            if (cur(p).kind == TC_TK_LBRACE) {
+                // Nested aggregate initializer (e.g. `{ {a,b}, c }` for a
+                // struct field that is itself a struct or array). The
+                // element type isn't known here without resolving the
+                // surrounding struct definition, so flag the type as
+                // TY_VOID (a sentinel: void cannot otherwise appear as a
+                // cast_type). The emitter looks up the field type by
+                // position / designated name and fills it in before
+                // emitting the inner compound.
+                Type unset = (Type){0};
+                unset.kind = TY_VOID;
+                v = parse_aggregate_init(p, unset);
+            } else {
+                v = parse_expr(p);
+            }
             VecExprPtr_push_back(p->arena, &e->args, v);
             if (nn == cap) {
                 size_t ncap = cap ? cap * 2 : 4;
