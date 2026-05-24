@@ -2500,7 +2500,14 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 }
                 bool want_i64 = (ck == TY_I64);
                 if (want_i64 && !v.is_i64) {
-                    v.val = emit_extsi_i32_to_i64(e, v.val);
+                    // Use unsigned widening when the source carried an
+                    // `unsigned` C type — otherwise an i32 value with
+                    // its top bit set (e.g. `(int64_t)<uint32_t>` with
+                    // bit 31 set) sign-extends to a huge "negative"
+                    // i64. The cast itself doesn't change signedness,
+                    // so propagate `is_unsigned` to the widened value.
+                    v.val = v.is_unsigned ? emit_extui_i32_to_i64(e, v.val)
+                                          : emit_extsi_i32_to_i64(e, v.val);
                     v.is_i64 = true;
                 } else if (!want_i64 && v.is_i64) {
                     v.val = emit_trunci_i64_to_i32(e, v.val);
@@ -3678,6 +3685,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                 r.is_float = (fnty->fnptr_ret->kind == TY_F32 || fnty->fnptr_ret->kind == TY_F64);
                 r.is_f64 = (fnty->fnptr_ret->kind == TY_F64);
                 r.is_i64 = (fnty->fnptr_ret->kind == TY_I64);
+                r.is_unsigned = fnty->fnptr_ret->int_unsigned;
                 r.is_ptr = (rty == e->ptr);
                 return r;
             }
@@ -3702,6 +3710,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             r.is_float = (sig->ret.type.kind == TY_F32 || sig->ret.type.kind == TY_F64);
             r.is_f64 = (sig->ret.type.kind == TY_F64);
             r.is_i64 = (sig->ret.type.kind == TY_I64);
+            r.is_unsigned = sig->ret.type.int_unsigned;
             if (sig->ret.type.kind == TY_PTR_STRUCT) {
                 r.is_ptr = true;
                 r.sdef = sig->ret.sdef;
