@@ -2779,6 +2779,46 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                             }
                         }
                     }
+                    // Local variable indexed by a single subscript:
+                    //   `a[i]` where `a` is `char **` / `char *arr[N]` /
+                    //   `struct T *arr[N]`. The loaded element is a single
+                    //   T*; without tagging `v.ptr_elem`, subsequent
+                    //   pointer arithmetic (`a[i] + n`) falls back to the
+                    //   `e->i32` default and GEPs with the wrong stride
+                    //   (4 bytes per `n` instead of 1 byte per `n` for
+                    //   char*) — observed during stage-3 self-host as the
+                    //   driver.c `--export=NAME` parser advancing 36
+                    //   bytes past the prefix instead of 9.
+                    if (ex->lhs->kind == EX_VAR) {
+                        Sym *vs = lookup(e, sc, ex->lhs->name);
+                        if (vs) {
+                            if (vs->type.kind == TY_PTR_PTR && vs->type.pointee) {
+                                Type *pe = vs->type.pointee;
+                                if (pe->kind == TY_PTR_CHAR) {
+                                    v.is_str = true;
+                                    v.ptr_elem = e->i8;
+                                } else if (pe->kind == TY_PTR_STRUCT) {
+                                    v.sdef = find_struct(e, pe->struct_name);
+                                } else if (pe->kind == TY_PTR_I32) {
+                                    v.ptr_elem = pe->ptr_is_i64 ? e->i64
+                                               : pe->ptr_is_f32 ? e->f32
+                                               : pe->ptr_is_f64 ? e->f64
+                                               : e->i32;
+                                } else if (pe->kind == TY_PTR_VOID) {
+                                    v.is_void_ptr = true;
+                                } else if (pe->kind == TY_FNPTR) {
+                                    Type *fnty = arena_new(e->arena, Type);
+                                    *fnty = *pe;
+                                    v.fnptr_ty = fnty;
+                                }
+                            } else if (vs->type.kind == TY_ARRAY_PTR_CHAR) {
+                                v.is_str = true;
+                                v.ptr_elem = e->i8;
+                            } else if (vs->type.kind == TY_ARRAY_PTR_STRUCT) {
+                                v.sdef = find_struct(e, vs->type.struct_name);
+                            }
+                        }
+                    }
                 }
             }
             return v;

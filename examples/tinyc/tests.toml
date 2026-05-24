@@ -966,6 +966,18 @@ name = "static_local_var"
 expected_stdout = "1\n2\n3\n110\n120\n4\n"
 
 [[test]]
+name = "ptr_arith_after_index_char_pp"
+# Regression for tinyc bug #41 (parser/codegen bug surfaced during
+# stage-3 self-host): when an array-indexed `char **` is followed by
+# pointer arithmetic — `argv[j] + 9` in driver.c's --export= parser —
+# tinyc advanced by `9 * sizeof(char *)` (= 36 bytes on wasm32) rather
+# than 9 bytes, so `link_entry` pointed past the export name into the
+# next argv slot. The MRE exercises `a[1] + 9` then dereferences
+# successive bytes to confirm the resulting pointer lands 9 bytes
+# inside the indexed char* (i.e., at "_start...").
+expected_stdout = "95\n115\n116\n97\n114\n116\n"
+
+[[test]]
 name = "i64_init_narrows_to_i32_slot"
 # Regression for tinyc bug #40 (parser bug discovered during stage-3
 # self-host): `uint8_t byte = v & 0x7f` (where v is uint64_t) emitted
