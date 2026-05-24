@@ -1025,7 +1025,8 @@ static Stmt *parse_decl(P *p, bool require_semi) {
         if (accept(p, TC_TK_ASSIGN)) {
             if (s->decl_type.kind != TY_PTR_STRUCT &&
                 s->decl_type.kind != TY_PTR_PTR &&
-                s->decl_type.kind != TY_STRUCT) {
+                s->decl_type.kind != TY_STRUCT &&
+                s->decl_type.kind != TY_ARRAY_STRUCT) {
                 perror_at(p, line, str_lit("struct/array initializers are not supported"));
             }
             { Expr *agg = parse_aggregate_init(p, s->decl_type); s->decl_init = agg ? agg : parse_expr(p); }
