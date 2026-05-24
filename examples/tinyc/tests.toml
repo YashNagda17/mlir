@@ -1281,3 +1281,8 @@ expected_stdout = "7\n"
 name = "uint8_array_zext"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "253\n254\n255\n"
+
+[[test]]
+name = "uint32_widen_to_i64"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "2147483648\n2147483648\n2147483648\n"
