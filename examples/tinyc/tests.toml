@@ -51,6 +51,10 @@ name = "va_comma_paste_forward"
 expected_stdout = "0\n0\n1\n2\n2\n2\n7\n"
 
 [[test]]
+name = "multi_decl_pointer"
+expected_stdout = "11\n22\n100\n200\n15\n"
+
+[[test]]
 name = "return"
 expected_stdout = "3\n-1\n"
 

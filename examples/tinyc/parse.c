@@ -922,6 +922,12 @@ static Stmt *parse_decl(P *p, bool require_semi) {
             blk->block_no_scope = true;
             VecStmtPtr_push_back(p->arena, &blk->block_body, s);
             while (accept(p, TC_TK_COMMA)) {
+                // Accept (and ignore) any leading `*`s that match the
+                // pointer-ness already absorbed into `ty` by parse_sig_type.
+                // This lets `Td *a, *b;` and `Td *a, **b;` declare a/b with
+                // the same pointer type as `Td*` / `Td**` without choking
+                // on the per-declarator `*` tokens.
+                while (cur(p).kind == TC_TK_STAR) p->i++;
                 TcTok dname = cur(p);
                 expect(p, TC_TK_IDENT, str_lit("expected identifier"));
                 Stmt *ds = new_stmt(p, ST_DECL, dname.line);
