@@ -324,11 +324,18 @@ static Expr *parse_primary(P *p) {
     }
     if (t.kind == TC_TK_KW_SIZEOF) {
         p->i++;
-        expect(p, TC_TK_LPAREN, str_lit("expected '(' after sizeof"));
+        Expr *e = new_expr(p, EX_SIZEOF, t.line);
+        // C also accepts `sizeof <unary-expression>` (no parens). In that
+        // form the operand is always an expression, never a type-name.
+        if (cur(p).kind != TC_TK_LPAREN) {
+            e->lhs = parse_primary(p);
+            e->sizeof_is_expr = true;
+            return e;
+        }
+        p->i++;  // consume '('
         // Disambiguate `sizeof(<type>)` vs `sizeof(<expr>)`. A type-name
         // starts with a base-type keyword, `const`, `enum`, or a typedef
         // identifier. Anything else is parsed as an expression.
-        Expr *e = new_expr(p, EX_SIZEOF, t.line);
         TcTokKind nxt = cur(p).kind;
         bool looks_like_type =
             nxt == TC_TK_KW_INT || nxt == TC_TK_KW_FLOAT || nxt == TC_TK_KW_DOUBLE ||
