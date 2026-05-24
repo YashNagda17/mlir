@@ -18,7 +18,7 @@
 #include "mlir_wasm_link.h"
 #include "tinyc.h"
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasm__)
 #include <sys/stat.h>
 #endif
 
@@ -417,7 +417,7 @@ int app_main(void) {
     if (output_file) {
         if (emit_wasm || emit_macho) {
             wrc = write_bytes_to_file(out, output_file);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasm__)
             if (wrc == 0 && emit_macho) {
                 // chmod 0755 so the resulting Mach-O is directly runnable.
                 chmod(output_file, 0755);
