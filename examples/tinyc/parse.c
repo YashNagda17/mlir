@@ -1251,7 +1251,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
     if (cur(p).kind == TC_TK_LPAREN && peek(p, 1).kind == TC_TK_STAR) {
         Stmt *s = new_stmt(p, ST_DECL, line);
         s->decl_type.kind = base;
-        s->decl_type.is_long = is_long;
+        if (is_long) s->decl_type.int_bits = 64;
         string nm = (string){0};
         try_parse_fnptr_suffix(p, &s->decl_type, &nm);
         if (nm.size == 0) {
@@ -1275,7 +1275,7 @@ static Stmt *parse_decl(P *p, bool require_semi) {
     Stmt *s = new_stmt(p, ST_DECL, line);
     s->decl_name = name.text;
     s->decl_type.kind = base;
-    s->decl_type.is_long = is_long;
+    if (is_long) s->decl_type.int_bits = 64;
     if (is_ptr) {
         if (was_char) s->decl_type.kind = TY_PTR_CHAR;
         else if (base == TY_I32) s->decl_type.kind = TY_PTR_I32;
@@ -1741,23 +1741,29 @@ static bool parse_sig_type(P *p, Type *out) {
             if (cur(p).kind == TC_TK_KW_UNSIGNED) saw_unsigned = true;
             p->i++; skip_const(p);
         }
-        // `long long` is always 64-bit; a single `long` is 64-bit on
-        // the native host but 32-bit on wasm32 (matching clang's
-        // wasm32-wasi ABI).
-        bool long_is_64 = (n_long >= 2) || (n_long == 1 && !p->target_wasm32);
-        bool saw_long_64 = long_is_64;
-        out->kind = saw_long_64 ? TY_I64 : TY_I32;
-        if (saw_long_64) out->int_bits = 64;
+        // `long long` is always 64-bit storage; a single `long` is
+        // 64-bit storage on the native host but 32-bit on wasm32
+        // (matching clang's wasm32-wasi ABI). We tag the type with
+        // int_bits = 64 in BOTH cases so that `_Generic` can keep
+        // `long` distinct from `int` even on wasm32 where the
+        // storage kind collides (both TY_I32). The storage width is
+        // tracked by `kind` (TY_I32 / TY_I64), independent of this
+        // semantic tag.
+        bool long_storage_64 = (n_long >= 2) || (n_long == 1 && !p->target_wasm32);
+        out->kind = long_storage_64 ? TY_I64 : TY_I32;
+        if (n_long >= 1) out->int_bits = 64;
         else if (saw_char) out->int_bits = 8;
         else if (saw_short) out->int_bits = 16;
         else if (saw_bool) out->int_bits = 8;
         else out->int_bits = 32;
         out->int_unsigned = saw_unsigned;
-        out->is_long = (n_long >= 1);
         skip_const(p);
         if (accept(p, TC_TK_STAR)) {
-            out->kind = saw_char ? TY_PTR_CHAR : (saw_long_64 ? TY_PTR_I32 : TY_PTR_I32);
-            if (saw_long_64 && !saw_char) out->ptr_is_i64 = true;
+            // `long *` → pointer to long. Storage element width matches
+            // the long storage width: i64 on native, i32 on wasm32. We
+            // model the i64 element via TY_PTR_I32 with ptr_is_i64.
+            out->kind = saw_char ? TY_PTR_CHAR : TY_PTR_I32;
+            if (long_storage_64 && !saw_char) out->ptr_is_i64 = true;
             skip_const(p);
             if (accept(p, TC_TK_STAR)) { wrap_ptr_to_ptr(p, out); skip_const(p); }
         }
@@ -2153,7 +2159,7 @@ static StructDef *parse_struct_def(P *p) {
                 continue;
             }
             ft.kind = k;
-            ft.is_long = field_is_long;
+            if (field_is_long) ft.int_bits = 64;
             // Optional pointer suffix on base types: `T *` (single) or
             // `T **` (pointer-to-pointer). The `**` form wraps the
             // single-level pointer kind into a TY_PTR_PTR.

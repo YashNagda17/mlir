@@ -170,13 +170,12 @@ struct Type {
     bool     array_elem_is_i8;
     // For TY_I32/TY_I64: optional explicit bit width hint (0 = unspecified,
     // 8/16/32/64 = explicit width). Used by `_Generic` for typedef
-    // matching on narrow-int aliases (`int8_t`, `int16_t`, ...).
+    // matching on narrow-int aliases (`int8_t`, `int16_t`, ...). For
+    // wasm32 we also use int_bits == 64 with kind == TY_I32 to tag
+    // `long`-semantic types (storage is i32 because of the ABI, but
+    // `_Generic` must keep them distinct from `int`).
     int      int_bits;
     bool     int_unsigned;
-    // True when the type was declared with the `long` keyword (including
-    // `long long`). Used by `_Generic` to disambiguate `int` from `long`
-    // on wasm32 where both have storage kind TY_I32 and int_bits == 32.
-    bool     is_long;
 };
 
 typedef enum {

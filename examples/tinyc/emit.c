@@ -2165,9 +2165,6 @@ static bool generic_type_matches(Type a, Type b) {
     if (a.kind == TY_I32 || a.kind == TY_I64) {
         if (a.int_bits != 0 && b.int_bits != 0 && a.int_bits != b.int_bits)
             return false;
-        // `int` vs `long`: on wasm32 both have kind TY_I32 with int_bits == 32,
-        // so distinguish them by the `is_long` parser flag.
-        if (a.is_long != b.is_long) return false;
         return true;
     }
     return true;
