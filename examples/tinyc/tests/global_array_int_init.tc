@@ -1,0 +1,17 @@
+// MRE: global int array initialised with non-zero literal values.
+// Comes from `static const uint32_t SHA256_K[64] = { 0x42..., ... };`
+// in mlir_wasm_to_macho.c. tinyc previously rejected any non-0/NULL
+// element with "global array initializer element must be 0/NULL".
+//
+// Expected: clang accepts and prints 100; tinyc must too.
+extern int printf(const char *fmt, ...);
+
+static const int K[4] = { 10, 20, 30, 40 };
+
+int main() {
+    int s = 0;
+    int i;
+    for (i = 0; i < 4; i = i + 1) s = s + K[i];
+    printf("%d\n", s);
+    return 0;
+}
