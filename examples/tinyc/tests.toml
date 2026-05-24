@@ -47,6 +47,10 @@ name = "global_cast_init"
 expected_stdout = "-2147483648\n42\n-7\n"
 
 [[test]]
+name = "va_comma_paste_forward"
+expected_stdout = "0\n0\n1\n2\n2\n2\n7\n"
+
+[[test]]
 name = "return"
 expected_stdout = "3\n-1\n"
 
