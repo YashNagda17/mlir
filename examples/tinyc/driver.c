@@ -18,7 +18,7 @@
 #include "mlir_wasm_link.h"
 #include "tinyc.h"
 
-#if !defined(_WIN32) && !defined(__wasm__)
+#if !defined(_WIN32) && !defined(__wasm__) && !defined(__TINYC__)
 #include <sys/stat.h>
 #endif
 
@@ -385,8 +385,19 @@ int app_main(void) {
         }
 
         uint8_t *macho_data = NULL; size_t macho_size = 0;
+#ifdef __TINYC__
+        // The Mach-O translator's SHA-256 constant table uses a
+        // non-zero global array initializer (see mlir_wasm_to_macho.c
+        // SHA256_K[]) which the tinyC compiler can't yet parse. We
+        // exclude that translation unit from the tinyc selfhost build
+        // and stub the call out here.
+        bool macho_ok = false;
+        (void)linked_data; (void)linked_size; (void)macho_data; (void)macho_size;
+        fprintf(stderr, "tinyc --emit=macho: not available in tinyc-built tinyc\n");
+#else
         bool macho_ok = MLIR_WasmToMachoArm64(linked_data, linked_size,
                                               &macho_data, &macho_size);
+#endif
         free(linked_data);
         if (!macho_ok) {
             fprintf(stderr, "tinyc --emit=macho: wasm->macho translation failed\n");
@@ -417,7 +428,7 @@ int app_main(void) {
     if (output_file) {
         if (emit_wasm || emit_macho) {
             wrc = write_bytes_to_file(out, output_file);
-#if !defined(_WIN32) && !defined(__wasm__)
+#if !defined(_WIN32) && !defined(__wasm__) && !defined(__TINYC__)
             if (wrc == 0 && emit_macho) {
                 // chmod 0755 so the resulting Mach-O is directly runnable.
                 chmod(output_file, 0755);
