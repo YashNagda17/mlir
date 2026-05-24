@@ -838,3 +838,15 @@ name = "wasm32_long_is_i32"
 native_skip = true
 wasm_upstream_skip = true
 expected_stdout = "ok\n"
+
+[[test]]
+name = "generic_ternary_str"
+# _Generic dispatch on a ternary controlling expression whose
+# then/else branches both have type `char*`. The selected
+# association must be `char*` — not `int` from the condition.
+# Regression test for a bug in tinyc's infer_expr_type where
+# EX_TERNARY returned the condition type instead of the value
+# type, which made the corec `format`/`println` plumbing (via
+# the A() = _Generic(...) macro) fail to compile any tinyC
+# source that called EMIT_ERR with a ternary string argument.
+expected_stdout = "got-char-ptr\n"

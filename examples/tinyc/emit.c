@@ -5189,10 +5189,18 @@ static Type infer_expr_type(E *e, Scope *sc, Expr *ex) {
             return a;
         }
         case EX_UN:
-        case EX_TERNARY:
         case EX_ASSIGN: {
             // Use the LHS type as the result type.
             return infer_expr_type(e, sc, ex->lhs ? ex->lhs : ex->lvalue);
+        }
+        case EX_TERNARY: {
+            // For `c ? a : b` the result type is the type of the
+            // then/else branches (`a` / `b`), NOT the condition `c`.
+            // tinyc's AST stores: lhs=cond, rhs=then, lvalue=else.
+            // Pick the then-branch (rhs) first; fall back to lvalue or
+            // lhs only if rhs is missing (defensive).
+            Expr *val = ex->rhs ? ex->rhs : (ex->lvalue ? ex->lvalue : ex->lhs);
+            return infer_expr_type(e, sc, val);
         }
         default: return t;
     }
