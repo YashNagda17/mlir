@@ -69,6 +69,8 @@ expected_stdout = "10\n20\n30\n30\n40\n7\n11\n"
 [[test]]
 name = "sizeof_no_parens"
 expected_stdout = "4\n4\n20\n20\n16\n4\n8\n8\n"
+# On wasm32, `sizeof &x` is 4 (pointer width) instead of 8.
+expected_stdout_wasm = "4\n4\n20\n20\n16\n4\n4\n8\n"
 
 [[test]]
 name = "hex_escape"
@@ -149,6 +151,8 @@ expected_stdout = "1\n0\n1\n0\n0\n42\n99\n"
 [[test]]
 name = "sizeof_basic"
 expected_stdout = "4\n4\n8\n16\n"
+# On wasm32, pointers are 4 bytes, so `struct WithPtr` = int(4)+ptr(4) = 8.
+expected_stdout_wasm = "4\n4\n8\n8\n"
 
 [[test]]
 name = "struct_ptr_return"
@@ -315,6 +319,8 @@ expected_stdout = "55\n5050\n0\n"
 [[test]]
 name = "sizeof_expr"
 expected_stdout = "4\n4\n8\n8\n8\n4\n4\n8\n"
+# On wasm32, `sizeof(char *)` is 4 (the 4th value).
+expected_stdout_wasm = "4\n4\n8\n4\n8\n4\n4\n8\n"
 
 [[test]]
 name = "compound_literal"
@@ -718,6 +724,8 @@ expected_stdout = "tag=7 x=11 y=22\ntag=1 x=0 y=0\n"
 [[test]]
 name = "sizeof_string_lit"
 expected_stdout = "hi=3 empty=1 hello=6 ptr=8\n"
+# On wasm32, `sizeof(char *)` is 4.
+expected_stdout_wasm = "hi=3 empty=1 hello=6 ptr=4\n"
 
 [[test]]
 name = "variadic_struct_arg_count"
@@ -915,3 +923,14 @@ name = "u64_size_field_narrowing"
 # without corrupting the previous arg. Reproduces the same struct
 # layout / argument-narrowing shape.
 expected_stdout = "size=6 str0=a\n"
+
+[[test]]
+name = "sizeof_struct_ptr_wasm32"
+# Regression for emit.c `type_size`/`type_align` hard-coding pointers
+# as 8 bytes regardless of target. On wasm32, pointers are 4 bytes,
+# so a struct of N pointers was reported as 8*N bytes but the actual
+# layout used 4*N bytes. `memset(&s, 0, sizeof s)` would then write
+# past the struct's end and clobber adjacent locals on the C stack —
+# which manifested as stage-2 selfhost zeroing internal pass state
+# inside `mlir_llvm_to_wasmssa`.
+expected_stdout = "0\n"

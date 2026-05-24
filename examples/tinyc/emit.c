@@ -3139,7 +3139,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                                                    str_lit("arith.subi"), e->i64, ai, bi);
                 int64_t es = 4;
                 if (elem == e->i8) es = 1; else if (elem == e->f32) es = 4;
-                else if (elem == e->ptr) es = 8;
+                else if (elem == e->ptr) es = e->target_wasm32 ? 4 : 8;
                 MLIR_ValueHandle szc = emit_const_i64(e, es);
                 MLIR_ValueHandle q = emit_binop(e, OP_TYPE_ARITH_DIVSI,
                                                  str_lit("arith.divsi"), e->i64, diff, szc);
@@ -5209,20 +5209,21 @@ static Type infer_expr_type(E *e, Scope *sc, Expr *ex) {
 }
 
 static int64_t type_size(E *e, Type t) {
+    int64_t ptr_sz = e->target_wasm32 ? 4 : 8;
     if (t.kind == TY_I32) return 4;
     if (t.kind == TY_I64) return 8;
     if (t.kind == TY_F32) return 4;
     if (t.kind == TY_F64) return 8;
-    if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return 8;
-    if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return 8;
-    if (t.kind == TY_PTR_PTR) return 8;
+    if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return ptr_sz;
+    if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return ptr_sz;
+    if (t.kind == TY_PTR_PTR) return ptr_sz;
     if (t.kind == TY_ARRAY_I32) {
         int64_t es = t.array_elem_is_i64 ? 8 : t.array_elem_is_i8 ? 1 : 4;
         return es * t.array_len * (t.array_len2 ? t.array_len2 : 1);
     }
     if (t.kind == TY_ARRAY_F32) return 4 * t.array_len * (t.array_len2 ? t.array_len2 : 1);
     if (t.kind == TY_ARRAY_PTR_STRUCT || t.kind == TY_ARRAY_PTR_CHAR)
-        return 8 * t.array_len;
+        return ptr_sz * t.array_len;
     if (t.kind == TY_STRUCT) {
         StructDef *sd = find_struct(e, t.struct_name);
         if (!sd) return 0;
@@ -5246,13 +5247,14 @@ static int64_t type_size(E *e, Type t) {
     return 0;
 }
 static int64_t type_align(E *e, Type t) {
+    int64_t ptr_a = e->target_wasm32 ? 4 : 8;
     if (t.kind == TY_I32 || t.kind == TY_F32) return 4;
     if (t.kind == TY_I64 || t.kind == TY_F64) return 8;
-    if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return 8;
-    if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return 8;
-    if (t.kind == TY_PTR_PTR) return 8;
+    if (t.kind == TY_PTR_I32 || t.kind == TY_PTR_STRUCT) return ptr_a;
+    if (t.kind == TY_PTR_CHAR || t.kind == TY_PTR_VOID || t.kind == TY_FNPTR) return ptr_a;
+    if (t.kind == TY_PTR_PTR) return ptr_a;
     if (t.kind == TY_ARRAY_I32 || t.kind == TY_ARRAY_F32) return 4;
-    if (t.kind == TY_ARRAY_PTR_STRUCT || t.kind == TY_ARRAY_PTR_CHAR) return 8;
+    if (t.kind == TY_ARRAY_PTR_STRUCT || t.kind == TY_ARRAY_PTR_CHAR) return ptr_a;
     if (t.kind == TY_STRUCT) {
         StructDef *sd = find_struct(e, t.struct_name);
         if (!sd) return 1;

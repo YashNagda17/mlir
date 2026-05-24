@@ -177,6 +177,11 @@ def main():
     for t in tests:
         name = t["name"]
         expected = t["expected_stdout"]
+        # Tests that differ between wasm32 (4-byte pointers, 4-byte long)
+        # and the host (8-byte pointers on x86_64/aarch64) can override
+        # the expected stdout with `expected_stdout_wasm`.
+        if TARGET == "wasm" and "expected_stdout_wasm" in t:
+            expected = t["expected_stdout_wasm"]
         platforms = t.get("platforms")
         if platforms is not None and plat_key not in platforms:
             print(f"SKIP {name} (platforms={platforms}, current={plat_key})")
