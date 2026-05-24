@@ -2515,13 +2515,30 @@ int tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks) {
                             p.i++;
                         } else if (lit.kind == TC_TK_LPAREN) {
                             // `((void*)0)` — scalar null pointer init via cast.
+                            // Also `(int32_t)<int-lit>` and similar simple
+                            // single-token cast forms used in tinyc's own
+                            // source (e.g. `(int32_t)0x80000000`); recognise
+                            // these by looking for an INT_LIT or MINUS+INT_LIT
+                            // after a single matching `)`.
                             int depth = 0;
                             while (cur(&p).kind == TC_TK_LPAREN) { depth++; p.i++; }
                             while (cur(&p).kind != TC_TK_RPAREN &&
                                    cur(&p).kind != TC_TK_EOF) p.i++;
                             if (cur(&p).kind == TC_TK_RPAREN) { p.i++; depth--; }
-                            if (cur(&p).kind == TC_TK_INT_LIT &&
-                                cur(&p).int_value == 0) p.i++;
+                            bool neg = accept(&p, TC_TK_MINUS);
+                            if (cur(&p).kind == TC_TK_INT_LIT) {
+                                int64_t iv = cur(&p).int_value;
+                                g.init_int = neg ? -iv : iv;
+                                p.i++;
+                            } else if (cur(&p).kind == TC_TK_FLOAT_LIT) {
+                                double fv = cur(&p).float_value;
+                                g.init_float = neg ? -fv : fv;
+                                p.i++;
+                            } else if (neg) {
+                                // Roll back the consumed MINUS — it wasn't a
+                                // negative number literal.
+                                p.i--;
+                            }
                             while (depth > 0 && cur(&p).kind == TC_TK_RPAREN) {
                                 p.i++; depth--;
                             }

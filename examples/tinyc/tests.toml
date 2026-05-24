@@ -43,6 +43,10 @@ name = "nested_struct_pointer_field"
 expected_stdout = "100\n200\n1\n7\n2\n"
 
 [[test]]
+name = "global_cast_init"
+expected_stdout = "-2147483648\n42\n-7\n"
+
+[[test]]
 name = "return"
 expected_stdout = "3\n-1\n"
 
