@@ -2707,6 +2707,29 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                                     v.ptr_elem = e->i8;
                                 } else if (ft.kind == TY_ARRAY_PTR_STRUCT) {
                                     v.sdef = find_struct(e, ft.struct_name);
+                                } else if (ft.kind == TY_PTR_PTR && ft.pointee) {
+                                    // Indexing a struct field of type T**:
+                                    // the loaded element is a single T*.
+                                    // Tag with the inner type so '->'
+                                    // chains and string ops work.
+                                    Type *pe = ft.pointee;
+                                    if (pe->kind == TY_PTR_CHAR) {
+                                        v.is_str = true;
+                                        v.ptr_elem = e->i8;
+                                    } else if (pe->kind == TY_PTR_STRUCT) {
+                                        v.sdef = find_struct(e, pe->struct_name);
+                                    } else if (pe->kind == TY_PTR_I32) {
+                                        v.ptr_elem = pe->ptr_is_i64 ? e->i64
+                                                   : pe->ptr_is_f32 ? e->f32
+                                                   : pe->ptr_is_f64 ? e->f64
+                                                   : e->i32;
+                                    } else if (pe->kind == TY_PTR_VOID) {
+                                        v.is_void_ptr = true;
+                                    } else if (pe->kind == TY_FNPTR) {
+                                        Type *fnty = arena_new(e->arena, Type);
+                                        *fnty = *pe;
+                                        v.fnptr_ty = fnty;
+                                    }
                                 }
                             }
                         }
