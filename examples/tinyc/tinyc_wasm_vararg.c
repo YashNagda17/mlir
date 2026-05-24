@@ -17,16 +17,24 @@
 #include <stdarg.h>
 #include <stdint.h>
 
-extern void *memcpy(void *dst, const void *src, unsigned long n);
-
 int            tinyc_va_arg_i32(va_list *ap) { return va_arg(*ap, int); }
 long long      tinyc_va_arg_i64(va_list *ap) { return va_arg(*ap, long long); }
 double         tinyc_va_arg_f64(va_list *ap) { return va_arg(*ap, double); }
 void          *tinyc_va_arg_ptr(va_list *ap) { return va_arg(*ap, void *); }
 
-// Struct varargs: clang's wasm32 ABI passes structs by-reference for
-// varargs, so the helper just chases the pointer and memcpys.
+// Struct varargs: tinyC emits a `call @sum_pts(i32, i64, ...)` where each
+// struct vararg gets unpacked into `(sizeof(struct) + 7) / 8` consecutive
+// i64 words at the call site (see the variadic-struct loop in emit.c).
+// The helper must match: read that many i64 words straight out of the
+// va_list and write them into the destination buffer. This is the same
+// implementation as `runtime_wasm.c`'s `tinyc_va_arg_struct`, kept in
+// sync intentionally — the selfhost (`selfhost_tinyc_wasm.sh`) links
+// THIS object instead of `runtime_wasm.c` to avoid pulling in printf /
+// malloc symbols.
 void tinyc_va_arg_struct(va_list *ap, void *out, long long size) {
-    void *p = va_arg(*ap, void *);
-    memcpy(out, p, (unsigned long)size);
+    long long *o = (long long *)out;
+    long long words = (size + 7) / 8;
+    for (long long i = 0; i < words; i++) {
+        o[i] = va_arg(*ap, long long);
+    }
 }
