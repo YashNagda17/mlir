@@ -620,6 +620,16 @@ static uint32_t arm64_cbz_w(uint32_t rt, int32_t off_bytes) {
     int32_t imm19 = off_bytes >> 2;
     return 0x34000000u | (((uint32_t)imm19 & 0x7ffffu) << 5) | (rt & 0x1fu);
 }
+// CSEL Wd, Wn, Wm, cond. If cond holds, Wd = Wn else Wd = Wm.
+static uint32_t arm64_csel_w(uint32_t rd, uint32_t rn, uint32_t rm,
+                             uint32_t cond) {
+    return 0x1a800000u | ((rm & 0x1fu) << 16) | ((cond & 0xfu) << 12)
+         | ((rn & 0x1fu) << 5) | (rd & 0x1fu);
+}
+// CMP Wn, #0   alias for SUBS WZR, Wn, #0 (32-bit sub immediate).
+static uint32_t arm64_cmp_w_imm0(uint32_t rn) {
+    return 0x7100001fu | ((rn & 0x1fu) << 5);
+}
 // MOV Xd, SP   alias for ADD Xd, SP, #0 (only valid when Rd != 31).
 static uint32_t arm64_mov_x_sp(uint32_t rd) {
     return 0x91000000u | (31u << 5) | (rd & 0x1fu);
@@ -1025,23 +1035,34 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
         emit_word(&e->code, arm64_str_x_xn(31 /* xzr */, 25, off));
     }
 
-    // Block frame stack — tracks structured control-flow nesting
-    // (block/loop/if). For milestone 5a we only handle `if`/`else`/
-    // `end`, which need to remember:
-    //   - the site of the conditional CBZ that branches over the
-    //     `then` body (so we can patch it to land at the start of
-    //     the `else` body, or at `end` if there is no `else`),
-    //   - the site of an unconditional B at the end of the `then`
-    //     body (if there is an `else`), which is patched to skip the
-    //     `else` body and land at the matching `end`.
+    // Block frame stack — tracks structured control-flow nesting.
+    // Three kinds:
+    //   0 = block (forward branch target == after matching `end`)
+    //   1 = if    (also a forward target; pops a cond, may have else)
+    //   2 = loop  (backward branch target == loop_header_off)
+    // Each frame remembers the value-stack depth (in 16-byte slots)
+    // at entry so that `br N` can drop the right number of
+    // intermediate values before branching.  For block/if we also
+    // accumulate a list of branch fixups that we patch when the
+    // matching `end` is reached.
     typedef struct {
-        uint8_t  kind;             // 1 = if (only kind we support yet)
-        uint8_t  has_else;
-        uint32_t cond_branch_site; // site of CBZ for an if
-        uint32_t else_jump_site;   // site of B at end of `then`
+        uint8_t  kind;
+        uint8_t  has_else;         // for if
+        uint8_t  arity;            // result arity (only 0 supported today)
+        uint32_t entry_depth;      // value-stack depth (slots) at frame entry
+        uint32_t cond_branch_site; // for if: CBZ over the `then` body
+        uint32_t else_jump_site;   // for if-with-else: B over the `else` body
+        uint32_t loop_header_off;  // for loop: code offset to branch back to
+        uint32_t fixups[32];       // for block/if: br/br_if B sites to patch
+        uint32_t n_fixups;
     } BlockFrame;
     BlockFrame block_stack[64];
     uint32_t block_depth = 0;
+    // Running value-stack depth (in 16-byte slots) since the start of
+    // this function's body.  Each opcode handler updates this in
+    // lock-step with the SP adjustments it emits, so `br`/`br_if` can
+    // compute how many slots to deallocate before branching.
+    uint32_t value_depth = 0;
 
     // Helper to emit the epilogue (used by both explicit `return` and
     // the fall-through end-of-function). When the function has locals
@@ -1067,6 +1088,8 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 BlockFrame *frame = &block_stack[--block_depth];
                 uint32_t here = (uint32_t)e->code.len;
                 if (frame->kind == 1) {
+                    // if/else: patch the CBZ (or the B at end-of-then)
+                    // to land here.
                     if (frame->has_else) {
                         patch_b_local(e->code.data,
                                       frame->else_jump_site, here);
@@ -1074,18 +1097,59 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                         patch_cbz_local(e->code.data,
                                         frame->cond_branch_site, here);
                     }
+                } else if (frame->kind == 0) {
+                    // block: patch every recorded br/br_if branch
+                    // site to land just past `end`.
+                    for (uint32_t fi = 0; fi < frame->n_fixups; fi++) {
+                        patch_b_local(e->code.data,
+                                      frame->fixups[fi], here);
+                    }
                 }
+                // loop frame: br targets a backward edge already
+                // patched at the branch site; nothing to do here.
+                value_depth = frame->entry_depth + frame->arity;
+                break;
+            }
+            case 0x02:                                // block blocktype
+            case 0x03: {                              // loop  blocktype
+                uint8_t bt = rd_u8(&r);
+                if (bt != 0x40) {
+                    fprintf(stderr,
+                            "wasm->macho: only void block-type (0x40) "
+                            "supported (got 0x%02x) in func %u\n",
+                            bt, fidx);
+                    free(local_types); return false;
+                }
+                if (block_depth >= 64) {
+                    fprintf(stderr,
+                            "wasm->macho: block depth >64 in func %u\n",
+                            fidx);
+                    free(local_types); return false;
+                }
+                BlockFrame *frame = &block_stack[block_depth++];
+                frame->kind = (op == 0x02) ? 0 : 2;
+                frame->has_else = 0;
+                frame->arity = 0;
+                frame->entry_depth = value_depth;
+                frame->cond_branch_site = 0;
+                frame->else_jump_site = 0;
+                frame->loop_header_off = (uint32_t)e->code.len;
+                frame->n_fixups = 0;
                 break;
             }
             case 0x04: {                              // if blocktype
-                // Skip the block-type byte. Tinyc-emitted code uses
-                // the void shape (0x40); a single-byte valtype or a
-                // negative sleb encoding would also fit in the same
-                // single byte here.
-                rd_u8(&r);
+                uint8_t bt = rd_u8(&r);
+                if (bt != 0x40) {
+                    fprintf(stderr,
+                            "wasm->macho: only void if-type (0x40) "
+                            "supported (got 0x%02x) in func %u\n",
+                            bt, fidx);
+                    free(local_types); return false;
+                }
                 // Pop the condition off the value stack into w0.
                 emit_word(&e->code, arm64_ldr_w_sp(0, 0));
                 emit_word(&e->code, arm64_add_sp_imm(16));
+                value_depth -= 1;
                 // CBZ placeholder: branch to `else` (or `end` if no
                 // `else`), patched when we get there.
                 if (block_depth >= 64) {
@@ -1099,8 +1163,12 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 BlockFrame *frame = &block_stack[block_depth++];
                 frame->kind = 1;
                 frame->has_else = 0;
+                frame->arity = 0;
+                frame->entry_depth = value_depth;
                 frame->cond_branch_site = site;
                 frame->else_jump_site = 0;
+                frame->loop_header_off = 0;
+                frame->n_fixups = 0;
                 break;
             }
             case 0x05: {                              // else
@@ -1120,10 +1188,108 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                                 (uint32_t)e->code.len);
                 frame->has_else = 1;
                 frame->else_jump_site = jump_site;
+                // Reset depth to entry for the else body.
+                value_depth = frame->entry_depth;
+                break;
+            }
+            case 0x0c:                                // br labelidx
+            case 0x0d: {                              // br_if labelidx
+                uint32_t labelidx = (uint32_t)rd_uleb(&r);
+                if (labelidx >= block_depth) {
+                    fprintf(stderr,
+                            "wasm->macho: br label %u out of range "
+                            "(depth=%u) in func %u\n",
+                            labelidx, block_depth, fidx);
+                    free(local_types); return false;
+                }
+                BlockFrame *target =
+                    &block_stack[block_depth - 1 - labelidx];
+                // Branch arity is the loop's *input* arity (only 0 is
+                // supported today), or the block's result arity.
+                uint32_t branch_arity = target->arity;
+                if (op == 0x0d) {
+                    // Pop the condition into w0 first.
+                    emit_word(&e->code, arm64_ldr_w_sp(0, 0));
+                    emit_word(&e->code, arm64_add_sp_imm(16));
+                    value_depth -= 1;
+                }
+                int32_t drop = (int32_t)value_depth
+                             - (int32_t)target->entry_depth
+                             - (int32_t)branch_arity;
+                if (drop < 0) {
+                    fprintf(stderr,
+                            "wasm->macho: br N=%u underflow drop=%d "
+                            "in func %u (depth=%u target_entry=%u)\n",
+                            labelidx, drop, fidx,
+                            value_depth, target->entry_depth);
+                    free(local_types); return false;
+                }
+                uint32_t skip_site = 0;
+                if (op == 0x0d) {
+                    skip_site = (uint32_t)e->code.len;
+                    // CBZ over the {drop, b} bypass: if cond==0,
+                    // skip the branch and fall through.
+                    emit_word(&e->code, arm64_cbz_w(0, 0));
+                }
+                if (drop > 0) {
+                    uint32_t bytes = (uint32_t)drop * 16u;
+                    if (bytes > 4095) {
+                        fprintf(stderr,
+                                "wasm->macho: br drop %d slots exceeds "
+                                "12-bit imm in func %u\n", drop, fidx);
+                        free(local_types); return false;
+                    }
+                    emit_word(&e->code,
+                        arm64_add_sp_imm((uint16_t)bytes));
+                }
+                uint32_t b_site = (uint32_t)e->code.len;
+                if (target->kind == 2) {
+                    // Backward branch to loop header (concrete).
+                    int32_t off = (int32_t)target->loop_header_off
+                                - (int32_t)b_site;
+                    emit_word(&e->code, arm64_b(off));
+                } else {
+                    // Forward branch to matching end; record fixup.
+                    if (target->n_fixups >= 32) {
+                        fprintf(stderr,
+                                "wasm->macho: too many br fixups in "
+                                "func %u\n", fidx);
+                        free(local_types); return false;
+                    }
+                    target->fixups[target->n_fixups++] = b_site;
+                    emit_word(&e->code, arm64_b(0));
+                }
+                if (op == 0x0d) {
+                    patch_cbz_local(e->code.data, skip_site,
+                                    (uint32_t)e->code.len);
+                }
+                // For unconditional br, subsequent code until the
+                // matching `end` is unreachable; we still emit it but
+                // value_depth tracking will resync at `end`.
                 break;
             }
             case 0x0f: {                              // return
                 EMIT_EPILOGUE();
+                break;
+            }
+            case 0x1a: {                              // drop
+                emit_word(&e->code, arm64_add_sp_imm(16));
+                value_depth -= 1;
+                break;
+            }
+            case 0x1b: {                              // select
+                // [val_true, val_false, cond] on the stack (cond is
+                // top). Result is val_true when cond != 0, else
+                // val_false. We pop cond and val_false, then
+                // overwrite the (now-top) val_true slot.
+                emit_word(&e->code, arm64_ldr_w_sp(0, 0));   // cond -> w0
+                emit_word(&e->code, arm64_ldr_w_sp(1, 16));  // false -> w1
+                emit_word(&e->code, arm64_ldr_w_sp(2, 32));  // true  -> w2
+                emit_word(&e->code, arm64_add_sp_imm(32));   // pop 2 slots
+                emit_word(&e->code, arm64_cmp_w_imm0(0));
+                emit_word(&e->code, arm64_csel_w(2, 2, 1, 1)); // NE
+                emit_word(&e->code, arm64_str_w_sp(2, 0));
+                value_depth -= 2;
                 break;
             }
             case 0x20:                                // local.get
@@ -1144,11 +1310,13 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                     emit_word(&e->code, arm64_sub_sp_imm(16));
                     if (is_i64) emit_word(&e->code, arm64_str_x_sp(0, 0));
                     else        emit_word(&e->code, arm64_str_w_sp(0, 0));
+                    value_depth += 1;
                 } else {                              // set / tee
                     if (is_i64) emit_word(&e->code, arm64_ldr_x_sp(0, 0));
                     else        emit_word(&e->code, arm64_ldr_w_sp(0, 0));
                     if (op == 0x21) {                  // set: pop
                         emit_word(&e->code, arm64_add_sp_imm(16));
+                        value_depth -= 1;
                     }
                     if (is_i64) emit_word(&e->code, arm64_str_x_xn(0, 25, off));
                     else        emit_word(&e->code, arm64_str_w_xn(0, 25, off));
@@ -1160,6 +1328,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 emit_mov_w_imm32(&e->code, 0, (uint32_t)(int32_t)v);
                 emit_word(&e->code, arm64_sub_sp_imm(16));
                 emit_word(&e->code, arm64_str_w_sp(0, 0));
+                value_depth += 1;
                 break;
             }
             case 0x42: { // i64.const sleb
@@ -1167,6 +1336,24 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 emit_mov_x_imm64(&e->code, 0, (uint64_t)v);
                 emit_word(&e->code, arm64_sub_sp_imm(16));
                 emit_word(&e->code, arm64_str_x_sp(0, 0));
+                value_depth += 1;
+                break;
+            }
+            case 0x45: { // i32.eqz
+                emit_word(&e->code, arm64_ldr_w_sp(0, 0));
+                emit_word(&e->code, arm64_cmp_w_imm0(0));
+                emit_word(&e->code, arm64_cset_w(0, 1));      // cset w0, eq
+                emit_word(&e->code, arm64_str_w_sp(0, 0));
+                break;
+            }
+            case 0x48: { // i32.lt_s
+                emit_word(&e->code, arm64_ldr_w_sp(1, 0));   // top   -> w1
+                emit_word(&e->code, arm64_ldr_w_sp(0, 16));  // below -> w0
+                emit_word(&e->code, arm64_cmp_w(0, 1));
+                emit_word(&e->code, arm64_cset_w(0, 0xa));    // cset w0, lt
+                emit_word(&e->code, arm64_add_sp_imm(16));
+                emit_word(&e->code, arm64_str_w_sp(0, 0));
+                value_depth -= 1;
                 break;
             }
             case 0x6a: { // i32.add
@@ -1175,6 +1362,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 emit_word(&e->code, arm64_add_w_reg(0, 0, 1));
                 emit_word(&e->code, arm64_add_sp_imm(16));   // pop one slot
                 emit_word(&e->code, arm64_str_w_sp(0, 0));   // overwrite remaining
+                value_depth -= 1;
                 break;
             }
             case 0x6b: { // i32.sub
@@ -1183,6 +1371,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 emit_word(&e->code, arm64_sub_w_reg(0, 0, 1));
                 emit_word(&e->code, arm64_add_sp_imm(16));   // pop one slot
                 emit_word(&e->code, arm64_str_w_sp(0, 0));   // overwrite remaining
+                value_depth -= 1;
                 break;
             }
             case 0x47: { // i32.ne
@@ -1194,6 +1383,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 emit_word(&e->code, arm64_cset_w(0, 0));     // cset w0, ne
                 emit_word(&e->code, arm64_add_sp_imm(16));
                 emit_word(&e->code, arm64_str_w_sp(0, 0));
+                value_depth -= 1;
                 break;
             }
             case 0x23: {                                     // global.get
@@ -1215,6 +1405,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 emit_word(&e->code, arm64_sub_sp_imm(16));
                 if (gi64) emit_word(&e->code, arm64_str_x_sp(0, 0));
                 else      emit_word(&e->code, arm64_str_w_sp(0, 0));
+                value_depth += 1;
                 break;
             }
             case 0x24: {                                     // global.set
@@ -1236,6 +1427,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                                 | (27u << 5) | 0u);          // str x0, [x27, #slot]
                 else      emit_word(&e->code,
                     arm64_str_w_xn(0, 27, slot_off));
+                value_depth -= 1;
                 break;
             }
             case 0x28: {                                     // i32.load
@@ -1283,6 +1475,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                     arm64_add_x_xn_wm_uxtw(10, 28, 0));      // x10 = x28 + (u32)addr
                 emit_word(&e->code,
                     arm64_str_w_xn(1, 10, off));             // str w1, [x10, #off]
+                value_depth -= 2;
                 break;
             }
             case 0x10: { // call funcidx
@@ -1337,6 +1530,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                             nr);
                     free(local_types); return false;
                 }
+                value_depth = value_depth - np + nr;
                 break;
             }
             default:

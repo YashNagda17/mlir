@@ -718,3 +718,8 @@ targets = ["macho"]
 name = "macho_if"
 expected_exit_code = 0
 targets = ["macho"]
+
+[[test]]
+name = "macho_loop"
+expected_exit_code = 3
+targets = ["macho"]
