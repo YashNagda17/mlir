@@ -964,3 +964,15 @@ name = "static_local_var"
 # reinitialized to 0 on every nested anonymous-struct parse, collapsing
 # every union member to the same synthesized struct name.
 expected_stdout = "1\n2\n3\n110\n120\n4\n"
+
+[[test]]
+name = "i64_init_narrows_to_i32_slot"
+# Regression for tinyc bug #40 (parser bug discovered during stage-3
+# self-host): `uint8_t byte = v & 0x7f` (where v is uint64_t) emitted
+# `llvm.store i64, ptr` into a 4-byte slot, overflowing into the next
+# stack slot. In `leb_u`, the next slot held `v` itself, so v got
+# clobbered to 0 after one iteration and every multi-byte LEB128 size
+# the self-hosted compiler tried to emit truncated to its low byte
+# without the continuation bit — producing "truncated section" /
+# "unexpected end-of-file" errors on stage-3 outputs.
+expected_stdout = "197\n3\n"

@@ -797,6 +797,16 @@ static MLIR_ValueHandle emit_expr_i32(E *e, Scope *sc, Expr *ex) {
                 rts, 1, rs, 1, ops, 1, NULL, 0, NULL, 0);
         return r;
     }
+    // Narrow `long long` / `uint64_t` initializers down to i32 when the
+    // destination is a default-i32 local. Without this, a declaration
+    // like `uint8_t byte = v & 0x7f;` (where `v` is i64) emits an
+    // `llvm.store i64, ptr` into a 4-byte slot — the store overflows
+    // into the adjacent stack slot, clobbering whatever lives next door
+    // (commonly the i64 source variable). Use the existing coerce_eval
+    // path to insert an `i32.wrap_i64` (a.k.a. trunc i64 → i32).
+    if (v.is_i64) {
+        return emit_trunci_i64_to_i32(e, v.val);
+    }
     return v.val;
 }
 
