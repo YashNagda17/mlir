@@ -134,6 +134,29 @@ typedef struct IR_Location {
     string original_text;
 } IR_Location;
 
+// Def-use chain node. One UseNode per operand slot (regular operand or
+// successor-operand) that currently points at a real value. Each value
+// owns a doubly-linked list of the UseNodes that reference it, threaded
+// through prev/next. Slot-to-UseNode mapping lives in IR_Op's parallel
+// `operand_uses` / `successor_operand_uses` arrays so unlinking is O(1)
+// when an operand is overwritten or the owning op is erased.
+typedef struct UseNode {
+    struct UseNode *prev;
+    struct UseNode *next;
+    MLIR_OpHandle owner;
+    uint16_t kind;       // 0 = regular operand, 1 = successor operand
+    uint16_t succ_idx;   // kind==1: which successor segment
+    uint32_t op_idx;     // index within operands or successor_operands[succ_idx]
+} UseNode;
+
+// Single row of the per-successor use-list array. Wrapped in a struct
+// so the outer pointer `IR_Op::successor_operand_uses` stays at two
+// pointer levels (UseSlot ⇒ TY_STRUCT inside tinyC, then one `*`
+// in the field type — tinyC rejects a `UseNode ***` field directly).
+typedef struct UseSlot {
+    UseNode **arr;
+} UseSlot;
+
 typedef struct IR_Value {
     MLIR_ValueKind kind;
     uintptr_t def_handle;  // MLIR_OpHandle if OP_RESULT, MLIR_BlockHandle if BLOCK_ARG
@@ -141,12 +164,21 @@ typedef struct IR_Value {
     MLIR_TypeHandle type;
     string register_name;
     MLIR_LocationHandle location;
+    // Head of the doubly-linked list of UseNodes whose owner ops currently
+    // reference this value as an operand. `n_uses` is the cached length so
+    // MLIR_GetValueNumUses is O(1).
+    UseNode *use_head;
+    uint32_t n_uses;
 } IR_Value;
 
 typedef struct IR_Op {
     MLIR_OpType op_type;
     MLIR_ValueHandle *operands;
     uint64_t n_operands;
+    // Parallel to `operands`: operand_uses[i] is the UseNode linking
+    // operands[i] into its value's use list (or NULL if operands[i] is
+    // MLIR_INVALID_HANDLE).
+    UseNode **operand_uses;
     MLIR_TypeHandle *result_types;
     uint64_t n_result_types;
     MLIR_AttributeHandle *attributes;
@@ -156,6 +188,9 @@ typedef struct IR_Op {
     MLIR_BlockHandle *successors;
     uint64_t n_successors;
     MLIR_ValueHandle **successor_operands;
+    // Parallel to `successor_operands`:
+    // successor_operand_uses[s].arr[i] mirrors successor_operands[s][i].
+    UseSlot *successor_operand_uses;
     uint64_t *n_successor_operands;
     string opname;
     MLIR_ValueHandle *results;
@@ -219,6 +254,78 @@ static inline IR_Location *resolve_loc(MLIR_LocationHandle h) {
 static MLIR_OpHandle *g_all_ops = NULL;
 static size_t         g_n_all_ops = 0;
 static size_t         g_cap_all_ops = 0;
+
+// --- Def-use chain machinery -----------------------------------------------
+//
+// On every assignment `op->operands[i] = v` (or successor-operand slot
+// equivalent) we create a UseNode and link it into v's doubly-linked
+// `use_head` list. On the reverse — slot overwrite, op erase, operand
+// array resize — we unlink the corresponding UseNode. This makes
+// MLIR_GetValueNumUses O(1), MLIR_ReplaceAllUsesOfValue O(uses), and
+// MLIR_GetValueUseOwner O(idx). The previous scan-the-module
+// implementations were O(N) per call and dominated cf->scf lifting on
+// non-trivial functions.
+
+static inline void use_list_unlink(IR_Value *v, UseNode *u) {
+    if (!v || !u) return;
+    if (u->prev) u->prev->next = u->next;
+    else         v->use_head = u->next;
+    if (u->next) u->next->prev = u->prev;
+    u->prev = u->next = NULL;
+    if (v->n_uses) v->n_uses--;
+}
+
+static inline void use_list_push_front(IR_Value *v, UseNode *u) {
+    if (!v || !u) return;
+    u->prev = NULL;
+    u->next = v->use_head;
+    if (v->use_head) v->use_head->prev = u;
+    v->use_head = u;
+    v->n_uses++;
+}
+
+// Register `slot_value` as a use by `owner_op` at the indicated
+// regular-operand slot (kind=0, op_idx=i, succ_idx unused). Returns the
+// newly-allocated UseNode (or NULL if slot_value is invalid). The
+// returned pointer is stored in IR_Op::operand_uses[i] so it can later
+// be unlinked in O(1).
+static UseNode *use_register_operand(MLIR_Context *ctx, MLIR_OpHandle owner_op,
+                                     MLIR_ValueHandle slot_value, uint32_t op_idx) {
+    if (slot_value == MLIR_INVALID_HANDLE) return NULL;
+    IR_Value *v = resolve_value(slot_value);
+    if (!v) return NULL;
+    UseNode *u = arena_new(ctx->arena, UseNode);
+    u->owner = owner_op;
+    u->kind = 0;
+    u->succ_idx = 0;
+    u->op_idx = op_idx;
+    use_list_push_front(v, u);
+    return u;
+}
+
+static UseNode *use_register_succ_operand(MLIR_Context *ctx, MLIR_OpHandle owner_op,
+                                          MLIR_ValueHandle slot_value,
+                                          uint32_t succ_idx, uint32_t op_idx) {
+    if (slot_value == MLIR_INVALID_HANDLE) return NULL;
+    IR_Value *v = resolve_value(slot_value);
+    if (!v) return NULL;
+    UseNode *u = arena_new(ctx->arena, UseNode);
+    u->owner = owner_op;
+    u->kind = 1;
+    u->succ_idx = (uint16_t)succ_idx;
+    u->op_idx = op_idx;
+    use_list_push_front(v, u);
+    return u;
+}
+
+// Unlink the UseNode currently associated with `slot_value`. No-op if
+// slot_value is INVALID or `u` is NULL. Safe to call repeatedly.
+static inline void use_unregister(MLIR_ValueHandle slot_value, UseNode *u) {
+    if (slot_value == MLIR_INVALID_HANDLE || !u) return;
+    IR_Value *v = resolve_value(slot_value);
+    if (!v) return;
+    use_list_unlink(v, u);
+}
 
 static void register_op(MLIR_Context *ctx, MLIR_OpHandle h) {
     if (!ctx || !ctx->arena) return;
@@ -340,16 +447,24 @@ MLIR_OpHandle MLIR_CreateOpWithSuccessors(
     if (n_successors > 0 && arena) {
         op.successor_operands = arena_new_array(arena, MLIR_ValueHandle *, n_successors);
         op.n_successor_operands = arena_new_array(arena, uint64_t, n_successors);
+        op.successor_operand_uses = arena_new_array(arena, UseSlot, n_successors);
         for (size_t s = 0; s < n_successors; s++) {
             uint64_t cnt = n_successor_operands ? (uint64_t)n_successor_operands[s] : 0;
             op.n_successor_operands[s] = cnt;
             if (cnt > 0 && successor_operands && successor_operands[s]) {
                 op.successor_operands[s] = arena_new_array(arena, MLIR_ValueHandle, cnt);
                 memcpy(op.successor_operands[s], successor_operands[s], cnt * sizeof(MLIR_ValueHandle));
+                op.successor_operand_uses[s].arr = arena_new_array(arena, UseNode *, cnt);
+                for (size_t k = 0; k < cnt; k++) op.successor_operand_uses[s].arr[k] = NULL;
             } else {
                 op.successor_operands[s] = NULL;
+                op.successor_operand_uses[s].arr = NULL;
             }
         }
+    }
+    if (n_operands > 0 && arena) {
+        op.operand_uses = arena_new_array(arena, UseNode *, n_operands);
+        for (size_t i = 0; i < n_operands; i++) op.operand_uses[i] = NULL;
     }
     #undef DUP
     op.location = location;
@@ -358,6 +473,24 @@ MLIR_OpHandle MLIR_CreateOpWithSuccessors(
     op.source_line_start = source_line_start;
 
     MLIR_OpHandle handle = alloc_op(ctx, op);
+
+    // Wire up def-use chains for every operand slot we just copied. We do
+    // this after alloc_op so each UseNode carries the final op handle.
+    IR_Op *stored = resolve_op(handle);
+    if (stored) {
+        for (size_t i = 0; i < stored->n_operands; i++) {
+            stored->operand_uses[i] = use_register_operand(
+                ctx, handle, stored->operands[i], (uint32_t)i);
+        }
+        for (size_t s = 0; s < stored->n_successors; s++) {
+            uint64_t cnt = stored->n_successor_operands[s];
+            for (uint64_t k = 0; k < cnt; k++) {
+                stored->successor_operand_uses[s].arr[k] = use_register_succ_operand(
+                    ctx, handle, stored->successor_operands[s][k],
+                    (uint32_t)s, (uint32_t)k);
+            }
+        }
+    }
 
     // Set def_handle on result values
     for (size_t i = 0; i < n_results; i++) {
@@ -1663,26 +1796,72 @@ void MLIR_ReplaceAllUsesOfValue(MLIR_Context *ctx,
                                 MLIR_ValueHandle new_value) {
     (void)ctx;
     if (old_value == MLIR_INVALID_HANDLE || old_value == new_value) return;
-    for (size_t k = 0; k < g_n_all_ops; k++) {
-        IR_Op *o = resolve_op(g_all_ops[k]);
-        if (!o) continue;
-        for (size_t i = 0; i < o->n_operands; i++) {
-            if (o->operands[i] == old_value) o->operands[i] = new_value;
-        }
-        for (size_t s = 0; s < o->n_successors; s++) {
-            uint64_t n = o->n_successor_operands ? o->n_successor_operands[s] : 0;
-            MLIR_ValueHandle *arr = o->successor_operands ? o->successor_operands[s] : NULL;
-            for (uint64_t i = 0; i < n; i++) {
-                if (arr && arr[i] == old_value) arr[i] = new_value;
+    IR_Value *ov = resolve_value(old_value);
+    if (!ov || !ov->use_head) return;
+    IR_Value *nv = (new_value == MLIR_INVALID_HANDLE) ? NULL : resolve_value(new_value);
+    // Walk the use list, repointing each operand slot to new_value.
+    UseNode *u = ov->use_head;
+    while (u) {
+        UseNode *next = u->next;
+        IR_Op *o = resolve_op(u->owner);
+        if (o) {
+            if (u->kind == 0 && u->op_idx < o->n_operands) {
+                o->operands[u->op_idx] = new_value;
+            } else if (u->kind == 1 && u->succ_idx < o->n_successors &&
+                       o->successor_operands &&
+                       o->successor_operands[u->succ_idx] &&
+                       u->op_idx < o->n_successor_operands[u->succ_idx]) {
+                o->successor_operands[u->succ_idx][u->op_idx] = new_value;
             }
         }
+        u = next;
     }
+    // Splice the whole list from ov onto nv (or just drop it if nv==NULL).
+    if (nv) {
+        UseNode *head = ov->use_head;
+        // Append ov's chain to nv's chain — find ov's tail, then link.
+        UseNode *tail = head;
+        while (tail->next) tail = tail->next;
+        tail->next = nv->use_head;
+        if (nv->use_head) nv->use_head->prev = tail;
+        nv->use_head = head;
+        nv->n_uses += ov->n_uses;
+    } else {
+        // Drop chain; UseNodes leak in the arena but that's fine (arena
+        // is freed at context end).
+        for (UseNode *x = ov->use_head; x; x = x->next) {
+            x->prev = x->next = NULL;
+        }
+    }
+    ov->use_head = NULL;
+    ov->n_uses = 0;
 }
 
 void MLIR_EraseOp(MLIR_Context *ctx, MLIR_OpHandle op) {
     (void)ctx;
     IR_Op *o = resolve_op(op);
     if (!o) return;
+    // Tear down def-use entries so callers no longer see this op in any
+    // value's use list. Leave the IR_Op shell in place — other code may
+    // still hold the handle and call MLIR_GetOpParentBlock on it.
+    if (o->operand_uses) {
+        for (uint64_t i = 0; i < o->n_operands; i++) {
+            use_unregister(o->operands[i], o->operand_uses[i]);
+            o->operand_uses[i] = NULL;
+        }
+    }
+    if (o->successor_operand_uses) {
+        for (uint64_t s = 0; s < o->n_successors; s++) {
+            if (!o->successor_operand_uses[s].arr) continue;
+            uint64_t cnt = o->n_successor_operands ? o->n_successor_operands[s] : 0;
+            for (uint64_t k = 0; k < cnt; k++) {
+                MLIR_ValueHandle v = o->successor_operands && o->successor_operands[s]
+                    ? o->successor_operands[s][k] : MLIR_INVALID_HANDLE;
+                use_unregister(v, o->successor_operand_uses[s].arr[k]);
+                o->successor_operand_uses[s].arr[k] = NULL;
+            }
+        }
+    }
     IR_Block *b = resolve_block(o->parent_block);
     if (b) {
         size_t w = 0;
@@ -1773,7 +1952,16 @@ void MLIR_SetOpOperand(MLIR_Context *ctx, MLIR_OpHandle op,
     (void)ctx;
     IR_Op *o = resolve_op(op);
     if (!o || idx >= o->n_operands) return;
+    MLIR_ValueHandle old = o->operands[idx];
+    if (old == value) return;
+    if (o->operand_uses) {
+        use_unregister(old, o->operand_uses[idx]);
+        o->operand_uses[idx] = NULL;
+    }
     o->operands[idx] = value;
+    if (o->operand_uses) {
+        o->operand_uses[idx] = use_register_operand(ctx, op, value, (uint32_t)idx);
+    }
 }
 
 void MLIR_SetOpSuccessor(MLIR_Context *ctx, MLIR_OpHandle op,
@@ -1798,12 +1986,31 @@ void MLIR_SetOpSuccessorOperands(MLIR_Context *ctx, MLIR_OpHandle op,
         o->n_successor_operands = arena_new_array(arena, uint64_t, o->n_successors);
         for (size_t s = 0; s < o->n_successors; s++) o->n_successor_operands[s] = 0;
     }
+    if (!o->successor_operand_uses) {
+        o->successor_operand_uses = arena_new_array(arena, UseSlot, o->n_successors);
+        for (size_t s = 0; s < o->n_successors; s++) o->successor_operand_uses[s].arr = NULL;
+    }
+    // Unregister existing uses in this segment before replacing.
+    uint64_t old_n = o->n_successor_operands[succ_idx];
+    for (uint64_t k = 0; k < old_n; k++) {
+        MLIR_ValueHandle v = o->successor_operands[succ_idx]
+            ? o->successor_operands[succ_idx][k] : MLIR_INVALID_HANDLE;
+        UseNode *u = o->successor_operand_uses[succ_idx].arr
+            ? o->successor_operand_uses[succ_idx].arr[k] : NULL;
+        use_unregister(v, u);
+    }
     if (n > 0) {
         MLIR_ValueHandle *arr = arena_new_array(arena, MLIR_ValueHandle, n);
         if (values) memcpy(arr, values, n * sizeof(MLIR_ValueHandle));
         o->successor_operands[succ_idx] = arr;
+        o->successor_operand_uses[succ_idx].arr = arena_new_array(arena, UseNode *, n);
+        for (size_t k = 0; k < n; k++) {
+            o->successor_operand_uses[succ_idx].arr[k] = use_register_succ_operand(
+                ctx, op, arr[k], (uint32_t)succ_idx, (uint32_t)k);
+        }
     } else {
         o->successor_operands[succ_idx] = NULL;
+        o->successor_operand_uses[succ_idx].arr = NULL;
     }
     o->n_successor_operands[succ_idx] = (uint64_t)n;
 }
@@ -2067,61 +2274,42 @@ MLIR_BlockHandle MLIR_GetValueParentBlock(MLIR_ValueHandle value) {
 size_t MLIR_GetValueNumUses(MLIR_Context *ctx, MLIR_ValueHandle value) {
     (void)ctx;
     if (value == MLIR_INVALID_HANDLE) return 0;
-    size_t n = 0;
-    for (size_t i = 0; i < g_n_all_ops; i++) {
-        IR_Op *op = resolve_op(g_all_ops[i]);
-        if (!op) continue;
-        for (size_t k = 0; k < op->n_operands; k++)
-            if (op->operands[k] == value) n++;
-        for (size_t s = 0; s < op->n_successors; s++)
-            for (size_t k = 0; k < op->n_successor_operands[s]; k++)
-                if (op->successor_operands[s][k] == value) n++;
-    }
-    return n;
+    IR_Value *v = resolve_value(value);
+    return v ? v->n_uses : 0;
 }
 
 MLIR_OpHandle MLIR_GetValueUseOwner(MLIR_Context *ctx, MLIR_ValueHandle value,
                                     size_t idx, size_t *out_operand_idx) {
     (void)ctx;
-    if (value == MLIR_INVALID_HANDLE) {
-        if (out_operand_idx) *out_operand_idx = SIZE_MAX;
-        return MLIR_INVALID_HANDLE;
-    }
-    size_t n = 0;
-    // Iterate in the same order as GetValueNumUses: regular operands first,
-    // then successor operands per successor.
-    for (size_t i = 0; i < g_n_all_ops; i++) {
-        IR_Op *op = resolve_op(g_all_ops[i]);
-        if (!op) continue;
-        for (size_t k = 0; k < op->n_operands; k++) {
-            if (op->operands[k] == value) {
-                if (n == idx) {
-                    if (out_operand_idx) *out_operand_idx = k;
-                    return g_all_ops[i];
-                }
-                n++;
-            }
-        }
-        // Successor-operand uses report a synthetic operand_idx of
-        // n_operands + sum-of-previous-segments + k. This matches MLIR's
-        // unified operand storage on the upstream side and lets callers
-        // pass the index to mutate via setOperand-style APIs.
-        size_t off = op->n_operands;
-        for (size_t s = 0; s < op->n_successors; s++) {
-            for (size_t k = 0; k < op->n_successor_operands[s]; k++) {
-                if (op->successor_operands[s][k] == value) {
-                    if (n == idx) {
-                        if (out_operand_idx) *out_operand_idx = off + k;
-                        return g_all_ops[i];
-                    }
-                    n++;
-                }
-            }
-            off += op->n_successor_operands[s];
-        }
-    }
     if (out_operand_idx) *out_operand_idx = SIZE_MAX;
-    return MLIR_INVALID_HANDLE;
+    if (value == MLIR_INVALID_HANDLE) return MLIR_INVALID_HANDLE;
+    IR_Value *v = resolve_value(value);
+    if (!v) return MLIR_INVALID_HANDLE;
+    // Walk the use list to position idx. Use list order is "most recently
+    // linked first" because use_list_push_front prepends. Callers don't
+    // depend on a specific iteration order (snapshot_uses copies into an
+    // owned array, then iterates regardless).
+    UseNode *u = v->use_head;
+    size_t n = 0;
+    while (u && n < idx) { u = u->next; n++; }
+    if (!u) return MLIR_INVALID_HANDLE;
+    IR_Op *o = resolve_op(u->owner);
+    if (!o) return MLIR_INVALID_HANDLE;
+    if (out_operand_idx) {
+        if (u->kind == 0) {
+            *out_operand_idx = u->op_idx;
+        } else {
+            // Successor-operand uses report a synthetic operand_idx of
+            // n_operands + sum-of-previous-segments + k, matching the
+            // unified-operand view exposed by the upstream backend.
+            size_t off = o->n_operands;
+            for (uint16_t s = 0; s < u->succ_idx && s < o->n_successors; s++) {
+                off += o->n_successor_operands ? o->n_successor_operands[s] : 0;
+            }
+            *out_operand_idx = off + u->op_idx;
+        }
+    }
+    return u->owner;
 }
 
 void MLIR_SetOpOperands(MLIR_Context *ctx, MLIR_OpHandle op,
@@ -2129,10 +2317,20 @@ void MLIR_SetOpOperands(MLIR_Context *ctx, MLIR_OpHandle op,
     IR_Op *o = resolve_op(op);
     if (!o) return;
     Arena *arena = MLIR_GetArenaAllocator(ctx);
+    // Unregister all existing operand uses.
+    if (o->operand_uses) {
+        for (uint64_t i = 0; i < o->n_operands; i++) {
+            use_unregister(o->operands[i], o->operand_uses[i]);
+        }
+    }
     MLIR_ValueHandle *nv = n ? arena_new_array(arena, MLIR_ValueHandle, n) : NULL;
     for (size_t i = 0; i < n; i++) nv[i] = values ? values[i] : MLIR_INVALID_HANDLE;
     o->operands = nv;
     o->n_operands = n;
+    o->operand_uses = n ? arena_new_array(arena, UseNode *, n) : NULL;
+    for (size_t i = 0; i < n; i++) {
+        o->operand_uses[i] = use_register_operand(ctx, op, nv[i], (uint32_t)i);
+    }
 }
 
 void MLIR_AppendOpSuccessorOperand(MLIR_Context *ctx, MLIR_OpHandle op,
@@ -2146,7 +2344,20 @@ void MLIR_AppendOpSuccessorOperand(MLIR_Context *ctx, MLIR_OpHandle op,
         memcpy(na, o->successor_operands[succ_idx],
                old_n * sizeof(MLIR_ValueHandle));
     na[old_n] = value;
+    // Resize the parallel UseNode-pointer array. Existing UseNodes stay
+    // valid (they're individually arena-allocated; only the pointer
+    // array changes).
+    if (!o->successor_operand_uses) {
+        o->successor_operand_uses = arena_new_array(arena, UseSlot, o->n_successors);
+        for (size_t s = 0; s < o->n_successors; s++) o->successor_operand_uses[s].arr = NULL;
+    }
+    UseNode **nu = arena_new_array(arena, UseNode *, old_n + 1);
+    if (old_n > 0 && o->successor_operand_uses[succ_idx].arr)
+        memcpy(nu, o->successor_operand_uses[succ_idx].arr, old_n * sizeof(UseNode *));
+    nu[old_n] = use_register_succ_operand(ctx, op, value,
+                                          (uint32_t)succ_idx, (uint32_t)old_n);
     o->successor_operands[succ_idx] = na;
+    o->successor_operand_uses[succ_idx].arr = nu;
     o->n_successor_operands[succ_idx] = old_n + 1;
 }
 
