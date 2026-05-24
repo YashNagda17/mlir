@@ -1,0 +1,28 @@
+// MRE: struct field multi-declarator where each declarator has its own
+// `*` pointer marker. From mlir_wasm_to_macho.c:173:
+//
+//     typedef struct {
+//         const uint8_t *p, *end;
+//         bool overflow;
+//     } Rd;
+//
+// tinyc parses the first `*` as part of the base type and applies it to
+// all declarators -- correct for this case -- but then chokes when the
+// second declarator literally re-states the `*`. clang accepts it.
+//
+// Expected: clang and tinyc both accept and print "3 9\n".
+extern int printf(const char *fmt, ...);
+
+typedef struct {
+    int *a, *b;
+} Pair;
+
+int main() {
+    int x = 3;
+    int y = 9;
+    Pair pr;
+    pr.a = &x;
+    pr.b = &y;
+    printf("%d %d\n", *pr.a, *pr.b);
+    return 0;
+}

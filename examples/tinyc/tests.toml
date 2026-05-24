@@ -803,6 +803,11 @@ targets = ["native", "wasm", "macho"]
 expected_stdout = "7\n"
 
 [[test]]
+name = "struct_multi_ptr_field"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "3 9\n"
+
+[[test]]
 name = "inttoptr_cast"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "42\n"
