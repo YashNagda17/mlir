@@ -83,11 +83,21 @@ static bool name_eq(string s, const char *cstr) {
     return s.size == n && memcmp(s.str, cstr, n) == 0;
 }
 static MLIR_AttributeHandle find_attr(MLIR_OpHandle op, const char *name) {
+    // First try by-name, which on the upstream backend walks both the
+    // discardable attribute dictionary AND the typed property storage
+    // (ODS-defined inherent attrs like scf.index_switch's `cases`,
+    // arith.cmpi's `predicate`, llvm.func's `function_type`, ...).
+    MLIR_AttributeHandle a = MLIR_GetOpAttributeByName(op, name);
+    if (a != MLIR_INVALID_HANDLE) return a;
+    // Fall back to the indexed attribute list. The two implementations
+    // agree on what's "user-set" for ops constructed via MLIR_CreateOp,
+    // so this branch matters mainly for operations created by upstream
+    // pass internals where the by-name lookup may also miss.
     size_t n = MLIR_GetOpNumAttributes(op);
     for (size_t i = 0; i < n; i++) {
-        MLIR_AttributeHandle a = MLIR_GetOpAttribute(op, i);
-        string an = MLIR_GetAttributeName(a);
-        if (name_eq(an, name)) return a;
+        MLIR_AttributeHandle ai = MLIR_GetOpAttribute(op, i);
+        string an = MLIR_GetAttributeName(ai);
+        if (name_eq(an, name)) return ai;
     }
     return MLIR_INVALID_HANDLE;
 }
