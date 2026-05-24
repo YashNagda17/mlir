@@ -389,6 +389,7 @@ static bool stackify_body(MLIR_Context *ctx, Arena *arena,
 static MLIR_OpHandle convert_func(MLIR_Context *ctx, Arena *arena, MLIR_OpHandle src) {
     string name = at_s(src, "sym_name");
     bool exported = at_b(src, "exported");
+    bool internal = at_b(src, "internal");
     string pt = at_s(src, "param_types");
     string rt = at_s(src, "result_types");
     size_t n_params = pt.size / 2;
@@ -400,6 +401,7 @@ static MLIR_OpHandle convert_func(MLIR_Context *ctx, Arena *arena, MLIR_OpHandle
     attrs[na++] = attr_s(ctx, "param_types", pt.str, pt.size);
     attrs[na++] = attr_s(ctx, "result_types", rt.str, rt.size);
     attrs[na++] = attr_b(ctx, "exported", exported);
+    attrs[na++] = attr_b(ctx, "internal", internal);
 
     bool is_import = MLIR_GetOpType(src) == OP_TYPE_WASMSSA_IMPORT_FUNC;
     if (is_import) {

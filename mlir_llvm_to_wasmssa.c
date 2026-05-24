@@ -2194,6 +2194,24 @@ static bool lower_function(MLIR_Context *ctx, Arena *arena, ModCtx *mod,
         attrs[na++] = attr_s_hex(ctx, arena, "param_types", param_types, n_params);
         attrs[na++] = attr_s_hex(ctx, arena, "result_types", result_types, n_results);
         attrs[na++] = attr_b(ctx, "exported", exported);
+        // `static` C functions arrive as `llvm.func` with a
+        // `llvm.linkage = "#llvm.linkage<internal>"` attribute (set in
+        // emit.c). Forward that as a boolean `internal` flag on the
+        // wasmssa.func so the wasm binary emitter can mark the
+        // function's symbol-table entry BINDING_LOCAL — otherwise two
+        // `static`s with the same name in different TUs collide at
+        // link time.
+        bool internal = false;
+        MLIR_AttributeHandle linka = find_attr(fn, "llvm.linkage");
+        if (linka != MLIR_INVALID_HANDLE) {
+            string ls = MLIR_GetAttributeString(linka);
+            const char *want = "#llvm.linkage<internal>";
+            size_t wantn = strlen(want);
+            if (ls.size == wantn && memcmp(ls.str, want, wantn) == 0) {
+                internal = true;
+            }
+        }
+        attrs[na++] = attr_b(ctx, "internal", internal);
         attrs[na++] = attr_s_hex(ctx, arena, "carrier_types",
                                  F.carrier_vts.data, F.carrier_vts.size);
 

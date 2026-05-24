@@ -793,3 +793,19 @@ expected_stdout = "42\n"
 [[test]]
 name = "i64_compare_intlit"
 expected_stdout = "10\n20\n30\n10\n30\n60\n-1\n"
+
+[[test]]
+name = "static_func_collision"
+# Multi-TU test: each helper TU defines `static int helper(int)` with
+# a different body. Verifies wasm-link respects per-object static
+# binding so cross-TU symbol-name collisions don't merge into a
+# single global function.
+sources = ["static_func_collision.tc", "static_func_collision_a.tc", "static_func_collision_b.tc"]
+link_separately = true
+native_skip = true
+expected_stdout = """\
+101
+201
+105
+205
+"""

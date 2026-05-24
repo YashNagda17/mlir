@@ -245,6 +245,7 @@ typedef struct {
     uint32_t sig;
     bool     imported;
     bool     exported;
+    bool     internal;
     Buf      body;
     uint32_t func_index;
     uint32_t sym_index;
@@ -613,7 +614,19 @@ static void build_linking_section(EmFunc *funcs, size_t n_funcs,
     for (size_t i = 0; i < n_funcs; i++) {
         EmFunc *f = &funcs[i];
         buf_putc(&sub, SYM_FUNCTION);
-        uint32_t flags = f->imported ? SYMF_UNDEFINED : 0;
+        // Imported functions are referenced by name (UNDEFINED).
+        // Static / file-local C functions get BINDING_LOCAL +
+        // VISIBILITY_HIDDEN so the wasm linker won't merge two
+        // same-named statics from different TUs into one global
+        // symbol (which causes signature-mismatch link errors).
+        uint32_t flags;
+        if (f->imported) {
+            flags = SYMF_UNDEFINED;
+        } else if (f->internal) {
+            flags = SYMF_BINDING_LOCAL | SYMF_VISIBILITY_HIDDEN;
+        } else {
+            flags = 0;
+        }
         leb_u(&sub, flags);
         leb_u(&sub, f->func_index);
         if (!f->imported) emit_string(&sub, f->name);
@@ -765,6 +778,7 @@ string mlir_wasmstack_to_bin(MLIR_Context *ctx,
         funcs[n_funcs].sig = sig_intern(&sigs, p, np, r, nr);
         funcs[n_funcs].imported = false;
         funcs[n_funcs].exported = at_b(op, "exported");
+        funcs[n_funcs].internal = at_b(op, "internal");
         funcs[n_funcs].func_index = (uint32_t)n_funcs;
         funcs[n_funcs].src_op = op;
         funcs[n_funcs].local_types = ll;
