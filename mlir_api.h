@@ -322,6 +322,18 @@ typedef enum {
     OP_TYPE_WMIR_FUNC,
     OP_TYPE_WMIR_CONST,
     OP_TYPE_WMIR_RETURN,
+    // Integer arithmetic (i32; i64 added when first test needs it).
+    OP_TYPE_WMIR_IADD,
+    OP_TYPE_WMIR_ISUB,
+    // Wasm global access (vmctx-relative; first-light: i32 globals only).
+    OP_TYPE_WMIR_GLOBAL_GET,
+    OP_TYPE_WMIR_GLOBAL_SET,
+    // Wasm linear-memory access. operand is a wasm32 byte offset; the
+    // wmir->aarch64 lowering adds linmem_base + zext(offset).
+    OP_TYPE_WMIR_LOAD,
+    OP_TYPE_WMIR_STORE,
+    // Direct function call by symbol name.
+    OP_TYPE_WMIR_CALL,
 
     // -------------------------------------------------------------------------
     // aarch64 dialect — 1:1 with the AArch64 instruction encoding. The
@@ -338,6 +350,26 @@ typedef enum {
     OP_TYPE_AARCH64_BL,     // bl <symbol>  (branch-and-link, PC-relative)
     OP_TYPE_AARCH64_SVC,    // svc #imm16
     OP_TYPE_AARCH64_RET,    // ret (== ret x30)
+
+    // Arithmetic + memory + stack-frame ops added in the arith slice.
+    OP_TYPE_AARCH64_ADD_IMM,  // add Wd|Xd, Wn|Xn, #imm12 (LSL 0)
+    OP_TYPE_AARCH64_SUB_IMM,  // sub Wd|Xd, Wn|Xn, #imm12 (LSL 0)
+    OP_TYPE_AARCH64_ADD_REG,  // add Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_SUB_REG,  // sub Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_LDR_W,    // ldr Wd, [Xn, #imm] (i32 unsigned-offset)
+    OP_TYPE_AARCH64_STR_W,    // str Wd, [Xn, #imm] (i32 unsigned-offset)
+    // Pseudo: ADRP+ADD pair that resolves to the runtime base address
+    // of one of the predeclared __DATA regions (vmctx, globals, linmem).
+    // The macho backend patches the encoded PC-relative immediates
+    // after layout. Body of the macho-backend tracks this list of
+    // bases as part of the data-segment layout.
+    OP_TYPE_AARCH64_ADRP_DATA,    // adrp Xd, page_of(<region>)
+    OP_TYPE_AARCH64_ADD_DATA_LO,  // add  Xd, Xn, #lo12(<region>)
+    // Function prologue/epilogue (modeled as an op pair so the dumb
+    // backend can emit the exact instruction sequence; details of
+    // sp/fp/lr handling baked into the encoder).
+    OP_TYPE_AARCH64_PROLOGUE,
+    OP_TYPE_AARCH64_EPILOGUE,
 
     OP_TYPE_COUNT
 } MLIR_OpType;

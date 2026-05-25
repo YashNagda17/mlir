@@ -187,17 +187,34 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_WASMSTACK_MEMORY_SIZE: return str_lit("wasmstack.memory_size");
         case OP_TYPE_WASMSTACK_MEMORY_GROW: return str_lit("wasmstack.memory_grow");
         // wmir dialect
-        case OP_TYPE_WMIR_FUNC:    return str_lit("wmir.func");
-        case OP_TYPE_WMIR_CONST:   return str_lit("wmir.const");
-        case OP_TYPE_WMIR_RETURN:  return str_lit("wmir.return");
+        case OP_TYPE_WMIR_FUNC:       return str_lit("wmir.func");
+        case OP_TYPE_WMIR_CONST:      return str_lit("wmir.const");
+        case OP_TYPE_WMIR_RETURN:     return str_lit("wmir.return");
+        case OP_TYPE_WMIR_IADD:       return str_lit("wmir.iadd");
+        case OP_TYPE_WMIR_ISUB:       return str_lit("wmir.isub");
+        case OP_TYPE_WMIR_GLOBAL_GET: return str_lit("wmir.global_get");
+        case OP_TYPE_WMIR_GLOBAL_SET: return str_lit("wmir.global_set");
+        case OP_TYPE_WMIR_LOAD:       return str_lit("wmir.load");
+        case OP_TYPE_WMIR_STORE:      return str_lit("wmir.store");
+        case OP_TYPE_WMIR_CALL:       return str_lit("wmir.call");
         // aarch64 dialect
-        case OP_TYPE_AARCH64_FUNC:  return str_lit("aarch64.func");
-        case OP_TYPE_AARCH64_MOVZ:  return str_lit("aarch64.movz");
-        case OP_TYPE_AARCH64_MOVK:  return str_lit("aarch64.movk");
-        case OP_TYPE_AARCH64_MOV_X: return str_lit("aarch64.mov_x");
-        case OP_TYPE_AARCH64_BL:    return str_lit("aarch64.bl");
-        case OP_TYPE_AARCH64_SVC:   return str_lit("aarch64.svc");
-        case OP_TYPE_AARCH64_RET:   return str_lit("aarch64.ret");
+        case OP_TYPE_AARCH64_FUNC:         return str_lit("aarch64.func");
+        case OP_TYPE_AARCH64_MOVZ:         return str_lit("aarch64.movz");
+        case OP_TYPE_AARCH64_MOVK:         return str_lit("aarch64.movk");
+        case OP_TYPE_AARCH64_MOV_X:        return str_lit("aarch64.mov_x");
+        case OP_TYPE_AARCH64_BL:           return str_lit("aarch64.bl");
+        case OP_TYPE_AARCH64_SVC:          return str_lit("aarch64.svc");
+        case OP_TYPE_AARCH64_RET:          return str_lit("aarch64.ret");
+        case OP_TYPE_AARCH64_ADD_IMM:      return str_lit("aarch64.add_imm");
+        case OP_TYPE_AARCH64_SUB_IMM:      return str_lit("aarch64.sub_imm");
+        case OP_TYPE_AARCH64_ADD_REG:      return str_lit("aarch64.add_reg");
+        case OP_TYPE_AARCH64_SUB_REG:      return str_lit("aarch64.sub_reg");
+        case OP_TYPE_AARCH64_LDR_W:        return str_lit("aarch64.ldr_w");
+        case OP_TYPE_AARCH64_STR_W:        return str_lit("aarch64.str_w");
+        case OP_TYPE_AARCH64_ADRP_DATA:    return str_lit("aarch64.adrp_data");
+        case OP_TYPE_AARCH64_ADD_DATA_LO:  return str_lit("aarch64.add_data_lo");
+        case OP_TYPE_AARCH64_PROLOGUE:     return str_lit("aarch64.prologue");
+        case OP_TYPE_AARCH64_EPILOGUE:     return str_lit("aarch64.epilogue");
         default: return str_lit("unknown");
     }
 }

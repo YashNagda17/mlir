@@ -208,6 +208,63 @@ static uint32_t arm64_svc(uint16_t imm16) {
 }
 static uint32_t arm64_ret(void) { return 0xd65f03c0u; }
 
+// ---- frame ops ----------------------------------------------------
+static uint32_t arm64_stp_fp_lr_pre(void)   { return 0xa9bf7bfdu; } // stp x29,x30,[sp,#-16]!
+static uint32_t arm64_ldp_fp_lr_post(void)  { return 0xa8c17bfdu; } // ldp x29,x30,[sp],#16
+static uint32_t arm64_mov_fp_sp(void)       { return 0x910003fdu; } // add x29,sp,#0
+static uint32_t arm64_add_sp_imm(uint16_t imm12) {
+    return 0x910003ffu | (((uint32_t)imm12 & 0xfffu) << 10);
+}
+static uint32_t arm64_sub_sp_imm(uint16_t imm12) {
+    return 0xd10003ffu | (((uint32_t)imm12 & 0xfffu) << 10);
+}
+
+// ---- arithmetic ---------------------------------------------------
+// add/sub imm (X or W). When rn or rd is 31 it means SP, not XZR.
+static uint32_t arm64_add_imm(uint8_t rd, uint8_t rn, uint16_t imm12, bool sf) {
+    uint32_t base = sf ? 0x91000000u : 0x11000000u;
+    return base | (((uint32_t)imm12 & 0xfffu) << 10)
+                | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rd & 0x1f);
+}
+static uint32_t arm64_sub_imm(uint8_t rd, uint8_t rn, uint16_t imm12, bool sf) {
+    uint32_t base = sf ? 0xd1000000u : 0x51000000u;
+    return base | (((uint32_t)imm12 & 0xfffu) << 10)
+                | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rd & 0x1f);
+}
+// add/sub Xd, Xn, Xm (shifted-register, LSL #0). With sf=false we get
+// the W form. NB: for our wmir.load lowering we use sf=true on values
+// produced by W-form loads, which zero-extend into the full X register
+// — so a plain X-form add is equivalent to "add Xd, Xn, Wm, UXTW".
+static uint32_t arm64_add_reg(uint8_t rd, uint8_t rn, uint8_t rm, bool sf) {
+    uint32_t base = sf ? 0x8b000000u : 0x0b000000u;
+    return base | ((uint32_t)(rm & 0x1f) << 16) | ((uint32_t)(rn & 0x1f) << 5)
+                | (uint32_t)(rd & 0x1f);
+}
+static uint32_t arm64_sub_reg(uint8_t rd, uint8_t rn, uint8_t rm, bool sf) {
+    uint32_t base = sf ? 0xcb000000u : 0x4b000000u;
+    return base | ((uint32_t)(rm & 0x1f) << 16) | ((uint32_t)(rn & 0x1f) << 5)
+                | (uint32_t)(rd & 0x1f);
+}
+
+// ---- memory access ------------------------------------------------
+// LDR Wt, [Xn, #pimm]   pimm is unsigned byte offset, divisible by 4.
+static uint32_t arm64_ldr_w_uoff(uint8_t rt, uint8_t rn, uint16_t off_bytes) {
+    return 0xb9400000u | (((uint32_t)(off_bytes >> 2) & 0xfffu) << 10)
+                       | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
+}
+static uint32_t arm64_str_w_uoff(uint8_t rt, uint8_t rn, uint16_t off_bytes) {
+    return 0xb9000000u | (((uint32_t)(off_bytes >> 2) & 0xfffu) << 10)
+                       | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
+}
+
+// ---- ADRP / ADD ---------------------------------------------------
+// ADRP Xd, #rel_pages*4096 (rel_pages is a signed 21-bit value).
+static uint32_t arm64_adrp(uint8_t rd, int64_t rel_pages) {
+    uint32_t immlo = (uint32_t)(rel_pages & 0x3);
+    uint32_t immhi = (uint32_t)((rel_pages >> 2) & 0x7ffffu);
+    return 0x90000000u | (immlo << 29) | (immhi << 5) | (uint32_t)(rd & 0x1f);
+}
+
 static void emit_word(Buf *b, uint32_t w) { buf_le32(b, w); }
 
 // =============================================================================
@@ -220,13 +277,26 @@ typedef struct {
     uint32_t fn_off;        // byte offset within the function's code
 } BlReloc;
 
+// ADRP / ADD imm12 relocs. `kind` is one of "data_priv" / "globals" /
+// "linmem"; the patcher computes the page-relative ADRP imm21 and the
+// low-12 ADD imm12 once segment VM addresses are known.
 typedef struct {
-    string    name;
-    bool      exported;
-    Buf       code;
-    BlReloc  *relocs;
-    size_t    n_relocs, c_relocs;
-    uint32_t  text_off;     // assigned after layout
+    string   kind;          // "data_priv" / "globals" / "linmem"
+    bool     is_add_lo;     // false = ADRP, true = ADD imm12
+    uint8_t  rd;
+    uint8_t  rn;
+    uint32_t fn_off;
+} DataReloc;
+
+typedef struct {
+    string     name;
+    bool       exported;
+    Buf        code;
+    BlReloc   *relocs;
+    size_t     n_relocs, c_relocs;
+    DataReloc *dr;
+    size_t     n_dr, c_dr;
+    uint32_t   text_off;     // assigned after layout
 } EmittedFunc;
 
 static void ef_add_reloc(EmittedFunc *e, string callee, uint32_t off) {
@@ -237,6 +307,19 @@ static void ef_add_reloc(EmittedFunc *e, string callee, uint32_t off) {
     e->relocs[e->n_relocs].callee = callee;
     e->relocs[e->n_relocs].fn_off = off;
     e->n_relocs++;
+}
+static void ef_add_dr(EmittedFunc *e, string kind, bool is_add_lo,
+                      uint8_t rd, uint8_t rn, uint32_t off) {
+    if (e->n_dr == e->c_dr) {
+        e->c_dr = e->c_dr ? e->c_dr * 2 : 4;
+        e->dr = (DataReloc *)realloc(e->dr, e->c_dr * sizeof(DataReloc));
+    }
+    e->dr[e->n_dr].kind      = kind;
+    e->dr[e->n_dr].is_add_lo = is_add_lo;
+    e->dr[e->n_dr].rd        = rd;
+    e->dr[e->n_dr].rn        = rn;
+    e->dr[e->n_dr].fn_off    = off;
+    e->n_dr++;
 }
 
 static int64_t attr_i(MLIR_OpHandle op, const char *name) {
@@ -305,6 +388,82 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
         case OP_TYPE_AARCH64_RET:
             emit_word(&out->code, arm64_ret());
             break;
+        case OP_TYPE_AARCH64_PROLOGUE: {
+            uint32_t fs = (uint32_t)attr_i(op, "frame_size");
+            emit_word(&out->code, arm64_stp_fp_lr_pre());
+            emit_word(&out->code, arm64_mov_fp_sp());
+            if (fs > 0) emit_word(&out->code, arm64_sub_sp_imm((uint16_t)fs));
+            break;
+        }
+        case OP_TYPE_AARCH64_EPILOGUE: {
+            uint32_t fs = (uint32_t)attr_i(op, "frame_size");
+            if (fs > 0) emit_word(&out->code, arm64_add_sp_imm((uint16_t)fs));
+            emit_word(&out->code, arm64_ldp_fp_lr_post());
+            break;
+        }
+        case OP_TYPE_AARCH64_ADD_IMM: {
+            uint8_t  rd = (uint8_t)attr_i(op, "rd");
+            uint8_t  rn = (uint8_t)attr_i(op, "rn");
+            uint16_t im = (uint16_t)attr_i(op, "imm12");
+            bool     sf = attr_b(op, "sf");
+            emit_word(&out->code, arm64_add_imm(rd, rn, im, sf));
+            break;
+        }
+        case OP_TYPE_AARCH64_SUB_IMM: {
+            uint8_t  rd = (uint8_t)attr_i(op, "rd");
+            uint8_t  rn = (uint8_t)attr_i(op, "rn");
+            uint16_t im = (uint16_t)attr_i(op, "imm12");
+            bool     sf = attr_b(op, "sf");
+            emit_word(&out->code, arm64_sub_imm(rd, rn, im, sf));
+            break;
+        }
+        case OP_TYPE_AARCH64_ADD_REG: {
+            uint8_t rd = (uint8_t)attr_i(op, "rd");
+            uint8_t rn = (uint8_t)attr_i(op, "rn");
+            uint8_t rm = (uint8_t)attr_i(op, "rm");
+            bool    sf = attr_b(op, "sf");
+            emit_word(&out->code, arm64_add_reg(rd, rn, rm, sf));
+            break;
+        }
+        case OP_TYPE_AARCH64_SUB_REG: {
+            uint8_t rd = (uint8_t)attr_i(op, "rd");
+            uint8_t rn = (uint8_t)attr_i(op, "rn");
+            uint8_t rm = (uint8_t)attr_i(op, "rm");
+            bool    sf = attr_b(op, "sf");
+            emit_word(&out->code, arm64_sub_reg(rd, rn, rm, sf));
+            break;
+        }
+        case OP_TYPE_AARCH64_LDR_W: {
+            uint8_t  rt = (uint8_t)attr_i(op, "rt");
+            uint8_t  rn = (uint8_t)attr_i(op, "rn");
+            uint16_t of = (uint16_t)attr_i(op, "off_bytes");
+            emit_word(&out->code, arm64_ldr_w_uoff(rt, rn, of));
+            break;
+        }
+        case OP_TYPE_AARCH64_STR_W: {
+            uint8_t  rt = (uint8_t)attr_i(op, "rt");
+            uint8_t  rn = (uint8_t)attr_i(op, "rn");
+            uint16_t of = (uint16_t)attr_i(op, "off_bytes");
+            emit_word(&out->code, arm64_str_w_uoff(rt, rn, of));
+            break;
+        }
+        case OP_TYPE_AARCH64_ADRP_DATA: {
+            uint8_t rd      = (uint8_t)attr_i(op, "rd");
+            string  target  = attr_s(op, "target");
+            uint32_t off    = (uint32_t)out->code.len;
+            emit_word(&out->code, arm64_adrp(rd, 0));    // patched
+            ef_add_dr(out, target, /*is_add_lo=*/false, rd, /*rn=*/0, off);
+            break;
+        }
+        case OP_TYPE_AARCH64_ADD_DATA_LO: {
+            uint8_t rd     = (uint8_t)attr_i(op, "rd");
+            uint8_t rn     = (uint8_t)attr_i(op, "rn");
+            string  target = attr_s(op, "target");
+            uint32_t off   = (uint32_t)out->code.len;
+            emit_word(&out->code, arm64_add_imm(rd, rn, 0, /*sf=*/true)); // patched
+            ef_add_dr(out, target, /*is_add_lo=*/true, rd, rn, off);
+            break;
+        }
         default: {
             string nm = MLIR_GetOpName(op);
             fprintf(stderr,
@@ -365,6 +524,18 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     size_t n_top = MLIR_GetBlockNumOps(mb);
 
     // -----------------------------------------------------------------
+    // Read module-level layout attributes set by mlir_wmir_to_aarch64.
+    // -----------------------------------------------------------------
+    uint32_t n_globals    = (uint32_t)attr_i(module, "n_globals");
+    uint64_t global0_init = (uint64_t)attr_i(module, "global0_init");
+    uint64_t linmem_size  = (uint64_t)attr_i(module, "linmem_size");
+
+    uint32_t globals_bytes  = n_globals * 8u;
+    uint32_t globals_padded = (globals_bytes + 15u) & ~15u;
+    bool     has_data_seg   = (n_globals > 0) || (linmem_size > 0);
+    uint32_t data_priv_size = has_data_seg ? 32u : 0u;
+
+    // -----------------------------------------------------------------
     // Collect functions, find `_start`. `_start` must be placed first
     // in __text so LC_MAIN.entryoff equals text_section_off.
     // -----------------------------------------------------------------
@@ -382,7 +553,7 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         }
         if (!emit_aarch64_func(op, &efs[n_funcs])) {
             for (size_t k = 0; k <= n_funcs; k++) {
-                free(efs[k].code.data); free(efs[k].relocs);
+                free(efs[k].code.data); free(efs[k].relocs); free(efs[k].dr);
             }
             free(efs); return false;
         }
@@ -395,7 +566,7 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     if (start_idx == (size_t)-1) {
         fprintf(stderr, "aarch64->macho: no `_start` function in module\n");
         for (size_t k = 0; k < n_funcs; k++) {
-            free(efs[k].code.data); free(efs[k].relocs);
+            free(efs[k].code.data); free(efs[k].relocs); free(efs[k].dr);
         }
         free(efs); return false;
     }
@@ -434,7 +605,7 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
                     "aarch64->macho: bl to unknown symbol '%.*s'\n",
                     (int)r->callee.size, r->callee.str);
                 for (size_t k2 = 0; k2 < n_funcs; k2++) {
-                    free(efs[k2].code.data); free(efs[k2].relocs);
+                    free(efs[k2].code.data); free(efs[k2].relocs); free(efs[k2].dr);
                 }
                 free(efs); return false;
             }
@@ -460,8 +631,11 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     const uint32_t stub_size = 12;
     const uint32_t got_size  = n_stubs * 8;
 
-    const uint32_t n_cmds      = 17;
-    const uint32_t sizeofcmds  = 976;
+    // sizeofcmds varies with __DATA presence. The 232 increment is 72
+    // (segment header) + 2*80 (two sections: __data + __linmem_bss).
+    uint32_t data_seg_lc_size = has_data_seg ? (72u + 2u * 80u) : 0u;
+    const uint32_t n_cmds      = has_data_seg ? 18u : 17u;
+    const uint32_t sizeofcmds  = 976u + data_seg_lc_size;
     uint32_t text_section_off  = (32u + sizeofcmds + 15u) & ~15u;
     if (text_section_off < 1040u) text_section_off = 1040u;
 
@@ -475,8 +649,31 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     if (text_seg_size < VMSEG_SIZE) text_seg_size = VMSEG_SIZE;
     const uint64_t data_const_vm_base   = TEXT_VM_BASE + text_seg_size;
     const uint32_t data_const_file_base = text_seg_size;
-    const uint64_t linkedit_vm_base     = data_const_vm_base + VMSEG_SIZE;
-    const uint32_t linkedit_file_base   = data_const_file_base + VMSEG_SIZE;
+
+    // __DATA segment (between __DATA_CONST and __LINKEDIT). Two sections:
+    //   __data        S_REGULAR (file-backed): data_priv (32B) + globals
+    //   __linmem_bss  S_ZEROFILL: linmem_size bytes of zeros
+    uint32_t data_seg_payload    = data_priv_size + globals_padded;
+    uint64_t data_seg_filesize_v = has_data_seg
+        ? (((uint64_t)data_seg_payload + (VMSEG_SIZE - 1u)) & ~(uint64_t)(VMSEG_SIZE - 1u))
+        : 0u;
+    uint64_t data_seg_vmpayload  = (uint64_t)data_seg_payload + linmem_size;
+    uint64_t data_seg_vmsize     = has_data_seg
+        ? ((data_seg_vmpayload + (VMSEG_SIZE - 1u)) & ~(uint64_t)(VMSEG_SIZE - 1u))
+        : 0u;
+
+    const uint64_t data_vm_base    = data_const_vm_base + VMSEG_SIZE;
+    const uint32_t data_file_base  = data_const_file_base + VMSEG_SIZE;
+    const uint64_t data_priv_vmaddr = data_vm_base;
+    const uint64_t globals_vmaddr   = data_priv_vmaddr + data_priv_size;
+    const uint64_t linmem_vmaddr    = globals_vmaddr + globals_padded;
+
+    const uint64_t linkedit_vm_base   = has_data_seg
+        ? (data_vm_base + data_seg_vmsize)
+        : (data_const_vm_base + VMSEG_SIZE);
+    const uint32_t linkedit_file_base = has_data_seg
+        ? (data_file_base + (uint32_t)data_seg_filesize_v)
+        : (data_const_file_base + VMSEG_SIZE);
 
     // -----------------------------------------------------------------
     // Build the image.
@@ -581,6 +778,46 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         buf_le32(&img, 0);
     }
 
+    // LC_SEGMENT_64 __DATA (optional). Two sections:
+    //   __data        : S_REGULAR, file-backed, holds data_priv + globals.
+    //   __linmem_bss  : S_ZEROFILL, holds the linear memory.
+    if (has_data_seg) {
+        buf_le32(&img, LC_SEGMENT_64); buf_le32(&img, 72u + 2u * 80u);
+        { static const char SEG[16] = "__DATA"; buf_append(&img, SEG, 16); }
+        buf_le64(&img, data_vm_base);
+        buf_le64(&img, data_seg_vmsize);
+        buf_le64(&img, (uint64_t)data_file_base);
+        buf_le64(&img, data_seg_filesize_v);
+        buf_le32(&img, VM_PROT_READ | VM_PROT_WRITE);
+        buf_le32(&img, VM_PROT_READ | VM_PROT_WRITE);
+        buf_le32(&img, 2);
+        buf_le32(&img, 0);
+        {
+            static const char SN[16] = "__data";
+            static const char SG[16] = "__DATA";
+            buf_append(&img, SN, 16); buf_append(&img, SG, 16);
+            buf_le64(&img, data_vm_base);
+            buf_le64(&img, (uint64_t)data_seg_payload);
+            buf_le32(&img, data_file_base);
+            buf_le32(&img, 3);                // align = 2^3 = 8
+            buf_le32(&img, 0); buf_le32(&img, 0);
+            buf_le32(&img, 0);                // S_REGULAR
+            buf_le32(&img, 0); buf_le32(&img, 0); buf_le32(&img, 0);
+        }
+        {
+            static const char SN[16] = "__linmem_bss";
+            static const char SG[16] = "__DATA";
+            buf_append(&img, SN, 16); buf_append(&img, SG, 16);
+            buf_le64(&img, linmem_vmaddr);
+            buf_le64(&img, linmem_size);
+            buf_le32(&img, 0);                // offset = 0 (zerofill)
+            buf_le32(&img, 3);
+            buf_le32(&img, 0); buf_le32(&img, 0);
+            buf_le32(&img, 1);                // S_ZEROFILL
+            buf_le32(&img, 0); buf_le32(&img, 0); buf_le32(&img, 0);
+        }
+    }
+
     // LC_SEGMENT_64 __LINKEDIT (filesize patched at end)
     size_t pos_linkedit_seg = img.len;
     buf_le32(&img, LC_SEGMENT_64); buf_le32(&img, 72);
@@ -675,8 +912,75 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     // Pad to __DATA_CONST.
     buf_pad_to(&img, data_const_file_base);
     // __got empty (zero bytes written; the segment file size is
-    // VMSEG_SIZE, padded below when we pad to linkedit_file_base).
+    // VMSEG_SIZE, padded below when we pad to data_file_base or
+    // linkedit_file_base).
+
+    // -----------------------------------------------------------------
+    // __DATA file content (if any): data_priv (32 zero bytes) followed
+    // by globals. The __linmem_bss section is S_ZEROFILL so it
+    // contributes only to vmsize, not filesize.
+    // -----------------------------------------------------------------
+    if (has_data_seg) {
+        buf_pad_to(&img, data_file_base);
+        // data_priv: 32 zero bytes.
+        for (uint32_t k = 0; k < data_priv_size; k++) buf_u8(&img, 0);
+        // globals: 8 bytes each. global[0] = global0_init; rest = 0.
+        for (uint32_t k = 0; k < n_globals; k++) {
+            uint64_t v = (k == 0) ? global0_init : 0;
+            buf_le64(&img, v);
+        }
+        // Pad globals to 16.
+        while ((img.len - (data_file_base + data_priv_size)) < globals_padded) {
+            buf_u8(&img, 0);
+        }
+        // Pad to data_seg_filesize (VMSEG boundary).
+        buf_pad_to(&img, data_file_base + (uint32_t)data_seg_filesize_v);
+    }
+
     buf_pad_to(&img, linkedit_file_base);
+
+    // -----------------------------------------------------------------
+    // Patch ADRP / ADD imm12 for data-segment references. Done after
+    // text content lives in `img` so we know its absolute offset.
+    // -----------------------------------------------------------------
+    for (size_t i = 0; i < n_funcs; i++) {
+        for (size_t k = 0; k < efs[i].n_dr; k++) {
+            DataReloc *dr = &efs[i].dr[k];
+            uint64_t dst_vm;
+            if (dr->kind.size == 9 && memcmp(dr->kind.str, "data_priv", 9) == 0) {
+                dst_vm = data_priv_vmaddr;
+            } else if (dr->kind.size == 7 && memcmp(dr->kind.str, "globals", 7) == 0) {
+                dst_vm = globals_vmaddr;
+            } else if (dr->kind.size == 6 && memcmp(dr->kind.str, "linmem", 6) == 0) {
+                dst_vm = linmem_vmaddr;
+            } else {
+                fprintf(stderr,
+                    "aarch64->macho: unknown data reloc kind '%.*s'\n",
+                    (int)dr->kind.size, dr->kind.str);
+                for (size_t k2 = 0; k2 < n_funcs; k2++) {
+                    free(efs[k2].code.data); free(efs[k2].relocs); free(efs[k2].dr);
+                }
+                free(efs); free(img.data); return false;
+            }
+            uint64_t src_pc = TEXT_VM_BASE + (uint64_t)text_section_off
+                            + (uint64_t)efs[i].text_off + (uint64_t)dr->fn_off;
+            size_t   img_off = text_section_off + efs[i].text_off + dr->fn_off;
+            uint32_t insn;
+            if (!dr->is_add_lo) {
+                int64_t dst_page = (int64_t)(dst_vm >> 12);
+                int64_t src_page = (int64_t)(src_pc >> 12);
+                int64_t rel_pages = dst_page - src_page;
+                insn = arm64_adrp(dr->rd, rel_pages);
+            } else {
+                uint16_t imm12 = (uint16_t)(dst_vm & 0xfffu);
+                insn = arm64_add_imm(dr->rd, dr->rn, imm12, /*sf=*/true);
+            }
+            img.data[img_off + 0] = (uint8_t)(insn      );
+            img.data[img_off + 1] = (uint8_t)(insn >>  8);
+            img.data[img_off + 2] = (uint8_t)(insn >> 16);
+            img.data[img_off + 3] = (uint8_t)(insn >> 24);
+        }
+    }
 
     // =====================================================================
     // __LINKEDIT
@@ -919,6 +1223,7 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     for (size_t i = 0; i < n_funcs; i++) {
         free(efs[i].code.data);
         free(efs[i].relocs);
+        free(efs[i].dr);
     }
     free(efs);
 

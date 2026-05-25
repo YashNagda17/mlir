@@ -156,6 +156,203 @@ static bool lower_wasmssa_op(MLIR_Context *ctx, MLIR_OpHandle src_op,
         return true;
     }
 
+    case OP_TYPE_WASMSSA_ADD:
+    case OP_TYPE_WASMSSA_SUB: {
+        // Plain wasmssa.add/sub: address-arithmetic operators emitted by
+        // the lowering, with no `wasm_opcode` attribute. Always i32.
+        MLIR_ValueHandle a, b;
+        if (!vmap_get(vmap, MLIR_GetOpOperand(src_op, 0), &a) ||
+            !vmap_get(vmap, MLIR_GetOpOperand(src_op, 1), &b)) {
+            fprintf(stderr, "wmir: unbound operand on wasmssa.%s\n",
+                    t == OP_TYPE_WASMSSA_ADD ? "add" : "sub");
+            return false;
+        }
+        MLIR_TypeHandle res_ty[1] = { MLIR_CreateTypeInteger(ctx, 32, true) };
+        MLIR_ValueHandle res[1] = {
+            MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, res_ty[0],
+                (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}))
+        };
+        MLIR_ValueHandle ops[2] = { a, b };
+        MLIR_OpType out_t = (t == OP_TYPE_WASMSSA_ADD)
+                          ? OP_TYPE_WMIR_IADD : OP_TYPE_WMIR_ISUB;
+        MLIR_OpHandle out = build_op_simple(ctx, out_t,
+            NULL, 0, res_ty, 1, res, ops, 2);
+        MLIR_AppendBlockOp(ctx, dst_blk, out);
+        vmap_set(vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_BINOP: {
+        // wasmssa.binop carries the raw wasm opcode in `wasm_opcode`.
+        // For the arith slice we only handle i32 add (0x6a) and i32
+        // sub (0x6b); the table grows test-by-test.
+        int64_t opc = at_i(src_op, "wasm_opcode");
+        MLIR_OpType out_t;
+        switch (opc) {
+            case 0x6a: out_t = OP_TYPE_WMIR_IADD; break;
+            case 0x6b: out_t = OP_TYPE_WMIR_ISUB; break;
+            default:
+                fprintf(stderr,
+                    "wmir: wasmssa.binop opcode 0x%llx not yet supported\n",
+                    (unsigned long long)opc);
+                return false;
+        }
+        MLIR_ValueHandle a, b;
+        if (!vmap_get(vmap, MLIR_GetOpOperand(src_op, 0), &a) ||
+            !vmap_get(vmap, MLIR_GetOpOperand(src_op, 1), &b)) {
+            fprintf(stderr, "wmir: unbound operand on wasmssa.binop\n");
+            return false;
+        }
+        uint8_t vt = (uint8_t)at_i(src_op, "valtype");
+        MLIR_TypeHandle res_ty[1] = { vt_to_type(ctx, vt) };
+        MLIR_ValueHandle res[1] = {
+            MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, res_ty[0],
+                (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}))
+        };
+        MLIR_ValueHandle ops[2] = { a, b };
+        MLIR_OpHandle out = build_op_simple(ctx, out_t,
+            NULL, 0, res_ty, 1, res, ops, 2);
+        MLIR_AppendBlockOp(ctx, dst_blk, out);
+        vmap_set(vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_GLOBAL_GET: {
+        // Returns the current value of wasm global `global_idx`. First-
+        // light: i32 globals only (matches the stack-pointer global
+        // emitted by clang).
+        uint8_t vt = (uint8_t)at_i(src_op, "valtype");
+        int64_t idx = at_i(src_op, "global_idx");
+        MLIR_AttributeHandle attrs[1] = { attr_i32(ctx, "global_idx", idx) };
+        MLIR_TypeHandle res_ty[1] = { vt_to_type(ctx, vt) };
+        MLIR_ValueHandle res[1] = {
+            MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, res_ty[0],
+                (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}))
+        };
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_GLOBAL_GET,
+            attrs, 1, res_ty, 1, res, NULL, 0);
+        MLIR_AppendBlockOp(ctx, dst_blk, out);
+        vmap_set(vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_GLOBAL_SET: {
+        int64_t idx = at_i(src_op, "global_idx");
+        MLIR_ValueHandle v;
+        if (!vmap_get(vmap, MLIR_GetOpOperand(src_op, 0), &v)) {
+            fprintf(stderr, "wmir: unbound operand on wasmssa.global_set\n");
+            return false;
+        }
+        MLIR_AttributeHandle attrs[1] = { attr_i32(ctx, "global_idx", idx) };
+        MLIR_ValueHandle ops[1] = { v };
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_GLOBAL_SET,
+            attrs, 1, NULL, 0, NULL, ops, 1);
+        MLIR_AppendBlockOp(ctx, dst_blk, out);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_LOAD: {
+        // wasmssa.load(%addr_i32) -> T   with attrs:
+        //   memory_offset    static byte offset added to %addr
+        //   mem_size_bytes   1 / 2 / 4 / 8 for sub-word / full-width loads
+        //   valtype          target type (e.g. i32 for i32.load)
+        // First-light supports only the full-width i32 case
+        // (mem_size_bytes=4, valtype=i32). Sub-word loads need a
+        // sign/zero-extend op which we don't have yet.
+        int64_t off    = at_i(src_op, "memory_offset");
+        int64_t sz     = at_i(src_op, "mem_size_bytes");
+        uint8_t vt     = (uint8_t)at_i(src_op, "valtype");
+        if (!(sz == 4 && vt == WT_I32)) {
+            fprintf(stderr,
+                "wmir: wasmssa.load mem_size=%lld valtype=%u not yet supported\n",
+                (long long)sz, (unsigned)vt);
+            return false;
+        }
+        MLIR_ValueHandle addr;
+        if (!vmap_get(vmap, MLIR_GetOpOperand(src_op, 0), &addr)) {
+            fprintf(stderr, "wmir: unbound operand on wasmssa.load\n");
+            return false;
+        }
+        MLIR_AttributeHandle attrs[1] = { attr_i32(ctx, "memory_offset", off) };
+        MLIR_TypeHandle res_ty[1] = { MLIR_CreateTypeInteger(ctx, 32, true) };
+        MLIR_ValueHandle res[1] = {
+            MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, res_ty[0],
+                (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}))
+        };
+        MLIR_ValueHandle ops[1] = { addr };
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_LOAD,
+            attrs, 1, res_ty, 1, res, ops, 1);
+        MLIR_AppendBlockOp(ctx, dst_blk, out);
+        vmap_set(vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_STORE: {
+        int64_t off    = at_i(src_op, "memory_offset");
+        int64_t sz     = at_i(src_op, "mem_size_bytes");
+        uint8_t vt     = (uint8_t)at_i(src_op, "valtype");
+        if (!(sz == 4 && vt == WT_I32)) {
+            fprintf(stderr,
+                "wmir: wasmssa.store mem_size=%lld valtype=%u not yet supported\n",
+                (long long)sz, (unsigned)vt);
+            return false;
+        }
+        MLIR_ValueHandle addr, val;
+        if (!vmap_get(vmap, MLIR_GetOpOperand(src_op, 0), &addr) ||
+            !vmap_get(vmap, MLIR_GetOpOperand(src_op, 1), &val)) {
+            fprintf(stderr, "wmir: unbound operand on wasmssa.store\n");
+            return false;
+        }
+        MLIR_AttributeHandle attrs[1] = { attr_i32(ctx, "memory_offset", off) };
+        MLIR_ValueHandle ops[2] = { addr, val };
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_STORE,
+            attrs, 1, NULL, 0, NULL, ops, 2);
+        MLIR_AppendBlockOp(ctx, dst_blk, out);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_CALL: {
+        // wasmssa.call(%args...) {target=<callee_name>} -> result
+        string callee = at_s(src_op, "target");
+        if (callee.size == 0) {
+            fprintf(stderr, "wmir: wasmssa.call without `target` attribute\n");
+            return false;
+        }
+        size_t no = MLIR_GetOpNumOperands(src_op);
+        MLIR_ValueHandle ops[16];
+        if (no > 16) {
+            fprintf(stderr, "wmir: wasmssa.call with >16 args unsupported\n");
+            return false;
+        }
+        for (size_t k = 0; k < no; k++) {
+            if (!vmap_get(vmap, MLIR_GetOpOperand(src_op, k), &ops[k])) {
+                fprintf(stderr, "wmir: unbound operand on wasmssa.call\n");
+                return false;
+            }
+        }
+        size_t nr = MLIR_GetOpNumResults(src_op);
+        if (nr > 1) {
+            fprintf(stderr, "wmir: wasmssa.call multi-result not yet supported\n");
+            return false;
+        }
+        MLIR_AttributeHandle attrs[1];
+        attrs[0] = attr_s(ctx, "target", callee.str, callee.size);
+        MLIR_TypeHandle res_ty[1];
+        MLIR_ValueHandle res[1];
+        if (nr == 1) {
+            MLIR_ValueHandle rv = MLIR_GetOpResult(src_op, 0);
+            MLIR_TypeHandle rt = MLIR_GetValueType(rv);
+            res_ty[0] = rt;
+            res[0] = MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, rt,
+                (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}));
+        }
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_CALL,
+            attrs, 1, res_ty, nr, res, ops, no);
+        MLIR_AppendBlockOp(ctx, dst_blk, out);
+        if (nr == 1) vmap_set(vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        return true;
+    }
+
     case OP_TYPE_WASMSSA_RETURN: {
         // Variadic, matches the func's result_types. For the first-light
         // slice the host function returns at most one value.
@@ -199,23 +396,11 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
 
     MLIR_BlockHandle dst_blk = MLIR_CreateBlock(ctx);
 
-    // wmir doesn't model the wasm value-type kingdom in its op
-    // attributes — the param/result types live as MLIR types on the
-    // function signature. We still preserve the raw `param_types` /
-    // `result_types` attribute strings on wmir.func so downstream
-    // passes can recover ABI-relevant info without re-deriving it.
-    // The first-light slice (`macho_exit`) has zero params, so we
-    // don't actually need block arguments yet; we still create the
-    // dst block empty so the structure matches the production layout.
-    if (pt.size > 0) {
-        // Will be filled in by a later slice once we have a test that
-        // exercises function parameters through the wmir backend.
-        fprintf(stderr,
-            "wmir lowering: function '%.*s' has parameters — not yet supported\n",
-            (int)name.size, name.str);
-        return MLIR_INVALID_HANDLE;
-    }
-
+    // Build block arguments matching the function's wasm value-type
+    // signature. The wasmssa entry block's args are the function's
+    // parameters; we mirror them as wmir block args and seed the
+    // vmap so wasmssa→wmir operand lookups resolve cleanly.
+    VMap vmap = {0};
     if (MLIR_GetOpNumRegions(src) < 1) {
         fprintf(stderr, "wmir lowering: wasmssa.func has no region\n");
         return MLIR_INVALID_HANDLE;
@@ -227,7 +412,16 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     }
     MLIR_BlockHandle src_blk = MLIR_GetRegionBlock(src_region, 0);
 
-    VMap vmap = {0};
+    size_t n_params = MLIR_GetBlockNumArgs(src_blk);
+    for (size_t i = 0; i < n_params; i++) {
+        MLIR_ValueHandle sa = MLIR_GetBlockArg(src_blk, i);
+        MLIR_TypeHandle  ty = MLIR_GetValueType(sa);
+        MLIR_ValueHandle da = MLIR_CreateValueBlockArg(ctx, (string){0},
+            (uint32_t)i, ty,
+            MLIR_CreateLocationUnknown(ctx, (string){0}));
+        MLIR_AppendBlockArg(ctx, dst_blk, da);
+        vmap_set(&vmap, sa, da);
+    }
     size_t n_ops = MLIR_GetBlockNumOps(src_blk);
     bool ok = true;
     for (size_t i = 0; i < n_ops; i++) {
