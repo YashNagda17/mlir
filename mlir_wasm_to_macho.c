@@ -1559,6 +1559,13 @@ typedef struct {
     uint32_t top;        // logical depth (lazy + mem)
     uint32_t mem_count;  // # slots actually pushed to the SP-stack
     uint32_t gpr_busy;   // bitmask over OS_GPR_POOL indices
+    // Per pool-reg cache: -1 if the reg's contents are unknown, else
+    // the local index whose current value lives in OS_GPR_POOL[i].
+    // Survives across slot pops (the bits stay in the reg until a
+    // producer overwrites them) but is cleared on producer-write to
+    // the reg, on `local.set N` overwriting that local's value, and
+    // on control-flow boundaries (call, br, if, end, ...).
+    int16_t  pool_cached_lidx[OS_GPR_POOL_N];
     const uint8_t *local_types;
     uint32_t n_locals_total;
 } OpStack;
@@ -1576,6 +1583,7 @@ static void os_init(OpStack *os, const uint8_t *local_types,
     os->top = 0;
     os->mem_count = 0;
     os->gpr_busy = 0;
+    for (uint32_t i = 0; i < OS_GPR_POOL_N; i++) os->pool_cached_lidx[i] = -1;
     os->local_types = local_types;
     os->n_locals_total = n_locals_total;
 }
@@ -1583,6 +1591,37 @@ static void os_init(OpStack *os, const uint8_t *local_types,
 static void os_free(OpStack *os) {
     free(os->slots);
     os->slots = NULL;
+}
+
+// Local-cache helpers.  pool_cached_lidx[i] == L means "OS_GPR_POOL[i]
+// currently holds the live value of local L".  Cleared whenever the
+// reg is overwritten, when local L is set to a new value, or when
+// control flow / a call could invalidate the assumption.
+
+static void os_cache_invalidate_all(OpStack *os) {
+    for (uint32_t i = 0; i < OS_GPR_POOL_N; i++) os->pool_cached_lidx[i] = -1;
+}
+
+static void os_cache_invalidate_local(OpStack *os, int32_t lidx) {
+    for (uint32_t i = 0; i < OS_GPR_POOL_N; i++)
+        if (os->pool_cached_lidx[i] == lidx) os->pool_cached_lidx[i] = -1;
+}
+
+// Returns the pool index whose reg already holds local `lidx` AND is
+// currently free (not owned by a live slot), or -1 if no cache hit.
+static int32_t os_cache_lookup_free(OpStack *os, int32_t lidx) {
+    for (uint32_t i = 0; i < OS_GPR_POOL_N; i++)
+        if (os->pool_cached_lidx[i] == lidx &&
+            !(os->gpr_busy & (1u << i)))
+            return (int32_t)i;
+    return -1;
+}
+
+// Returns the pool index for ARM64 reg `reg` (11..15), or -1 if not in pool.
+static int32_t os_pool_idx_of(uint32_t reg) {
+    for (uint32_t i = 0; i < OS_GPR_POOL_N; i++)
+        if (OS_GPR_POOL[i] == reg) return (int32_t)i;
+    return -1;
 }
 
 // Emit code to write the bits of `slot` into x-register `reg` (full
@@ -1792,8 +1831,19 @@ static void os_pop_drop(OpStack *os, Buf *buf) {
     os->top--;
 }
 
-// Push a deferred local.get.  Emits no code.
+// Push a deferred local.get.  Emits no code, but if a pool reg
+// currently caches this local's value AND is free, attach it as
+// OS_REG_GPR to skip the ldr at the next consumer.
 static void os_push_local(OpStack *os, uint32_t lidx) {
+    int32_t hit = os_cache_lookup_free(os, (int32_t)lidx);
+    if (hit >= 0) {
+        os->gpr_busy |= (1u << (uint32_t)hit);
+        OpSlot *s = &os->slots[os->top++];
+        s->kind = OS_REG_GPR;
+        s->ty   = os->local_types[lidx];
+        s->reg  = OS_GPR_POOL[hit];
+        return;
+    }
     OpSlot *s = &os->slots[os->top++];
     s->kind = OS_LOCAL;
     s->ty   = os->local_types[lidx];
@@ -1829,9 +1879,19 @@ static void os_push_mem(OpStack *os, uint8_t ty) {
 // stack while there are still un-materialised lazy slots below it.
 static void os_push_from_gpr(OpStack *os, Buf *buf, uint32_t src_reg,
                              uint8_t ty, bool is_64) {
+    // Prefer a free pool reg that is NOT currently caching a local
+    // (to preserve cache entries across binops).  If all free pool
+    // regs are cached, fall back to any free pool reg.
     uint32_t pool_idx = OS_GPR_POOL_N;
     for (uint32_t i = 0; i < OS_GPR_POOL_N; i++) {
-        if (!(os->gpr_busy & (1u << i))) { pool_idx = i; break; }
+        if (!(os->gpr_busy & (1u << i)) && os->pool_cached_lidx[i] < 0) {
+            pool_idx = i; break;
+        }
+    }
+    if (pool_idx == OS_GPR_POOL_N) {
+        for (uint32_t i = 0; i < OS_GPR_POOL_N; i++) {
+            if (!(os->gpr_busy & (1u << i))) { pool_idx = i; break; }
+        }
     }
     if (pool_idx < OS_GPR_POOL_N) {
         uint32_t reg = OS_GPR_POOL[pool_idx];
@@ -1841,6 +1901,7 @@ static void os_push_from_gpr(OpStack *os, Buf *buf, uint32_t src_reg,
             else       emit_word(buf, arm64_mov_w_reg(reg, src_reg));
         }
         os->gpr_busy |= (1u << pool_idx);
+        os->pool_cached_lidx[pool_idx] = -1; // overwritten by mov
         OpSlot *s = &os->slots[os->top++];
         s->kind = OS_REG_GPR;
         s->ty   = ty;
@@ -1860,6 +1921,47 @@ static void os_push_from_gpr(OpStack *os, Buf *buf, uint32_t src_reg,
     if (is_64) emit_word(buf, arm64_str_x_sp(0, 0));
     else       emit_word(buf, arm64_str_w_sp(0, 0));
     os_push_mem(os, ty);
+}
+
+// Reserve a pool reg into which an upcoming producer (binop / cmp /
+// cset / ...) will emit its result directly, avoiding the
+// `mov w_pool, w0` round-trip that os_push_from_gpr would normally
+// emit.  Returns the chosen GPR number (11..15), or 0 if no pool reg
+// is free.  When 0 is returned the caller falls back to its old path
+// (emit into x0, then os_push_from_gpr(0)).  Must be paired with
+// os_commit_result_reg() to publish the slot.
+static uint32_t os_reserve_result_reg(OpStack *os) {
+    // Prefer a free pool reg that is NOT currently caching a local.
+    for (uint32_t i = 0; i < OS_GPR_POOL_N; i++) {
+        if (!(os->gpr_busy & (1u << i)) && os->pool_cached_lidx[i] < 0) {
+            os->gpr_busy |= (1u << i);
+            return OS_GPR_POOL[i];
+        }
+    }
+    for (uint32_t i = 0; i < OS_GPR_POOL_N; i++) {
+        if (!(os->gpr_busy & (1u << i))) {
+            os->gpr_busy |= (1u << i);
+            os->pool_cached_lidx[i] = -1; // about to be overwritten
+            return OS_GPR_POOL[i];
+        }
+    }
+    return 0;
+}
+
+// Publish a producer's result.  If `r_dst` is one of the pool regs
+// reserved via os_reserve_result_reg, attach an OS_REG_GPR slot
+// referring to it.  Otherwise the value is in x0 and we route through
+// the standard memory/pool push path.
+static void os_commit_result_reg(OpStack *os, Buf *buf, uint32_t r_dst,
+                                 uint8_t ty, bool is_64) {
+    if (r_dst == 0) {
+        os_push_from_gpr(os, buf, 0, ty, is_64);
+        return;
+    }
+    OpSlot *s = &os->slots[os->top++];
+    s->kind = OS_REG_GPR;
+    s->ty   = ty;
+    s->reg  = (uint8_t)r_dst;
 }
 
 // Advance `r` past one WASM instruction. Knows the immediate-operand
@@ -2355,6 +2457,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
         if (!lazy_op) os_flush_all(&os, &e->code);
         switch (op) {
             case 0x0b: {                              // end
+                os_cache_invalidate_all(&os);
                 if (block_depth == 0) {
                     ended = true;
                     break;
@@ -2389,6 +2492,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
             }
             case 0x02:                                // block blocktype
             case 0x03: {                              // loop  blocktype
+                os_cache_invalidate_all(&os);
                 uint8_t bt = rd_u8(&r);
                 if (bt != 0x40) {
                     fprintf(stderr,
@@ -2415,6 +2519,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 break;
             }
             case 0x04: {                              // if blocktype
+                os_cache_invalidate_all(&os);
                 uint8_t bt = rd_u8(&r);
                 if (bt != 0x40) {
                     fprintf(stderr,
@@ -2458,6 +2563,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 break;
             }
             case 0x05: {                              // else
+                os_cache_invalidate_all(&os);
                 if (block_depth == 0
                     || block_stack[block_depth-1].kind != 1) {
                     fprintf(stderr,
@@ -2482,6 +2588,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
             }
             case 0x0c:                                // br labelidx
             case 0x0d: {                              // br_if labelidx
+                os_cache_invalidate_all(&os);
                 uint32_t labelidx = (uint32_t)rd_uleb(&r);
                 if (labelidx >= block_depth) {
                     fprintf(stderr,
@@ -2557,6 +2664,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 break;
             }
             case 0x0e: {                              // br_table
+                os_cache_invalidate_all(&os);
                 // Layout: u32_leb N, then N+1 u32_leb labels:
                 //   N case labels followed by the default label.
                 uint32_t n = (uint32_t)rd_uleb(&r);
@@ -2683,6 +2791,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 break;
             }
             case 0x0f: {                              // return
+                os_cache_invalidate_all(&os);
                 EMIT_EPILOGUE();
                 break;
             }
@@ -2726,18 +2835,56 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 bool is_64 = (local_types[li] == 0x7e) // i64
                           || (local_types[li] == 0x7c); // f64
                 if (op == 0x20) {                      // local.get
-                    // Push lazily — emits no code.
+                    // Push lazily — emits no code.  os_push_local()
+                    // will cache-hit into a pool reg if one already
+                    // holds this local's value, skipping the ldr.
                     os_push_local(&os, li);
                 } else {
-                    // local.set / local.tee: pop the value off the lazy
-                    // operand stack into x0 and store it into the local
-                    // slab.  For tee we then re-push it lazily as
-                    // OS_LOCAL referring to the same slot we just wrote.
-                    os_pop_to_gpr(&os, &e->code, 0, is_64);
-                    if (is_64) macho_local_str_x(&e->code, 0, off);
-                    else       macho_local_str_w(&e->code, 0, off);
-                    if (op == 0x22) {                  // tee: re-push
-                        os_push_local(&os, li);
+                    // local.set / local.tee.  Three paths:
+                    //  (a) top is OS_REG_GPR(R) (typical: fresh binop
+                    //      result): `str w_R, [x25, off]` direct and
+                    //      tag cache[idx(R)] = li.
+                    //  (b) top is OS_LOCAL/OS_CONST/OS_MEM and a pool
+                    //      reg is free: pop into that pool reg and
+                    //      tag cache[idx(reg)] = li (same code size
+                    //      as the x0 path, but lets future local.get
+                    //      li skip the ldr).
+                    //  (c) pool full: pop to x0, str.
+                    OpSlot *top = (os.top > 0) ? &os.slots[os.top - 1] : NULL;
+                    if (top && top->kind == OS_REG_GPR) {
+                        uint32_t r = top->reg;
+                        if (is_64) macho_local_str_x(&e->code, r, off);
+                        else       macho_local_str_w(&e->code, r, off);
+                        os_cache_invalidate_local(&os, (int32_t)li);
+                        int32_t pidx = os_pool_idx_of(r);
+                        if (pidx >= 0) os.pool_cached_lidx[pidx] = (int16_t)li;
+                        if (op == 0x21) {                  // set: pop
+                            os_release_pool_reg(&os, r);
+                            top->kind = OS_MEM;
+                            os.top--;
+                        }
+                        // tee: leave slot in place (still OS_REG_GPR
+                        // holding the value), so subsequent consumers
+                        // see the same register without a re-load.
+                    } else {
+                        uint32_t r_use = os_reserve_result_reg(&os);
+                        if (r_use != 0) {
+                            os_pop_to_gpr(&os, &e->code, r_use, is_64);
+                            if (is_64) macho_local_str_x(&e->code, r_use, off);
+                            else       macho_local_str_w(&e->code, r_use, off);
+                            os_cache_invalidate_local(&os, (int32_t)li);
+                            int32_t pidx = os_pool_idx_of(r_use);
+                            if (pidx >= 0)
+                                os.pool_cached_lidx[pidx] = (int16_t)li;
+                            os_release_pool_reg(&os, r_use);
+                            if (op == 0x22) os_push_local(&os, li);
+                        } else {
+                            os_pop_to_gpr(&os, &e->code, 0, is_64);
+                            if (is_64) macho_local_str_x(&e->code, 0, off);
+                            else       macho_local_str_w(&e->code, 0, off);
+                            os_cache_invalidate_local(&os, (int32_t)li);
+                            if (op == 0x22) os_push_local(&os, li);
+                        }
                     }
                 }
                 break;
@@ -2754,39 +2901,44 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
             }
             case 0x45: { // i32.eqz
                 os_pop_to_gpr(&os, &e->code, 0, false);
+                uint32_t r_dst = os_reserve_result_reg(&os);
                 emit_word(&e->code, arm64_cmp_w_imm0(0));
-                emit_word(&e->code, arm64_cset_w(0, 1));      // cset w0, eq
-                os_push_from_gpr(&os, &e->code, 0, 0x7f, false);
+                emit_word(&e->code, arm64_cset_w(r_dst, 1));      // cset, eq
+                os_commit_result_reg(&os, &e->code, r_dst, 0x7f, false);
                 break;
             }
             case 0x48: { // i32.lt_s
                 os_pop_to_gpr(&os, &e->code, 1, false);
                 os_pop_to_gpr(&os, &e->code, 0, false);
+                uint32_t r_dst = os_reserve_result_reg(&os);
                 emit_word(&e->code, arm64_cmp_w(0, 1));
-                emit_word(&e->code, arm64_cset_w(0, 0xa));    // cset w0, lt
-                os_push_from_gpr(&os, &e->code, 0, 0x7f, false);
+                emit_word(&e->code, arm64_cset_w(r_dst, 0xa));    // cset, lt
+                os_commit_result_reg(&os, &e->code, r_dst, 0x7f, false);
                 break;
             }
             case 0x6a: { // i32.add
                 os_pop_to_gpr(&os, &e->code, 1, false);
                 os_pop_to_gpr(&os, &e->code, 0, false);
-                emit_word(&e->code, arm64_add_w_reg(0, 0, 1));
-                os_push_from_gpr(&os, &e->code, 0, 0x7f, false);
+                uint32_t r_dst = os_reserve_result_reg(&os);
+                emit_word(&e->code, arm64_add_w_reg(r_dst, 0, 1));
+                os_commit_result_reg(&os, &e->code, r_dst, 0x7f, false);
                 break;
             }
             case 0x6b: { // i32.sub
                 os_pop_to_gpr(&os, &e->code, 1, false);
                 os_pop_to_gpr(&os, &e->code, 0, false);
-                emit_word(&e->code, arm64_sub_w_reg(0, 0, 1));
-                os_push_from_gpr(&os, &e->code, 0, 0x7f, false);
+                uint32_t r_dst = os_reserve_result_reg(&os);
+                emit_word(&e->code, arm64_sub_w_reg(r_dst, 0, 1));
+                os_commit_result_reg(&os, &e->code, r_dst, 0x7f, false);
                 break;
             }
             case 0x47: { // i32.ne
                 os_pop_to_gpr(&os, &e->code, 1, false);
                 os_pop_to_gpr(&os, &e->code, 0, false);
+                uint32_t r_dst = os_reserve_result_reg(&os);
                 emit_word(&e->code, arm64_cmp_w(0, 1));
-                emit_word(&e->code, arm64_cset_w(0, 0));     // cset w0, ne
-                os_push_from_gpr(&os, &e->code, 0, 0x7f, false);
+                emit_word(&e->code, arm64_cset_w(r_dst, 0));     // cset, ne
+                os_commit_result_reg(&os, &e->code, r_dst, 0x7f, false);
                 break;
             }
             case 0x23: {                                     // global.get
@@ -3144,6 +3296,9 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 };
                 ef_push_reloc(e, rel);
                 emit_word(&e->code, arm64_bl(0));
+                // x11..x15 are caller-saved; the callee may have
+                // clobbered them, so the local-value cache is dead.
+                os_cache_invalidate_all(&os);
                 // Free PCS region + only the MEM arg slots (lazy args
                 // never occupied SP-stack space).
                 {
@@ -3315,6 +3470,9 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 // x9 = *(x10 + w8 * 8)   ; w8 zero-extended to 64.
                 emit_word(&e->code, arm64_ldr_x_xn_wm_uxtw3(9, 10, 8));
                 emit_word(&e->code, arm64_blr(9));
+                // x11..x15 are caller-saved; the callee may have
+                // clobbered them, so the local-value cache is dead.
+                os_cache_invalidate_all(&os);
 
                 {
                     uint32_t total_free = pcs_size + nm * 16u;
@@ -3347,8 +3505,8 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 break;
             }
             // --- i32 comparisons (2 pop, 1 push). Pattern:
-            //     pop top -> w1; pop below -> w0; cmp w0,w1; cset w0,COND;
-            //     push i32 result via os_push_from_gpr.
+            //     pop top -> w1; pop below -> w0; cmp w0,w1; cset w_dst,COND;
+            //     push i32 result.
             case 0x46:   // i32.eq      cset cond_inv = NE = 1
             case 0x49:   // i32.lt_u    cset cond_inv = HS = 2
             case 0x4a:   // i32.gt_s    cset cond_inv = LE = 0xd
@@ -3371,9 +3529,10 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 }
                 os_pop_to_gpr(&os, &e->code, 1, false);
                 os_pop_to_gpr(&os, &e->code, 0, false);
+                uint32_t r_dst = os_reserve_result_reg(&os);
                 emit_word(&e->code, arm64_cmp_w(0, 1));
-                emit_word(&e->code, arm64_cset_w(0, cond_inv));
-                os_push_from_gpr(&os, &e->code, 0, 0x7f, false);
+                emit_word(&e->code, arm64_cset_w(r_dst, cond_inv));
+                os_commit_result_reg(&os, &e->code, r_dst, 0x7f, false);
                 break;
             }
 
@@ -3390,29 +3549,31 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
             case 0x76: { // i32.shr_u
                 os_pop_to_gpr(&os, &e->code, 1, false);
                 os_pop_to_gpr(&os, &e->code, 0, false);
+                uint32_t r_dst = os_reserve_result_reg(&os);
                 uint32_t insn = 0;
                 switch (op) {
-                    case 0x6c: insn = arm64_mul_w   (0, 0, 1); break;
-                    case 0x6d: insn = arm64_sdiv_w  (0, 0, 1); break;
-                    case 0x6e: insn = arm64_udiv_w  (0, 0, 1); break;
-                    case 0x71: insn = arm64_and_w_reg(0, 0, 1); break;
-                    case 0x72: insn = arm64_orr_w_reg(0, 0, 1); break;
-                    case 0x73: insn = arm64_eor_w_reg(0, 0, 1); break;
-                    case 0x74: insn = arm64_lsl_w_reg(0, 0, 1); break;
-                    case 0x75: insn = arm64_asr_w_reg(0, 0, 1); break;
-                    case 0x76: insn = arm64_lsr_w_reg(0, 0, 1); break;
+                    case 0x6c: insn = arm64_mul_w   (r_dst, 0, 1); break;
+                    case 0x6d: insn = arm64_sdiv_w  (r_dst, 0, 1); break;
+                    case 0x6e: insn = arm64_udiv_w  (r_dst, 0, 1); break;
+                    case 0x71: insn = arm64_and_w_reg(r_dst, 0, 1); break;
+                    case 0x72: insn = arm64_orr_w_reg(r_dst, 0, 1); break;
+                    case 0x73: insn = arm64_eor_w_reg(r_dst, 0, 1); break;
+                    case 0x74: insn = arm64_lsl_w_reg(r_dst, 0, 1); break;
+                    case 0x75: insn = arm64_asr_w_reg(r_dst, 0, 1); break;
+                    case 0x76: insn = arm64_lsr_w_reg(r_dst, 0, 1); break;
                 }
                 emit_word(&e->code, insn);
-                os_push_from_gpr(&os, &e->code, 0, 0x7f, false);
+                os_commit_result_reg(&os, &e->code, r_dst, 0x7f, false);
                 break;
             }
 
             // --- i64.eqz (1 pop, 1 push i32).
             case 0x50: {
                 os_pop_to_gpr(&os, &e->code, 0, true);
+                uint32_t r_dst = os_reserve_result_reg(&os);
                 emit_word(&e->code, arm64_cmp_x_imm0(0));
-                emit_word(&e->code, arm64_cset_w(0, 1));  // cset w0, eq
-                os_push_from_gpr(&os, &e->code, 0, 0x7f, false);
+                emit_word(&e->code, arm64_cset_w(r_dst, 1));  // cset, eq
+                os_commit_result_reg(&os, &e->code, r_dst, 0x7f, false);
                 break;
             }
 
@@ -3444,9 +3605,10 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 }
                 os_pop_to_gpr(&os, &e->code, 1, true);
                 os_pop_to_gpr(&os, &e->code, 0, true);
+                uint32_t r_dst = os_reserve_result_reg(&os);
                 emit_word(&e->code, arm64_cmp_x(0, 1));
-                emit_word(&e->code, arm64_cset_w(0, cond_inv));
-                os_push_from_gpr(&os, &e->code, 0, 0x7f, false);
+                emit_word(&e->code, arm64_cset_w(r_dst, cond_inv));
+                os_commit_result_reg(&os, &e->code, r_dst, 0x7f, false);
                 break;
             }
 
@@ -3465,22 +3627,23 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
             case 0x88: { // i64.shr_u
                 os_pop_to_gpr(&os, &e->code, 1, true);
                 os_pop_to_gpr(&os, &e->code, 0, true);
+                uint32_t r_dst = os_reserve_result_reg(&os);
                 uint32_t insn = 0;
                 switch (op) {
-                    case 0x7c: insn = arm64_add_x_reg(0, 0, 1); break;
-                    case 0x7d: insn = arm64_sub_x_reg(0, 0, 1); break;
-                    case 0x7e: insn = arm64_mul_x    (0, 0, 1); break;
-                    case 0x7f: insn = arm64_sdiv_x   (0, 0, 1); break;
-                    case 0x80: insn = arm64_udiv_x   (0, 0, 1); break;
-                    case 0x83: insn = arm64_and_x_reg(0, 0, 1); break;
-                    case 0x84: insn = arm64_orr_x_reg(0, 0, 1); break;
-                    case 0x85: insn = arm64_eor_x_reg(0, 0, 1); break;
-                    case 0x86: insn = arm64_lsl_x_reg(0, 0, 1); break;
-                    case 0x87: insn = arm64_asr_x_reg(0, 0, 1); break;
-                    case 0x88: insn = arm64_lsr_x_reg(0, 0, 1); break;
+                    case 0x7c: insn = arm64_add_x_reg(r_dst, 0, 1); break;
+                    case 0x7d: insn = arm64_sub_x_reg(r_dst, 0, 1); break;
+                    case 0x7e: insn = arm64_mul_x    (r_dst, 0, 1); break;
+                    case 0x7f: insn = arm64_sdiv_x   (r_dst, 0, 1); break;
+                    case 0x80: insn = arm64_udiv_x   (r_dst, 0, 1); break;
+                    case 0x83: insn = arm64_and_x_reg(r_dst, 0, 1); break;
+                    case 0x84: insn = arm64_orr_x_reg(r_dst, 0, 1); break;
+                    case 0x85: insn = arm64_eor_x_reg(r_dst, 0, 1); break;
+                    case 0x86: insn = arm64_lsl_x_reg(r_dst, 0, 1); break;
+                    case 0x87: insn = arm64_asr_x_reg(r_dst, 0, 1); break;
+                    case 0x88: insn = arm64_lsr_x_reg(r_dst, 0, 1); break;
                 }
                 emit_word(&e->code, insn);
-                os_push_from_gpr(&os, &e->code, 0, 0x7e, true);
+                os_commit_result_reg(&os, &e->code, r_dst, 0x7e, true);
                 break;
             }
 
