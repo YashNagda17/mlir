@@ -62,6 +62,8 @@ def compile_one(cfg: Config, src: Path, obj: Path) -> None:
         raise SystemExit(
             f"error: {cfg.name} failed to compile {src.relative_to(ROOT)}:\n"
             f"  cmd: {' '.join(cfg.cmd_compile(src, obj))}\n"
+            f"  returncode: {proc.returncode}\n"
+            f"  stdout:\n{(proc.stdout or '').rstrip()}\n"
             f"  stderr:\n{tail}"
         )
 
