@@ -1944,6 +1944,48 @@ static void rewriteWasmMemoryIntrinsicsForUpstream(mlir::ModuleOp module) {
     }
 }
 
+// After the LLVM-lowering pass pipeline runs, convert our MLIR-level
+// `wasm.import_module` / `wasm.import_name` / `wasm.export_name`
+// attributes on `llvm.func` ops into the upstream LLVM dialect's
+// `passthrough` attribute. `passthrough` is the canonical mechanism for
+// forwarding arbitrary LLVM IR function attribute strings through
+// `translateModuleToLLVMIR`; LLVM's WebAssembly backend reads
+// `wasm-import-module` / `wasm-import-name` / `wasm-export-name`
+// function attributes to place imports in the correct WASI module
+// (`wasi_snapshot_preview1`) and to honor explicit exports. Without
+// this conversion, the upstream translator drops these on the floor
+// and all imports fall back to module `env`. (Clang itself attaches
+// these same strings when compiling `__attribute__((import_module(...)))`.)
+static void liftWasmImportExportAttrsToPassthrough(mlir::ModuleOp module) {
+    using namespace mlir;
+    module.walk([&](LLVM::LLVMFuncOp fn) {
+        struct KV { llvm::StringRef key; llvm::StringRef val; };
+        llvm::SmallVector<KV, 3> kvs;
+        if (auto a = fn->getAttrOfType<StringAttr>("wasm.import_module"))
+            kvs.push_back({"wasm-import-module", a.getValue()});
+        if (auto a = fn->getAttrOfType<StringAttr>("wasm.import_name"))
+            kvs.push_back({"wasm-import-name", a.getValue()});
+        if (auto a = fn->getAttrOfType<StringAttr>("wasm.export_name"))
+            kvs.push_back({"wasm-export-name", a.getValue()});
+        if (kvs.empty()) return;
+        auto &mctx = *module.getContext();
+        llvm::SmallVector<Attribute, 4> elements;
+        // Preserve any existing passthrough entries (the pass pipeline
+        // does not currently add any, but be defensive).
+        if (auto existing = fn.getPassthroughAttr()) {
+            for (Attribute e : existing) elements.push_back(e);
+        }
+        for (const KV &kv : kvs) {
+            Attribute pair_elts[2] = {
+                StringAttr::get(&mctx, kv.key),
+                StringAttr::get(&mctx, kv.val),
+            };
+            elements.push_back(ArrayAttr::get(&mctx, pair_elts));
+        }
+        fn.setPassthroughAttr(ArrayAttr::get(&mctx, elements));
+    });
+}
+
 extern "C" bool MLIR_LowerToLLVMDialectUpstream(MLIR_Context *ctx,
                                                 MLIR_OpHandle module_h) {
     (void)ctx;
@@ -2011,6 +2053,7 @@ extern "C" bool MLIR_LowerToLLVMDialectUpstream(MLIR_Context *ctx,
                      "MLIR_LowerToLLVMDialectUpstream: pass pipeline failed\n");
         return false;
     }
+    liftWasmImportExportAttrsToPassthrough(module);
     return true;
 }
 
