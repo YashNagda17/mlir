@@ -16,6 +16,9 @@
 #include "mlir_wasm_to_wat.h"
 #include "mlir_wasm_to_macho.h"
 #include "mlir_wasm_link.h"
+#include "mlir_wasmssa_to_wmir.h"
+#include "mlir_wmir_to_aarch64.h"
+#include "mlir_aarch64_to_macho.h"
 #include "tinyc.h"
 
 #if !defined(_WIN32) && !defined(__wasm__) && !defined(__TINYC__)
@@ -77,6 +80,13 @@ int app_main(void) {
     bool emit_wasmstack = false;
     bool emit_wat = false;
     bool emit_macho = false;
+    bool emit_wmir = false;
+    bool emit_aarch64 = false;
+    // --macho-backend selects which pipeline produces the final Mach-O
+    // binary. "wasm" (default) keeps the established wasm-link +
+    // wasm->macho path. "wmir" routes the wasmssa IR through the new
+    // wmir -> aarch64 -> macho path.
+    bool macho_backend_wmir = false;
     // `--lowering=upstream` switches the four lowering / translation calls
     // below to the *Upstream variants (which run upstream MLIR's pass
     // pipeline / translator / LLVM target machine). Only available in the
@@ -198,14 +208,18 @@ int app_main(void) {
             arena_destroy(boot_arena);
             return wrc;
         }
-        if      (strcmp(argv[i], "--emit=mlir")    == 0) { emit_llvm = false; emit_lowered = false; emit_wasm = false; emit_wasmssa = false; emit_wasmstack = false; emit_wat = false; emit_macho = false; }
-        else if (strcmp(argv[i], "--emit=lowered") == 0) { emit_lowered = true;  emit_llvm = false; emit_wasm = false; emit_wasmssa = false; emit_wasmstack = false; emit_wat = false; emit_macho = false; }
-        else if (strcmp(argv[i], "--emit=llvm")    == 0) { emit_llvm = true;     emit_lowered = false; emit_wasm = false; emit_wasmssa = false; emit_wasmstack = false; emit_wat = false; emit_macho = false; }
-        else if (strcmp(argv[i], "--emit=wasm")    == 0) { emit_wasm = true;     emit_llvm = false; emit_lowered = false; emit_wasmssa = false; emit_wasmstack = false; emit_wat = false; emit_macho = false; }
-        else if (strcmp(argv[i], "--emit=wasmssa") == 0) { emit_wasmssa = true; emit_wasm = false; emit_llvm = false; emit_lowered = false; emit_wasmstack = false; emit_wat = false; emit_macho = false; }
-        else if (strcmp(argv[i], "--emit=wasmstack") == 0) { emit_wasmstack = true; emit_wasm = false; emit_llvm = false; emit_lowered = false; emit_wasmssa = false; emit_wat = false; emit_macho = false; }
-        else if (strcmp(argv[i], "--emit=wat")     == 0) { emit_wat = true;     emit_wasm = false; emit_llvm = false; emit_lowered = false; emit_wasmssa = false; emit_wasmstack = false; emit_macho = false; }
-        else if (strcmp(argv[i], "--emit=macho")   == 0) { emit_macho = true;   emit_wat = false; emit_wasm = false; emit_llvm = false; emit_lowered = false; emit_wasmssa = false; emit_wasmstack = false; }
+        if      (strcmp(argv[i], "--emit=mlir")    == 0) { emit_llvm = false; emit_lowered = false; emit_wasm = false; emit_wasmssa = false; emit_wasmstack = false; emit_wat = false; emit_macho = false; emit_wmir = false; emit_aarch64 = false; }
+        else if (strcmp(argv[i], "--emit=lowered") == 0) { emit_lowered = true;  emit_llvm = false; emit_wasm = false; emit_wasmssa = false; emit_wasmstack = false; emit_wat = false; emit_macho = false; emit_wmir = false; emit_aarch64 = false; }
+        else if (strcmp(argv[i], "--emit=llvm")    == 0) { emit_llvm = true;     emit_lowered = false; emit_wasm = false; emit_wasmssa = false; emit_wasmstack = false; emit_wat = false; emit_macho = false; emit_wmir = false; emit_aarch64 = false; }
+        else if (strcmp(argv[i], "--emit=wasm")    == 0) { emit_wasm = true;     emit_llvm = false; emit_lowered = false; emit_wasmssa = false; emit_wasmstack = false; emit_wat = false; emit_macho = false; emit_wmir = false; emit_aarch64 = false; }
+        else if (strcmp(argv[i], "--emit=wasmssa") == 0) { emit_wasmssa = true; emit_wasm = false; emit_llvm = false; emit_lowered = false; emit_wasmstack = false; emit_wat = false; emit_macho = false; emit_wmir = false; emit_aarch64 = false; }
+        else if (strcmp(argv[i], "--emit=wasmstack") == 0) { emit_wasmstack = true; emit_wasm = false; emit_llvm = false; emit_lowered = false; emit_wasmssa = false; emit_wat = false; emit_macho = false; emit_wmir = false; emit_aarch64 = false; }
+        else if (strcmp(argv[i], "--emit=wat")     == 0) { emit_wat = true;     emit_wasm = false; emit_llvm = false; emit_lowered = false; emit_wasmssa = false; emit_wasmstack = false; emit_macho = false; emit_wmir = false; emit_aarch64 = false; }
+        else if (strcmp(argv[i], "--emit=macho")   == 0) { emit_macho = true;   emit_wat = false; emit_wasm = false; emit_llvm = false; emit_lowered = false; emit_wasmssa = false; emit_wasmstack = false; emit_wmir = false; emit_aarch64 = false; }
+        else if (strcmp(argv[i], "--emit=wmir")    == 0) { emit_wmir = true;    emit_macho = false; emit_wat = false; emit_wasm = false; emit_llvm = false; emit_lowered = false; emit_wasmssa = false; emit_wasmstack = false; emit_aarch64 = false; }
+        else if (strcmp(argv[i], "--emit=aarch64") == 0) { emit_aarch64 = true; emit_wmir = false; emit_macho = false; emit_wat = false; emit_wasm = false; emit_llvm = false; emit_lowered = false; emit_wasmssa = false; emit_wasmstack = false; }
+        else if (strcmp(argv[i], "--macho-backend=wmir") == 0) { macho_backend_wmir = true; }
+        else if (strcmp(argv[i], "--macho-backend=wasm") == 0) { macho_backend_wmir = false; }
         else if (strncmp(argv[i], "--wasm-runtime-obj=", 19) == 0) {
             wasm_runtime_objs[n_wasm_runtime_objs++] = argv[i] + 19;
         }
@@ -250,7 +264,7 @@ int app_main(void) {
         return 1;
     }
 
-    if ((emit_wasmssa || emit_wasmstack) &&
+    if ((emit_wasmssa || emit_wasmstack || emit_wmir || emit_aarch64) &&
 #ifdef TINYC_HAS_UPSTREAM
             lowering_explicit && use_upstream
 #else
@@ -258,13 +272,19 @@ int app_main(void) {
 #endif
             ) {
         fprintf(stderr,
-                "tinyc: --emit=wasmssa/wasmstack require --lowering=native "
-                "(upstream lowering does not produce these IRs)\n");
+                "tinyc: --emit=wasmssa/wasmstack/wmir/aarch64 require "
+                "--lowering=native (upstream lowering does not produce "
+                "these IRs)\n");
         arena_destroy(boot_arena);
         return 1;
     }
 #ifdef TINYC_HAS_UPSTREAM
-    if (emit_wasmssa || emit_wasmstack) {
+    if (emit_wasmssa || emit_wasmstack || emit_wmir || emit_aarch64) {
+        use_upstream = false;
+    }
+    // The new wmir-backed Mach-O pipeline only consumes wasmssa, which
+    // is only produced by the native lowering. Force native lowering on.
+    if (emit_macho && macho_backend_wmir) {
         use_upstream = false;
     }
     if (use_upstream) {
@@ -299,7 +319,7 @@ int app_main(void) {
     // 32-bit so the imported function signatures we generate match
     // wasm32-wasi's ABI. tinyC otherwise hardcodes them at 64-bit
     // (the size on every 64-bit native host we support).
-    bool target_wasm32 = emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho;
+    bool target_wasm32 = emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho || emit_wmir || emit_aarch64;
     Program *prog = arena_new(arena, Program);
     *prog = (Program){0};
     int total_errs = 0;
@@ -323,8 +343,8 @@ int app_main(void) {
         return 1;
     }
 
-    if (emit_lowered || emit_llvm || emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho) {
-        bool needs_wasm_lowering = emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho;
+    if (emit_lowered || emit_llvm || emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho || emit_wmir || emit_aarch64) {
+        bool needs_wasm_lowering = emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho || emit_wmir || emit_aarch64;
         bool ok = needs_wasm_lowering
                       ? lower_for_wasm_fn(&ctx, module)
                       : lower_fn(&ctx, module);
@@ -377,58 +397,128 @@ int app_main(void) {
             return 1;
         }
     } else if (emit_macho) {
-        // Pipeline: lower to wasm32 object, link with the provided
-        // --wasm-runtime-obj inputs, then translate the linked wasm
-        // module to a signed Mach-O ARM64 binary.
-        string obj = translate_to_wasm_fn(&ctx, module);
-        if (obj.size == 0) {
-            arena_destroy(arena);
-            arena_destroy(boot_arena);
-            return 1;
-        }
+        // Two paths:
+        // - macho_backend_wmir == false (default): the established
+        //   wasm-emit + wasm-link + wasm-to-macho pipeline.
+        // - macho_backend_wmir == true: the new wasmssa -> wmir ->
+        //   aarch64 -> macho pipeline. The new pipeline is being
+        //   built up op-by-op; on unsupported wasmssa shapes it
+        //   returns a clear error from its respective stage.
+        if (macho_backend_wmir) {
+            MLIR_OpHandle ssa = mlir_llvm_to_wasmssa(&ctx, module);
+            if (ssa == MLIR_INVALID_HANDLE) {
+                arena_destroy(arena);
+                arena_destroy(boot_arena);
+                return 1;
+            }
+            MLIR_OpHandle wmir = mlir_wasmssa_to_wmir(&ctx, ssa);
+            if (wmir == MLIR_INVALID_HANDLE) {
+                arena_destroy(arena);
+                arena_destroy(boot_arena);
+                return 1;
+            }
+            MLIR_OpHandle aarch64 = mlir_wmir_to_aarch64(&ctx, wmir);
+            if (aarch64 == MLIR_INVALID_HANDLE) {
+                arena_destroy(arena);
+                arena_destroy(boot_arena);
+                return 1;
+            }
+            uint8_t *macho_data = NULL; size_t macho_size = 0;
+            if (!mlir_aarch64_to_macho(&ctx, aarch64, &macho_data, &macho_size)) {
+                arena_destroy(arena);
+                arena_destroy(boot_arena);
+                return 1;
+            }
+            out.str = (char *)macho_data;
+            out.size = macho_size;
+        } else {
+            // Pipeline: lower to wasm32 object, link with the provided
+            // --wasm-runtime-obj inputs, then translate the linked wasm
+            // module to a signed Mach-O ARM64 binary.
+            string obj = translate_to_wasm_fn(&ctx, module);
+            if (obj.size == 0) {
+                arena_destroy(arena);
+                arena_destroy(boot_arena);
+                return 1;
+            }
 
-        size_t n_link_inputs = n_wasm_runtime_objs + 1;
-        MLIR_WasmLinkInput *ins = (MLIR_WasmLinkInput *)arena_new_array(
-            arena, MLIR_WasmLinkInput, n_link_inputs);
-        ins[0].data = (const uint8_t *)obj.str;
-        ins[0].size = obj.size;
-        ins[0].name = "<input>.wasm.o";
-        for (size_t k = 0; k < n_wasm_runtime_objs; k++) {
-            string buf = read_file_ok(arena, str_from_cstr_view(wasm_runtime_objs[k]));
-            ins[1 + k].data = (const uint8_t *)buf.str;
-            // read_file_ok appends a trailing NUL — strip it for the
-            // linker, which expects the exact file size.
-            ins[1 + k].size = buf.size > 0 ? buf.size - 1 : 0;
-            ins[1 + k].name = wasm_runtime_objs[k];
-        }
-        uint8_t *linked_data = NULL; size_t linked_size = 0;
-        if (!MLIR_WasmLink(ins, n_link_inputs, "_start", &linked_data, &linked_size)) {
-            fprintf(stderr, "tinyc --emit=macho: wasm link failed\n");
-            arena_destroy(arena);
-            arena_destroy(boot_arena);
-            return 1;
-        }
-        // Optional debugging hook: dump the post-link wasm bytes that
-        // feed the macho translator. Useful when a test fails to
-        // identify which opcode/feature the backend is missing; pair
-        // with `wasm2wat $TINYC_DUMP_LINKED_WASM`.
-        if (getenv("TINYC_DUMP_LINKED_WASM")) {
-            FILE *df = fopen(getenv("TINYC_DUMP_LINKED_WASM"), "wb");
-            if (df) { fwrite(linked_data, 1, linked_size, df); fclose(df); }
-        }
+            size_t n_link_inputs = n_wasm_runtime_objs + 1;
+            MLIR_WasmLinkInput *ins = (MLIR_WasmLinkInput *)arena_new_array(
+                arena, MLIR_WasmLinkInput, n_link_inputs);
+            ins[0].data = (const uint8_t *)obj.str;
+            ins[0].size = obj.size;
+            ins[0].name = "<input>.wasm.o";
+            for (size_t k = 0; k < n_wasm_runtime_objs; k++) {
+                string buf = read_file_ok(arena, str_from_cstr_view(wasm_runtime_objs[k]));
+                ins[1 + k].data = (const uint8_t *)buf.str;
+                // read_file_ok appends a trailing NUL — strip it for the
+                // linker, which expects the exact file size.
+                ins[1 + k].size = buf.size > 0 ? buf.size - 1 : 0;
+                ins[1 + k].name = wasm_runtime_objs[k];
+            }
+            uint8_t *linked_data = NULL; size_t linked_size = 0;
+            if (!MLIR_WasmLink(ins, n_link_inputs, "_start", &linked_data, &linked_size)) {
+                fprintf(stderr, "tinyc --emit=macho: wasm link failed\n");
+                arena_destroy(arena);
+                arena_destroy(boot_arena);
+                return 1;
+            }
+            // Optional debugging hook: dump the post-link wasm bytes that
+            // feed the macho translator. Useful when a test fails to
+            // identify which opcode/feature the backend is missing; pair
+            // with `wasm2wat $TINYC_DUMP_LINKED_WASM`.
+            if (getenv("TINYC_DUMP_LINKED_WASM")) {
+                FILE *df = fopen(getenv("TINYC_DUMP_LINKED_WASM"), "wb");
+                if (df) { fwrite(linked_data, 1, linked_size, df); fclose(df); }
+            }
 
-        uint8_t *macho_data = NULL; size_t macho_size = 0;
-        bool macho_ok = MLIR_WasmToMachoArm64(linked_data, linked_size,
-                                              &macho_data, &macho_size);
-        free(linked_data);
-        if (!macho_ok) {
-            fprintf(stderr, "tinyc --emit=macho: wasm->macho translation failed\n");
+            uint8_t *macho_data = NULL; size_t macho_size = 0;
+            bool macho_ok = MLIR_WasmToMachoArm64(linked_data, linked_size,
+                                                  &macho_data, &macho_size);
+            free(linked_data);
+            if (!macho_ok) {
+                fprintf(stderr, "tinyc --emit=macho: wasm->macho translation failed\n");
+                arena_destroy(arena);
+                arena_destroy(boot_arena);
+                return 1;
+            }
+            out.str = (char *)macho_data;
+            out.size = macho_size;
+        }
+    } else if (emit_wmir) {
+        MLIR_OpHandle ssa = mlir_llvm_to_wasmssa(&ctx, module);
+        if (ssa == MLIR_INVALID_HANDLE) {
             arena_destroy(arena);
             arena_destroy(boot_arena);
             return 1;
         }
-        out.str = (char *)macho_data;
-        out.size = macho_size;
+        MLIR_OpHandle wmir = mlir_wasmssa_to_wmir(&ctx, ssa);
+        if (wmir == MLIR_INVALID_HANDLE) {
+            arena_destroy(arena);
+            arena_destroy(boot_arena);
+            return 1;
+        }
+        out = MLIR_PrintOperationGeneric(&ctx, wmir);
+    } else if (emit_aarch64) {
+        MLIR_OpHandle ssa = mlir_llvm_to_wasmssa(&ctx, module);
+        if (ssa == MLIR_INVALID_HANDLE) {
+            arena_destroy(arena);
+            arena_destroy(boot_arena);
+            return 1;
+        }
+        MLIR_OpHandle wmir = mlir_wasmssa_to_wmir(&ctx, ssa);
+        if (wmir == MLIR_INVALID_HANDLE) {
+            arena_destroy(arena);
+            arena_destroy(boot_arena);
+            return 1;
+        }
+        MLIR_OpHandle aarch64 = mlir_wmir_to_aarch64(&ctx, wmir);
+        if (aarch64 == MLIR_INVALID_HANDLE) {
+            arena_destroy(arena);
+            arena_destroy(boot_arena);
+            return 1;
+        }
+        out = MLIR_PrintOperationGeneric(&ctx, aarch64);
     } else if (emit_llvm) {
         out = translate_to_llvm_fn(&ctx, module);
         if (out.size == 0) {

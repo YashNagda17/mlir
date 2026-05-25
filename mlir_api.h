@@ -311,6 +311,34 @@ typedef enum {
     OP_TYPE_WASMSTACK_MEMORY_SIZE,
     OP_TYPE_WASMSTACK_MEMORY_GROW,
 
+    // -------------------------------------------------------------------------
+    // wmir dialect — flat-CFG, post-wasmssa middle IR. The plan is to make
+    // this the "computation, not bytecode" representation that the AArch64
+    // selector consumes: real iN/fN/ptr types, explicit `trap_if`,
+    // explicit heap-address computation, explicit indirect-call type
+    // checks. The first-light slice (`macho_exit`) only needs three ops;
+    // everything else will be added test-by-test in subsequent passes.
+    // -------------------------------------------------------------------------
+    OP_TYPE_WMIR_FUNC,
+    OP_TYPE_WMIR_CONST,
+    OP_TYPE_WMIR_RETURN,
+
+    // -------------------------------------------------------------------------
+    // aarch64 dialect — 1:1 with the AArch64 instruction encoding. The
+    // `aarch64 → Mach-O` backend is a "dumb" byte emitter; all isel /
+    // register-allocation knowledge lives in the `wmir → aarch64` lowering.
+    // First-light slice: just enough to run `int main() { return 42; }`
+    // and have its return value become the process exit code via a
+    // direct `svc #0x80` Mach syscall (no `proc_exit` shim required).
+    // -------------------------------------------------------------------------
+    OP_TYPE_AARCH64_FUNC,
+    OP_TYPE_AARCH64_MOVZ,   // movz Wd|Xd, #imm16, LSL #(hw*16)
+    OP_TYPE_AARCH64_MOVK,   // movk Wd|Xd, #imm16, LSL #(hw*16)
+    OP_TYPE_AARCH64_MOV_X,  // mov Xd, Xn  (register move; X-form)
+    OP_TYPE_AARCH64_BL,     // bl <symbol>  (branch-and-link, PC-relative)
+    OP_TYPE_AARCH64_SVC,    // svc #imm16
+    OP_TYPE_AARCH64_RET,    // ret (== ret x30)
+
     OP_TYPE_COUNT
 } MLIR_OpType;
 

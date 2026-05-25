@@ -186,6 +186,18 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_WASMSTACK_CALL_INDIRECT: return str_lit("wasmstack.call_indirect");
         case OP_TYPE_WASMSTACK_MEMORY_SIZE: return str_lit("wasmstack.memory_size");
         case OP_TYPE_WASMSTACK_MEMORY_GROW: return str_lit("wasmstack.memory_grow");
+        // wmir dialect
+        case OP_TYPE_WMIR_FUNC:    return str_lit("wmir.func");
+        case OP_TYPE_WMIR_CONST:   return str_lit("wmir.const");
+        case OP_TYPE_WMIR_RETURN:  return str_lit("wmir.return");
+        // aarch64 dialect
+        case OP_TYPE_AARCH64_FUNC:  return str_lit("aarch64.func");
+        case OP_TYPE_AARCH64_MOVZ:  return str_lit("aarch64.movz");
+        case OP_TYPE_AARCH64_MOVK:  return str_lit("aarch64.movk");
+        case OP_TYPE_AARCH64_MOV_X: return str_lit("aarch64.mov_x");
+        case OP_TYPE_AARCH64_BL:    return str_lit("aarch64.bl");
+        case OP_TYPE_AARCH64_SVC:   return str_lit("aarch64.svc");
+        case OP_TYPE_AARCH64_RET:   return str_lit("aarch64.ret");
         default: return str_lit("unknown");
     }
 }
