@@ -3898,8 +3898,15 @@ static void emit_path_open_shim(EmittedFunc *e, LibSysRegistry *ls) {
     // with whatever junk happened to be on the stack (we saw 0240
     // = "-w-r-----" on macOS, which made the produced .wasm.o files
     // unreadable to their own owner).
+    //
+    // The immediate is written in hex (0x1a4 == 0o644) on purpose:
+    // tinyC's lexer does not parse C octal literals (a literal
+    // beginning with `0` is read as decimal), so when this file is
+    // compiled by a tinyC-self-host binary an octal literal `0644`
+    // would silently mean 644 decimal == 0o1204, which the kernel
+    // strips down to 0o204 ("-w----r--") on regular files.
     emit_word(&e->code, arm64_sub_sp_imm(16));
-    emit_word(&e->code, arm64_movz_x(12, 0644, 0));            // x12 = 0o644
+    emit_word(&e->code, arm64_movz_x(12, 0x1a4, 0));           // x12 = 0o644 (rw-r--r--)
     emit_word(&e->code, arm64_str_x_sp(12, 0));                // [sp+0] = mode
     emit_word(&e->code, arm64_add_x_imm(0, 31 /*SP*/, 48));    // x0 = &buf (buf is now sp+48)
     emit_word(&e->code, arm64_mov_w_reg(1, 9));                // x1 = flags
@@ -5162,9 +5169,22 @@ bool MLIR_WasmToMachoArm64(const uint8_t *wasm_bytes, size_t wasm_size,
     uint32_t ident_len = (uint32_t)strlen(ident);
     const uint32_t n_slots = (code_limit + page_size - 1) / page_size;
     const uint32_t ident_offset = 88;
-    const uint32_t hash_offset = ident_offset + ident_len + 1;
-    const uint32_t cd_len = hash_offset + n_slots * SHA256_DIGEST_LEN;
-    const uint32_t sb_len_unpadded = 20 + cd_len;
+    // The CodeDirectory carries n_special_slots = 2 hashes that
+    // precede the n_slots code-page hashes:
+    //   slot -2 (cdRequirementsSlot): SHA-256 of the Requirements blob
+    //   slot -1 (cdInfoSlot):         zero (no Info.plist)
+    // hash_offset points at code slot 0, so the two special slots
+    // live at hash_offset - 64.
+    const uint32_t n_special_slots = 2;
+    const uint32_t hash_offset = ident_offset + ident_len + 1
+                                 + n_special_slots * SHA256_DIGEST_LEN;
+    const uint32_t cd_len  = hash_offset + n_slots * SHA256_DIGEST_LEN;
+    const uint32_t req_len = 12;  // Requirements blob: magic+length+count(=0)
+    const uint32_t cms_len = 8;   // empty CMS BlobWrapper: magic+length
+    // SuperBlob header: 12 bytes (magic+length+count) + 3 index entries
+    // (8 bytes each) = 36 bytes.
+    const uint32_t sb_header = 12 + 3 * 8;
+    const uint32_t sb_len_unpadded = sb_header + cd_len + req_len + cms_len;
     const uint32_t code_sig_size = (sb_len_unpadded + 15u) & ~15u;
 
     // Patch all linkedit-data LCs (including LC_CODE_SIGNATURE) so
@@ -5202,16 +5222,51 @@ bool MLIR_WasmToMachoArm64(const uint8_t *wasm_bytes, size_t wasm_size,
     buf_patch_le32(&img, pos_lc_code_sig         + 8,  (uint32_t)code_sig_off);
     buf_patch_le32(&img, pos_lc_code_sig         + 12, code_sig_size);
 
-    // Patch __LINKEDIT segment filesize (data + code signature).
-    buf_patch_le64(&img, pos_linkedit_filesize,
-                   (uint64_t)(code_limit + code_sig_size) - linkedit_file_base);
+    // Patch __LINKEDIT segment filesize (data + code signature) and
+    // vmsize. vmsize must be at least as large as filesize and a
+    // multiple of the system page size — when vmsize is reported as
+    // smaller than filesize (as it was when we hard-coded it to
+    // VMSEG_SIZE = 16 KiB), AMFI sporadically rejects the binary
+    // at exec with "The file is adhoc signed or signed by an unknown
+    // certificate chain" (error -423), SIGKILLing the process.
+    uint64_t linkedit_filesize_v =
+        (uint64_t)(code_limit + code_sig_size) - linkedit_file_base;
+    uint64_t linkedit_vmsize_v =
+        (linkedit_filesize_v + (VMSEG_SIZE - 1u)) & ~(uint64_t)(VMSEG_SIZE - 1u);
+    if (linkedit_vmsize_v < VMSEG_SIZE) linkedit_vmsize_v = VMSEG_SIZE;
+    buf_patch_le64(&img, pos_linkedit_filesize,        linkedit_filesize_v);
+    buf_patch_le64(&img, pos_linkedit_filesize - 16,   linkedit_vmsize_v);
 
     free(symtab.data); free(indsyms.data); free(strtab.data);
 
     // Now build and append the code signature blob, hashing pages of
     // the now-final image bytes [0, code_limit).
+    //
+    // The SuperBlob mirrors what `codesign -f -s - <bin>` produces:
+    //
+    //   index[0] CSSLOT_CODEDIRECTORY (type 0x00000000) → CodeDirectory
+    //   index[1] CSSLOT_REQUIREMENTS  (type 0x00000002) → Requirements
+    //   index[2] CSSLOT_SIGNATURESLOT (type 0x00010000) → empty CMS
+    //
+    // A bare CodeDirectory (which is what we used to emit) caused
+    // AMFI on macOS to sporadically SIGKILL the process at exec with
+    // "Unrecoverable CT signature issue, bailing out" — roughly 5%
+    // of invocations on macOS 15.7 Apple Silicon. Embedding the two
+    // extra (empty) sub-blobs makes AMFI accept the adhoc signature
+    // reliably, matching the layout `codesign -f -s -` produces.
     Buf cs = {0};
     {
+        // Build the Requirements blob first so we can hash it for
+        // the cdRequirementsSlot special slot before finalising the
+        // CodeDirectory.
+        Buf req = {0};
+        buf_be32(&req, 0xfade0c01);              // CSMAGIC_REQUIREMENTS
+        buf_be32(&req, req_len);                 // total length
+        buf_be32(&req, 0);                       // sub-count = 0
+
+        uint8_t req_hash[SHA256_DIGEST_LEN];
+        sha256(req.data, req.len, req_hash);
+
         Buf cd = {0};
         buf_be32(&cd, 0xfade0c02);
         buf_be32(&cd, cd_len);
@@ -5222,11 +5277,11 @@ bool MLIR_WasmToMachoArm64(const uint8_t *wasm_bytes, size_t wasm_size,
         // (logged as "no CMS blob? ... Unrecoverable CT signature
         // issue, bailing out."). Producing a plain adhoc signature
         // (matching `codesign -f -s - <bin>` output) sidesteps the
-        // issue without needing to embed a real CMS SuperBlob.
+        // issue.
         buf_be32(&cd, 0x00000002);              // flags = CS_ADHOC
         buf_be32(&cd, hash_offset);
         buf_be32(&cd, ident_offset);
-        buf_be32(&cd, 0);
+        buf_be32(&cd, n_special_slots);         // nSpecialSlots = 2
         buf_be32(&cd, n_slots);
         buf_be32(&cd, code_limit);
         buf_u8(&cd, SHA256_DIGEST_LEN);
@@ -5255,6 +5310,13 @@ bool MLIR_WasmToMachoArm64(const uint8_t *wasm_bytes, size_t wasm_size,
         while (cd.len < ident_offset) buf_u8(&cd, 0);
         buf_append(&cd, ident, ident_len);
         buf_u8(&cd, 0);
+        // Special slots: stored at negative offsets from hash_offset.
+        // Slot -2 (cdRequirementsSlot) is the SHA-256 of the
+        // Requirements blob; slot -1 (cdInfoSlot) is zero (we don't
+        // embed an Info.plist). Slot -2 is written first so that its
+        // 32 bytes occupy [hash_offset - 64, hash_offset - 32).
+        buf_append(&cd, req_hash, SHA256_DIGEST_LEN);
+        for (int z = 0; z < SHA256_DIGEST_LEN; z++) buf_u8(&cd, 0);
         for (uint32_t i = 0; i < n_slots; i++) {
             uint32_t start  = i * page_size;
             uint32_t remain = code_limit - start;
@@ -5264,13 +5326,27 @@ bool MLIR_WasmToMachoArm64(const uint8_t *wasm_bytes, size_t wasm_size,
             buf_append(&cd, d, sizeof(d));
         }
 
-        buf_be32(&cs, 0xfade0cc0);
-        buf_be32(&cs, (uint32_t)(20 + cd.len));
-        buf_be32(&cs, 1);
-        buf_be32(&cs, 0);
-        buf_be32(&cs, 20);
+        // Assemble the SuperBlob: header + 3 index entries + the
+        // three sub-blobs in the same order as the index.
+        const uint32_t cd_off  = sb_header;
+        const uint32_t req_off = cd_off + cd_len;
+        const uint32_t cms_off = req_off + req_len;
+        buf_be32(&cs, 0xfade0cc0);              // CSMAGIC_EMBEDDED_SIGNATURE
+        buf_be32(&cs, sb_len_unpadded);
+        buf_be32(&cs, 3);                       // count
+        buf_be32(&cs, 0x00000000);              // CSSLOT_CODEDIRECTORY
+        buf_be32(&cs, cd_off);
+        buf_be32(&cs, 0x00000002);              // CSSLOT_REQUIREMENTS
+        buf_be32(&cs, req_off);
+        buf_be32(&cs, 0x00010000);              // CSSLOT_SIGNATURESLOT
+        buf_be32(&cs, cms_off);
         buf_append(&cs, cd.data, cd.len);
+        buf_append(&cs, req.data, req.len);
+        // Empty CMS BlobWrapper: header only, no payload.
+        buf_be32(&cs, 0xfade0b01);              // CSMAGIC_BLOBWRAPPER
+        buf_be32(&cs, cms_len);
         free(cd.data);
+        free(req.data);
     }
     while (cs.len < code_sig_size) buf_u8(&cs, 0);
     buf_append(&img, cs.data, cs.len);
