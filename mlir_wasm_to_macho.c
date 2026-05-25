@@ -1706,6 +1706,49 @@ static void os_flush_all(OpStack *os, Buf *buf) {
     os->mem_count = os->top;
 }
 
+// Spill all lazy (non-MEM) slots in the range [mem_count, top - keep_top)
+// to the SP-based memory stack, leaving the top `keep_top` slots
+// untouched.  Used by `call` and `call_indirect` to free the pool regs
+// (which are caller-saved across `bl`) while still consuming arg slots
+// lazily.  Slots are flushed bottom-up so each newly-spilled slot lands
+// at the (then) lowest SP, preserving the
+// "opstack-index-monotonic-in-SP" invariant.
+static void os_flush_below_top(OpStack *os, Buf *buf, uint32_t keep_top) {
+    if (os->top < keep_top) return;
+    uint32_t end = os->top - keep_top;
+    if (os->mem_count >= end) return;
+    for (uint32_t i = os->mem_count; i < end; i++) {
+        OpSlot *s = &os->slots[i];
+        bool is_64 = os_ty_is_64(s->ty);
+        switch (s->kind) {
+        case OS_LOCAL: {
+            uint32_t off = (os->n_locals_total - s->lidx) * 16u;
+            if (is_64) macho_local_ldr_x(buf, 0, off);
+            else       macho_local_ldr_w(buf, 0, off);
+            break;
+        }
+        case OS_CONST:
+            if (is_64) emit_mov_x_imm64(buf, 0, s->cval);
+            else       emit_mov_w_imm32(buf, 0, (uint32_t)s->cval);
+            break;
+        case OS_REG_GPR:
+            if (s->reg != 0) {
+                if (is_64) emit_word(buf, 0xaa0003e0u | ((uint32_t)s->reg << 16) | 0u);
+                else       emit_word(buf, arm64_mov_w_reg(0, s->reg));
+            }
+            os_release_pool_reg(os, s->reg);
+            break;
+        case OS_MEM:
+            continue;
+        }
+        emit_word(buf, arm64_sub_sp_imm(16));
+        if (is_64) emit_word(buf, arm64_str_x_sp(0, 0));
+        else       emit_word(buf, arm64_str_w_sp(0, 0));
+        s->kind = OS_MEM;
+    }
+    os->mem_count = end;
+}
+
 // Pop the top operand off the lazy stack and materialize it into a
 // specific GPR (writing the low 32 or full 64 bits depending on
 // `is_64`).  No-op-allowed: if the top is OS_REG_GPR with the same
@@ -2288,9 +2331,13 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
     // SP-based memory operand stack.
     #define LAZY_SYNC()  do { os.mem_count = os.top; } while (0)
     #define IS_LAZY_OP(op) (                                                  \
+            (op) == 0x10 /* call */ ||                                        \
+            (op) == 0x11 /* call_indirect */ ||                               \
             (op) == 0x20 /* local.get */ ||                                   \
             (op) == 0x21 /* local.set */ ||                                   \
             (op) == 0x22 /* local.tee */ ||                                   \
+            ((op) >= 0x28 && (op) <= 0x35) /* loads */ ||                     \
+            ((op) >= 0x36 && (op) <= 0x3b) /* stores */ ||                    \
             (op) == 0x41 /* i32.const */ ||                                   \
             (op) == 0x42 /* i64.const */ ||                                   \
             (op) == 0x45 /* i32.eqz */ ||                                     \
@@ -2786,7 +2833,10 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 value_depth -= 1;
                 break;
             }
-            // --- Memory loads (1 pop addr, 1 push value).
+            // --- Memory loads (1 pop addr, 1 push value). Address is
+            // consumed lazily from the operand stack; result is pushed
+            // back via `os_push_from_gpr` so it stays in a pool reg
+            // for the next consumer.
             //
             // Every load goes through `emit_compute_mem_addr` so the
             // final LDR uses #0 immediate offset. This sidesteps the
@@ -2814,71 +2864,62 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                             "func %u\n", op, fidx);
                     free(local_types); free(os.slots); return false;
                 }
-                emit_word(&e->code, arm64_ldr_w_sp(0, 0));   // addr -> w0
+                os_pop_to_gpr(&os, &e->code, 0, false);  // addr -> w0
                 if (!emit_compute_mem_addr(&e->code, off)) {
                     fprintf(stderr,
                             "wasm->macho: load 0x%02x offset %u exceeds "
                             "16 MB in func %u\n", op, off, fidx);
                     free(local_types); free(os.slots); return false;
                 }
+                uint8_t res_ty; bool res_is64;
                 // Issue the load; result -> w0 / x0.
                 switch (op) {
                     case 0x28: case 0x2a:
                         emit_word(&e->code, arm64_ldr_w_xn(0, 10, 0));
-                        emit_word(&e->code, arm64_str_w_sp(0, 0));
-                        break;
+                        res_ty = (op == 0x2a ? 0x7d : 0x7f); res_is64 = false; break;
                     case 0x29: case 0x2b:
                         emit_word(&e->code, arm64_ldr_x_xn(0, 10, 0));
-                        emit_word(&e->code, arm64_str_x_sp(0, 0));
-                        break;
+                        res_ty = (op == 0x2b ? 0x7c : 0x7e); res_is64 = true; break;
                     case 0x2c:
                         emit_word(&e->code, arm64_ldrsb_w_xn(0, 10, 0));
-                        emit_word(&e->code, arm64_str_w_sp(0, 0));
-                        break;
+                        res_ty = 0x7f; res_is64 = false; break;
                     case 0x2d:
                         emit_word(&e->code, arm64_ldrb_w_xn(0, 10, 0));
-                        emit_word(&e->code, arm64_str_w_sp(0, 0));
-                        break;
+                        res_ty = 0x7f; res_is64 = false; break;
                     case 0x2e:
                         emit_word(&e->code, arm64_ldrsh_w_xn(0, 10, 0));
-                        emit_word(&e->code, arm64_str_w_sp(0, 0));
-                        break;
+                        res_ty = 0x7f; res_is64 = false; break;
                     case 0x2f:
                         emit_word(&e->code, arm64_ldrh_w_xn(0, 10, 0));
-                        emit_word(&e->code, arm64_str_w_sp(0, 0));
-                        break;
+                        res_ty = 0x7f; res_is64 = false; break;
                     case 0x30:
-                        // ldrsb w0; sxtb x0,w0; str x0 -> slot.
                         emit_word(&e->code, arm64_ldrsb_w_xn(0, 10, 0));
                         emit_word(&e->code, arm64_sxtb_x(0, 0));
-                        emit_word(&e->code, arm64_str_x_sp(0, 0));
-                        break;
+                        res_ty = 0x7e; res_is64 = true; break;
                     case 0x31:
                         emit_word(&e->code, arm64_ldrb_w_xn(0, 10, 0));
-                        emit_word(&e->code, arm64_str_x_sp(0, 0));
-                        break;
+                        res_ty = 0x7e; res_is64 = true; break;
                     case 0x32:
                         emit_word(&e->code, arm64_ldrsh_w_xn(0, 10, 0));
                         emit_word(&e->code, arm64_sxth_x(0, 0));
-                        emit_word(&e->code, arm64_str_x_sp(0, 0));
-                        break;
+                        res_ty = 0x7e; res_is64 = true; break;
                     case 0x33:
                         emit_word(&e->code, arm64_ldrh_w_xn(0, 10, 0));
-                        emit_word(&e->code, arm64_str_x_sp(0, 0));
-                        break;
+                        res_ty = 0x7e; res_is64 = true; break;
                     case 0x34:
                         emit_word(&e->code, arm64_ldrsw_x_xn(0, 10, 0));
-                        emit_word(&e->code, arm64_str_x_sp(0, 0));
-                        break;
+                        res_ty = 0x7e; res_is64 = true; break;
                     case 0x35:
                         emit_word(&e->code, arm64_ldr_w_xn(0, 10, 0));
-                        emit_word(&e->code, arm64_str_x_sp(0, 0));
-                        break;
+                        res_ty = 0x7e; res_is64 = true; break;
+                    default: res_ty = 0x7f; res_is64 = false; break;
                 }
+                os_push_from_gpr(&os, &e->code, 0, res_ty, res_is64);
                 break;
             }
 
-            // --- Memory stores (2 pop: addr below, value above).
+            // --- Memory stores (2 pop: value above, addr below). Both
+            // operands are consumed lazily from the operand stack.
             case 0x36:   // i32.store
             case 0x37:   // i64.store
             case 0x38:   // f32.store    (bit-identical to i32.store)
@@ -2893,10 +2934,11 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                             "func %u\n", op, fidx);
                     free(local_types); free(os.slots); return false;
                 }
-                // Pop value (full 64-bit slot) into x1, addr into w0.
-                emit_word(&e->code, arm64_ldr_x_sp(1, 0));
-                emit_word(&e->code, arm64_ldr_w_sp(0, 16));
-                emit_word(&e->code, arm64_add_sp_imm(32));
+                bool val_is64 = (op == 0x37 || op == 0x39);
+                // Pop value -> x1 / w1, addr -> w0. The lazy materializers
+                // only touch x0/x10/SP, never x1, so the order is safe.
+                os_pop_to_gpr(&os, &e->code, 1, val_is64);
+                os_pop_to_gpr(&os, &e->code, 0, false);
                 if (!emit_compute_mem_addr(&e->code, off)) {
                     fprintf(stderr,
                             "wasm->macho: store 0x%02x offset %u exceeds "
@@ -2917,7 +2959,6 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                         emit_word(&e->code, arm64_strh_w_xn(1, 10, 0));
                         break;
                 }
-                value_depth -= 2;
                 break;
             }
             case 0x3f: { // memory.size — pushes the linear-memory size in
@@ -2962,16 +3003,12 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 emit_word(&e->code, arm64_str_w_sp(5, 0));
                 break;
             }
-            case 0x10: { // call funcidx
+            case 0x10: { // call funcidx — lazy-arg variant
                 uint32_t cidx = (uint32_t)rd_uleb(&r);
                 uint32_t np = 0, nr = 0;
                 uint8_t param_types[32] = {0};
                 uint8_t result_types[1] = {0};
                 if (cidx < wm->n_imported_funcs) {
-                    // Look up the imported function's wasm-PCS signature
-                    // from its type index. The shim we emit for this
-                    // import follows the same signature, so the
-                    // arg-passing convention below applies uniformly.
                     if (!type_arity_params(wm,
                                            wm->import_type_idx[cidx],
                                            &np, &nr,
@@ -3004,11 +3041,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                     free(local_types); free(os.slots); return false;
                 }
                 // ARM64 PCS: GPRs (x0..x7) and FPRs (d0..d7) are
-                // *independent* sequences. Walk left-to-right and
-                // assign each param either to its register slot, or
-                // (once that sequence overflows past 8 args) to the
-                // next 8-byte slot in a contiguous PCS region pushed
-                // just below the new SP at the call site.
+                // *independent* sequences.
                 uint8_t arg_reg[32] = {0};
                 uint8_t arg_is_fp[32] = {0};
                 uint8_t arg_on_stack[32] = {0};
@@ -3035,29 +3068,37 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                         }
                     }
                 }
-                // Reserve a PCS stack-args region just below the
-                // current CPU-stack tip. The region is 16-byte
-                // aligned so SP stays aligned across the `bl`.
+                // Spill any non-arg lazy slots so pool regs are free
+                // across `bl` (x11..x15 are caller-saved).  Args remain
+                // on the lazy stack and are consumed below.
+                os_flush_below_top(&os, &e->code, np);
+                uint32_t args_base = os.top - np;
+                // Count MEM args: the bottom of the args region overlaps
+                // with the OS_MEM region (which is now [0, mem_count)).
+                uint32_t nm = 0;
+                if (os.mem_count > args_base) nm = os.mem_count - args_base;
+                if (nm > np) nm = np;
+                // Reserve PCS stack-args region just below the current
+                // CPU-stack tip.
                 uint32_t pcs_size = (n_stack_args * 8u + 15u) & ~15u;
                 if (pcs_size > 0) {
                     emit_word(&e->code, arm64_sub_sp_imm((uint16_t)pcs_size));
                 }
-                // Pop args off the CPU stack from top (= last param)
-                // down to bottom (= first param). The CPU-stack value
-                // for arg `k` currently lives at
-                //   [sp, #(pcs_size + (np - 1 - k) * 16)]
-                // (pcs_size accounts for the freshly-reserved PCS
-                // region below the value-stack args). Register args
-                // are loaded directly into their assigned register;
-                // stack args are loaded into scratch x9/d9 and then
-                // stored into the PCS region at the corresponding
-                // 8-byte slot.
+                // Materialize args right-to-left.  Reg-arg loads use the
+                // highest reg index first, then lower; this avoids
+                // clobbering an already-loaded x0 when later args want a
+                // higher reg.  Stack-args go through scratch x9/d9.
                 for (int k = (int)np - 1; k >= 0; k--) {
+                    OpSlot *slot = &os.slots[args_base + (uint32_t)k];
                     uint8_t t = param_types[k];
-                    uint32_t cpu_off = pcs_size
-                                     + (uint32_t)(np - 1 - (uint32_t)k) * 16u;
-                    if (!arg_on_stack[k]) {
-                        uint32_t r_idx = arg_reg[k];
+                    bool fp = arg_is_fp[k];
+                    uint32_t r_idx = arg_on_stack[k] ? 9u : (uint32_t)arg_reg[k];
+                    if (slot->kind == OS_MEM) {
+                        // SP offset of the j-th slot of the MEM region
+                        // (counted from bottom = 0) is (mem_count-1-j)*16.
+                        uint32_t j = args_base + (uint32_t)k;
+                        uint32_t cpu_off = pcs_size
+                                         + (os.mem_count - 1u - j) * 16u;
                         if (t == 0x7c)
                             emit_word(&e->code, arm64_ldr_d_sp(r_idx, cpu_off));
                         else if (t == 0x7d)
@@ -3065,20 +3106,37 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                         else
                             emit_word(&e->code, arm64_ldr_x_sp(r_idx, cpu_off));
                     } else {
-                        uint32_t pcs_off = (uint32_t)pcs_slot_idx[k] * 8u;
-                        if (t == 0x7c) {
-                            emit_word(&e->code, arm64_ldr_d_sp(9, cpu_off));
-                            emit_word(&e->code, arm64_str_d_sp(9, pcs_off));
-                        } else if (t == 0x7d) {
-                            emit_word(&e->code, arm64_ldr_s_sp(9, cpu_off));
-                            emit_word(&e->code, arm64_str_s_sp(9, pcs_off));
+                        // OS_LOCAL/OS_CONST/OS_REG_GPR: materialize
+                        // directly (no SP traffic), so subsequent OS_MEM
+                        // arg offsets stay valid.
+                        if (fp) {
+                            bool is_64 = (t == 0x7c);
+                            os_materialize_into_fpr(&os, &e->code, slot,
+                                                    r_idx, is_64);
                         } else {
-                            emit_word(&e->code, arm64_ldr_x_sp(9, cpu_off));
-                            emit_word(&e->code, arm64_str_x_sp(9, pcs_off));
+                            bool is_64 = (t == 0x7e);
+                            os_materialize_into_gpr(&os, &e->code, slot,
+                                                    r_idx, is_64);
+                        }
+                        if (slot->kind == OS_REG_GPR) {
+                            os_release_pool_reg(&os, slot->reg);
                         }
                     }
+                    if (arg_on_stack[k]) {
+                        uint32_t pcs_off = (uint32_t)pcs_slot_idx[k] * 8u;
+                        if (t == 0x7c)
+                            emit_word(&e->code, arm64_str_d_sp(9, pcs_off));
+                        else if (t == 0x7d)
+                            emit_word(&e->code, arm64_str_s_sp(9, pcs_off));
+                        else
+                            emit_word(&e->code, arm64_str_x_sp(9, pcs_off));
+                    }
+                    // Clear stale kind so a later legacy push at this
+                    // slot index doesn't get mis-interpreted as a still-
+                    // live lazy producer (e.g. OS_LOCAL(N) loading the
+                    // wrong local).
+                    slot->kind = OS_MEM;
                 }
-                // Place a `bl` placeholder.
                 CallReloc rel = {
                     .site_off = (uint32_t)e->code.len,
                     .target = cidx,
@@ -3086,11 +3144,10 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 };
                 ef_push_reloc(e, rel);
                 emit_word(&e->code, arm64_bl(0));
-                // Free the PCS region + all CPU-stack arg slots in one
-                // shot. With np <= 32, total_free <= 32*16 + 256 == 768,
-                // fits comfortably in imm12.
+                // Free PCS region + only the MEM arg slots (lazy args
+                // never occupied SP-stack space).
                 {
-                    uint32_t total_free = pcs_size + np * 16u;
+                    uint32_t total_free = pcs_size + nm * 16u;
                     if (total_free > 0xfffu) {
                         fprintf(stderr,
                                 "wasm->macho: call with %u params (frame "
@@ -3101,21 +3158,30 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                         emit_word(&e->code, arm64_add_sp_imm((uint16_t)total_free));
                     }
                 }
+                // Drop args from the OpStack.
+                os.top -= np;
+                os.mem_count -= nm;
                 if (nr == 1) {
-                    emit_word(&e->code, arm64_sub_sp_imm(16));
                     uint8_t rt = result_types[0];
-                    if (rt == 0x7c)
-                        emit_word(&e->code, arm64_str_d_sp(0, 0));
-                    else if (rt == 0x7d)
-                        emit_word(&e->code, arm64_str_s_sp(0, 0));
-                    else
-                        emit_word(&e->code, arm64_str_x_sp(0, 0));
+                    if (rt == 0x7c || rt == 0x7d) {
+                        // Float result: spill to SP-stack (no FPR pool
+                        // yet).
+                        emit_word(&e->code, arm64_sub_sp_imm(16));
+                        if (rt == 0x7c)
+                            emit_word(&e->code, arm64_str_d_sp(0, 0));
+                        else
+                            emit_word(&e->code, arm64_str_s_sp(0, 0));
+                        os_push_mem(&os, rt);
+                    } else {
+                        // Integer/pointer result in x0: push via pool reg.
+                        bool res_is64 = (rt == 0x7e);
+                        os_push_from_gpr(&os, &e->code, 0, rt, res_is64);
+                    }
                 }
-                value_depth = value_depth - np + nr;
                 break;
             }
 
-            case 0x11: { // call_indirect typeidx tableidx
+            case 0x11: { // call_indirect typeidx tableidx — lazy-arg variant
                 uint32_t typeidx  = (uint32_t)rd_uleb(&r);
                 uint32_t tableidx = (uint32_t)rd_uleb(&r);
                 if (tableidx != 0) {
@@ -3143,14 +3209,14 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                             "not supported\n", nr);
                     free(local_types); free(os.slots); return false;
                 }
-                // Pop the table index (i32, top of stack) into w8.
-                // x8 is a scratch register not used by the PCS for the
-                // args we are about to load (x0..x7 / d0..d7), so it
-                // survives the arg-load loop intact.
-                emit_word(&e->code, arm64_ldr_w_sp(8, 0));
-                emit_word(&e->code, arm64_add_sp_imm(16));
+                // Pop the table index (top of operand stack) into w8.
+                // x8 is scratch-safe across the rest of the call setup
+                // because PCS uses only x0..x7/d0..d7 + x9 for our
+                // scratch path.
+                os_pop_to_gpr(&os, &e->code, 8, false);
 
                 uint8_t arg_reg[32] = {0};
+                uint8_t arg_is_fp[32] = {0};
                 uint8_t arg_on_stack[32] = {0};
                 uint8_t pcs_slot_idx[32] = {0};
                 uint32_t n_gpr = 0, n_fpr = 0;
@@ -3158,6 +3224,7 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 for (uint32_t k = 0; k < np; k++) {
                     uint8_t t = param_types[k];
                     bool fp = (t == 0x7c) || (t == 0x7d);
+                    arg_is_fp[k] = fp;
                     if (fp) {
                         if (n_fpr < 8) {
                             arg_reg[k] = (uint8_t)n_fpr++;
@@ -3174,16 +3241,24 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                         }
                     }
                 }
+                os_flush_below_top(&os, &e->code, np);
+                uint32_t args_base = os.top - np;
+                uint32_t nm = 0;
+                if (os.mem_count > args_base) nm = os.mem_count - args_base;
+                if (nm > np) nm = np;
                 uint32_t pcs_size = (n_stack_args * 8u + 15u) & ~15u;
                 if (pcs_size > 0) {
                     emit_word(&e->code, arm64_sub_sp_imm((uint16_t)pcs_size));
                 }
                 for (int k = (int)np - 1; k >= 0; k--) {
+                    OpSlot *slot = &os.slots[args_base + (uint32_t)k];
                     uint8_t t = param_types[k];
-                    uint32_t cpu_off = pcs_size
-                                     + (uint32_t)(np - 1 - (uint32_t)k) * 16u;
-                    if (!arg_on_stack[k]) {
-                        uint32_t r_idx = arg_reg[k];
+                    bool fp = arg_is_fp[k];
+                    uint32_t r_idx = arg_on_stack[k] ? 9u : (uint32_t)arg_reg[k];
+                    if (slot->kind == OS_MEM) {
+                        uint32_t j = args_base + (uint32_t)k;
+                        uint32_t cpu_off = pcs_size
+                                         + (os.mem_count - 1u - j) * 16u;
                         if (t == 0x7c)
                             emit_word(&e->code, arm64_ldr_d_sp(r_idx, cpu_off));
                         else if (t == 0x7d)
@@ -3191,18 +3266,32 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                         else
                             emit_word(&e->code, arm64_ldr_x_sp(r_idx, cpu_off));
                     } else {
-                        uint32_t pcs_off = (uint32_t)pcs_slot_idx[k] * 8u;
-                        if (t == 0x7c) {
-                            emit_word(&e->code, arm64_ldr_d_sp(9, cpu_off));
-                            emit_word(&e->code, arm64_str_d_sp(9, pcs_off));
-                        } else if (t == 0x7d) {
-                            emit_word(&e->code, arm64_ldr_s_sp(9, cpu_off));
-                            emit_word(&e->code, arm64_str_s_sp(9, pcs_off));
+                        if (fp) {
+                            bool is_64 = (t == 0x7c);
+                            os_materialize_into_fpr(&os, &e->code, slot,
+                                                    r_idx, is_64);
                         } else {
-                            emit_word(&e->code, arm64_ldr_x_sp(9, cpu_off));
-                            emit_word(&e->code, arm64_str_x_sp(9, pcs_off));
+                            bool is_64 = (t == 0x7e);
+                            os_materialize_into_gpr(&os, &e->code, slot,
+                                                    r_idx, is_64);
+                        }
+                        if (slot->kind == OS_REG_GPR) {
+                            os_release_pool_reg(&os, slot->reg);
                         }
                     }
+                    if (arg_on_stack[k]) {
+                        uint32_t pcs_off = (uint32_t)pcs_slot_idx[k] * 8u;
+                        if (t == 0x7c)
+                            emit_word(&e->code, arm64_str_d_sp(9, pcs_off));
+                        else if (t == 0x7d)
+                            emit_word(&e->code, arm64_str_s_sp(9, pcs_off));
+                        else
+                            emit_word(&e->code, arm64_str_x_sp(9, pcs_off));
+                    }
+                    // Clear stale kind so a later legacy push at this
+                    // slot index doesn't get mis-interpreted as a still-
+                    // live lazy producer.
+                    slot->kind = OS_MEM;
                 }
                 // x10 = x27 + fnptr_table_off  (table base in __DATA).
                 uint32_t fto = wm->fnptr_table_off;
@@ -3227,9 +3316,8 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 emit_word(&e->code, arm64_ldr_x_xn_wm_uxtw3(9, 10, 8));
                 emit_word(&e->code, arm64_blr(9));
 
-                // Free PCS region + cpu stack args.
                 {
-                    uint32_t total_free = pcs_size + np * 16u;
+                    uint32_t total_free = pcs_size + nm * 16u;
                     if (total_free > 0xfffu) {
                         fprintf(stderr,
                                 "wasm->macho: call_indirect with %u params "
@@ -3240,18 +3328,22 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                         emit_word(&e->code, arm64_add_sp_imm((uint16_t)total_free));
                     }
                 }
-
+                os.top -= np;
+                os.mem_count -= nm;
                 if (nr == 1) {
-                    emit_word(&e->code, arm64_sub_sp_imm(16));
                     uint8_t rt = result_types[0];
-                    if (rt == 0x7c)
-                        emit_word(&e->code, arm64_str_d_sp(0, 0));
-                    else if (rt == 0x7d)
-                        emit_word(&e->code, arm64_str_s_sp(0, 0));
-                    else
-                        emit_word(&e->code, arm64_str_x_sp(0, 0));
+                    if (rt == 0x7c || rt == 0x7d) {
+                        emit_word(&e->code, arm64_sub_sp_imm(16));
+                        if (rt == 0x7c)
+                            emit_word(&e->code, arm64_str_d_sp(0, 0));
+                        else
+                            emit_word(&e->code, arm64_str_s_sp(0, 0));
+                        os_push_mem(&os, rt);
+                    } else {
+                        bool res_is64 = (rt == 0x7e);
+                        os_push_from_gpr(&os, &e->code, 0, rt, res_is64);
+                    }
                 }
-                value_depth = value_depth - 1 - np + nr;
                 break;
             }
             // --- i32 comparisons (2 pop, 1 push). Pattern:
