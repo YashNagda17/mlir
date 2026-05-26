@@ -519,6 +519,7 @@ static void bm_free(BlockMap *m) { free(m->src); free(m->dst); memset(m, 0, size
 // =============================================================================
 enum {
     COND_EQ = 0, COND_NE = 1, COND_CS = 2, COND_CC = 3,
+    COND_MI = 4, COND_PL = 5, COND_VS = 6, COND_VC = 7,
     COND_HI = 8, COND_LS = 9, COND_GE = 10, COND_LT = 11,
     COND_GT = 12, COND_LE = 13,
 };
@@ -1493,6 +1494,8 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     MLIR_BlockHandle spec_s_loop  = MLIR_CreateBlock(ctx);
     MLIR_BlockHandle spec_s_done  = MLIR_CreateBlock(ctx);
     MLIR_BlockHandle spec_c       = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle spec_f       = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle spec_skip    = MLIR_CreateBlock(ctx);
     MLIR_BlockHandle done         = MLIR_CreateBlock(ctx);
 
     MLIR_AppendRegionBlock(ctx, region, entry);
@@ -1509,6 +1512,8 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     MLIR_AppendRegionBlock(ctx, region, spec_s_loop);
     MLIR_AppendRegionBlock(ctx, region, spec_s_done);
     MLIR_AppendRegionBlock(ctx, region, spec_c);
+    MLIR_AppendRegionBlock(ctx, region, spec_f);
+    MLIR_AppendRegionBlock(ctx, region, spec_skip);
     MLIR_AppendRegionBlock(ctx, region, done);
 
     // ---------- entry ----------
@@ -1578,6 +1583,21 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     emit_b_cond(ctx, spec_top, COND_EQ, spec_s);
     emit_cmp_imm(ctx, spec_top, /*rn=*/9, /*imm12=*/'c', /*sf=*/false);
     emit_b_cond(ctx, spec_top, COND_EQ, spec_c);
+    emit_cmp_imm(ctx, spec_top, /*rn=*/9, /*imm12=*/'f', /*sf=*/false);
+    emit_b_cond(ctx, spec_top, COND_EQ, spec_f);
+    emit_cmp_imm(ctx, spec_top, /*rn=*/9, /*imm12=*/'g', /*sf=*/false);
+    emit_b_cond(ctx, spec_top, COND_EQ, spec_f);
+    emit_cmp_imm(ctx, spec_top, /*rn=*/9, /*imm12=*/'e', /*sf=*/false);
+    emit_b_cond(ctx, spec_top, COND_EQ, spec_f);
+    // Precision / width specifiers: skip '.' and any decimal digits and
+    // come back around for the actual conversion character.
+    emit_cmp_imm(ctx, spec_top, /*rn=*/9, /*imm12=*/'.', /*sf=*/false);
+    emit_b_cond(ctx, spec_top, COND_EQ, spec_skip);
+    // '0' .. '9' → skip (treat as width/precision digit)
+    emit_cmp_imm(ctx, spec_top, /*rn=*/9, /*imm12=*/'0', /*sf=*/false);
+    emit_b_cond(ctx, spec_top, COND_LT, loop_top);
+    emit_cmp_imm(ctx, spec_top, /*rn=*/9, /*imm12=*/'9', /*sf=*/false);
+    emit_b_cond(ctx, spec_top, COND_LE, spec_skip);
     // Unknown spec char: silently skip back to top-level fmt loop.
     emit_b(ctx, spec_top, loop_top);
 
@@ -1683,6 +1703,27 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     emit_movz(ctx, spec_c, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
     emit_svc(ctx, spec_c, 0x80);
     emit_b(ctx, spec_c, loop_top);
+
+    // ---------- spec_f ----------
+    // %f / %g / %e: read a double (8 bytes, aligned to 8) from args and
+    // BL printF64. The double's i64 bit pattern is passed in x0 as the
+    // wmir carrier convention.
+    emit_add_imm(ctx, spec_f, /*rd=*/20, /*rn=*/20,
+                 /*imm12=*/7, /*sf=*/true);
+    emit_movz(ctx, spec_f, /*rd=*/12, /*imm16=*/3, /*hw=*/0, /*sf=*/true);
+    emit_3reg(ctx, spec_f, OP_TYPE_AARCH64_LSR_REG,
+              /*rd=*/20, /*rn=*/20, /*rm=*/12, /*sf=*/true);
+    emit_3reg(ctx, spec_f, OP_TYPE_AARCH64_LSL_REG,
+              /*rd=*/20, /*rn=*/20, /*rm=*/12, /*sf=*/true);
+    emit_ldr_x(ctx, spec_f, /*rt=*/0, /*rn=*/20, /*off=*/0);
+    emit_add_imm(ctx, spec_f, /*rd=*/20, /*rn=*/20,
+                 /*imm12=*/8, /*sf=*/true);
+    emit_bl(ctx, spec_f, str_lit("printF64"));
+    emit_b(ctx, spec_f, loop_top);
+
+    // ---------- spec_skip ----------
+    // Width / precision digit or '.': consume but don't reset ll_count.
+    emit_b(ctx, spec_skip, spec_top);
 
     // ---------- done ----------
     // Return 0 (we don't bother tracking the actual byte count).
@@ -2142,6 +2183,626 @@ static MLIR_OpHandle synth_tinyc_va_arg_ptr(MLIR_Context *ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// tinyc_va_arg_f64(i32 ap_ofs) -> i64: identical to tinyc_va_arg_i64 — the
+// wmir carrier convention treats f64 as its i64 bit-pattern, and the
+// va_list always stores f64 args as 8 raw bytes 8-byte-aligned.
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_tinyc_va_arg_f64(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    // x9 = host(ap)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 9); a[1] = attr_i32(ctx, "rn", 0);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/9, /*rn=*/28, /*rm=*/9, /*sf=*/true);
+    // w10 = *ap; align up to 8.
+    emit_ldr_w(ctx, entry, /*rt=*/10, /*rn=*/9, /*off=*/0);
+    emit_add_imm(ctx, entry, /*rd=*/10, /*rn=*/10, /*imm12=*/7, /*sf=*/false);
+    emit_movz(ctx, entry, /*rd=*/12, /*imm16=*/3, /*hw=*/0, /*sf=*/false);
+    emit_3reg(ctx, entry, OP_TYPE_AARCH64_LSR_REG,
+              /*rd=*/10, /*rn=*/10, /*rm=*/12, /*sf=*/false);
+    emit_3reg(ctx, entry, OP_TYPE_AARCH64_LSL_REG,
+              /*rd=*/10, /*rn=*/10, /*rm=*/12, /*sf=*/false);
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 11); a[1] = attr_i32(ctx, "rn", 10);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/11, /*rn=*/28, /*rm=*/11, /*sf=*/true);
+    emit_ldr_x(ctx, entry, /*rt=*/0, /*rn=*/11, /*off=*/0);
+    emit_add_imm(ctx, entry, /*rd=*/10, /*rn=*/10, /*imm12=*/8, /*sf=*/false);
+    emit_str_w(ctx, entry, /*rt=*/10, /*rn=*/9, /*off=*/0);
+    emit_epilogue(ctx, entry, /*frame_size=*/16);
+    emit_ret(ctx, entry);
+    return synth_leaf_finish(ctx, region, "tinyc_va_arg_f64", 16);
+}
+
+// -----------------------------------------------------------------------------
+// printF64(double v) -> void  (v arrives as the i64 bit-pattern in X0).
+//
+// Implements a fixed-decimal-style float formatter equivalent to
+// runtime_wasm.c's fmt_f64 + wasm_write(buf,len). Output:
+//   - "nan" if NaN
+//   - "-<rest>" if negative
+//   - "inf" if magnitude > 1e308
+//   - "0" if magnitude exactly zero
+//   - Otherwise 6 significant digits, trailing zeros trimmed, fixed
+//     notation when -4 <= exp10 < 6, scientific notation otherwise.
+//
+// All cross-block state lives in callee-saved-style registers within
+// this single function frame, since synth_print_f64 is a leaf except
+// for the trailing write(2) syscall which doesn't clobber GPRs we use.
+//
+// Frame layout (96 bytes, 16-aligned):
+//   [ 0..63 ] 64-byte ASCII output buffer (no NUL)
+//   [64..71 ] 8-byte digit ring used during extraction
+//
+// Live registers (preserved across all internal blocks):
+//   X13 = buf base   X14 = digits ptr
+//   W9  = out        W10 = exp10 (signed)   W11 = ndig
+//   W12 = neg (0/1)  D8  = m (current mantissa)
+//   D9  = 10.0       D10 = 1.0              D11 = 0.0
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_print_f64(MLIR_Context *ctx) {
+    MLIR_RegionHandle region = MLIR_CreateRegion(ctx);
+    MLIR_BlockHandle entry        = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bnan         = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bcheck_neg   = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bdo_neg      = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bcheck_inf   = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle binf         = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bcheck_zero  = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bzero        = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bnorm_up_hd  = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bnorm_up_bd  = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bnorm_dn_hd  = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bnorm_dn_bd  = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bextract_hd  = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bextract_bd  = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle btrim_hd     = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle btrim_bd     = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bfmt_select  = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bfixed_pos_hd= MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bfixed_pos_bd= MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bfixed_pos_dot = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bfixed_pos_fr_hd = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bfixed_pos_fr_bd = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bfixed_neg_lead_hd = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bfixed_neg_lead_bd = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bfixed_neg_digits_hd = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bfixed_neg_digits_bd = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bsci         = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bsci_frac_hd = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bsci_frac_bd = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bsci_exp     = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bdo_write    = MLIR_CreateBlock(ctx);
+
+    MLIR_AppendRegionBlock(ctx, region, entry);
+    MLIR_AppendRegionBlock(ctx, region, bnan);
+    MLIR_AppendRegionBlock(ctx, region, bcheck_neg);
+    MLIR_AppendRegionBlock(ctx, region, bdo_neg);
+    MLIR_AppendRegionBlock(ctx, region, bcheck_inf);
+    MLIR_AppendRegionBlock(ctx, region, binf);
+    MLIR_AppendRegionBlock(ctx, region, bcheck_zero);
+    MLIR_AppendRegionBlock(ctx, region, bzero);
+    MLIR_AppendRegionBlock(ctx, region, bnorm_up_hd);
+    MLIR_AppendRegionBlock(ctx, region, bnorm_up_bd);
+    MLIR_AppendRegionBlock(ctx, region, bnorm_dn_hd);
+    MLIR_AppendRegionBlock(ctx, region, bnorm_dn_bd);
+    MLIR_AppendRegionBlock(ctx, region, bextract_hd);
+    MLIR_AppendRegionBlock(ctx, region, bextract_bd);
+    MLIR_AppendRegionBlock(ctx, region, btrim_hd);
+    MLIR_AppendRegionBlock(ctx, region, btrim_bd);
+    MLIR_AppendRegionBlock(ctx, region, bfmt_select);
+    MLIR_AppendRegionBlock(ctx, region, bfixed_pos_hd);
+    MLIR_AppendRegionBlock(ctx, region, bfixed_pos_bd);
+    MLIR_AppendRegionBlock(ctx, region, bfixed_pos_dot);
+    MLIR_AppendRegionBlock(ctx, region, bfixed_pos_fr_hd);
+    MLIR_AppendRegionBlock(ctx, region, bfixed_pos_fr_bd);
+    MLIR_AppendRegionBlock(ctx, region, bfixed_neg_lead_hd);
+    MLIR_AppendRegionBlock(ctx, region, bfixed_neg_lead_bd);
+    MLIR_AppendRegionBlock(ctx, region, bfixed_neg_digits_hd);
+    MLIR_AppendRegionBlock(ctx, region, bfixed_neg_digits_bd);
+    MLIR_AppendRegionBlock(ctx, region, bsci);
+    MLIR_AppendRegionBlock(ctx, region, bsci_frac_hd);
+    MLIR_AppendRegionBlock(ctx, region, bsci_frac_bd);
+    MLIR_AppendRegionBlock(ctx, region, bsci_exp);
+    MLIR_AppendRegionBlock(ctx, region, bdo_write);
+
+    emit_prologue(ctx, entry, /*frame_size=*/96);
+    // D0 <- X0 (FP carrier convention: i64 bit-pattern in X0 is the
+    // double we want to format).
+    emit_fmov_gp_v(ctx, entry, /*dir_to_v=*/true, /*sf=*/true,
+                   /*rd=*/0, /*rn=*/0);
+    // X13 = sp + 0 (buf base)
+    emit_add_imm(ctx, entry, /*rd=*/13, /*rn=*/31, /*imm12=*/0, /*sf=*/true);
+    // X14 = X13 + 64 (digits ptr)
+    emit_add_imm(ctx, entry, /*rd=*/14, /*rn=*/13, /*imm12=*/64, /*sf=*/true);
+    // W9 = 0 (out), W12 = 0 (neg)
+    emit_movz(ctx, entry, /*rd=*/9, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_movz(ctx, entry, /*rd=*/12, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    // D9 = 10.0  (0x4024_0000_0000_0000)
+    emit_movz(ctx, entry, /*rd=*/15, /*imm16=*/0x4024, /*hw=*/3, /*sf=*/true);
+    emit_fmov_gp_v(ctx, entry, /*dir_to_v=*/true, /*sf=*/true,
+                   /*rd=*/9,  /*rn=*/15);
+    // D10 = 1.0   (0x3FF0_0000_0000_0000)
+    emit_movz(ctx, entry, /*rd=*/15, /*imm16=*/0x3FF0, /*hw=*/3, /*sf=*/true);
+    emit_fmov_gp_v(ctx, entry, /*dir_to_v=*/true, /*sf=*/true,
+                   /*rd=*/10, /*rn=*/15);
+    // D11 = 0.0
+    emit_movz(ctx, entry, /*rd=*/15, /*imm16=*/0, /*hw=*/0, /*sf=*/true);
+    emit_fmov_gp_v(ctx, entry, /*dir_to_v=*/true, /*sf=*/true,
+                   /*rd=*/11, /*rn=*/15);
+    // D8 = D0 (working copy)
+    emit_fmov_gp_v(ctx, entry, /*dir_to_v=*/false, /*sf=*/true,
+                   /*rd=*/15, /*rn=*/0);
+    emit_fmov_gp_v(ctx, entry, /*dir_to_v=*/true,  /*sf=*/true,
+                   /*rd=*/8,  /*rn=*/15);
+    // NaN check: FCMP D0,D0; B.NE bnan
+    emit_fcmp(ctx, entry, /*fwidth=*/64, /*rn=*/0, /*rm=*/0);
+    emit_b_cond(ctx, entry, COND_NE, bnan);
+    emit_b(ctx, entry, bcheck_neg);
+
+    // ---- bnan: write "nan" (3 bytes) directly at buf[0..2], out=3
+    emit_movz(ctx, bnan, /*rd=*/15, /*imm16=*/'n', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, bnan, /*rt=*/15, /*rn=*/13, /*off=*/0);
+    emit_movz(ctx, bnan, /*rd=*/15, /*imm16=*/'a', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, bnan, /*rt=*/15, /*rn=*/13, /*off=*/1);
+    emit_movz(ctx, bnan, /*rd=*/15, /*imm16=*/'n', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, bnan, /*rt=*/15, /*rn=*/13, /*off=*/2);
+    emit_movz(ctx, bnan, /*rd=*/9,  /*imm16=*/3, /*hw=*/0, /*sf=*/false);
+    emit_b(ctx, bnan, bdo_write);
+
+    // ---- bcheck_neg: if D8 < 0 -> write '-', D8 = -D8, neg=1, out=1
+    emit_fcmp(ctx, bcheck_neg, /*fwidth=*/64, /*rn=*/8, /*rm=*/11);
+    emit_b_cond(ctx, bcheck_neg, COND_MI, bdo_neg);
+    emit_b(ctx, bcheck_neg, bcheck_inf);
+
+    // ---- bdo_neg
+    emit_movz(ctx, bdo_neg, /*rd=*/15, /*imm16=*/'-', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, bdo_neg, /*rt=*/15, /*rn=*/13, /*off=*/0);
+    emit_movz(ctx, bdo_neg, /*rd=*/9,  /*imm16=*/1, /*hw=*/0, /*sf=*/false);
+    emit_movz(ctx, bdo_neg, /*rd=*/12, /*imm16=*/1, /*hw=*/0, /*sf=*/false);
+    emit_fp_unop(ctx, bdo_neg, "fneg", /*fwidth=*/64, /*rd=*/8, /*rn=*/8);
+    emit_b(ctx, bdo_neg, bcheck_inf);
+
+    // ---- bcheck_inf: load 1e308 into D1, compare. D8 > 1e308 -> binf
+    //   1e308 ~= 0x7FE1CCF385EBC8A0 (more precisely 1.0e308 = 0x7FE1CCF385EBC8A0)
+    //   We'll build that constant via two MOVZ + two MOVK into X15 then FMOV.
+    emit_movz(ctx, bcheck_inf, /*rd=*/15, /*imm16=*/0xc8a0, /*hw=*/0, /*sf=*/true);
+    emit_movk(ctx, bcheck_inf, /*rd=*/15, /*imm16=*/0x85eb, /*hw=*/1, /*sf=*/true);
+    emit_movk(ctx, bcheck_inf, /*rd=*/15, /*imm16=*/0xccf3, /*hw=*/2, /*sf=*/true);
+    emit_movk(ctx, bcheck_inf, /*rd=*/15, /*imm16=*/0x7fe1, /*hw=*/3, /*sf=*/true);
+    emit_fmov_gp_v(ctx, bcheck_inf, /*dir_to_v=*/true, /*sf=*/true,
+                   /*rd=*/1, /*rn=*/15);
+    emit_fcmp(ctx, bcheck_inf, /*fwidth=*/64, /*rn=*/8, /*rm=*/1);
+    emit_b_cond(ctx, bcheck_inf, COND_GT, binf);
+    emit_b(ctx, bcheck_inf, bcheck_zero);
+
+    // ---- binf: write "inf" at buf[out..out+2], out += 3
+    //  X15 = X13 + W9 (host write head)
+    {
+        // sxtw not needed: out fits in low 32 bits and W9 is sign-extendable.
+        // Use add Xd, Xn, Wm UXTW: but our helpers don't expose that. Use a
+        // simple ADD with X9 (we treat w9 as a 64-bit byte offset; out is
+        // small so the upper bits are zero from previous movz/add_imm).
+        emit_add_reg(ctx, binf, /*rd=*/15, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    }
+    emit_movz(ctx, binf, /*rd=*/16, /*imm16=*/'i', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, binf, /*rt=*/16, /*rn=*/15, /*off=*/0);
+    emit_movz(ctx, binf, /*rd=*/16, /*imm16=*/'n', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, binf, /*rt=*/16, /*rn=*/15, /*off=*/1);
+    emit_movz(ctx, binf, /*rd=*/16, /*imm16=*/'f', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, binf, /*rt=*/16, /*rn=*/15, /*off=*/2);
+    emit_add_imm(ctx, binf, /*rd=*/9, /*rn=*/9, /*imm12=*/3, /*sf=*/false);
+    emit_b(ctx, binf, bdo_write);
+
+    // ---- bcheck_zero: FCMP D8, D11; B.EQ bzero
+    emit_fcmp(ctx, bcheck_zero, /*fwidth=*/64, /*rn=*/8, /*rm=*/11);
+    emit_b_cond(ctx, bcheck_zero, COND_EQ, bzero);
+    emit_b(ctx, bcheck_zero, bnorm_up_hd);
+
+    // ---- bzero: write '0' at buf[out], out += 1
+    emit_add_reg(ctx, bzero, /*rd=*/15, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_movz(ctx, bzero, /*rd=*/16, /*imm16=*/'0', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, bzero, /*rt=*/16, /*rn=*/15, /*off=*/0);
+    emit_add_imm(ctx, bzero, /*rd=*/9, /*rn=*/9, /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, bzero, bdo_write);
+
+    // ---- normalize up: while D8 >= 10: D8 /= 10; exp10++
+    emit_movz(ctx, bnorm_up_hd, /*rd=*/10, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_b(ctx, bnorm_up_hd, bnorm_up_bd);
+    // body: if D8 < 10 -> goto norm_dn_hd else divide
+    emit_fcmp(ctx, bnorm_up_bd, /*fwidth=*/64, /*rn=*/8, /*rm=*/9);
+    emit_b_cond(ctx, bnorm_up_bd, COND_MI, bnorm_dn_hd);
+    emit_fp_binop(ctx, bnorm_up_bd, "fdiv", 64, /*rd=*/8, /*rn=*/8, /*rm=*/9);
+    emit_add_imm(ctx, bnorm_up_bd, /*rd=*/10, /*rn=*/10,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, bnorm_up_bd, bnorm_up_bd);
+
+    // ---- normalize down: while D8 < 1: D8 *= 10; exp10--
+    emit_b(ctx, bnorm_dn_hd, bnorm_dn_bd);
+    emit_fcmp(ctx, bnorm_dn_bd, /*fwidth=*/64, /*rn=*/8, /*rm=*/10);
+    // if !(D8 < 1), exit. B.GE bextract_hd
+    emit_b_cond(ctx, bnorm_dn_bd, COND_GE, bextract_hd);
+    emit_fp_binop(ctx, bnorm_dn_bd, "fmul", 64, /*rd=*/8, /*rn=*/8, /*rm=*/9);
+    emit_sub_imm(ctx, bnorm_dn_bd, /*rd=*/10, /*rn=*/10,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, bnorm_dn_bd, bnorm_dn_bd);
+
+    // ---- extract 6 digits: for i in 0..5
+    //   d = (int)D8 (clamp 0..9)
+    //   digits[i] = '0' + d
+    //   D8 = (D8 - d) * 10
+    // i counter = X15 (scratch within block; but we need cross-block too).
+    // Use W11 for the counter (we'll reset W11 below to ndig).
+    emit_movz(ctx, bextract_hd, /*rd=*/11, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_b(ctx, bextract_hd, bextract_bd);
+    // loop body
+    // if W11 == 6 -> btrim_hd
+    {
+        emit_cmp_imm(ctx, bextract_bd, /*rn=*/11, /*imm12=*/6, /*sf=*/false);
+        emit_b_cond(ctx, bextract_bd, COND_GE, btrim_hd);
+    }
+    // d = fcvtzs Wd, D8 (truncate toward zero); use V1 as int holder
+    emit_fp_cvt(ctx, bextract_bd, "f2i", /*src_w=*/64, /*dst_w=*/32,
+                /*sign=*/true, /*rd=*/15, /*rn=*/8);
+    // clamp: d = max(0, min(9, d))
+    emit_cmp_imm(ctx, bextract_bd, /*rn=*/15, /*imm12=*/9, /*sf=*/false);
+    // csel d, d, #9 if d > 9
+    {
+        // Use cset/csel; simpler: if d > 9, w15 = 9. Synthesize via
+        // movz w16, #9; csel w15, w16, w15, gt.
+        emit_movz(ctx, bextract_bd, /*rd=*/16, /*imm16=*/9, /*hw=*/0, /*sf=*/false);
+        emit_csel(ctx, bextract_bd, /*rd=*/15, /*rn=*/16, /*rm=*/15,
+                  /*cond=*/COND_GT, /*sf=*/false);
+    }
+    emit_cmp_imm(ctx, bextract_bd, /*rn=*/15, /*imm12=*/0, /*sf=*/false);
+    {
+        emit_movz(ctx, bextract_bd, /*rd=*/16, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+        emit_csel(ctx, bextract_bd, /*rd=*/15, /*rn=*/16, /*rm=*/15,
+                  /*cond=*/COND_LT, /*sf=*/false);
+    }
+    // digits[i] = '0' + d
+    emit_add_imm(ctx, bextract_bd, /*rd=*/16, /*rn=*/15,
+                 /*imm12=*/'0', /*sf=*/false);
+    // digit_addr = X14 + W11
+    emit_add_reg(ctx, bextract_bd, /*rd=*/0, /*rn=*/14, /*rm=*/11, /*sf=*/true);
+    emit_strb_imm(ctx, bextract_bd, /*rt=*/16, /*rn=*/0, /*off=*/0);
+    // D2 = (double)d
+    emit_fp_cvt(ctx, bextract_bd, "i2f", /*src_w=*/32, /*dst_w=*/64,
+                /*sign=*/true, /*rd=*/2, /*rn=*/15);
+    // D8 = (D8 - D2) * 10
+    emit_fp_binop(ctx, bextract_bd, "fsub", 64, /*rd=*/8, /*rn=*/8, /*rm=*/2);
+    emit_fp_binop(ctx, bextract_bd, "fmul", 64, /*rd=*/8, /*rn=*/8, /*rm=*/9);
+    emit_add_imm(ctx, bextract_bd, /*rd=*/11, /*rn=*/11,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, bextract_bd, bextract_bd);
+
+    // ---- trim trailing zeros: ndig = 6; while ndig > 1 && digits[ndig-1] == '0': ndig--
+    emit_movz(ctx, btrim_hd, /*rd=*/11, /*imm16=*/6, /*hw=*/0, /*sf=*/false);
+    emit_b(ctx, btrim_hd, btrim_bd);
+    // body
+    emit_cmp_imm(ctx, btrim_bd, /*rn=*/11, /*imm12=*/1, /*sf=*/false);
+    emit_b_cond(ctx, btrim_bd, COND_LE, bfmt_select);
+    // x15 = X14 + (W11 - 1)
+    emit_sub_imm(ctx, btrim_bd, /*rd=*/15, /*rn=*/11,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_add_reg(ctx, btrim_bd, /*rd=*/15, /*rn=*/14, /*rm=*/15, /*sf=*/true);
+    emit_ldrb_imm(ctx, btrim_bd, /*rt=*/16, /*rn=*/15, /*off=*/0);
+    emit_cmp_imm(ctx, btrim_bd, /*rn=*/16, /*imm12=*/'0', /*sf=*/false);
+    emit_b_cond(ctx, btrim_bd, COND_NE, bfmt_select);
+    emit_sub_imm(ctx, btrim_bd, /*rd=*/11, /*rn=*/11,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, btrim_bd, btrim_bd);
+
+    // ---- fmt_select: if exp10 in [-4, 6): fixed; else scientific
+    // exp10 is signed in W10. We need to test:
+    //   if (exp10 >= -4 && exp10 < 6).
+    emit_cmp_imm(ctx, bfmt_select, /*rn=*/10, /*imm12=*/6, /*sf=*/false);
+    emit_b_cond(ctx, bfmt_select, COND_GE, bsci);
+    // exp10 < 6 — now check exp10 >= -4 i.e. exp10 >= 0xFFFFFFFC (signed -4).
+    // We do: cmn w10, #4 (i.e. cmp w10, #-4 with reverse). Lacking cmn,
+    // use add w15, w10, #4; cmp w15, #0; b.lt sci.
+    emit_add_imm(ctx, bfmt_select, /*rd=*/15, /*rn=*/10,
+                 /*imm12=*/4, /*sf=*/false);
+    emit_cmp_imm(ctx, bfmt_select, /*rn=*/15, /*imm12=*/0, /*sf=*/false);
+    emit_b_cond(ctx, bfmt_select, COND_LT, bsci);
+    // exp10 >= -4 and exp10 < 6 - choose fixed-pos or fixed-neg.
+    emit_cmp_imm(ctx, bfmt_select, /*rn=*/10, /*imm12=*/0, /*sf=*/false);
+    emit_b_cond(ctx, bfmt_select, COND_LT, bfixed_neg_lead_hd);
+    emit_b(ctx, bfmt_select, bfixed_pos_hd);
+
+    // ---- fixed_pos: int_digits = exp10 + 1
+    //   for i in 0..int_digits: buf[out++] = (i < ndig) ? digits[i] : '0'
+    //   if (int_digits < ndig): buf[out++] = '.'; for i in int_digits..ndig: buf[out++] = digits[i]
+    // We use X15 as i counter, X16 (caller-saved) for tmp.
+    emit_add_imm(ctx, bfixed_pos_hd, /*rd=*/0, /*rn=*/10,
+                 /*imm12=*/1, /*sf=*/false); // X0 = int_digits
+    emit_movz(ctx, bfixed_pos_hd, /*rd=*/15, /*imm16=*/0, /*hw=*/0, /*sf=*/false); // i = 0
+    emit_b(ctx, bfixed_pos_hd, bfixed_pos_bd);
+
+    emit_cmp_reg(ctx, bfixed_pos_bd, /*rn=*/15, /*rm=*/0, /*sf=*/false);
+    emit_b_cond(ctx, bfixed_pos_bd, COND_GE, bfixed_pos_dot);
+    // ch = (i < ndig) ? digits[i] : '0'
+    emit_cmp_reg(ctx, bfixed_pos_bd, /*rn=*/15, /*rm=*/11, /*sf=*/false);
+    // load digits[i] into w16; '0' into w17; csel
+    emit_add_reg(ctx, bfixed_pos_bd, /*rd=*/2, /*rn=*/14, /*rm=*/15, /*sf=*/true);
+    emit_ldrb_imm(ctx, bfixed_pos_bd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_movz(ctx, bfixed_pos_bd, /*rd=*/17, /*imm16=*/'0', /*hw=*/0, /*sf=*/false);
+    emit_csel(ctx, bfixed_pos_bd, /*rd=*/16, /*rn=*/16, /*rm=*/17,
+              /*cond=*/COND_LT, /*sf=*/false);
+    // buf[out] = ch; out++
+    emit_add_reg(ctx, bfixed_pos_bd, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_strb_imm(ctx, bfixed_pos_bd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bfixed_pos_bd, /*rd=*/9, /*rn=*/9,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_add_imm(ctx, bfixed_pos_bd, /*rd=*/15, /*rn=*/15,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, bfixed_pos_bd, bfixed_pos_bd);
+
+    // dot: if (int_digits >= ndig) -> bdo_write
+    emit_cmp_reg(ctx, bfixed_pos_dot, /*rn=*/0, /*rm=*/11, /*sf=*/false);
+    emit_b_cond(ctx, bfixed_pos_dot, COND_GE, bdo_write);
+    // emit '.'
+    emit_movz(ctx, bfixed_pos_dot, /*rd=*/16, /*imm16=*/'.', /*hw=*/0, /*sf=*/false);
+    emit_add_reg(ctx, bfixed_pos_dot, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_strb_imm(ctx, bfixed_pos_dot, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bfixed_pos_dot, /*rd=*/9, /*rn=*/9,
+                 /*imm12=*/1, /*sf=*/false);
+    // i = int_digits (= X0)
+    emit_mov_x(ctx, bfixed_pos_dot, /*rd=*/15, /*rn=*/0);
+    emit_b(ctx, bfixed_pos_dot, bfixed_pos_fr_hd);
+
+    emit_b(ctx, bfixed_pos_fr_hd, bfixed_pos_fr_bd);
+    emit_cmp_reg(ctx, bfixed_pos_fr_bd, /*rn=*/15, /*rm=*/11, /*sf=*/false);
+    emit_b_cond(ctx, bfixed_pos_fr_bd, COND_GE, bdo_write);
+    emit_add_reg(ctx, bfixed_pos_fr_bd, /*rd=*/2, /*rn=*/14, /*rm=*/15, /*sf=*/true);
+    emit_ldrb_imm(ctx, bfixed_pos_fr_bd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_reg(ctx, bfixed_pos_fr_bd, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_strb_imm(ctx, bfixed_pos_fr_bd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bfixed_pos_fr_bd, /*rd=*/9, /*rn=*/9,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_add_imm(ctx, bfixed_pos_fr_bd, /*rd=*/15, /*rn=*/15,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, bfixed_pos_fr_bd, bfixed_pos_fr_bd);
+
+    // ---- fixed_neg: buf[out++]='0'; buf[out++]='.';
+    //                  for i in 0..(-exp10-1): buf[out++]='0';
+    //                  for i in 0..ndig:       buf[out++]=digits[i];
+    emit_add_reg(ctx, bfixed_neg_lead_hd, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_movz(ctx, bfixed_neg_lead_hd, /*rd=*/16, /*imm16=*/'0', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, bfixed_neg_lead_hd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bfixed_neg_lead_hd, /*rd=*/9, /*rn=*/9,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_add_reg(ctx, bfixed_neg_lead_hd, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_movz(ctx, bfixed_neg_lead_hd, /*rd=*/16, /*imm16=*/'.', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, bfixed_neg_lead_hd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bfixed_neg_lead_hd, /*rd=*/9, /*rn=*/9,
+                 /*imm12=*/1, /*sf=*/false);
+    // i_max = -exp10 - 1.  W15 used as i.
+    // W0 = (-exp10) - 1 = -(exp10+1).
+    emit_movz(ctx, bfixed_neg_lead_hd, /*rd=*/15, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    // w0 = 0 - exp10 - 1 = -(exp10 + 1)
+    emit_add_imm(ctx, bfixed_neg_lead_hd, /*rd=*/0, /*rn=*/10,
+                 /*imm12=*/1, /*sf=*/false);  // w0 = exp10 + 1 (signed)
+    // negate w0: sub w0, wzr, w0 (rn=31 = wzr)
+    {
+        MLIR_AttributeHandle a[4];
+        a[0] = attr_i32(ctx, "rd", 0);
+        a[1] = attr_i32(ctx, "rn", 31);
+        a[2] = attr_i32(ctx, "rm", 0);
+        a[3] = attr_b  (ctx, "sf", false);
+        MLIR_AppendBlockOp(ctx, bfixed_neg_lead_hd,
+            build_op(ctx, OP_TYPE_AARCH64_SUB_REG, a, 4));
+    }
+    emit_b(ctx, bfixed_neg_lead_hd, bfixed_neg_lead_bd);
+
+    emit_cmp_reg(ctx, bfixed_neg_lead_bd, /*rn=*/15, /*rm=*/0, /*sf=*/false);
+    emit_b_cond(ctx, bfixed_neg_lead_bd, COND_GE, bfixed_neg_digits_hd);
+    emit_add_reg(ctx, bfixed_neg_lead_bd, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_movz(ctx, bfixed_neg_lead_bd, /*rd=*/16, /*imm16=*/'0', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, bfixed_neg_lead_bd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bfixed_neg_lead_bd, /*rd=*/9, /*rn=*/9,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_add_imm(ctx, bfixed_neg_lead_bd, /*rd=*/15, /*rn=*/15,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, bfixed_neg_lead_bd, bfixed_neg_lead_bd);
+
+    // digits loop: for i in 0..ndig: buf[out++] = digits[i]
+    emit_movz(ctx, bfixed_neg_digits_hd, /*rd=*/15, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_b(ctx, bfixed_neg_digits_hd, bfixed_neg_digits_bd);
+
+    emit_cmp_reg(ctx, bfixed_neg_digits_bd, /*rn=*/15, /*rm=*/11, /*sf=*/false);
+    emit_b_cond(ctx, bfixed_neg_digits_bd, COND_GE, bdo_write);
+    emit_add_reg(ctx, bfixed_neg_digits_bd, /*rd=*/2, /*rn=*/14, /*rm=*/15, /*sf=*/true);
+    emit_ldrb_imm(ctx, bfixed_neg_digits_bd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_reg(ctx, bfixed_neg_digits_bd, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_strb_imm(ctx, bfixed_neg_digits_bd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bfixed_neg_digits_bd, /*rd=*/9, /*rn=*/9,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_add_imm(ctx, bfixed_neg_digits_bd, /*rd=*/15, /*rn=*/15,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, bfixed_neg_digits_bd, bfixed_neg_digits_bd);
+
+    // ---- scientific: buf[out++] = digits[0]; if ndig>1: buf[out++]='.', then digits[1..ndig]
+    //   buf[out++]='e'; sign; |exp10| in decimal (>=2 chars)
+    emit_add_reg(ctx, bsci, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_ldrb_imm(ctx, bsci, /*rt=*/16, /*rn=*/14, /*off=*/0);
+    emit_strb_imm(ctx, bsci, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bsci, /*rd=*/9, /*rn=*/9, /*imm12=*/1, /*sf=*/false);
+    emit_cmp_imm(ctx, bsci, /*rn=*/11, /*imm12=*/1, /*sf=*/false);
+    emit_b_cond(ctx, bsci, COND_LE, bsci_exp);
+    // emit dot
+    emit_add_reg(ctx, bsci, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_movz(ctx, bsci, /*rd=*/16, /*imm16=*/'.', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, bsci, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bsci, /*rd=*/9, /*rn=*/9, /*imm12=*/1, /*sf=*/false);
+    emit_movz(ctx, bsci, /*rd=*/15, /*imm16=*/1, /*hw=*/0, /*sf=*/false);
+    emit_b(ctx, bsci, bsci_frac_hd);
+
+    emit_b(ctx, bsci_frac_hd, bsci_frac_bd);
+    emit_cmp_reg(ctx, bsci_frac_bd, /*rn=*/15, /*rm=*/11, /*sf=*/false);
+    emit_b_cond(ctx, bsci_frac_bd, COND_GE, bsci_exp);
+    emit_add_reg(ctx, bsci_frac_bd, /*rd=*/2, /*rn=*/14, /*rm=*/15, /*sf=*/true);
+    emit_ldrb_imm(ctx, bsci_frac_bd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_reg(ctx, bsci_frac_bd, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_strb_imm(ctx, bsci_frac_bd, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bsci_frac_bd, /*rd=*/9, /*rn=*/9,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_add_imm(ctx, bsci_frac_bd, /*rd=*/15, /*rn=*/15,
+                 /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, bsci_frac_bd, bsci_frac_bd);
+
+    // bsci_exp: emit 'e', sign, 2-digit (or more) decimal of |exp10|
+    emit_add_reg(ctx, bsci_exp, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_movz(ctx, bsci_exp, /*rd=*/16, /*imm16=*/'e', /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, bsci_exp, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bsci_exp, /*rd=*/9, /*rn=*/9, /*imm12=*/1, /*sf=*/false);
+    emit_cmp_imm(ctx, bsci_exp, /*rn=*/10, /*imm12=*/0, /*sf=*/false);
+    // We'll emit sign char then digits. Negate exp10 if < 0.
+    {
+        // w16 = (exp10 < 0) ? '-' : '+'
+        emit_movz(ctx, bsci_exp, /*rd=*/16, /*imm16=*/'+', /*hw=*/0, /*sf=*/false);
+        emit_movz(ctx, bsci_exp, /*rd=*/17, /*imm16=*/'-', /*hw=*/0, /*sf=*/false);
+        emit_csel(ctx, bsci_exp, /*rd=*/16, /*rn=*/17, /*rm=*/16,
+                  /*cond=*/COND_LT, /*sf=*/false);
+    }
+    emit_add_reg(ctx, bsci_exp, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+    emit_strb_imm(ctx, bsci_exp, /*rt=*/16, /*rn=*/2, /*off=*/0);
+    emit_add_imm(ctx, bsci_exp, /*rd=*/9, /*rn=*/9, /*imm12=*/1, /*sf=*/false);
+    // w0 = |exp10|: if exp10 < 0 then -exp10 else exp10
+    {
+        // w15 = -exp10  (sub w15, wzr, w10)
+        MLIR_AttributeHandle a[4];
+        a[0] = attr_i32(ctx, "rd", 15);
+        a[1] = attr_i32(ctx, "rn", 31);
+        a[2] = attr_i32(ctx, "rm", 10);
+        a[3] = attr_b  (ctx, "sf", false);
+        MLIR_AppendBlockOp(ctx, bsci_exp,
+            build_op(ctx, OP_TYPE_AARCH64_SUB_REG, a, 4));
+        emit_cmp_imm(ctx, bsci_exp, /*rn=*/10, /*imm12=*/0, /*sf=*/false);
+        emit_csel(ctx, bsci_exp, /*rd=*/0, /*rn=*/15, /*rm=*/10,
+                  /*cond=*/COND_LT, /*sf=*/false);
+    }
+    // Emit 2 digits min: tens then ones (exp10 magnitude <= 308 fits in 3 chars,
+    // but we just emit modulo-10 always until done, then pad to 2).
+    //   ones = w0 % 10; tens = w0 / 10; if tens > 0 emit (tens digits then ones); else emit "0<ones>"
+    // Simple: hundreds = w0/100; tens = (w0/10)%10; ones = w0%10.
+    //   if hundreds != 0 emit it; always emit tens and ones.
+    emit_movz(ctx, bsci_exp, /*rd=*/1, /*imm16=*/10, /*hw=*/0, /*sf=*/false);
+    // w15 = w0/10
+    {
+        MLIR_AttributeHandle a[4];
+        a[0] = attr_i32(ctx, "rd", 15);
+        a[1] = attr_i32(ctx, "rn", 0);
+        a[2] = attr_i32(ctx, "rm", 1);
+        a[3] = attr_b  (ctx, "sf", false);
+        MLIR_AppendBlockOp(ctx, bsci_exp,
+            build_op(ctx, OP_TYPE_AARCH64_UDIV, a, 4));
+    }
+    // w16 = w0 - w15*10 = w0 % 10
+    emit_msub(ctx, bsci_exp, /*rd=*/16, /*rn=*/15, /*rm=*/1,
+              /*ra=*/0, /*sf=*/false);
+    // w17 = w15/10  (hundreds)
+    {
+        MLIR_AttributeHandle a[4];
+        a[0] = attr_i32(ctx, "rd", 17);
+        a[1] = attr_i32(ctx, "rn", 15);
+        a[2] = attr_i32(ctx, "rm", 1);
+        a[3] = attr_b  (ctx, "sf", false);
+        MLIR_AppendBlockOp(ctx, bsci_exp,
+            build_op(ctx, OP_TYPE_AARCH64_UDIV, a, 4));
+    }
+    // w18 = w15 - w17*10 = tens
+    emit_msub(ctx, bsci_exp, /*rd=*/18, /*rn=*/17, /*rm=*/1,
+              /*ra=*/15, /*sf=*/false);
+    // Emit hundreds if non-zero
+    emit_cmp_imm(ctx, bsci_exp, /*rn=*/17, /*imm12=*/0, /*sf=*/false);
+    {
+        MLIR_BlockHandle skip_h = MLIR_CreateBlock(ctx);
+        MLIR_BlockHandle do_h   = MLIR_CreateBlock(ctx);
+        MLIR_AppendRegionBlock(ctx, region, skip_h);
+        MLIR_AppendRegionBlock(ctx, region, do_h);
+        emit_b_cond(ctx, bsci_exp, COND_EQ, skip_h);
+        emit_b(ctx, bsci_exp, do_h);
+
+        // do_h: emit hundreds digit
+        emit_add_imm(ctx, do_h, /*rd=*/16, /*rn=*/17,
+                     /*imm12=*/'0', /*sf=*/false);
+        emit_add_reg(ctx, do_h, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+        emit_strb_imm(ctx, do_h, /*rt=*/16, /*rn=*/2, /*off=*/0);
+        emit_add_imm(ctx, do_h, /*rd=*/9, /*rn=*/9, /*imm12=*/1, /*sf=*/false);
+        emit_b(ctx, do_h, skip_h);
+
+        // skip_h: emit tens
+        emit_add_imm(ctx, skip_h, /*rd=*/15, /*rn=*/18,
+                     /*imm12=*/'0', /*sf=*/false);
+        emit_add_reg(ctx, skip_h, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+        emit_strb_imm(ctx, skip_h, /*rt=*/15, /*rn=*/2, /*off=*/0);
+        emit_add_imm(ctx, skip_h, /*rd=*/9, /*rn=*/9, /*imm12=*/1, /*sf=*/false);
+        // emit ones (still in w0%10 which we put in w16-original; reload via msub)
+        // We've clobbered w16. Re-derive ones from w0 % 10:
+        emit_movz(ctx, skip_h, /*rd=*/1, /*imm16=*/10, /*hw=*/0, /*sf=*/false);
+        {
+            MLIR_AttributeHandle a[4];
+            a[0] = attr_i32(ctx, "rd", 15);
+            a[1] = attr_i32(ctx, "rn", 0);
+            a[2] = attr_i32(ctx, "rm", 1);
+            a[3] = attr_b  (ctx, "sf", false);
+            MLIR_AppendBlockOp(ctx, skip_h,
+                build_op(ctx, OP_TYPE_AARCH64_UDIV, a, 4));
+        }
+        emit_msub(ctx, skip_h, /*rd=*/16, /*rn=*/15, /*rm=*/1,
+                  /*ra=*/0, /*sf=*/false);
+        emit_add_imm(ctx, skip_h, /*rd=*/16, /*rn=*/16,
+                     /*imm12=*/'0', /*sf=*/false);
+        emit_add_reg(ctx, skip_h, /*rd=*/2, /*rn=*/13, /*rm=*/9, /*sf=*/true);
+        emit_strb_imm(ctx, skip_h, /*rt=*/16, /*rn=*/2, /*off=*/0);
+        emit_add_imm(ctx, skip_h, /*rd=*/9, /*rn=*/9, /*imm12=*/1, /*sf=*/false);
+        emit_b(ctx, skip_h, bdo_write);
+    }
+
+    // ---- bdo_write: write(1, buf=X13, W9 bytes), epilogue, ret
+    emit_movz(ctx, bdo_write, /*rd=*/0, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
+    emit_mov_x(ctx, bdo_write, /*rd=*/1, /*rn=*/13);
+    emit_mov_x(ctx, bdo_write, /*rd=*/2, /*rn=*/9);
+    emit_movz(ctx, bdo_write, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
+    emit_svc(ctx, bdo_write, 0x80);
+    emit_epilogue(ctx, bdo_write, /*frame_size=*/96);
+    emit_ret(ctx, bdo_write);
+
+    return synth_leaf_finish(ctx, region, "printF64", 8);
+}
+
+// -----------------------------------------------------------------------------
+// printF32(float v) -> void  (v arrives as the i32 bit-pattern in W0).
+// Convert to double, then tail-call printF64.
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_print_f32(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    // S0 <- W0 (32-bit GP->V)
+    emit_fmov_gp_v(ctx, entry, /*dir_to_v=*/true, /*sf=*/false,
+                   /*rd=*/0, /*rn=*/0);
+    // FCVT D0, S0
+    emit_fp_cvt(ctx, entry, "f2f", /*src_w=*/32, /*dst_w=*/64,
+                /*sign=*/false, /*rd=*/0, /*rn=*/0);
+    // X0 <- D0 (carrier for the call to printF64)
+    emit_fmov_gp_v(ctx, entry, /*dir_to_v=*/false, /*sf=*/true,
+                   /*rd=*/0, /*rn=*/0);
+    emit_bl(ctx, entry, str_from_cstr_view("printF64"));
+    emit_epilogue(ctx, entry, /*frame_size=*/16);
+    emit_ret(ctx, entry);
+    return synth_leaf_finish(ctx, region, "printF32", 8);
+}
+
+
+// -----------------------------------------------------------------------------
 // tinyc_va_arg_struct(i32 ap_ofs, i32 out_ofs, i64 size) -> void:
 //   long long *o = (long long *)out;
 //   long long words = (size + 7) / 8;
@@ -2233,6 +2894,9 @@ typedef struct {
     bool    needs_va_arg_i64;
     bool    needs_va_arg_ptr;
     bool    needs_va_arg_struct;
+    bool    needs_va_arg_f64;
+    bool    needs_print_f32;
+    bool    needs_print_f64;
 } ModInfo;
 
 static void scan_block(MLIR_BlockHandle blk, ModInfo *mi) {
@@ -2271,6 +2935,9 @@ static void scan_block(MLIR_BlockHandle blk, ModInfo *mi) {
             if (EQ_LIT(callee, "tinyc_va_arg_i64")) mi->needs_va_arg_i64 = true;
             if (EQ_LIT(callee, "tinyc_va_arg_ptr")) mi->needs_va_arg_ptr = true;
             if (EQ_LIT(callee, "tinyc_va_arg_struct")) mi->needs_va_arg_struct = true;
+            if (EQ_LIT(callee, "tinyc_va_arg_f64")) mi->needs_va_arg_f64 = true;
+            if (EQ_LIT(callee, "printF32"))      mi->needs_print_f32   = true;
+            if (EQ_LIT(callee, "printF64"))      mi->needs_print_f64   = true;
             #undef EQ_LIT
         }
         size_t nr = MLIR_GetOpNumRegions(op);
@@ -2371,7 +3038,8 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
         mi.needs_malloc || mi.needs_free || mi.needs_strlen ||
         mi.needs_strcmp || mi.needs_memcmp || mi.needs_memchr ||
         mi.needs_fd_write || mi.needs_va_arg_i32 || mi.needs_va_arg_i64 ||
-        mi.needs_va_arg_ptr || mi.needs_va_arg_struct;
+        mi.needs_va_arg_ptr || mi.needs_va_arg_struct ||
+        mi.needs_va_arg_f64;
     MLIR_OpHandle start = synth_start(ctx, entry_name,
         /*use_data_priv=*/false, use_globals, use_linmem);
     if (!start) return MLIR_INVALID_HANDLE;
@@ -2449,6 +3117,23 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
     }
     if (mi.needs_va_arg_struct) {
         MLIR_OpHandle p = synth_tinyc_va_arg_struct(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_va_arg_f64) {
+        MLIR_OpHandle p = synth_tinyc_va_arg_f64(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_print_f32 || mi.needs_print_f64 || mi.needs_printf) {
+        // printF32 and the synthesised printf both call printF64; emit
+        // printF64 if any consumer is present.
+        MLIR_OpHandle p = synth_print_f64(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_print_f32) {
+        MLIR_OpHandle p = synth_print_f32(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }

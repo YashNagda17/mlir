@@ -1424,6 +1424,12 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
     // global-base of 1024). Honour the global's align_pow attribute.
     // Emit one wmir.data_init at module level per global and build a
     // name -> offset table for the later wasmssa.addressof handler.
+    //
+    // We make TWO passes over globals:
+    //   1. Assign offsets to all of them up-front.
+    //   2. Emit data_init ops with `relocs` attribute applied to the
+    //      init_data bytes (since a global's relocs may reference any
+    //      other global, including ones declared later in source order).
     // -----------------------------------------------------------------
     enum { WASM_DATA_BASE = 1024 };
     OffsetMap globals = {0};
@@ -1440,17 +1446,86 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
         int32_t align = (ap > 0) ? (int32_t)(1 << ap) : 1;
         cursor = (cursor + align - 1) & ~(align - 1);
         omap_add(&globals, sn, cursor);
+        cursor += (int32_t)sz;
+    }
+    for (size_t i = 0; i < n_top; i++) {
+        MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
+        if (MLIR_GetOpType(top) != OP_TYPE_WASMSSA_IMPORT_GLOBAL) continue;
+        string sn = at_s(top, "sym_name");
+        string id = at_s(top, "init_data");
+        string rl = at_s(top, "relocs");
+        int32_t my_off = 0;
+        (void)omap_get(&globals, sn, &my_off);
+        // Make an editable copy of init_data so we can apply relocs.
+        size_t cap = id.size;
+        char *buf = (char *)malloc(cap > 0 ? cap : 1);
+        if (cap > 0) memcpy(buf, id.str, cap);
+        // Parse relocs of the form "off:target:addend,off:target:addend,..."
+        // (commas separate entries; colons separate fields). Each entry
+        // means: at local `off` within this global's bytes, store the
+        // 32-bit LE address of `target + addend`.
+        const char *p = rl.str;
+        const char *e = rl.str + rl.size;
+        while (p < e) {
+            // skip leading commas/whitespace
+            while (p < e && (*p == ',' || *p == ' ' || *p == '\t')) p++;
+            if (p >= e) break;
+            // parse offset
+            long off_local = 0;
+            while (p < e && *p >= '0' && *p <= '9') {
+                off_local = off_local * 10 + (*p - '0'); p++;
+            }
+            if (p >= e || *p != ':') break;
+            p++;
+            // parse target name (until next ':')
+            const char *tname = p;
+            while (p < e && *p != ':') p++;
+            size_t tlen = (size_t)(p - tname);
+            if (p >= e || *p != ':') break;
+            p++;
+            // parse addend (may be negative)
+            long addend = 0;
+            int neg = 0;
+            if (p < e && *p == '-') { neg = 1; p++; }
+            while (p < e && *p >= '0' && *p <= '9') {
+                addend = addend * 10 + (*p - '0'); p++;
+            }
+            if (neg) addend = -addend;
+            string tn = { tname, tlen };
+            int32_t toff = 0;
+            if (!omap_get(&globals, tn, &toff)) {
+                fprintf(stderr,
+                    "wasmssa->wmir: reloc references unknown global '%.*s'\n",
+                    (int)tlen, tname);
+                free(buf);
+                return MLIR_INVALID_HANDLE;
+            }
+            uint32_t val = (uint32_t)(toff + (int32_t)addend);
+            if ((size_t)off_local + 4 > cap) {
+                fprintf(stderr,
+                    "wasmssa->wmir: reloc offset %ld out of range for "
+                    "global '%.*s' (size %zu)\n",
+                    off_local, (int)sn.size, sn.str, cap);
+                free(buf);
+                return MLIR_INVALID_HANDLE;
+            }
+            buf[off_local + 0] = (char)((val >>  0) & 0xff);
+            buf[off_local + 1] = (char)((val >>  8) & 0xff);
+            buf[off_local + 2] = (char)((val >> 16) & 0xff);
+            buf[off_local + 3] = (char)((val >> 24) & 0xff);
+        }
         MLIR_AttributeHandle a[3];
         a[0] = attr_s  (ctx, "sym_name",  sn.str, sn.size);
-        a[1] = attr_i32(ctx, "offset",    cursor);
-        a[2] = attr_s  (ctx, "init_data", id.str, id.size);
+        a[1] = attr_i32(ctx, "offset",    my_off);
+        a[2] = attr_s  (ctx, "init_data", buf, cap);
         MLIR_OpHandle di = MLIR_CreateOp(ctx, OP_TYPE_WMIR_DATA_INIT,
             op_type_to_string(OP_TYPE_WMIR_DATA_INIT),
             a, 3, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
             MLIR_CreateLocationUnknown(ctx, (string){0}),
             MLIR_INVALID_HANDLE, (string){0}, -1);
         MLIR_AppendBlockOp(ctx, out_body, di);
-        cursor += (int32_t)sz;
+        // Intentionally leak `buf`: attr_s above does not copy, so the
+        // memory must outlive this function.
     }
 
     // -----------------------------------------------------------------
