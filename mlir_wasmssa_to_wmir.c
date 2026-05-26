@@ -43,6 +43,13 @@
 #define WT_F32 0x7d
 #define WT_F64 0x7c
 
+// Default linear-memory data-segment base offset (matches wasm-ld's
+// default --global-base of 1024). Used when laying out import_global
+// data into the wmir linmem image. Defined as a #define (rather than
+// a local `enum`) so the file compiles cleanly under tinyc, which
+// only supports enum bodies at module scope.
+#define WASM_DATA_BASE 1024
+
 // =============================================================================
 // Attribute / op helpers.
 // =============================================================================
@@ -1431,7 +1438,9 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
     //      init_data bytes (since a global's relocs may reference any
     //      other global, including ones declared later in source order).
     // -----------------------------------------------------------------
-    enum { WASM_DATA_BASE = 1024 };
+    // Note: WASM_DATA_BASE is a #define (not a local enum), because
+    // tinyc — used during wasm self-hosting — only allows enum bodies
+    // at module scope.
     OffsetMap globals = {0};
     int32_t cursor = (int32_t)WASM_DATA_BASE;
     size_t n_top = MLIR_GetBlockNumOps(mb);
