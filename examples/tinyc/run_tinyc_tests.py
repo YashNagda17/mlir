@@ -50,6 +50,10 @@ LOWERING_FLAG = [f"--lowering={LOWERING}"] if LOWERING else []
 # resulting .wasm via wasmtime. Both TINYC_LOWERING values are valid
 # with the wasm target.
 TARGET = os.environ.get("TINYC_TARGET", "native")
+# Selects which macho backend to use when TARGET=macho. The default
+# `wasm` backend goes wasmssa -> wasmstack -> wasm.o -> Mach-O. The
+# `wmir` backend goes wasmssa -> wmir -> aarch64 -> Mach-O.
+MACHO_BACKEND = os.environ.get("TINYC_MACHO_BACKEND", "wasm")
 # When TINYC_LIFT_USE_NATIVE=1, the upstream tinyc binary first runs the
 # (partial) native cf->scf lifter and then finishes any leftover cf ops
 # with upstream's CFGToSCF pass. That fallback handles all the patterns
@@ -324,12 +328,19 @@ def main():
             # Stage 1: tinyc emits wasm32 object, links it with the wasm
             # runtime + _start shim, and translates the linked module to
             # a signed Mach-O ARM64 binary — all in one invocation.
-            r = run([str(TINYC), "--emit=macho", *LOWERING_FLAG,
-                     "-I", str(HERE / "tests"),
-                     "-o", str(exe),
-                     f"--wasm-runtime-obj={wasm_runtime_obj}",
-                     f"--wasm-runtime-obj={wasm_start_obj}",
-                     *[str(s) for s in srcs]])
+            # For the experimental `wmir` backend the wasm runtime
+            # objects are not needed (the backend synthesises its own
+            # `_start` and uses a direct svc-based exit).
+            tinyc_cmd = [str(TINYC), "--emit=macho", *LOWERING_FLAG,
+                         "-I", str(HERE / "tests"),
+                         "-o", str(exe)]
+            if MACHO_BACKEND == "wmir":
+                tinyc_cmd.append("--macho-backend=wmir")
+            else:
+                tinyc_cmd.append(f"--wasm-runtime-obj={wasm_runtime_obj}")
+                tinyc_cmd.append(f"--wasm-runtime-obj={wasm_start_obj}")
+            tinyc_cmd.extend(str(s) for s in srcs)
+            r = run(tinyc_cmd)
             if r.returncode != 0:
                 print(f"FAIL {name}: tinyc returned {r.returncode}\nstderr:\n{r.stderr}")
                 failures += 1

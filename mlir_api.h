@@ -311,6 +311,185 @@ typedef enum {
     OP_TYPE_WASMSTACK_MEMORY_SIZE,
     OP_TYPE_WASMSTACK_MEMORY_GROW,
 
+    // -------------------------------------------------------------------------
+    // wmir dialect — flat-CFG, post-wasmssa middle IR. The plan is to make
+    // this the "computation, not bytecode" representation that the AArch64
+    // selector consumes: real iN/fN/ptr types, explicit `trap_if`,
+    // explicit heap-address computation, explicit indirect-call type
+    // checks. The first-light slice (`macho_exit`) only needs three ops;
+    // everything else will be added test-by-test in subsequent passes.
+    // -------------------------------------------------------------------------
+    OP_TYPE_WMIR_FUNC,
+    OP_TYPE_WMIR_CONST,
+    OP_TYPE_WMIR_RETURN,
+    // Integer arithmetic (i32 / i64, dispatched on result type).
+    OP_TYPE_WMIR_IADD,
+    OP_TYPE_WMIR_ISUB,
+    OP_TYPE_WMIR_IMUL,
+    OP_TYPE_WMIR_SDIV,
+    OP_TYPE_WMIR_UDIV,
+    OP_TYPE_WMIR_SREM,
+    OP_TYPE_WMIR_UREM,
+    OP_TYPE_WMIR_IAND,
+    OP_TYPE_WMIR_IOR,
+    OP_TYPE_WMIR_IXOR,
+    OP_TYPE_WMIR_ISHL,
+    OP_TYPE_WMIR_SSHR,   // arithmetic shift right
+    OP_TYPE_WMIR_USHR,   // logical  shift right
+    // Integer conversions (between i32 and i64).
+    OP_TYPE_WMIR_SEXT,   // sign-extend i32 -> i64
+    OP_TYPE_WMIR_ZEXT,   // zero-extend i32 -> i64
+    OP_TYPE_WMIR_TRUNC,  // truncate    i64 -> i32
+    // Wasm global access (vmctx-relative; first-light: i32 globals only).
+    OP_TYPE_WMIR_GLOBAL_GET,
+    OP_TYPE_WMIR_GLOBAL_SET,
+    // Wasm linear-memory access. operand is a wasm32 byte offset; the
+    // wmir->aarch64 lowering adds linmem_base + zext(offset).
+    OP_TYPE_WMIR_LOAD,
+    OP_TYPE_WMIR_STORE,
+    // Direct function call by symbol name.
+    OP_TYPE_WMIR_CALL,
+    // Integer compare. `pred` attribute is one of:
+    //   "eq", "ne", "slt", "sgt", "sle", "sge", "ult", "ugt", "ule", "uge".
+    // Returns i32 with the Wasm 0/1 boolean convention.
+    OP_TYPE_WMIR_ICMP,
+    // Compare-to-zero. Returns i32 0/1 (1 if operand == 0).
+    OP_TYPE_WMIR_EQZ,
+    // Unconditional branch to a block (with operands forwarded as block args).
+    OP_TYPE_WMIR_BR,
+    // Conditional branch. operand[0] = i32 condition (zero -> false branch,
+    // non-zero -> true branch). `true_block` and `false_block` are successors.
+    OP_TYPE_WMIR_COND_BR,
+    // Unreachable terminator. Lowers to a trap (currently brk #1).
+    OP_TYPE_WMIR_UNREACHABLE,
+    // 3-operand select. result = cond != 0 ? a : b.
+    OP_TYPE_WMIR_SELECT,
+    // Module-level: a slice of bytes to place at the given offset within
+    // linmem at link time. Lowers 1:1 to aarch64.data_init.
+    //   attrs: sym_name (string, debug), offset (i32), init_data (string).
+    OP_TYPE_WMIR_DATA_INIT,
+    // Float arithmetic, modelled on i32/i64 bit-pattern values. The
+    // f32/f64 type distinction is carried by the `fwidth` attribute
+    // (32 or 64) rather than the MLIR result type, which stays i32 /
+    // i64 throughout wmir. This lets the existing spill/reload machinery
+    // (which keys on i32 vs i64) just work — the wmir->aarch64 stage
+    // detours through a V register only for the duration of the FP
+    // instruction itself.
+    //   attrs: kind (string: fadd|fsub|fmul|fdiv), fwidth (i32: 32|64).
+    OP_TYPE_WMIR_FBINOP,
+    //   attrs: kind (string: fneg|fabs|fsqrt), fwidth.
+    OP_TYPE_WMIR_FUNOP,
+    //   attrs: pred (oeq|une|olt|ole|ogt|oge), fwidth. Result is i32 (0|1).
+    OP_TYPE_WMIR_FCMP,
+    //   attrs: kind (string: f2f|f2i|i2f), src_w, dst_w, sign (bool, for
+    //     f2i / i2f). Operand and result are i32 / i64 bit patterns.
+    OP_TYPE_WMIR_FCONV,
+
+    // -------------------------------------------------------------------------
+    // aarch64 dialect — 1:1 with the AArch64 instruction encoding. The
+    // `aarch64 → Mach-O` backend is a "dumb" byte emitter; all isel /
+    // register-allocation knowledge lives in the `wmir → aarch64` lowering.
+    // First-light slice: just enough to run `int main() { return 42; }`
+    // and have its return value become the process exit code via a
+    // direct `svc #0x80` Mach syscall (no `proc_exit` shim required).
+    // -------------------------------------------------------------------------
+    OP_TYPE_AARCH64_FUNC,
+    OP_TYPE_AARCH64_MOVZ,   // movz Wd|Xd, #imm16, LSL #(hw*16)
+    OP_TYPE_AARCH64_MOVK,   // movk Wd|Xd, #imm16, LSL #(hw*16)
+    OP_TYPE_AARCH64_MOV_X,  // mov Xd, Xn  (register move; X-form)
+    OP_TYPE_AARCH64_BL,     // bl <symbol>  (branch-and-link, PC-relative)
+    OP_TYPE_AARCH64_SVC,    // svc #imm16
+    OP_TYPE_AARCH64_RET,    // ret (== ret x30)
+
+    // Arithmetic + memory + stack-frame ops added in the arith slice.
+    OP_TYPE_AARCH64_ADD_IMM,  // add Wd|Xd, Wn|Xn, #imm12 (LSL 0)
+    OP_TYPE_AARCH64_SUB_IMM,  // sub Wd|Xd, Wn|Xn, #imm12 (LSL 0)
+    OP_TYPE_AARCH64_ADD_REG,  // add Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_SUB_REG,  // sub Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_MUL,      // mul Wd|Xd, Wn|Xn, Wm|Xm  (== madd ..., xzr)
+    OP_TYPE_AARCH64_SDIV,     // sdiv Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_UDIV,     // udiv Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_MSUB,     // msub Wd, Wn, Wm, Wa  (used for srem/urem)
+    OP_TYPE_AARCH64_AND_REG,  // and  Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_ORR_REG,  // orr  Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_EOR_REG,  // eor  Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_LSL_REG,  // lslv Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_LSR_REG,  // lsrv Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_ASR_REG,  // asrv Wd|Xd, Wn|Xn, Wm|Xm
+    OP_TYPE_AARCH64_SXTW,     // sxtw Xd, Wn  (alias for SBFM)
+    OP_TYPE_AARCH64_SXTB,     // sxtb Wd|Xd, Wn  (sign-extend low byte)
+    OP_TYPE_AARCH64_SXTH,     // sxth Wd|Xd, Wn  (sign-extend low half)
+    OP_TYPE_AARCH64_UXTW,     // mov  Wd, Wn  (== orr Wd, WZR, Wn ; zero-extends)
+    OP_TYPE_AARCH64_LDR_W,    // ldr Wd, [Xn, #imm] (i32 unsigned-offset)
+    OP_TYPE_AARCH64_STR_W,    // str Wd, [Xn, #imm] (i32 unsigned-offset)
+    OP_TYPE_AARCH64_LDR_X,    // ldr Xd, [Xn, #imm] (i64 unsigned-offset)
+    OP_TYPE_AARCH64_STR_X,    // str Xd, [Xn, #imm] (i64 unsigned-offset)
+    OP_TYPE_AARCH64_STRB_IMM, // strb Wt, [Xn, #imm12] (1-byte unscaled)
+    OP_TYPE_AARCH64_LDRB_IMM, // ldrb Wt, [Xn, #imm12] (1-byte zero-extend)
+    // Pseudo: ADRP+ADD pair that resolves to the runtime base address
+    // of one of the predeclared __DATA regions (vmctx, globals, linmem).
+    // The macho backend patches the encoded PC-relative immediates
+    // after layout. Body of the macho-backend tracks this list of
+    // bases as part of the data-segment layout.
+    OP_TYPE_AARCH64_ADRP_DATA,    // adrp Xd, page_of(<region>)
+    OP_TYPE_AARCH64_ADD_DATA_LO,  // add  Xd, Xn, #lo12(<region>)
+    // Function prologue/epilogue (modeled as an op pair so the dumb
+    // backend can emit the exact instruction sequence; details of
+    // sp/fp/lr handling baked into the encoder).
+    OP_TYPE_AARCH64_PROLOGUE,
+    OP_TYPE_AARCH64_EPILOGUE,
+    // Comparison + condition-set. Used to materialise i32 booleans for
+    // `wmir.icmp` and `wmir.eqz` results.
+    OP_TYPE_AARCH64_CMP_REG,    // cmp Wn, Wm  (== subs Wzr, Wn, Wm)
+    OP_TYPE_AARCH64_CMP_IMM,    // cmp Wn, #imm12  (== subs Wzr, Wn, #imm12)
+    OP_TYPE_AARCH64_CSET,       // cset Wd, COND (== csinc Wd, Wzr, Wzr, invert(COND))
+    // Conditional select. `csel Wd, Wn, Wm, COND`. Used for wmir.select.
+    OP_TYPE_AARCH64_CSEL,
+    // Control-flow ops. `target` attribute is the symbolic label name.
+    // The macho backend tracks all `aarch64.label` positions inside a
+    // function and patches the branch immediates after layout.
+    OP_TYPE_AARCH64_B,          // b <label>     (PC-relative imm26)
+    OP_TYPE_AARCH64_B_COND,     // b.<cond> <label> (PC-relative imm19)
+    OP_TYPE_AARCH64_CBZ,        // cbz Wn, <label>
+    OP_TYPE_AARCH64_CBNZ,       // cbnz Wn, <label>
+    OP_TYPE_AARCH64_LABEL,      // pseudo: marks a position; emits 0 bytes
+    OP_TYPE_AARCH64_BRK,        // brk #imm16 (trap)
+    // Floating-point ops. Operand and result registers in attributes are
+    // *V register* numbers (0..31) for the FP slots and GP register
+    // numbers for the GP slots; the two register files are disjoint, so
+    // a number like `0` means V0 in an FP slot and W0/X0 in a GP slot.
+    //
+    // FMOV between a GP and an FP register; `dir_to_v` chooses direction
+    // (true: GP→V, false: V→GP). `sf` selects W↔S (false) or X↔D (true).
+    //   attrs: dir_to_v (bool), sf (bool), rd (i32), rn (i32).
+    OP_TYPE_AARCH64_FMOV_GP_V,
+    // FADD/FSUB/FMUL/FDIV between two V regs into a V reg.
+    //   attrs: kind (string: fadd|fsub|fmul|fdiv), fwidth (32|64),
+    //          rd (i32), rn (i32), rm (i32).
+    OP_TYPE_AARCH64_FP_BINOP,
+    // FNEG/FABS/FSQRT on a V reg → V reg.
+    //   attrs: kind (string), fwidth, rd, rn.
+    OP_TYPE_AARCH64_FP_UNOP,
+    // FCMP Sn/Dn, Sm/Dm — sets NZCV (no rd).
+    //   attrs: fwidth (32|64), rn (i32), rm (i32).
+    OP_TYPE_AARCH64_FCMP,
+    // FP conversion family. `kind` is one of:
+    //   "f2f"   — FP-to-FP precision change (FCVT Dd,Sn / FCVT Sd,Dn).
+    //             rd and rn are both V registers.
+    //   "f2i"   — FP-to-integer (FCVTZS / FCVTZU). `sign` true => FCVTZS,
+    //             false => FCVTZU. rd is a GP register, rn is V.
+    //   "i2f"   — Integer-to-FP (SCVTF / UCVTF). rd is V, rn is GP.
+    // src_w / dst_w in {32, 64} pick S/W vs D/X.
+    //   attrs: kind (string), src_w (i32), dst_w (i32), sign (bool),
+    //          rd (i32), rn (i32).
+    OP_TYPE_AARCH64_FP_CVT,
+    // Module-level: a slice of bytes to overlay onto the linmem __DATA
+    // section at the given offset. The macho backend gathers all of
+    // these into a single file-backed section that precedes the
+    // zero-fill portion of linmem.
+    //   attrs: sym_name (string, debug), offset (i32), init_data (string).
+    OP_TYPE_AARCH64_DATA_INIT,
+
     OP_TYPE_COUNT
 } MLIR_OpType;
 

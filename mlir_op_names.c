@@ -1,12 +1,21 @@
 // Op-type → string mapping. Split out of mlir_parser.c so consumers like
 // mlir_api_impl.c that need only the table can link against it without
 // pulling in the parser/tokenizer/op_parsers tree.
+//
+// We split the table into two helper functions to keep each `switch`
+// well under the wasm->macho backend's 256-deep block-stack limit
+// (clang lowers a giant sparse switch into one nested block per case,
+// and the combined enum now has 260+ entries). The two halves are
+// chained: if the first returns a sentinel, the second runs.
 
 #include <base/string.h>
 #include "mlir_api.h"
 #include "mlir_op_names.h"
 
-string op_type_to_string(MLIR_OpType type) {
+// Sentinel used only between the two helpers below; never escapes.
+#define OP_NAME_NOT_IN_THIS_HALF str_lit("")
+
+static string op_type_to_string_half1(MLIR_OpType type) {
     switch (type) {
         case OP_TYPE_UNREGISTERED: return str_lit("unregistered");
         case OP_TYPE_MODULE: return str_lit("module");
@@ -138,6 +147,12 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_WASMSSA_EXTEND_I32_S: return str_lit("wasmssa.extend_i32_s");
         case OP_TYPE_WASMSSA_RETURN: return str_lit("wasmssa.return");
         case OP_TYPE_WASMSSA_CALL: return str_lit("wasmssa.call");
+        default: return OP_NAME_NOT_IN_THIS_HALF;
+    }
+}
+
+static string op_type_to_string_half2(MLIR_OpType type) {
+    switch (type) {
         case OP_TYPE_WASMSSA_BLOCK:        return str_lit("wasmssa.block");
         case OP_TYPE_WASMSSA_LOOP:         return str_lit("wasmssa.loop");
         case OP_TYPE_WASMSSA_IF:           return str_lit("wasmssa.if");
@@ -186,6 +201,102 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_WASMSTACK_CALL_INDIRECT: return str_lit("wasmstack.call_indirect");
         case OP_TYPE_WASMSTACK_MEMORY_SIZE: return str_lit("wasmstack.memory_size");
         case OP_TYPE_WASMSTACK_MEMORY_GROW: return str_lit("wasmstack.memory_grow");
-        default: return str_lit("unknown");
+        // wmir dialect
+        case OP_TYPE_WMIR_FUNC:       return str_lit("wmir.func");
+        case OP_TYPE_WMIR_CONST:      return str_lit("wmir.const");
+        case OP_TYPE_WMIR_RETURN:     return str_lit("wmir.return");
+        case OP_TYPE_WMIR_IADD:       return str_lit("wmir.iadd");
+        case OP_TYPE_WMIR_ISUB:       return str_lit("wmir.isub");
+        case OP_TYPE_WMIR_IMUL:       return str_lit("wmir.imul");
+        case OP_TYPE_WMIR_SDIV:       return str_lit("wmir.sdiv");
+        case OP_TYPE_WMIR_UDIV:       return str_lit("wmir.udiv");
+        case OP_TYPE_WMIR_SREM:       return str_lit("wmir.srem");
+        case OP_TYPE_WMIR_UREM:       return str_lit("wmir.urem");
+        case OP_TYPE_WMIR_IAND:       return str_lit("wmir.iand");
+        case OP_TYPE_WMIR_IOR:        return str_lit("wmir.ior");
+        case OP_TYPE_WMIR_IXOR:       return str_lit("wmir.ixor");
+        case OP_TYPE_WMIR_ISHL:       return str_lit("wmir.ishl");
+        case OP_TYPE_WMIR_SSHR:       return str_lit("wmir.sshr");
+        case OP_TYPE_WMIR_USHR:       return str_lit("wmir.ushr");
+        case OP_TYPE_WMIR_SEXT:       return str_lit("wmir.sext");
+        case OP_TYPE_WMIR_ZEXT:       return str_lit("wmir.zext");
+        case OP_TYPE_WMIR_TRUNC:      return str_lit("wmir.trunc");
+        case OP_TYPE_WMIR_GLOBAL_GET: return str_lit("wmir.global_get");
+        case OP_TYPE_WMIR_GLOBAL_SET: return str_lit("wmir.global_set");
+        case OP_TYPE_WMIR_LOAD:       return str_lit("wmir.load");
+        case OP_TYPE_WMIR_STORE:      return str_lit("wmir.store");
+        case OP_TYPE_WMIR_CALL:       return str_lit("wmir.call");
+        case OP_TYPE_WMIR_ICMP:       return str_lit("wmir.icmp");
+        case OP_TYPE_WMIR_EQZ:        return str_lit("wmir.eqz");
+        case OP_TYPE_WMIR_BR:         return str_lit("wmir.br");
+        case OP_TYPE_WMIR_COND_BR:    return str_lit("wmir.cond_br");
+        case OP_TYPE_WMIR_UNREACHABLE:return str_lit("wmir.unreachable");
+        case OP_TYPE_WMIR_SELECT:     return str_lit("wmir.select");
+        case OP_TYPE_WMIR_DATA_INIT:  return str_lit("wmir.data_init");
+        case OP_TYPE_WMIR_FBINOP:     return str_lit("wmir.fbinop");
+        case OP_TYPE_WMIR_FUNOP:      return str_lit("wmir.funop");
+        case OP_TYPE_WMIR_FCMP:       return str_lit("wmir.fcmp");
+        case OP_TYPE_WMIR_FCONV:      return str_lit("wmir.fconv");
+        // aarch64 dialect
+        case OP_TYPE_AARCH64_FUNC:         return str_lit("aarch64.func");
+        case OP_TYPE_AARCH64_MOVZ:         return str_lit("aarch64.movz");
+        case OP_TYPE_AARCH64_MOVK:         return str_lit("aarch64.movk");
+        case OP_TYPE_AARCH64_MOV_X:        return str_lit("aarch64.mov_x");
+        case OP_TYPE_AARCH64_BL:           return str_lit("aarch64.bl");
+        case OP_TYPE_AARCH64_SVC:          return str_lit("aarch64.svc");
+        case OP_TYPE_AARCH64_RET:          return str_lit("aarch64.ret");
+        case OP_TYPE_AARCH64_ADD_IMM:      return str_lit("aarch64.add_imm");
+        case OP_TYPE_AARCH64_SUB_IMM:      return str_lit("aarch64.sub_imm");
+        case OP_TYPE_AARCH64_ADD_REG:      return str_lit("aarch64.add_reg");
+        case OP_TYPE_AARCH64_SUB_REG:      return str_lit("aarch64.sub_reg");
+        case OP_TYPE_AARCH64_MUL:          return str_lit("aarch64.mul");
+        case OP_TYPE_AARCH64_SDIV:         return str_lit("aarch64.sdiv");
+        case OP_TYPE_AARCH64_UDIV:         return str_lit("aarch64.udiv");
+        case OP_TYPE_AARCH64_MSUB:         return str_lit("aarch64.msub");
+        case OP_TYPE_AARCH64_AND_REG:      return str_lit("aarch64.and_reg");
+        case OP_TYPE_AARCH64_ORR_REG:      return str_lit("aarch64.orr_reg");
+        case OP_TYPE_AARCH64_EOR_REG:      return str_lit("aarch64.eor_reg");
+        case OP_TYPE_AARCH64_LSL_REG:      return str_lit("aarch64.lsl_reg");
+        case OP_TYPE_AARCH64_LSR_REG:      return str_lit("aarch64.lsr_reg");
+        case OP_TYPE_AARCH64_ASR_REG:      return str_lit("aarch64.asr_reg");
+        case OP_TYPE_AARCH64_SXTW:         return str_lit("aarch64.sxtw");
+        case OP_TYPE_AARCH64_SXTB:         return str_lit("aarch64.sxtb");
+        case OP_TYPE_AARCH64_SXTH:         return str_lit("aarch64.sxth");
+        case OP_TYPE_AARCH64_UXTW:         return str_lit("aarch64.uxtw");
+        case OP_TYPE_AARCH64_LDR_W:        return str_lit("aarch64.ldr_w");
+        case OP_TYPE_AARCH64_STR_W:        return str_lit("aarch64.str_w");
+        case OP_TYPE_AARCH64_LDR_X:        return str_lit("aarch64.ldr_x");
+        case OP_TYPE_AARCH64_STR_X:        return str_lit("aarch64.str_x");
+        case OP_TYPE_AARCH64_STRB_IMM:     return str_lit("aarch64.strb_imm");
+        case OP_TYPE_AARCH64_LDRB_IMM:     return str_lit("aarch64.ldrb_imm");
+        case OP_TYPE_AARCH64_ADRP_DATA:    return str_lit("aarch64.adrp_data");
+        case OP_TYPE_AARCH64_ADD_DATA_LO:  return str_lit("aarch64.add_data_lo");
+        case OP_TYPE_AARCH64_PROLOGUE:     return str_lit("aarch64.prologue");
+        case OP_TYPE_AARCH64_EPILOGUE:     return str_lit("aarch64.epilogue");
+        case OP_TYPE_AARCH64_CMP_REG:      return str_lit("aarch64.cmp_reg");
+        case OP_TYPE_AARCH64_CMP_IMM:      return str_lit("aarch64.cmp_imm");
+        case OP_TYPE_AARCH64_CSET:         return str_lit("aarch64.cset");
+        case OP_TYPE_AARCH64_CSEL:         return str_lit("aarch64.csel");
+        case OP_TYPE_AARCH64_B:            return str_lit("aarch64.b");
+        case OP_TYPE_AARCH64_B_COND:       return str_lit("aarch64.b_cond");
+        case OP_TYPE_AARCH64_CBZ:          return str_lit("aarch64.cbz");
+        case OP_TYPE_AARCH64_CBNZ:         return str_lit("aarch64.cbnz");
+        case OP_TYPE_AARCH64_LABEL:        return str_lit("aarch64.label");
+        case OP_TYPE_AARCH64_BRK:          return str_lit("aarch64.brk");
+        case OP_TYPE_AARCH64_FMOV_GP_V:    return str_lit("aarch64.fmov_gp_v");
+        case OP_TYPE_AARCH64_FP_BINOP:     return str_lit("aarch64.fp_binop");
+        case OP_TYPE_AARCH64_FP_UNOP:      return str_lit("aarch64.fp_unop");
+        case OP_TYPE_AARCH64_FCMP:         return str_lit("aarch64.fcmp");
+        case OP_TYPE_AARCH64_FP_CVT:       return str_lit("aarch64.fp_cvt");
+        case OP_TYPE_AARCH64_DATA_INIT:    return str_lit("aarch64.data_init");
+        default: return OP_NAME_NOT_IN_THIS_HALF;
     }
+}
+
+string op_type_to_string(MLIR_OpType type) {
+    string s = op_type_to_string_half1(type);
+    if (s.size != 0) return s;
+    s = op_type_to_string_half2(type);
+    if (s.size != 0) return s;
+    return str_lit("unknown");
 }
