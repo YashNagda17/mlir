@@ -61,6 +61,10 @@ static bool is_synth_helper(string nm) {
         "fd_write", "proc_exit",
         "tinyc_va_arg_i32", "tinyc_va_arg_i64", "tinyc_va_arg_ptr",
         "tinyc_va_arg_struct", "tinyc_va_arg_f64",
+        // WASI host imports synthesised in the wmir aarch64 backend.
+        "path_open", "fd_close", "fd_read", "fd_seek", "fd_tell",
+        "args_get", "args_sizes_get",
+        "environ_get", "environ_sizes_get",
     };
     size_t n = sizeof(kHelpers) / sizeof(kHelpers[0]);
     for (size_t i = 0; i < n; i++) {
@@ -150,10 +154,16 @@ static void st_push(Stack *s, MLIR_ValueHandle v) {
     }
     s->data[s->n++] = v;
 }
+// Per-fn / per-op diagnostics so st_pop() underflow messages can name
+// the function and op that triggered them. These are written by
+// lift_func / lift_body and read in st_pop. Defined at file scope so
+// tinyC (which rejects function-local `extern` declarations) can
+// compile this file.
+const char *g_current_fn_name = NULL;
+const char *g_current_op_name = NULL;
+
 static MLIR_ValueHandle st_pop(Stack *s) {
     if (s->n == 0) {
-        extern const char *g_current_fn_name;
-        extern const char *g_current_op_name;
         fprintf(stderr, "ws->ssa: stack underflow in st_pop (fn='%s' op='%s')\n",
             g_current_fn_name ? g_current_fn_name : "?",
             g_current_op_name ? g_current_op_name : "?");
@@ -162,8 +172,6 @@ static MLIR_ValueHandle st_pop(Stack *s) {
     return s->data[--s->n];
 }
 
-const char *g_current_fn_name = NULL;
-const char *g_current_op_name = NULL;
 static MLIR_ValueHandle st_peek(Stack *s) {
     if (s->n == 0) return MLIR_INVALID_HANDLE;
     return s->data[s->n - 1];
@@ -1307,6 +1315,22 @@ static bool lift_body(FnCtx *F, MLIR_BlockHandle src_blk) {
 // =============================================================================
 static MLIR_OpHandle lift_func(MLIR_Context *ctx, Arena *arena,
                                MLIR_OpHandle src, MLIR_BlockHandle siblings) {
+    // Transient working arena for this function. Allocations from
+    // `tmp` (operand-array scratch, hex-decoded type lists, the
+    // sym-name buf used for g_current_fn_name diagnostics) all
+    // become dead the moment lift_func returns: MLIR_CreateOp /
+    // _CreateValue / _AppendBlock* copy their inputs into the
+    // context arena, so nothing we write here escapes into the IR.
+    //
+    // Without a transient arena, every function's working bytes
+    // accumulate forever in ctx->arena (which also holds the
+    // permanent IR), and lifting a real-sized linked wasm
+    // (thousands of functions) blows past the 4 GiB heap. With a
+    // transient arena, peak memory is bounded by the largest
+    // function instead.
+    Arena *tmp = arena_create(64 * 1024);
+    (void)arena;  // arena parameter retained for ABI; tmp is used.
+
     string sym_name      = at_s(src, "sym_name");
     string pt_s          = at_s(src, "param_types");
     string rt_s          = at_s(src, "result_types");
@@ -1314,9 +1338,9 @@ static MLIR_OpHandle lift_func(MLIR_Context *ctx, Arena *arena,
     string local_types_s = at_s(src, "local_types");
 
     size_t np = 0, nr = 0, nl_total = 0;
-    uint8_t *params  = hex_decode_arena(arena, pt_s, &np);
-    uint8_t *results = hex_decode_arena(arena, rt_s, &nr);
-    uint8_t *locals  = hex_decode_arena(arena, local_types_s, &nl_total);
+    uint8_t *params  = hex_decode_arena(tmp, pt_s, &np);
+    uint8_t *results = hex_decode_arena(tmp, rt_s, &nr);
+    uint8_t *locals  = hex_decode_arena(tmp, local_types_s, &nl_total);
     (void)results;
 
     MLIR_BlockHandle entry = MLIR_CreateBlock(ctx);
@@ -1324,7 +1348,7 @@ static MLIR_OpHandle lift_func(MLIR_Context *ctx, Arena *arena,
     // Add block args for params.
     MLIR_ValueHandle *param_args = NULL;
     if (np) {
-        param_args = (MLIR_ValueHandle *)arena_alloc(arena,
+        param_args = (MLIR_ValueHandle *)arena_alloc(tmp,
             np * sizeof(MLIR_ValueHandle));
     }
     for (size_t i = 0; i < np; i++) {
@@ -1342,7 +1366,7 @@ static MLIR_OpHandle lift_func(MLIR_Context *ctx, Arena *arena,
     uint32_t *local_offs = NULL;
     uint32_t locals_size = 0;
     if (nl_total) {
-        local_offs = (uint32_t *)arena_alloc(arena,
+        local_offs = (uint32_t *)arena_alloc(tmp,
             nl_total * sizeof(uint32_t));
         for (size_t i = 0; i < nl_total; i++) {
             local_offs[i] = (uint32_t)(i * LOCAL_CELL_BYTES);
@@ -1354,12 +1378,15 @@ static MLIR_OpHandle lift_func(MLIR_Context *ctx, Arena *arena,
 
     FnCtx F = {0};
     F.ctx = ctx;
-    F.arena = arena;
+    F.arena = tmp;
     F.siblings = siblings;
     {
-        extern const char *g_current_fn_name;
-        // Need a stable C string; sym_name is not NUL-terminated.
-        char *buf = (char *)arena_alloc(arena, sym_name.size + 1);
+        // Need a stable C string; sym_name is not NUL-terminated. The
+        // pointer goes into the diagnostic global g_current_fn_name,
+        // which is read by st_pop on underflow — only while we're
+        // inside this lift_func call. Clearing the global before
+        // arena_destroy keeps it from dangling.
+        char *buf = (char *)arena_alloc(tmp, sym_name.size + 1);
         memcpy(buf, sym_name.str, sym_name.size);
         buf[sym_name.size] = '\0';
         g_current_fn_name = buf;
@@ -1434,6 +1461,11 @@ static MLIR_OpHandle lift_func(MLIR_Context *ctx, Arena *arena,
 
     st_free(&F.stack);
     fs_free(&F.frames);
+
+    // Diagnostic globals point into `tmp`; null them out before destroy.
+    g_current_fn_name = NULL;
+    g_current_op_name = NULL;
+    arena_destroy(tmp);
 
     if (!ok) return MLIR_INVALID_HANDLE;
 
@@ -1546,9 +1578,22 @@ MLIR_OpHandle mlir_wasmstack_to_wasmssa(MLIR_Context *ctx,
     MLIR_RegionHandle out_region = MLIR_CreateRegion(ctx);
     MLIR_AppendRegionBlock(ctx, out_region, out_body);
     MLIR_RegionHandle out_regs[1] = { out_region };
+
+    // Propagate `memory_min_pages` from the wasmstack module so the
+    // wasmssa -> wmir -> aarch64 chain can size the linear memory image
+    // correctly (see mlir_wasm_to_wasmstack.c for the rationale).
+    MLIR_AttributeHandle mod_attrs[1];
+    size_t n_mod_attrs = 0;
+    MLIR_AttributeHandle a_min_pages = MLIR_GetOpAttributeByName(
+        stack_module, "memory_min_pages");
+    if (a_min_pages) {
+        mod_attrs[n_mod_attrs++] = attr_i32(ctx, "memory_min_pages",
+            MLIR_GetAttributeInteger(a_min_pages));
+    }
+
     MLIR_OpHandle out_module = MLIR_CreateOp(ctx, OP_TYPE_MODULE,
         str_lit("module"),
-        NULL, 0, NULL, 0, NULL, 0, NULL, 0, out_regs, 1,
+        mod_attrs, n_mod_attrs, NULL, 0, NULL, 0, NULL, 0, out_regs, 1,
         MLIR_CreateLocationUnknown(ctx, (string){0}),
         MLIR_INVALID_HANDLE, (string){0}, -1);
 

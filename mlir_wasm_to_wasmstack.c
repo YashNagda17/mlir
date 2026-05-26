@@ -1238,9 +1238,23 @@ MLIR_OpHandle mlir_wasm_to_wasmstack(MLIR_Context *ctx,
     MLIR_RegionHandle out_region = MLIR_CreateRegion(ctx);
     MLIR_AppendRegionBlock(ctx, out_region, out_body);
     MLIR_RegionHandle out_regs[1] = { out_region };
+
+    // Propagate the wasm MEMORY section's `min_pages` so downstream
+    // passes (wmir -> aarch64 -> Mach-O) can size the linear memory
+    // image correctly. Without this the wmir backend hardcoded
+    // a tiny 4 MiB default and any module with >4 MiB of static
+    // data would silently overflow __heap_base past the end of
+    // linmem, causing platform_heap_size() to wrap to a huge value
+    // and the buddy allocator to scribble all over the binary.
+    MLIR_AttributeHandle mod_attrs[1];
+    size_t n_mod_attrs = 0;
+    if (m.has_memory) {
+        mod_attrs[n_mod_attrs++] = attr_i32(ctx, "memory_min_pages",
+                                            (int64_t)m.memory_min_pages);
+    }
     MLIR_OpHandle out_module = MLIR_CreateOp(ctx, OP_TYPE_MODULE,
         str_lit("module"),
-        NULL, 0, NULL, 0, NULL, 0, NULL, 0, out_regs, 1,
+        mod_attrs, n_mod_attrs, NULL, 0, NULL, 0, NULL, 0, out_regs, 1,
         MLIR_CreateLocationUnknown(ctx, (string){0}),
         MLIR_INVALID_HANDLE, (string){0}, -1);
 

@@ -1531,9 +1531,25 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
     MLIR_RegionHandle out_region = MLIR_CreateRegion(ctx);
     MLIR_AppendRegionBlock(ctx, out_region, out_body);
     MLIR_RegionHandle out_regs[1] = { out_region };
+
+    // Propagate `memory_min_pages` from the wasmssa module so the
+    // wmir -> aarch64 backend can size the linear memory image
+    // correctly (see mlir_wasm_to_wasmstack.c for the rationale).
+    MLIR_AttributeHandle mod_attrs[1];
+    size_t n_mod_attrs = 0;
+    MLIR_AttributeHandle a_min_pages = MLIR_GetOpAttributeByName(
+        ssa_module, "memory_min_pages");
+    if (a_min_pages) {
+        MLIR_AttributeHandle aa = MLIR_CreateAttributeInteger(ctx,
+            str_from_cstr_view((char *)"memory_min_pages"),
+            MLIR_GetAttributeInteger(a_min_pages),
+            MLIR_CreateTypeInteger(ctx, 32, true));
+        mod_attrs[n_mod_attrs++] = aa;
+    }
+
     MLIR_OpHandle out_module = MLIR_CreateOp(ctx, OP_TYPE_MODULE,
         str_lit("module"),
-        NULL, 0, NULL, 0, NULL, 0, NULL, 0, out_regs, 1,
+        mod_attrs, n_mod_attrs, NULL, 0, NULL, 0, NULL, 0, out_regs, 1,
         MLIR_CreateLocationUnknown(ctx, (string){0}),
         MLIR_INVALID_HANDLE, (string){0}, -1);
 
