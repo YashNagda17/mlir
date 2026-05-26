@@ -3803,14 +3803,18 @@ static MLIR_OpHandle synth_path_open(MLIR_Context *ctx) {
     // src + i:
     emit_add_reg(ctx, cploop, /*rd=*/11, /*rn=*/9, /*rm=*/10, /*sf=*/true);
     emit_ldrb_imm(ctx, cploop, /*rt=*/12, /*rn=*/11, /*off=*/0);
-    // dst (sp + i):
-    emit_add_reg(ctx, cploop, /*rd=*/13, /*rn=*/31, /*rm=*/10, /*sf=*/true);
+    // dst (sp + i): materialise sp into x13 first (shifted-reg form
+    // of `add` treats Rn=31 as XZR, not SP — must use add-imm to
+    // get sp into a real register, then add the offset).
+    emit_add_imm(ctx, cploop, /*rd=*/13, /*rn=*/31, /*imm12=*/0, /*sf=*/true);
+    emit_add_reg(ctx, cploop, /*rd=*/13, /*rn=*/13, /*rm=*/10, /*sf=*/true);
     emit_strb_imm(ctx, cploop, /*rt=*/12, /*rn=*/13, /*off=*/0);
     emit_add_imm(ctx, cploop, /*rd=*/10, /*rn=*/10, /*imm12=*/1, /*sf=*/true);
     emit_b(ctx, cploop, cpchk);
 
     // cpdone: nul terminator at sp + path_len; start flag translation.
-    emit_add_reg(ctx, cpdone, /*rd=*/13, /*rn=*/31, /*rm=*/20, /*sf=*/true);
+    emit_add_imm(ctx, cpdone, /*rd=*/13, /*rn=*/31, /*imm12=*/0, /*sf=*/true);
+    emit_add_reg(ctx, cpdone, /*rd=*/13, /*rn=*/13, /*rm=*/20, /*sf=*/true);
     emit_strb_imm(ctx, cpdone, /*rt=*/31, /*rn=*/13, /*off=*/0);
     // w14 = os_flags accumulator = 0.
     emit_movz(ctx, cpdone, /*rd=*/14, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
