@@ -267,11 +267,20 @@ static uint32_t arm64_brk(uint16_t imm16) {
 static uint32_t arm64_stp_fp_lr_pre(void)   { return 0xa9bf7bfdu; } // stp x29,x30,[sp,#-16]!
 static uint32_t arm64_ldp_fp_lr_post(void)  { return 0xa8c17bfdu; } // ldp x29,x30,[sp],#16
 static uint32_t arm64_mov_fp_sp(void)       { return 0x910003fdu; } // add x29,sp,#0
+// shift=0: imm12 in bits 21:10 unshifted. shift=1: same imm12 but LSL #12 (sh bit 22).
+static uint32_t arm64_add_sp_imm_sh(uint16_t imm12, bool lsl12) {
+    return 0x910003ffu | (lsl12 ? 0x00400000u : 0u)
+                       | (((uint32_t)imm12 & 0xfffu) << 10);
+}
+static uint32_t arm64_sub_sp_imm_sh(uint16_t imm12, bool lsl12) {
+    return 0xd10003ffu | (lsl12 ? 0x00400000u : 0u)
+                       | (((uint32_t)imm12 & 0xfffu) << 10);
+}
 static uint32_t arm64_add_sp_imm(uint16_t imm12) {
-    return 0x910003ffu | (((uint32_t)imm12 & 0xfffu) << 10);
+    return arm64_add_sp_imm_sh(imm12, /*lsl12=*/false);
 }
 static uint32_t arm64_sub_sp_imm(uint16_t imm12) {
-    return 0xd10003ffu | (((uint32_t)imm12 & 0xfffu) << 10);
+    return arm64_sub_sp_imm_sh(imm12, /*lsl12=*/false);
 }
 
 // ---- arithmetic ---------------------------------------------------
@@ -688,12 +697,21 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
                 uint32_t fs = (uint32_t)attr_i(op, "frame_size");
                 emit_word(&out->code, arm64_stp_fp_lr_pre());
                 emit_word(&out->code, arm64_mov_fp_sp());
-                if (fs > 0) emit_word(&out->code, arm64_sub_sp_imm((uint16_t)fs));
+                uint32_t lo = fs & 0xfffu;
+                uint32_t hi = (fs >> 12) & 0xfffu;
+                // Emit high-12-bit part first (subtract larger amount),
+                // then low-12 part. Both can be 0; we only emit non-zero
+                // chunks. Note: high is encoded as LSL #12.
+                if (hi) emit_word(&out->code, arm64_sub_sp_imm_sh((uint16_t)hi, /*lsl12=*/true));
+                if (lo) emit_word(&out->code, arm64_sub_sp_imm_sh((uint16_t)lo, /*lsl12=*/false));
                 break;
             }
             case OP_TYPE_AARCH64_EPILOGUE: {
                 uint32_t fs = (uint32_t)attr_i(op, "frame_size");
-                if (fs > 0) emit_word(&out->code, arm64_add_sp_imm((uint16_t)fs));
+                uint32_t lo = fs & 0xfffu;
+                uint32_t hi = (fs >> 12) & 0xfffu;
+                if (lo) emit_word(&out->code, arm64_add_sp_imm_sh((uint16_t)lo, /*lsl12=*/false));
+                if (hi) emit_word(&out->code, arm64_add_sp_imm_sh((uint16_t)hi, /*lsl12=*/true));
                 emit_word(&out->code, arm64_ldp_fp_lr_post());
                 break;
             }

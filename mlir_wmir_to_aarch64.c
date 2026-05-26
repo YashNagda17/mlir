@@ -301,15 +301,15 @@ static void emit_add_data_lo(MLIR_Context *ctx, MLIR_BlockHandle blk,
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_ADD_DATA_LO, a, 3));
 }
 static void emit_prologue(MLIR_Context *ctx, MLIR_BlockHandle blk,
-                          uint16_t frame_size) {
+                          uint32_t frame_size) {
     MLIR_AttributeHandle a[1];
-    a[0] = attr_i32(ctx, "frame_size", frame_size);
+    a[0] = attr_i32(ctx, "frame_size", (int32_t)frame_size);
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_PROLOGUE, a, 1));
 }
 static void emit_epilogue(MLIR_Context *ctx, MLIR_BlockHandle blk,
-                          uint16_t frame_size) {
+                          uint32_t frame_size) {
     MLIR_AttributeHandle a[1];
-    a[0] = attr_i32(ctx, "frame_size", frame_size);
+    a[0] = attr_i32(ctx, "frame_size", (int32_t)frame_size);
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_EPILOGUE, a, 1));
 }
 static void emit_cmp_reg(MLIR_Context *ctx, MLIR_BlockHandle blk,
@@ -576,9 +576,12 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     }
     uint32_t frame_size = (uint32_t)next_slot * 8u;
     frame_size = (frame_size + 15u) & ~15u;
-    if (frame_size > 0xfff) {
+    // SUB SP, SP, #imm12 [LSL #12] supports up to ~16 MB. LDR W with
+    // unsigned imm12 supports up to 16380 bytes; LDR X up to 32760. We
+    // cap at 16 KiB so every spill slot fits in either accessor.
+    if (frame_size > 0x4000) {
         fprintf(stderr,
-            "wmir->aarch64: function '%.*s' frame size %u exceeds imm12 budget\n",
+            "wmir->aarch64: function '%.*s' frame size %u exceeds 16 KiB budget\n",
             (int)name.size, name.str, frame_size);
         sm_free(&sm);
         return MLIR_INVALID_HANDLE;
@@ -596,7 +599,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     MLIR_BlockHandle entry_dst = bm_get(&bm, MLIR_GetRegionBlock(src_region, 0));
 
     // ---------- Entry prologue + parameter spill.
-    emit_prologue(ctx, entry_dst, (uint16_t)frame_size);
+    emit_prologue(ctx, entry_dst, frame_size);
     {
         MLIR_BlockHandle src_entry = MLIR_GetRegionBlock(src_region, 0);
         size_t n_params = MLIR_GetBlockNumArgs(src_entry);
@@ -1056,7 +1059,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                     return MLIR_INVALID_HANDLE;
                 }
                 if (no == 1) LD_OPERAND(0, 0);
-                emit_epilogue(ctx, dst_blk, (uint16_t)frame_size);
+                emit_epilogue(ctx, dst_blk, frame_size);
                 emit_ret(ctx, dst_blk);
                 break;
             }
@@ -2138,6 +2141,79 @@ static MLIR_OpHandle synth_tinyc_va_arg_ptr(MLIR_Context *ctx) {
     return synth_leaf_finish(ctx, region, "tinyc_va_arg_ptr", 16);
 }
 
+// -----------------------------------------------------------------------------
+// tinyc_va_arg_struct(i32 ap_ofs, i32 out_ofs, i64 size) -> void:
+//   long long *o = (long long *)out;
+//   long long words = (size + 7) / 8;
+//   for (long long i = 0; i < words; i++) o[i] = va_arg(*ap, long long);
+//
+// ap_ofs in W0, out_ofs in W1, size in X2.
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_tinyc_va_arg_struct(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry, loop, done;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    loop = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, loop);
+    done = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, done);
+
+    // x9 = host(ap_ofs)  (pointer to the i32 cursor stored in linmem)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 9); a[1] = attr_i32(ctx, "rn", 0);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/9, /*rn=*/28, /*rm=*/9, /*sf=*/true);
+    // x11 = host(out_ofs)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 11); a[1] = attr_i32(ctx, "rn", 1);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/11, /*rn=*/28, /*rm=*/11, /*sf=*/true);
+    // x12 = words = (size + 7) >> 3
+    emit_add_imm(ctx, entry, /*rd=*/12, /*rn=*/2, /*imm12=*/7, /*sf=*/true);
+    emit_movz(ctx, entry, /*rd=*/13, /*imm16=*/3, /*hw=*/0, /*sf=*/true);
+    emit_3reg(ctx, entry, OP_TYPE_AARCH64_LSR_REG,
+              /*rd=*/12, /*rn=*/12, /*rm=*/13, /*sf=*/true);
+    // w10 = *ap (i32 cursor)
+    emit_ldr_w(ctx, entry, /*rt=*/10, /*rn=*/9, /*off=*/0);
+    emit_b(ctx, entry, loop);
+
+    // loop_top: if x12 == 0 -> done; else copy one word, advance.
+    emit_cbz(ctx, loop, /*rt=*/12, /*sf=*/true, done);
+    // Align w10 up to 8: w10 = (w10 + 7) & ~7.
+    emit_add_imm(ctx, loop, /*rd=*/10, /*rn=*/10, /*imm12=*/7, /*sf=*/false);
+    emit_movz(ctx, loop, /*rd=*/14, /*imm16=*/3, /*hw=*/0, /*sf=*/false);
+    emit_3reg(ctx, loop, OP_TYPE_AARCH64_LSR_REG,
+              /*rd=*/10, /*rn=*/10, /*rm=*/14, /*sf=*/false);
+    emit_3reg(ctx, loop, OP_TYPE_AARCH64_LSL_REG,
+              /*rd=*/10, /*rn=*/10, /*rm=*/14, /*sf=*/false);
+    // x13 = host(cursor) = x28 + zext(w10)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 13); a[1] = attr_i32(ctx, "rn", 10);
+        MLIR_AppendBlockOp(ctx, loop,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, loop, /*rd=*/13, /*rn=*/28, /*rm=*/13, /*sf=*/true);
+    // x15 = *cursor;  *out = x15
+    emit_ldr_x(ctx, loop, /*rt=*/15, /*rn=*/13, /*off=*/0);
+    emit_str_x(ctx, loop, /*rt=*/15, /*rn=*/11, /*off=*/0);
+    // cursor += 8; out += 8; words -= 1
+    emit_add_imm(ctx, loop, /*rd=*/10, /*rn=*/10, /*imm12=*/8, /*sf=*/false);
+    emit_add_imm(ctx, loop, /*rd=*/11, /*rn=*/11, /*imm12=*/8, /*sf=*/true);
+    emit_sub_imm(ctx, loop, /*rd=*/12, /*rn=*/12, /*imm12=*/1, /*sf=*/true);
+    emit_b(ctx, loop, loop);
+
+    // done: write back cursor; return.
+    emit_str_w(ctx, done, /*rt=*/10, /*rn=*/9, /*off=*/0);
+    emit_epilogue(ctx, done, /*frame_size=*/16);
+    emit_ret(ctx, done);
+
+    return synth_leaf_finish(ctx, region, "tinyc_va_arg_struct", 19);
+}
+
 
 typedef struct {
     int32_t n_globals;
@@ -2156,6 +2232,7 @@ typedef struct {
     bool    needs_va_arg_i32;
     bool    needs_va_arg_i64;
     bool    needs_va_arg_ptr;
+    bool    needs_va_arg_struct;
 } ModInfo;
 
 static void scan_block(MLIR_BlockHandle blk, ModInfo *mi) {
@@ -2193,6 +2270,7 @@ static void scan_block(MLIR_BlockHandle blk, ModInfo *mi) {
             if (EQ_LIT(callee, "tinyc_va_arg_i32")) mi->needs_va_arg_i32 = true;
             if (EQ_LIT(callee, "tinyc_va_arg_i64")) mi->needs_va_arg_i64 = true;
             if (EQ_LIT(callee, "tinyc_va_arg_ptr")) mi->needs_va_arg_ptr = true;
+            if (EQ_LIT(callee, "tinyc_va_arg_struct")) mi->needs_va_arg_struct = true;
             #undef EQ_LIT
         }
         size_t nr = MLIR_GetOpNumRegions(op);
@@ -2293,7 +2371,7 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
         mi.needs_malloc || mi.needs_free || mi.needs_strlen ||
         mi.needs_strcmp || mi.needs_memcmp || mi.needs_memchr ||
         mi.needs_fd_write || mi.needs_va_arg_i32 || mi.needs_va_arg_i64 ||
-        mi.needs_va_arg_ptr;
+        mi.needs_va_arg_ptr || mi.needs_va_arg_struct;
     MLIR_OpHandle start = synth_start(ctx, entry_name,
         /*use_data_priv=*/false, use_globals, use_linmem);
     if (!start) return MLIR_INVALID_HANDLE;
@@ -2366,6 +2444,11 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
     }
     if (mi.needs_va_arg_ptr) {
         MLIR_OpHandle p = synth_tinyc_va_arg_ptr(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_va_arg_struct) {
+        MLIR_OpHandle p = synth_tinyc_va_arg_struct(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }

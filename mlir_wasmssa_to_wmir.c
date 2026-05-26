@@ -223,6 +223,77 @@ static int omap_get(const OffsetMap *m, string name, int32_t *out) {
     return 0;
 }
 
+// Maps a function name to its slot index in the indirect-call dispatch
+// table. Slots are assigned in the order wasmssa.func_addr targets are
+// first encountered during the pre-pass. Used to lower
+// wasmssa.func_addr -> wmir.const slot, and to drive the synthesised
+// __dispatch_<sig> functions.
+typedef struct {
+    string   *names;
+    int32_t  *slots;
+    size_t    n, cap;
+} FuncPtrMap;
+
+static int32_t fpm_intern(FuncPtrMap *m, string name) {
+    for (size_t i = 0; i < m->n; i++) {
+        if (m->names[i].size == name.size &&
+            memcmp(m->names[i].str, name.str, name.size) == 0) {
+            return m->slots[i];
+        }
+    }
+    if (m->n == m->cap) {
+        m->cap = m->cap ? m->cap * 2 : 8;
+        m->names = (string  *)realloc(m->names, m->cap * sizeof(string));
+        m->slots = (int32_t *)realloc(m->slots, m->cap * sizeof(int32_t));
+    }
+    int32_t s = (int32_t)m->n;
+    m->names[m->n] = name;
+    m->slots[m->n] = s;
+    m->n++;
+    return s;
+}
+static int fpm_lookup(const FuncPtrMap *m, string name, int32_t *out) {
+    for (size_t i = 0; i < m->n; i++) {
+        if (m->names[i].size == name.size &&
+            memcmp(m->names[i].str, name.str, name.size) == 0) {
+            *out = m->slots[i]; return 1;
+        }
+    }
+    return 0;
+}
+
+// Maps a function name to its (param_types, result_types) signature
+// strings (Wasm value-type tags, e.g. "7f7f" for (i32,i32)). Built
+// from the wasmssa.func ops in a pre-pass.
+typedef struct {
+    string   *names;
+    string   *param_types;
+    string   *result_types;
+    size_t    n, cap;
+} FuncSigMap;
+
+static void fsm_add(FuncSigMap *m, string name, string pt, string rt) {
+    if (m->n == m->cap) {
+        m->cap = m->cap ? m->cap * 2 : 8;
+        m->names        = (string *)realloc(m->names,        m->cap * sizeof(string));
+        m->param_types  = (string *)realloc(m->param_types,  m->cap * sizeof(string));
+        m->result_types = (string *)realloc(m->result_types, m->cap * sizeof(string));
+    }
+    m->names[m->n]        = name;
+    m->param_types[m->n]  = pt;
+    m->result_types[m->n] = rt;
+    m->n++;
+}
+static int fsm_get(const FuncSigMap *m, string name, string *pt, string *rt) {
+    for (size_t i = 0; i < m->n; i++) {
+        if (m->names[i].size == name.size &&
+            memcmp(m->names[i].str, name.str, name.size) == 0) {
+            *pt = m->param_types[i]; *rt = m->result_types[i]; return 1;
+        }
+    }
+    return 0;
+}
+
 typedef struct {
     MLIR_Context     *ctx;
     MLIR_RegionHandle dst_region;
@@ -232,6 +303,8 @@ typedef struct {
     size_t            n_frames, c_frames;
     bool              cur_terminated; // last appended op was a terminator
     const OffsetMap  *globals;        // module-level data globals offset map
+    const FuncPtrMap *fnptrs;         // target name -> slot
+    const FuncSigMap *sigs;           // func name -> signature
 } Lowerer;
 
 static void L_push_frame(Lowerer *L, MLIR_BlockHandle target,
@@ -877,6 +950,104 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         return true;
     }
 
+    case OP_TYPE_WASMSSA_FUNC_ADDR: {
+        // Returns the slot index assigned to the named function in the
+        // module-level fnptr table. Lowered to wmir.const slot.
+        string target = at_s(src_op, "target");
+        int32_t slot = -1;
+        if (!L->fnptrs || !fpm_lookup(L->fnptrs, target, &slot)) {
+            fprintf(stderr,
+                "wmir: wasmssa.func_addr target '%.*s' not in fnptr table\n",
+                (int)target.size, target.str);
+            return false;
+        }
+        MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
+        MLIR_AttributeHandle a[1];
+        a[0] = MLIR_CreateAttributeInteger(ctx, str_lit("value"),
+            (int64_t)slot, i32);
+        MLIR_ValueHandle rv = MLIR_CreateValueOpResult(ctx,
+            MLIR_INVALID_HANDLE, 0, i32, (string){0},
+            MLIR_CreateLocationUnknown(ctx, (string){0}));
+        MLIR_TypeHandle rty[1] = { i32 };
+        MLIR_ValueHandle res[1] = { rv };
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_CONST,
+            a, 1, rty, 1, res, NULL, 0);
+        L_append(L, out);
+        vmap_set(L->vmap, MLIR_GetOpResult(src_op, 0), rv);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_CALL_INDIRECT: {
+        // Operand layout in wasmssa: (args..., slot_idx).
+        // Lower to a regular wmir.call to a synthesised dispatcher
+        // function whose name is derived from the signature, passing
+        // (slot, args...) — slot moves to the front.
+        size_t no = MLIR_GetOpNumOperands(src_op);
+        if (no < 1) {
+            fprintf(stderr, "wmir: wasmssa.call_indirect with no operands\n");
+            return false;
+        }
+        MLIR_ValueHandle ops_in[16];
+        if (no > 16) {
+            fprintf(stderr,
+                "wmir: wasmssa.call_indirect with >16 operands unsupported\n");
+            return false;
+        }
+        for (size_t k = 0; k < no; k++) {
+            if (!vmap_get(L->vmap, MLIR_GetOpOperand(src_op, k), &ops_in[k])) {
+                fprintf(stderr, "wmir: unbound operand on wasmssa.call_indirect\n");
+                return false;
+            }
+        }
+        // Slot is last; reorder to (slot, args...).
+        MLIR_ValueHandle ops_out[16];
+        ops_out[0] = ops_in[no - 1];
+        for (size_t k = 0; k + 1 < no; k++) ops_out[1 + k] = ops_in[k];
+
+        // Build dispatcher name __dispatch_<sig>: e.g. "__dispatch_7f7f_7f"
+        // where the signature uses underscores as a delimiter so it is
+        // safe to use as a C identifier. The buffer must outlive the
+        // attribute (attr_s does not copy), so it is heap-allocated and
+        // intentionally leaked — only one per call_indirect site, lives
+        // until program exit.
+        string sig_p = at_s(src_op, "sig_params");
+        string sig_r = at_s(src_op, "sig_results");
+        size_t name_cap = sig_p.size + sig_r.size + 32;
+        char *name_buf = (char *)malloc(name_cap);
+        int nlen = snprintf(name_buf, name_cap,
+            "__dispatch_%.*s_%.*s",
+            (int)sig_p.size, sig_p.str,
+            (int)sig_r.size, sig_r.str);
+        if (nlen <= 0 || (size_t)nlen >= name_cap) {
+            fprintf(stderr, "wmir: call_indirect dispatcher name too long\n");
+            free(name_buf);
+            return false;
+        }
+
+        size_t nr = MLIR_GetOpNumResults(src_op);
+        if (nr > 1) {
+            fprintf(stderr,
+                "wmir: wasmssa.call_indirect multi-result not supported\n");
+            return false;
+        }
+        MLIR_AttributeHandle attrs[1];
+        attrs[0] = attr_s(ctx, "target", name_buf, (size_t)nlen);
+        MLIR_TypeHandle res_ty[1];
+        MLIR_ValueHandle res[1];
+        if (nr == 1) {
+            MLIR_ValueHandle rv = MLIR_GetOpResult(src_op, 0);
+            MLIR_TypeHandle rt = normalise_carrier(ctx, MLIR_GetValueType(rv));
+            res_ty[0] = rt;
+            res[0] = MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, rt,
+                (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}));
+        }
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_CALL,
+            attrs, 1, res_ty, nr, res, ops_out, no);
+        L_append(L, out);
+        if (nr == 1) vmap_set(L->vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        return true;
+    }
+
     case OP_TYPE_WASMSSA_RETURN: {
         size_t n_ops = MLIR_GetOpNumOperands(src_op);
         MLIR_ValueHandle operands[8];
@@ -1159,7 +1330,9 @@ static bool lower_region(Lowerer *L, MLIR_RegionHandle r) {
 // Lower one wasmssa.func to one wmir.func.
 // =============================================================================
 static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
-                                const OffsetMap *globals) {
+                                const OffsetMap *globals,
+                                const FuncPtrMap *fnptrs,
+                                const FuncSigMap *sigs) {
     string name      = at_s(src, "sym_name");
     bool   exported  = at_b(src, "exported");
     string pt        = at_s(src, "param_types");
@@ -1187,6 +1360,8 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     L.cur        = entry;
     L.vmap       = &vmap;
     L.globals    = globals;
+    L.fnptrs     = fnptrs;
+    L.sigs       = sigs;
 
     size_t n_params = MLIR_GetBlockNumArgs(src_blk);
     for (size_t i = 0; i < n_params; i++) {
@@ -1278,6 +1453,89 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
         cursor += (int32_t)sz;
     }
 
+    // -----------------------------------------------------------------
+    // Pre-pass over all wasmssa.func ops to build:
+    //   - FuncSigMap: function name -> (param_types, result_types).
+    //   - FuncPtrMap: function name -> slot index, assigned in the
+    //     encounter order of wasmssa.func_addr targets across the
+    //     entire module. Used by both wasmssa.func_addr lowering and
+    //     by the synthesised __dispatch_<sig> functions below.
+    // -----------------------------------------------------------------
+    FuncSigMap sigs   = {0};
+    FuncPtrMap fnptrs = {0};
+    for (size_t i = 0; i < n_top; i++) {
+        MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
+        MLIR_OpType t = MLIR_GetOpType(top);
+        if (t == OP_TYPE_WASMSSA_FUNC) {
+            string nm = at_s(top, "sym_name");
+            string pt = at_s(top, "param_types");
+            string rt = at_s(top, "result_types");
+            fsm_add(&sigs, nm, pt, rt);
+        }
+        if (t == OP_TYPE_WASMSSA_IMPORT_FUNC) {
+            string nm = at_s(top, "sym_name");
+            string pt = at_s(top, "param_types");
+            string rt = at_s(top, "result_types");
+            fsm_add(&sigs, nm, pt, rt);
+        }
+    }
+    // Walk every wasmssa.func_addr in the module to intern its target.
+    // We walk the full op-tree of each function looking for func_addr.
+    for (size_t i = 0; i < n_top; i++) {
+        MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
+        if (MLIR_GetOpType(top) != OP_TYPE_WASMSSA_FUNC) continue;
+        if (MLIR_GetOpNumRegions(top) < 1) continue;
+        MLIR_RegionHandle r = MLIR_GetOpRegion(top, 0);
+        size_t nb = MLIR_GetRegionNumBlocks(r);
+        for (size_t b = 0; b < nb; b++) {
+            MLIR_BlockHandle blk = MLIR_GetRegionBlock(r, b);
+            size_t nops = MLIR_GetBlockNumOps(blk);
+            for (size_t o = 0; o < nops; o++) {
+                MLIR_OpHandle op = MLIR_GetBlockOp(blk, o);
+                if (MLIR_GetOpType(op) == OP_TYPE_WASMSSA_FUNC_ADDR) {
+                    string tgt = at_s(op, "target");
+                    fpm_intern(&fnptrs, tgt);
+                }
+                // Nested regions (block/loop/if) may also contain
+                // func_addr ops. Recurse one level — wasmssa regions
+                // only have one block before flattening.
+                size_t nr = MLIR_GetOpNumRegions(op);
+                for (size_t k = 0; k < nr; k++) {
+                    MLIR_RegionHandle rr = MLIR_GetOpRegion(op, k);
+                    size_t nrb = MLIR_GetRegionNumBlocks(rr);
+                    for (size_t bb = 0; bb < nrb; bb++) {
+                        MLIR_BlockHandle bl = MLIR_GetRegionBlock(rr, bb);
+                        size_t nbo = MLIR_GetBlockNumOps(bl);
+                        for (size_t bo = 0; bo < nbo; bo++) {
+                            MLIR_OpHandle op2 = MLIR_GetBlockOp(bl, bo);
+                            if (MLIR_GetOpType(op2) == OP_TYPE_WASMSSA_FUNC_ADDR) {
+                                string tgt2 = at_s(op2, "target");
+                                fpm_intern(&fnptrs, tgt2);
+                            }
+                            // Recurse one more level for nested if/then/else.
+                            size_t nr2 = MLIR_GetOpNumRegions(op2);
+                            for (size_t k2 = 0; k2 < nr2; k2++) {
+                                MLIR_RegionHandle rr2 = MLIR_GetOpRegion(op2, k2);
+                                size_t nrb2 = MLIR_GetRegionNumBlocks(rr2);
+                                for (size_t bb2 = 0; bb2 < nrb2; bb2++) {
+                                    MLIR_BlockHandle bl2 = MLIR_GetRegionBlock(rr2, bb2);
+                                    size_t nbo2 = MLIR_GetBlockNumOps(bl2);
+                                    for (size_t bo2 = 0; bo2 < nbo2; bo2++) {
+                                        MLIR_OpHandle op3 = MLIR_GetBlockOp(bl2, bo2);
+                                        if (MLIR_GetOpType(op3) == OP_TYPE_WASMSSA_FUNC_ADDR) {
+                                            string tgt3 = at_s(op3, "target");
+                                            fpm_intern(&fnptrs, tgt3);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for (size_t i = 0; i < n_top; i++) {
         MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
         MLIR_OpType t = MLIR_GetOpType(top);
@@ -1286,9 +1544,12 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
             continue;
         }
         if (t == OP_TYPE_WASMSSA_FUNC) {
-            MLIR_OpHandle out_op = lower_func(ctx, top, &globals);
+            MLIR_OpHandle out_op = lower_func(ctx, top, &globals,
+                                              &fnptrs, &sigs);
             if (!out_op) {
                 free(globals.names); free(globals.offsets);
+                free(fnptrs.names);  free(fnptrs.slots);
+                free(sigs.names); free(sigs.param_types); free(sigs.result_types);
                 return MLIR_INVALID_HANDLE;
             }
             MLIR_AppendBlockOp(ctx, out_body, out_op);
@@ -1299,8 +1560,223 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
             "wmir lowering: unexpected top-level op '%.*s'\n",
             (int)nm.size, nm.str);
         free(globals.names); free(globals.offsets);
+        free(fnptrs.names);  free(fnptrs.slots);
+        free(sigs.names); free(sigs.param_types); free(sigs.result_types);
         return MLIR_INVALID_HANDLE;
     }
+
+    // -----------------------------------------------------------------
+    // Synthesise __dispatch_<sig> functions for every signature that
+    // some call_indirect site uses. The dispatcher takes
+    // (slot:i32, args...) and switches on slot to call the addressed
+    // function with the matching signature.
+    //
+    // We generate one dispatcher per signature that appears in the
+    // fnptr-addressed set. The pre-pass populated fnptrs in slot order;
+    // we walk it once per signature and pick out the matching ones.
+    // -----------------------------------------------------------------
+    bool sig_emitted[64] = {0};
+    for (size_t pi = 0; pi < fnptrs.n; pi++) {
+        string pname = fnptrs.names[pi];
+        string ppt, prt;
+        if (!fsm_get(&sigs, pname, &ppt, &prt)) continue;
+
+        // Skip if dispatcher for this signature already emitted.
+        bool dup = false;
+        for (size_t qi = 0; qi < pi; qi++) {
+            string qpt, qrt;
+            if (!fsm_get(&sigs, fnptrs.names[qi], &qpt, &qrt)) continue;
+            if (qpt.size == ppt.size && qrt.size == prt.size &&
+                memcmp(qpt.str, ppt.str, ppt.size) == 0 &&
+                memcmp(qrt.str, prt.str, prt.size) == 0) {
+                dup = true; break;
+            }
+        }
+        if (dup) continue;
+        if (pi < 64) sig_emitted[pi] = true;
+
+        // Build the dispatcher: function name __dispatch_<pt>_<rt>.
+        // Heap-allocated and intentionally leaked: attr_s does not copy
+        // the string, and the name must outlive the attribute.
+        size_t dname_cap = ppt.size + prt.size + 32;
+        char *dname = (char *)malloc(dname_cap);
+        int dlen = snprintf(dname, dname_cap,
+            "__dispatch_%.*s_%.*s",
+            (int)ppt.size, ppt.str,
+            (int)prt.size, prt.str);
+
+        // Parse the signature into a list of MLIR types for params.
+        // Wasm value type bytes: 0x7f=i32, 0x7e=i64, 0x7d=f32, 0x7c=f64.
+        // pt is the hex string e.g. "7f7f".
+        MLIR_TypeHandle ptys[16];
+        size_t n_pp = ppt.size / 2;
+        if (n_pp > 15) {
+            fprintf(stderr,
+                "wmir: dispatcher signature has too many params\n");
+            free(globals.names); free(globals.offsets);
+            free(fnptrs.names);  free(fnptrs.slots);
+            free(sigs.names); free(sigs.param_types); free(sigs.result_types);
+            return MLIR_INVALID_HANDLE;
+        }
+        MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
+        MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(ctx, 64, true);
+        ptys[0] = i32; // slot
+        for (size_t k = 0; k < n_pp; k++) {
+            unsigned hi = (unsigned)ppt.str[k * 2];
+            unsigned lo = (unsigned)ppt.str[k * 2 + 1];
+            // Parse one hex byte (2 chars).
+            unsigned b = 0;
+            #define HEX_NIB(c) ((c) >= '0' && (c) <= '9' ? (c) - '0' : \
+                                (c) >= 'a' && (c) <= 'f' ? (c) - 'a' + 10 : \
+                                (c) >= 'A' && (c) <= 'F' ? (c) - 'A' + 10 : 0)
+            b = (HEX_NIB(hi) << 4) | HEX_NIB(lo);
+            #undef HEX_NIB
+            ptys[k + 1] = (b == 0x7e || b == 0x7c) ? i64 : i32;
+        }
+        size_t n_dp = n_pp + 1;
+        MLIR_TypeHandle rty;
+        bool has_result = (prt.size >= 2);
+        if (has_result) {
+            unsigned hi = (unsigned)prt.str[0];
+            unsigned lo = (unsigned)prt.str[1];
+            #define HEX_NIB(c) ((c) >= '0' && (c) <= '9' ? (c) - '0' : \
+                                (c) >= 'a' && (c) <= 'f' ? (c) - 'a' + 10 : \
+                                (c) >= 'A' && (c) <= 'F' ? (c) - 'A' + 10 : 0)
+            unsigned b = (HEX_NIB(hi) << 4) | HEX_NIB(lo);
+            #undef HEX_NIB
+            rty = (b == 0x7e || b == 0x7c) ? i64 : i32;
+        }
+
+        // Build region with one block per slot test + call. We use one
+        // entry block doing nested icmp+cond_br to a fall-through chain.
+        MLIR_RegionHandle dreg = MLIR_CreateRegion(ctx);
+        // Entry block: receives all params.
+        MLIR_BlockHandle entry = MLIR_CreateBlock(ctx);
+        MLIR_AppendRegionBlock(ctx, dreg, entry);
+        MLIR_ValueHandle pvals[16];
+        for (size_t k = 0; k < n_dp; k++) {
+            pvals[k] = MLIR_CreateValueBlockArg(ctx, (string){0},
+                (uint32_t)k, ptys[k],
+                MLIR_CreateLocationUnknown(ctx, (string){0}));
+            MLIR_AppendBlockArg(ctx, entry, pvals[k]);
+        }
+
+        // Build the chain of check / call / next blocks.
+        MLIR_BlockHandle cur = entry;
+        // Collect matching addressed funcs.
+        size_t n_match = 0;
+        size_t match_idx[64];
+        for (size_t qi = 0; qi < fnptrs.n; qi++) {
+            string qpt, qrt;
+            if (!fsm_get(&sigs, fnptrs.names[qi], &qpt, &qrt)) continue;
+            if (qpt.size != ppt.size || qrt.size != prt.size) continue;
+            if (memcmp(qpt.str, ppt.str, ppt.size) != 0) continue;
+            if (memcmp(qrt.str, prt.str, prt.size) != 0) continue;
+            if (n_match >= 64) break;
+            match_idx[n_match++] = qi;
+        }
+
+        for (size_t mi = 0; mi < n_match; mi++) {
+            int32_t target_slot = fnptrs.slots[match_idx[mi]];
+            string  target_name = fnptrs.names[match_idx[mi]];
+
+            // %slot_const = wmir.const target_slot
+            MLIR_ValueHandle slot_cst = MLIR_CreateValueOpResult(ctx,
+                MLIR_INVALID_HANDLE, 0, i32, (string){0},
+                MLIR_CreateLocationUnknown(ctx, (string){0}));
+            {
+                MLIR_AttributeHandle a[1];
+                a[0] = MLIR_CreateAttributeInteger(ctx, str_lit("value"),
+                    (int64_t)target_slot, i32);
+                MLIR_TypeHandle rty1[1] = { i32 };
+                MLIR_ValueHandle res1[1] = { slot_cst };
+                MLIR_OpHandle cst = build_op_simple(ctx, OP_TYPE_WMIR_CONST,
+                    a, 1, rty1, 1, res1, NULL, 0);
+                MLIR_AppendBlockOp(ctx, cur, cst);
+            }
+            // %eq = wmir.icmp(eq, pvals[0], slot_cst) -> i32
+            MLIR_ValueHandle eq = MLIR_CreateValueOpResult(ctx,
+                MLIR_INVALID_HANDLE, 0, i32, (string){0},
+                MLIR_CreateLocationUnknown(ctx, (string){0}));
+            {
+                MLIR_AttributeHandle a[1];
+                a[0] = attr_s(ctx, "pred", "eq", 2);
+                MLIR_TypeHandle rty1[1] = { i32 };
+                MLIR_ValueHandle res1[1] = { eq };
+                MLIR_ValueHandle ops1[2] = { pvals[0], slot_cst };
+                MLIR_OpHandle ic = build_op_simple(ctx, OP_TYPE_WMIR_ICMP,
+                    a, 1, rty1, 1, res1, ops1, 2);
+                MLIR_AppendBlockOp(ctx, cur, ic);
+            }
+            MLIR_BlockHandle call_blk = MLIR_CreateBlock(ctx);
+            MLIR_AppendRegionBlock(ctx, dreg, call_blk);
+            MLIR_BlockHandle next_blk = MLIR_CreateBlock(ctx);
+            MLIR_AppendRegionBlock(ctx, dreg, next_blk);
+
+            // wmir.cond_br %eq, ^call_blk, ^next_blk
+            MLIR_OpHandle cbr = build_op_cond_br(ctx, eq, call_blk, next_blk);
+            MLIR_AppendBlockOp(ctx, cur, cbr);
+
+            // call_blk: %r = wmir.call target(pvals[1..]); wmir.return %r
+            MLIR_ValueHandle call_args[16];
+            for (size_t k = 0; k + 1 < n_dp; k++) call_args[k] = pvals[k + 1];
+            MLIR_OpHandle call_op;
+            MLIR_ValueHandle call_res_v = MLIR_INVALID_HANDLE;
+            {
+                MLIR_AttributeHandle a[1];
+                a[0] = attr_s(ctx, "target", target_name.str, target_name.size);
+                MLIR_TypeHandle res_ty[1];
+                MLIR_ValueHandle res_v[1];
+                size_t nr = has_result ? 1 : 0;
+                if (has_result) {
+                    res_ty[0] = rty;
+                    res_v[0] = MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE,
+                        0, rty, (string){0},
+                        MLIR_CreateLocationUnknown(ctx, (string){0}));
+                    call_res_v = res_v[0];
+                }
+                call_op = build_op_simple(ctx, OP_TYPE_WMIR_CALL,
+                    a, 1, res_ty, nr, res_v, call_args, n_dp - 1);
+                MLIR_AppendBlockOp(ctx, call_blk, call_op);
+            }
+            // wmir.return [%r]
+            if (has_result) {
+                MLIR_ValueHandle ret_ops[1] = { call_res_v };
+                MLIR_OpHandle ret_op = build_op_simple(ctx, OP_TYPE_WMIR_RETURN,
+                    NULL, 0, NULL, 0, NULL, ret_ops, 1);
+                MLIR_AppendBlockOp(ctx, call_blk, ret_op);
+            } else {
+                MLIR_OpHandle ret_op = build_op_simple(ctx, OP_TYPE_WMIR_RETURN,
+                    NULL, 0, NULL, 0, NULL, NULL, 0);
+                MLIR_AppendBlockOp(ctx, call_blk, ret_op);
+            }
+
+            cur = next_blk;
+        }
+        // Trailing block: unreachable (slot didn't match any target).
+        {
+            MLIR_OpHandle un = build_op_simple(ctx, OP_TYPE_WMIR_UNREACHABLE,
+                NULL, 0, NULL, 0, NULL, NULL, 0);
+            MLIR_AppendBlockOp(ctx, cur, un);
+        }
+
+        // Wrap as a wmir.func.
+        MLIR_AttributeHandle fattrs[4];
+        fattrs[0] = attr_s(ctx, "sym_name",     dname, (size_t)dlen);
+        fattrs[1] = attr_s(ctx, "param_types",  "",    0);
+        fattrs[2] = attr_s(ctx, "result_types", "",    0);
+        fattrs[3] = attr_b(ctx, "exported",     false);
+        MLIR_RegionHandle regs[1] = { dreg };
+        MLIR_OpHandle dfunc = MLIR_CreateOp(ctx, OP_TYPE_WMIR_FUNC,
+            op_type_to_string(OP_TYPE_WMIR_FUNC),
+            fattrs, 4, NULL, 0, NULL, 0, NULL, 0, regs, 1,
+            MLIR_CreateLocationUnknown(ctx, (string){0}),
+            MLIR_INVALID_HANDLE, (string){0}, -1);
+        MLIR_AppendBlockOp(ctx, out_body, dfunc);
+    }
+
     free(globals.names); free(globals.offsets);
+    free(fnptrs.names);  free(fnptrs.slots);
+    free(sigs.names); free(sigs.param_types); free(sigs.result_types);
     return out_module;
 }
