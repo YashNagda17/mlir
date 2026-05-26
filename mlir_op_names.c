@@ -1,12 +1,21 @@
 // Op-type → string mapping. Split out of mlir_parser.c so consumers like
 // mlir_api_impl.c that need only the table can link against it without
 // pulling in the parser/tokenizer/op_parsers tree.
+//
+// We split the table into two helper functions to keep each `switch`
+// well under the wasm->macho backend's 256-deep block-stack limit
+// (clang lowers a giant sparse switch into one nested block per case,
+// and the combined enum now has 260+ entries). The two halves are
+// chained: if the first returns a sentinel, the second runs.
 
 #include <base/string.h>
 #include "mlir_api.h"
 #include "mlir_op_names.h"
 
-string op_type_to_string(MLIR_OpType type) {
+// Sentinel used only between the two helpers below; never escapes.
+#define OP_NAME_NOT_IN_THIS_HALF str_lit("")
+
+static string op_type_to_string_half1(MLIR_OpType type) {
     switch (type) {
         case OP_TYPE_UNREGISTERED: return str_lit("unregistered");
         case OP_TYPE_MODULE: return str_lit("module");
@@ -138,6 +147,12 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_WASMSSA_EXTEND_I32_S: return str_lit("wasmssa.extend_i32_s");
         case OP_TYPE_WASMSSA_RETURN: return str_lit("wasmssa.return");
         case OP_TYPE_WASMSSA_CALL: return str_lit("wasmssa.call");
+        default: return OP_NAME_NOT_IN_THIS_HALF;
+    }
+}
+
+static string op_type_to_string_half2(MLIR_OpType type) {
+    switch (type) {
         case OP_TYPE_WASMSSA_BLOCK:        return str_lit("wasmssa.block");
         case OP_TYPE_WASMSSA_LOOP:         return str_lit("wasmssa.loop");
         case OP_TYPE_WASMSSA_IF:           return str_lit("wasmssa.if");
@@ -274,6 +289,14 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_AARCH64_FCMP:         return str_lit("aarch64.fcmp");
         case OP_TYPE_AARCH64_FP_CVT:       return str_lit("aarch64.fp_cvt");
         case OP_TYPE_AARCH64_DATA_INIT:    return str_lit("aarch64.data_init");
-        default: return str_lit("unknown");
+        default: return OP_NAME_NOT_IN_THIS_HALF;
     }
+}
+
+string op_type_to_string(MLIR_OpType type) {
+    string s = op_type_to_string_half1(type);
+    if (s.size != 0) return s;
+    s = op_type_to_string_half2(type);
+    if (s.size != 0) return s;
+    return str_lit("unknown");
 }
