@@ -1609,8 +1609,9 @@ static MLIR_OpHandle synth_start(MLIR_Context *ctx, string main_name,
     }
 
     emit_bl(ctx, blk, main_name);
-    emit_movz(ctx, blk, /*rd=*/16, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, blk, 0x80);
+    // After main returns, exit with x0 (main's return value) as the
+    // status code. Calls libSystem _exit; noreturn.
+    emit_bl(ctx, blk, str_lit("_exit"));
 
     MLIR_AttributeHandle attrs[2];
     size_t na = 0;
@@ -2539,19 +2540,20 @@ static MLIR_OpHandle synth_fd_write(MLIR_Context *ctx) {
 }
 
 // -----------------------------------------------------------------------------
-// WASI proc_exit(i32 exit_code) -> noreturn: x16=1, svc #0x80.
+// WASI proc_exit(i32 exit_code) -> noreturn: bl _exit.
 // Used by the wasm->wasmstack->wasmssa lifter pipeline: wasm-ld synthesises
 // a `_start` that calls `__original_main` then `proc_exit`, and the lifter
 // preserves that call. The C-frontend pipeline doesn't generate this call
-// at all (the wmir backend's own synth_start does the syscall directly).
+// at all (the wmir backend's own synth_start does the libSystem call
+// directly).
 // -----------------------------------------------------------------------------
 static MLIR_OpHandle synth_proc_exit(MLIR_Context *ctx) {
     MLIR_BlockHandle entry;
     MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
-    // exit_code already in x0/w0 per AAPCS; just set syscall # and trap.
-    emit_movz(ctx, entry, /*rd=*/16, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, entry, 0x80);
-    // Unreachable, but emit a clean ret for IR well-formedness.
+    // exit_code already in x0/w0 per AAPCS; call libSystem _exit which
+    // is noreturn. The bl never returns but we emit a clean epilogue +
+    // ret for IR well-formedness.
+    emit_bl(ctx, entry, str_lit("_exit"));
     emit_epilogue(ctx, entry, /*frame_size=*/16);
     emit_ret(ctx, entry);
     return synth_leaf_finish(ctx, region, "proc_exit", 9);
