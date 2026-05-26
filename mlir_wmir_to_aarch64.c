@@ -614,6 +614,13 @@ static void st_result_from_fixed(MLIR_Context *ctx, MLIR_BlockHandle blk,
 // into the target block's argument homes. Handles the four
 // {reg,slot} × {reg,slot} combinations and resolves reg→reg cycles
 // (e.g. swap) by routing the cycle break through scratch register x9.
+#define MAX_PAIRS 16
+typedef struct {
+    ValueHome src;
+    ValueHome dst;
+    bool      is_i64;
+    bool      done;
+} BranchArgPair;
 static void emit_branch_arg_copies(MLIR_Context *ctx, MLIR_BlockHandle blk,
                                    const WmirRegAlloc *ra,
                                    MLIR_OpHandle op, size_t succ_idx,
@@ -624,14 +631,7 @@ static void emit_branch_arg_copies(MLIR_Context *ctx, MLIR_BlockHandle blk,
         // mismatched — caller already verifies/diagnoses this; bail.
         return;
     }
-    enum { MAX_PAIRS = 16 };
-    typedef struct {
-        ValueHome src;
-        ValueHome dst;
-        bool      is_i64;
-        bool      done;
-    } Pair;
-    Pair pairs[MAX_PAIRS];
+    BranchArgPair pairs[MAX_PAIRS];
     if (n > MAX_PAIRS) {
         // Fallback: route every pair through scratch r9. Same as the
         // pre-regalloc lowering. Safe for arbitrary fan-in.

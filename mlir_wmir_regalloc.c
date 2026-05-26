@@ -147,6 +147,13 @@ typedef struct {
     bool             crosses_call;
 } VInfo;
 
+// One slot in the linear-scan active list.
+typedef struct {
+    uint32_t vi;
+    uint8_t  reg;
+    uint8_t  pool_idx;
+} Active;
+
 // =============================================================================
 // Main entry.
 // =============================================================================
@@ -434,7 +441,6 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
     // Active list of intervals currently occupying a pool register.
     // We track the pool index (not just the reg number) so that the
     // pool can change without breaking reg_busy indexing.
-    typedef struct { uint32_t vi; uint8_t reg; uint8_t pool_idx; } Active;
     Active *active = calloc(POOL_N ? POOL_N : 1, sizeof(*active));
     size_t  n_active = 0;
     bool   *reg_busy = calloc(POOL_N ? POOL_N : 1, sizeof(bool));
