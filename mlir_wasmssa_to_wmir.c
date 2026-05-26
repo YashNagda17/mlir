@@ -122,6 +122,11 @@ static string at_s(MLIR_OpHandle op, const char *name) {
     MLIR_AttributeHandle a = MLIR_GetOpAttributeByName(op, name);
     return a ? MLIR_GetAttributeString(a) : (string){0};
 }
+// Returns an int attribute value or `dflt` if the attribute is absent.
+static int64_t at_i_or(MLIR_OpHandle op, const char *name, int64_t dflt) {
+    MLIR_AttributeHandle a = MLIR_GetOpAttributeByName(op, name);
+    return a ? MLIR_GetAttributeInteger(a) : dflt;
+}
 
 // Translate a wasm value-type byte to the matching MLIR integer / float
 // type used inside wmir. *Note*: f32 / f64 wasm values are carried by
@@ -241,10 +246,19 @@ typedef struct {
     size_t    n, cap;
 } FuncPtrMap;
 
-static int32_t fpm_intern(FuncPtrMap *m, string name) {
+// Optional explicit slot: if `slot >= 0`, the entry is added with that
+// exact slot (used by the wasm-lifter path, where the wasm table
+// layout determines the slot number — the dispatcher and call sites
+// must both agree on the same integer). Returns the slot ultimately
+// assigned.
+static int32_t fpm_intern_with_slot(FuncPtrMap *m, string name,
+                                    int32_t explicit_slot) {
     for (size_t i = 0; i < m->n; i++) {
         if (m->names[i].size == name.size &&
             memcmp(m->names[i].str, name.str, name.size) == 0) {
+            // If an explicit slot is provided and the existing entry
+            // has a different one, prefer the explicit slot.
+            if (explicit_slot >= 0) m->slots[i] = explicit_slot;
             return m->slots[i];
         }
     }
@@ -253,11 +267,14 @@ static int32_t fpm_intern(FuncPtrMap *m, string name) {
         m->names = (string  *)realloc(m->names, m->cap * sizeof(string));
         m->slots = (int32_t *)realloc(m->slots, m->cap * sizeof(int32_t));
     }
-    int32_t s = (int32_t)m->n;
+    int32_t s = (explicit_slot >= 0) ? explicit_slot : (int32_t)m->n;
     m->names[m->n] = name;
     m->slots[m->n] = s;
     m->n++;
     return s;
+}
+static int32_t fpm_intern(FuncPtrMap *m, string name) {
+    return fpm_intern_with_slot(m, name, -1);
 }
 static int fpm_lookup(const FuncPtrMap *m, string name, int32_t *out) {
     for (size_t i = 0; i < m->n; i++) {
@@ -449,7 +466,8 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
                     t == OP_TYPE_WASMSSA_ADD ? "add" : "sub");
             return false;
         }
-        MLIR_TypeHandle res_ty[1] = { MLIR_CreateTypeInteger(ctx, 32, true) };
+        uint8_t vt = (uint8_t)at_i(src_op, "valtype");
+        MLIR_TypeHandle res_ty[1] = { vt_to_type(ctx, vt ? vt : 0x7f) };
         MLIR_ValueHandle res[1] = {
             MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, res_ty[0],
                 (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}))
@@ -1110,6 +1128,33 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         return true;
     }
 
+    case OP_TYPE_WASMSSA_BR_IF: {
+        // wasmssa.br_if(%cond) {depth=D}: if cond != 0, jump to
+        // frames[top-D].target with no operands; otherwise fall through.
+        // The lifter emits value-carrying conditional branches as
+        // `wasmssa.if (%cond) { wasmssa.br D (vals) }` so we only ever
+        // see br_if with the bare cond and zero operands here.
+        int64_t depth = at_i(src_op, "depth");
+        if (depth < 0 || (size_t)depth >= L->n_frames) {
+            fprintf(stderr,
+                "wmir: wasmssa.br_if depth=%lld out of range (n_frames=%zu)\n",
+                (long long)depth, L->n_frames);
+            return false;
+        }
+        Frame *f = &L->frames[L->n_frames - 1 - (size_t)depth];
+        MLIR_ValueHandle cond_src = MLIR_GetOpOperand(src_op, 0);
+        MLIR_ValueHandle cond;
+        if (!vmap_get(L->vmap, cond_src, &cond)) {
+            fprintf(stderr, "wmir: unbound condition on wasmssa.br_if\n");
+            return false;
+        }
+        MLIR_BlockHandle fall = L_new_block(L);
+        L_emit_cond_br(L, cond, f->target, fall);
+        L->cur = fall;
+        L->cur_terminated = false;
+        return true;
+    }
+
     case OP_TYPE_WASMSSA_BLOCK_RETURN: {
         // Terminator of the innermost wasmssa.block / .if region.
         // Targets the topmost frame's exit block.
@@ -1441,6 +1486,13 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
     // Note: WASM_DATA_BASE is a #define (not a local enum), because
     // tinyc — used during wasm self-hosting — only allows enum bodies
     // at module scope.
+    //
+    // For the wasm-lifter pipeline, import_globals may carry an
+    // explicit `fixed_offset` attribute encoding the linmem byte
+    // address chosen by wasm-ld. When present we honour that offset
+    // verbatim (because the lifted code embeds it as `i32.const N`
+    // operands to load/store). When absent we fall back to the
+    // cursor-based layout used by the C-frontend pipeline.
     OffsetMap globals = {0};
     int32_t cursor = (int32_t)WASM_DATA_BASE;
     size_t n_top = MLIR_GetBlockNumOps(mb);
@@ -1451,9 +1503,15 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
         string id = at_s(top, "init_data");
         int64_t sz = at_i(top, "size");
         int64_t ap = at_i(top, "align_pow");
+        MLIR_AttributeHandle fa = MLIR_GetOpAttributeByName(top, "fixed_offset");
         if (sz <= 0) sz = (int64_t)id.size;
         int32_t align = (ap > 0) ? (int32_t)(1 << ap) : 1;
-        cursor = (cursor + align - 1) & ~(align - 1);
+        if (fa) {
+            int32_t fo = (int32_t)MLIR_GetAttributeInteger(fa);
+            cursor = fo;
+        } else {
+            cursor = (cursor + align - 1) & ~(align - 1);
+        }
         omap_add(&globals, sn, cursor);
         cursor += (int32_t)sz;
     }
@@ -1578,7 +1636,8 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
                 MLIR_OpHandle op = MLIR_GetBlockOp(blk, o);
                 if (MLIR_GetOpType(op) == OP_TYPE_WASMSSA_FUNC_ADDR) {
                     string tgt = at_s(op, "target");
-                    fpm_intern(&fnptrs, tgt);
+                    int32_t es = (int32_t)at_i_or(op, "slot", -1);
+                    fpm_intern_with_slot(&fnptrs, tgt, es);
                 }
                 // Nested regions (block/loop/if) may also contain
                 // func_addr ops. Recurse one level — wasmssa regions
@@ -1594,7 +1653,8 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
                             MLIR_OpHandle op2 = MLIR_GetBlockOp(bl, bo);
                             if (MLIR_GetOpType(op2) == OP_TYPE_WASMSSA_FUNC_ADDR) {
                                 string tgt2 = at_s(op2, "target");
-                                fpm_intern(&fnptrs, tgt2);
+                                int32_t es2 = (int32_t)at_i_or(op2, "slot", -1);
+                                fpm_intern_with_slot(&fnptrs, tgt2, es2);
                             }
                             // Recurse one more level for nested if/then/else.
                             size_t nr2 = MLIR_GetOpNumRegions(op2);
@@ -1608,7 +1668,8 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
                                         MLIR_OpHandle op3 = MLIR_GetBlockOp(bl2, bo2);
                                         if (MLIR_GetOpType(op3) == OP_TYPE_WASMSSA_FUNC_ADDR) {
                                             string tgt3 = at_s(op3, "target");
-                                            fpm_intern(&fnptrs, tgt3);
+                                            int32_t es3 = (int32_t)at_i_or(op3, "slot", -1);
+                                            fpm_intern_with_slot(&fnptrs, tgt3, es3);
                                         }
                                     }
                                 }

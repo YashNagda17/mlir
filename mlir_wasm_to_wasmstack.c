@@ -97,6 +97,12 @@ typedef struct {
 } WasmGlobal;
 
 typedef struct {
+    uint32_t offset;        // linmem byte offset (resolved const)
+    const uint8_t *data;    // owned by input wasm bytes (still valid)
+    uint32_t size;
+} WasmDataSeg;
+
+typedef struct {
     WasmType  *types;
     uint32_t   n_types;
 
@@ -115,6 +121,16 @@ typedef struct {
     uint32_t   memory_min_pages;
 
     uint32_t   start_export_idx;  // UINT32_MAX if no _start export
+
+    WasmDataSeg *data_segs;
+    uint32_t     n_data_segs;
+
+    // Element-segment contents: elem_funcs[slot] = func_index that
+    // wasm-ld placed at that table slot, or UINT32_MAX if the slot is
+    // unused. Indexed by wasm table slot (0..n_elem_funcs).
+    uint32_t  *elem_funcs;
+    uint32_t   n_elem_funcs;     // highest slot+1 written
+    uint32_t   elem_funcs_cap;   // current capacity
 } WasmModule;
 
 // =============================================================================
@@ -249,6 +265,67 @@ static bool wasm_parse(Arena *a, const uint8_t *bytes, size_t size,
             }
             break;
         }
+        case 9: { // ELEM
+            // Element segments populate the wasm function table at
+            // load time. wasm-ld emits one ACTIVE segment per
+            // address-taken function, e.g.:
+            //   (elem (i32.const N) func $foo)
+            // We collect (table_slot, func_index) pairs so the wmir
+            // lowering can pre-populate the call_indirect dispatcher
+            // with real table slots (rather than auto-interned ones).
+            uint32_t n = (uint32_t)rd_uleb(&s);
+            for (uint32_t i = 0; i < n && !s.overflow; i++) {
+                uint32_t flags = (uint32_t)rd_uleb(&s);
+                // We handle only flags=0: active segment for table 0
+                // with an i32.const offset expression and a vec of
+                // func indices (elemkind=funcref omitted because
+                // active-segment encoding uses opcode form).
+                if (flags != 0) {
+                    fprintf(stderr,
+                        "wasm->wasmstack: elem segment %u flags=%u "
+                        "not supported (only active/table0)\n",
+                        i, flags);
+                    return false;
+                }
+                uint32_t off = 0;
+                uint8_t op = rd_u8(&s);
+                if (op == 0x41) {
+                    off = (uint32_t)rd_sleb(&s);
+                } else {
+                    fprintf(stderr,
+                        "wasm->wasmstack: elem seg %u bad init 0x%02x\n",
+                        i, op);
+                    return false;
+                }
+                uint8_t e = rd_u8(&s);
+                if (e != 0x0b) {
+                    fprintf(stderr,
+                        "wasm->wasmstack: elem seg %u missing end\n", i);
+                    return false;
+                }
+                uint32_t cnt = (uint32_t)rd_uleb(&s);
+                // Grow elem_funcs to fit slot range [off, off+cnt).
+                uint32_t need = off + cnt;
+                if (need > out->elem_funcs_cap) {
+                    uint32_t nc = out->elem_funcs_cap ? out->elem_funcs_cap : 8;
+                    while (nc < need) nc *= 2;
+                    uint32_t *nf = (uint32_t *)arena_alloc(a,
+                        nc * sizeof(uint32_t));
+                    for (uint32_t k = 0; k < out->elem_funcs_cap; k++)
+                        nf[k] = out->elem_funcs[k];
+                    for (uint32_t k = out->elem_funcs_cap; k < nc; k++)
+                        nf[k] = UINT32_MAX;
+                    out->elem_funcs = nf;
+                    out->elem_funcs_cap = nc;
+                }
+                if (need > out->n_elem_funcs) out->n_elem_funcs = need;
+                for (uint32_t k = 0; k < cnt && !s.overflow; k++) {
+                    uint32_t fi = (uint32_t)rd_uleb(&s);
+                    out->elem_funcs[off + k] = fi;
+                }
+            }
+            break;
+        }
         case 5: { // MEMORY
             uint32_t n = (uint32_t)rd_uleb(&s);
             if (n > 0) {
@@ -298,10 +375,104 @@ static bool wasm_parse(Arena *a, const uint8_t *bytes, size_t size,
                 s.p += nl;
                 uint8_t kind = rd_u8(&s);
                 uint32_t idx = (uint32_t)rd_uleb(&s);
-                if (kind == 0 && nl == 6 && memcmp(np, "_start", 6) == 0) {
-                    out->start_export_idx = idx;
-                    if (idx < out->n_funcs) out->funcs[idx].exported = true;
+                if (kind == 0) {
+                    if (nl == 6 && memcmp(np, "_start", 6) == 0) {
+                        out->start_export_idx = idx;
+                    }
+                    if (idx < out->n_funcs) {
+                        // Remember the export name in case the name
+                        // section is absent. Don't overwrite a name we
+                        // already assigned from a prior export.
+                        if (!out->funcs[idx].name) {
+                            out->funcs[idx].name = arena_strndup(a,
+                                (const char *)np, nl);
+                        }
+                        out->funcs[idx].exported = true;
+                    }
                 }
+            }
+            break;
+        }
+        case 11: { // DATA
+            uint32_t n = (uint32_t)rd_uleb(&s);
+            out->data_segs = (WasmDataSeg *)arena_alloc(a,
+                (n ? n : 1) * sizeof(WasmDataSeg));
+            for (uint32_t i = 0; i < n && !s.overflow; i++) {
+                uint32_t flags = (uint32_t)rd_uleb(&s);
+                uint32_t off = 0;
+                if (flags == 0) {
+                    uint8_t op = rd_u8(&s);
+                    if (op == 0x41) {
+                        off = (uint32_t)rd_sleb(&s);
+                    } else if (op == 0x23) {
+                        (void)rd_uleb(&s);  // global.get gidx
+                    } else {
+                        fprintf(stderr,
+                            "wasm->wasmstack: data seg %u bad init 0x%02x\n",
+                            i, op);
+                        return false;
+                    }
+                    uint8_t e = rd_u8(&s);
+                    if (e != 0x0b) {
+                        fprintf(stderr,
+                            "wasm->wasmstack: data seg %u missing end\n", i);
+                        return false;
+                    }
+                } else if (flags == 1) {
+                    // Passive: offset unused. Treat as 0.
+                } else if (flags == 2) {
+                    (void)rd_uleb(&s); // memidx
+                    uint8_t op = rd_u8(&s);
+                    if (op == 0x41) off = (uint32_t)rd_sleb(&s);
+                    rd_u8(&s); // end
+                } else {
+                    fprintf(stderr, "wasm->wasmstack: data seg %u bad flags %u\n",
+                        i, flags);
+                    return false;
+                }
+                uint32_t dl = (uint32_t)rd_uleb(&s);
+                if (s.p + dl > s.end) { s.overflow = true; break; }
+                out->data_segs[out->n_data_segs].offset = off;
+                out->data_segs[out->n_data_segs].data = s.p;
+                out->data_segs[out->n_data_segs].size = dl;
+                out->n_data_segs++;
+                s.p += dl;
+            }
+            break;
+        }
+        case 0: { // CUSTOM
+            // Only the "name" custom section is consumed. Everything else
+            // (producers, target_features, ...) is silently skipped.
+            uint32_t nl = (uint32_t)rd_uleb(&s);
+            if (s.p + nl > s.end) { s.overflow = true; break; }
+            bool is_name = (nl == 4 && memcmp(s.p, "name", 4) == 0);
+            s.p += nl;
+            if (!is_name) break;
+            while (s.p < s.end && !s.overflow) {
+                uint8_t sub_id = rd_u8(&s);
+                uint32_t sub_len = (uint32_t)rd_uleb(&s);
+                const uint8_t *sub_end = s.p + sub_len;
+                if (sub_end > s.end) { s.overflow = true; break; }
+                if (sub_id == 1) {
+                    // Function names.
+                    uint32_t cnt = (uint32_t)rd_uleb(&s);
+                    for (uint32_t i = 0; i < cnt && !s.overflow; i++) {
+                        uint32_t fi = (uint32_t)rd_uleb(&s);
+                        uint32_t fnl = (uint32_t)rd_uleb(&s);
+                        if (s.p + fnl > sub_end) { s.overflow = true; break; }
+                        if (fi < out->n_funcs) {
+                            // Name section takes priority over export name
+                            // for non-exported functions. For exported ones
+                            // the export name is already set.
+                            if (!out->funcs[fi].name) {
+                                out->funcs[fi].name = arena_strndup(a,
+                                    (const char *)s.p, fnl);
+                            }
+                        }
+                        s.p += fnl;
+                    }
+                }
+                s.p = sub_end;
             }
             break;
         }
@@ -330,14 +501,20 @@ static bool wasm_parse(Arena *a, const uint8_t *bytes, size_t size,
         return false;
     }
 
-    // Name defined functions.
+    // Name defined functions. Priority: explicit name from EXPORT/name
+    // section > placeholder `func_N`. The wasm `_start` export is
+    // renamed to `wasi_start` so the wmir backend's synth_start (which
+    // generates a fresh `_start` from `__original_main`) doesn't
+    // collide.
     for (uint32_t i = out->n_imported_funcs; i < out->n_funcs; i++) {
-        if (out->funcs[i].exported && i == out->start_export_idx) {
-            // The wasm _start gets renamed to wasi_start so the wmir
-            // backend's synth_start doesn't collide.
+        if (out->funcs[i].name && strcmp(out->funcs[i].name, "_start") == 0) {
             out->funcs[i].name = arena_strdup(a, "wasi_start");
-        } else {
-            out->funcs[i].name = arena_printf(a, "func_%u", i);
+        } else if (!out->funcs[i].name) {
+            if (out->funcs[i].exported && i == out->start_export_idx) {
+                out->funcs[i].name = arena_strdup(a, "wasi_start");
+            } else {
+                out->funcs[i].name = arena_printf(a, "func_%u", i);
+            }
         }
     }
 
@@ -546,6 +723,424 @@ static bool decode_body(MLIR_Context *ctx, Arena *arena,
                 build_op(ctx, OP_TYPE_WASMSTACK_CALL, as, 2));
             break;
         }
+        case 0x11: { // call_indirect typeidx 0x00
+            uint32_t tidx = (uint32_t)rd_uleb(&r);
+            (void)rd_u8(&r); // table index byte (always 0)
+            if (tidx >= m->n_types) {
+                fprintf(stderr, "wasm->wasmstack: call_indirect: bad typeidx %u\n", tidx);
+                return false;
+            }
+            const WasmType *ft = &m->types[tidx];
+            char *sp = hex_encode_arena(arena, ft->params, ft->n_params);
+            char *sr = hex_encode_arena(arena, ft->results, ft->n_results);
+            MLIR_AttributeHandle as[3];
+            as[0] = attr_i32(ctx, "valtype", 0);
+            as[1] = attr_s(ctx, "sig_params", sp, ft->n_params * 2);
+            as[2] = attr_s(ctx, "sig_results", sr, ft->n_results * 2);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_CALL_INDIRECT, as, 3));
+            break;
+        }
+        case 0x1b: { // select
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", 0);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_SELECT, as, 1));
+            break;
+        }
+        case 0x23: { // global.get
+            uint32_t gi = (uint32_t)rd_uleb(&r);
+            uint8_t vt = (gi < m->n_globals) ? m->globals[gi].valtype : WT_I32;
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", vt);
+            as[1] = attr_i32(ctx, "global_idx", (int64_t)gi);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_GLOBAL_GET, as, 2));
+            break;
+        }
+        case 0x24: { // global.set
+            uint32_t gi = (uint32_t)rd_uleb(&r);
+            uint8_t vt = (gi < m->n_globals) ? m->globals[gi].valtype : WT_I32;
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", vt);
+            as[1] = attr_i32(ctx, "global_idx", (int64_t)gi);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_GLOBAL_SET, as, 2));
+            break;
+        }
+        case 0x28: case 0x29: case 0x2a: case 0x2b:
+        case 0x2c: case 0x2d: case 0x2e: case 0x2f:
+        case 0x30: case 0x31: case 0x32: case 0x33:
+        case 0x34: case 0x35: { // loads
+            uint32_t al = (uint32_t)rd_uleb(&r);
+            uint32_t off = (uint32_t)rd_uleb(&r);
+            uint8_t vt; uint32_t sz; bool sign_extend = false;
+            switch (op) {
+            case 0x28: vt = WT_I32; sz = 4; break;
+            case 0x29: vt = WT_I64; sz = 8; break;
+            case 0x2a: vt = WT_F32; sz = 4; break;
+            case 0x2b: vt = WT_F64; sz = 8; break;
+            case 0x2c: vt = WT_I32; sz = 1; sign_extend = true; break;
+            case 0x2d: vt = WT_I32; sz = 1; break;
+            case 0x2e: vt = WT_I32; sz = 2; sign_extend = true; break;
+            case 0x2f: vt = WT_I32; sz = 2; break;
+            case 0x30: vt = WT_I64; sz = 1; sign_extend = true; break;
+            case 0x31: vt = WT_I64; sz = 1; break;
+            case 0x32: vt = WT_I64; sz = 2; sign_extend = true; break;
+            case 0x33: vt = WT_I64; sz = 2; break;
+            case 0x34: vt = WT_I64; sz = 4; sign_extend = true; break;
+            case 0x35: vt = WT_I64; sz = 4; break;
+            default:   vt = WT_I32; sz = 4; break;
+            }
+            MLIR_AttributeHandle as[4];
+            as[0] = attr_i32(ctx, "valtype", vt);
+            as[1] = attr_i32(ctx, "memory_offset", (int64_t)off);
+            as[2] = attr_i32(ctx, "memory_align_log2", (int64_t)al);
+            as[3] = attr_i32(ctx, "mem_size_bytes", (int64_t)sz);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_LOAD, as, 4));
+            // For signed sub-word loads, emit an explicit sign-extension
+            // op after the zero-extending load. This matches the forward
+            // pipeline which represents `i32.load8_s` as `load8_u +
+            // i32.extend8_s` (the wasm UNOP with wasm_opcode 0xc0/0xc1
+            // for i32; 0xc2/0xc3/0xc4 for i64).
+            if (sign_extend) {
+                uint8_t uop_byte = 0;
+                if (vt == WT_I32) uop_byte = (sz == 1) ? 0xc0 : 0xc1;
+                else              uop_byte = (sz == 1) ? 0xc2 : (sz == 2 ? 0xc3 : 0xc4);
+                MLIR_AttributeHandle bs[2];
+                bs[0] = attr_i32(ctx, "valtype", vt);
+                bs[1] = attr_i32(ctx, "wasm_opcode", (int64_t)uop_byte);
+                MLIR_AppendBlockOp(ctx, dst_blk,
+                    build_op(ctx, OP_TYPE_WASMSTACK_UNOP, bs, 2));
+            }
+            break;
+        }
+        case 0x36: case 0x37: case 0x38: case 0x39:
+        case 0x3a: case 0x3b:
+        case 0x3c: case 0x3d: case 0x3e: { // stores
+            uint32_t al = (uint32_t)rd_uleb(&r);
+            uint32_t off = (uint32_t)rd_uleb(&r);
+            uint8_t vt; uint32_t sz;
+            switch (op) {
+            case 0x36: vt = WT_I32; sz = 4; break;
+            case 0x37: vt = WT_I64; sz = 8; break;
+            case 0x38: vt = WT_F32; sz = 4; break;
+            case 0x39: vt = WT_F64; sz = 8; break;
+            case 0x3a: vt = WT_I32; sz = 1; break;
+            case 0x3b: vt = WT_I32; sz = 2; break;
+            case 0x3c: vt = WT_I64; sz = 1; break;
+            case 0x3d: vt = WT_I64; sz = 2; break;
+            case 0x3e: vt = WT_I64; sz = 4; break;
+            default:   vt = WT_I32; sz = 4; break;
+            }
+            MLIR_AttributeHandle as[4];
+            as[0] = attr_i32(ctx, "valtype", vt);
+            as[1] = attr_i32(ctx, "memory_offset", (int64_t)off);
+            as[2] = attr_i32(ctx, "memory_align_log2", (int64_t)al);
+            as[3] = attr_i32(ctx, "mem_size_bytes", (int64_t)sz);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_STORE, as, 4));
+            break;
+        }
+        case 0x3f: { // memory.size 0x00
+            (void)rd_u8(&r);
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", 0);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_MEMORY_SIZE, as, 1));
+            break;
+        }
+        case 0x40: { // memory.grow 0x00
+            (void)rd_u8(&r);
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", 0);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_MEMORY_GROW, as, 1));
+            break;
+        }
+        case 0x45: { // i32.eqz
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", WT_I32);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_EQZ, as, 1));
+            break;
+        }
+        case 0x50: { // i64.eqz
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", WT_I64);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_EQZ, as, 1));
+            break;
+        }
+        case 0x6a: { // i32.add — special-case
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", WT_I32);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_ADD, as, 1));
+            break;
+        }
+        case 0x6b: { // i32.sub
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", WT_I32);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_SUB, as, 1));
+            break;
+        }
+        case 0x7c: { // i64.add
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", WT_I64);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_ADD, as, 1));
+            break;
+        }
+        case 0x7d: { // i64.sub
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", WT_I64);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_SUB, as, 1));
+            break;
+        }
+        case 0xac: { // i64.extend_i32_s
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", WT_I64);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_EXTEND_I32_S, as, 1));
+            break;
+        }
+        case 0x02: { // block btype
+            uint8_t bt = rd_u8(&r);
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", bt == 0x40 ? 0 : bt);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BLOCK, as, 1));
+            break;
+        }
+        case 0x03: { // loop btype
+            uint8_t bt = rd_u8(&r);
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", bt == 0x40 ? 0 : bt);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_LOOP, as, 1));
+            break;
+        }
+        case 0x04: { // if btype
+            uint8_t bt = rd_u8(&r);
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", bt == 0x40 ? 0 : bt);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_IF, as, 1));
+            break;
+        }
+        case 0x05: { // else
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", 0);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_ELSE, as, 1));
+            break;
+        }
+        case 0x0c: { // br depth
+            uint32_t d = (uint32_t)rd_uleb(&r);
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", 0);
+            as[1] = attr_i32(ctx, "depth", (int64_t)d);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BR, as, 2));
+            break;
+        }
+        case 0x0d: { // br_if depth
+            uint32_t d = (uint32_t)rd_uleb(&r);
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", 0);
+            as[1] = attr_i32(ctx, "depth", (int64_t)d);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BR_IF, as, 2));
+            break;
+        }
+        // Remaining wasm binops/unops: emit as WASMSTACK_BINOP / UNOP
+        // with the raw `wasm_opcode` byte attribute. The wasmstack ->
+        // wasmssa lifter knows the standard (vt, vt) -> vt shape for
+        // these, so this passes through cleanly.
+        //
+        // i32 family (vt=i32, takes/returns i32):
+        case 0x46: case 0x47: case 0x48: case 0x49: case 0x4a: case 0x4b:
+        case 0x4c: case 0x4d: case 0x4e: case 0x4f:
+        case 0x6c: case 0x6d: case 0x6e: case 0x6f: case 0x70:
+        case 0x71: case 0x72: case 0x73:
+        case 0x74: case 0x75: case 0x76:
+        case 0x77: case 0x78: { // i32 binops (mul/div/rem/and/or/xor/shl/shr/rotl/rotr) + i32 cmps
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_I32);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BINOP, as, 2));
+            break;
+        }
+        case 0x67: case 0x68: case 0x69: { // i32 unops clz/ctz/popcnt
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_I32);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_UNOP, as, 2));
+            break;
+        }
+        case 0x79: case 0x7a: case 0x7b: { // i64 clz/ctz/popcnt
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_I64);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_UNOP, as, 2));
+            break;
+        }
+        case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56:
+        case 0x57: case 0x58: case 0x59: case 0x5a: { // i64 cmps
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_I64);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BINOP, as, 2));
+            break;
+        }
+        case 0x7e: case 0x7f: case 0x80: case 0x81: case 0x82:
+        case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
+        case 0x88: case 0x89: case 0x8a: { // i64 binops (mul/div/rem/and/or/xor/shl/shr/rotl/rotr)
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_I64);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BINOP, as, 2));
+            break;
+        }
+        // f32 cmps (0x5b..0x60):
+        case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f: case 0x60: {
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_F32);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BINOP, as, 2));
+            break;
+        }
+        // f64 cmps (0x61..0x66):
+        case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: {
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_F64);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BINOP, as, 2));
+            break;
+        }
+        // f32 unops (abs/neg/ceil/floor/trunc/nearest/sqrt: 0x8b..0x91):
+        case 0x8b: case 0x8c: case 0x8d: case 0x8e: case 0x8f:
+        case 0x90: case 0x91: {
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_F32);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_UNOP, as, 2));
+            break;
+        }
+        // f32 binops (add/sub/mul/div/min/max/copysign: 0x92..0x98):
+        case 0x92: case 0x93: case 0x94: case 0x95: case 0x96:
+        case 0x97: case 0x98: {
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_F32);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BINOP, as, 2));
+            break;
+        }
+        // f64 unops (0x99..0x9f):
+        case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d:
+        case 0x9e: case 0x9f: {
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_F64);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_UNOP, as, 2));
+            break;
+        }
+        // f64 binops (0xa0..0xa6):
+        case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4:
+        case 0xa5: case 0xa6: {
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", WT_F64);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BINOP, as, 2));
+            break;
+        }
+        // Conversions (0xa7..0xc4):
+        // wrap/extend/trunc/convert/reinterpret. We treat all of these
+        // as UNOPs with a wasm_opcode attribute carrying the byte.
+        // Result valtype derived per opcode.
+        case 0xa7: case 0xa8: case 0xa9: case 0xaa: case 0xab:
+        /* 0xac handled above as EXTEND_I32_S */
+        case 0xad: case 0xae: case 0xaf: case 0xb0: case 0xb1:
+        case 0xb2: case 0xb3: case 0xb4: case 0xb5: case 0xb6:
+        case 0xb7: case 0xb8: case 0xb9: case 0xba: case 0xbb:
+        case 0xbc: case 0xbd: case 0xbe: case 0xbf:
+        case 0xc0: case 0xc1: case 0xc2: case 0xc3: case 0xc4: {
+            // Result valtype per opcode. Source valtype isn't stored on
+            // the op since the wasm stack already carries the typed
+            // value the unop reads from.
+            uint8_t res_vt;
+            switch (op) {
+            case 0xa7: res_vt = WT_I32; break;  // i32.wrap_i64
+            case 0xa8: case 0xa9: res_vt = WT_I32; break;  // i32.trunc_f32_s/u
+            case 0xaa: case 0xab: res_vt = WT_I32; break;  // i32.trunc_f64_s/u
+            case 0xad: case 0xae: res_vt = WT_I64; break;  // i64.extend_i32_u (0xad), trunc_f32_s (0xae)
+            case 0xaf: case 0xb0: case 0xb1: res_vt = WT_I64; break;  // various
+            case 0xb2: case 0xb3: case 0xb4: case 0xb5: res_vt = WT_F32; break;
+            case 0xb6: res_vt = WT_F32; break;  // f32.demote_f64
+            case 0xb7: case 0xb8: case 0xb9: case 0xba: res_vt = WT_F64; break;
+            case 0xbb: res_vt = WT_F64; break;  // f64.promote_f32
+            case 0xbc: res_vt = WT_I32; break;  // i32.reinterpret_f32
+            case 0xbd: res_vt = WT_I64; break;  // i64.reinterpret_f64
+            case 0xbe: res_vt = WT_F32; break;  // f32.reinterpret_i32
+            case 0xbf: res_vt = WT_F64; break;  // f64.reinterpret_i64
+            case 0xc0: case 0xc1: res_vt = WT_I32; break;  // i32.extend8_s/16_s
+            case 0xc2: case 0xc3: case 0xc4: res_vt = WT_I64; break;
+            default:   res_vt = WT_I32;
+            }
+            MLIR_AttributeHandle as[2];
+            as[0] = attr_i32(ctx, "valtype", res_vt);
+            as[1] = attr_i32(ctx, "wasm_opcode", (int64_t)op);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_UNOP, as, 2));
+            break;
+        }
+        case 0x1a: { // drop — pop one value, no result.
+            MLIR_AttributeHandle as[1];
+            as[0] = attr_i32(ctx, "valtype", 0);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_DROP, as, 1));
+            break;
+        }
+        case 0x0e: { // br_table — list of N depths, then default depth.
+            uint32_t n = (uint32_t)rd_uleb(&r);
+            // Collect depths into a comma-separated string.
+            char tbuf[1024];
+            size_t tlen = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                uint32_t d = (uint32_t)rd_uleb(&r);
+                int wr = snprintf(tbuf + tlen, sizeof(tbuf) - tlen,
+                    k == 0 ? "%u" : ",%u", d);
+                if (wr < 0 || (size_t)wr >= sizeof(tbuf) - tlen) {
+                    fprintf(stderr, "wasm->wasmstack: br_table too many targets\n");
+                    return false;
+                }
+                tlen += (size_t)wr;
+            }
+            uint32_t dflt = (uint32_t)rd_uleb(&r);
+            char *targets = arena_strndup(arena, tbuf, tlen);
+            MLIR_AttributeHandle as[3];
+            as[0] = attr_i32(ctx, "valtype", 0);
+            as[1] = attr_s(ctx, "targets", targets, tlen);
+            as[2] = attr_i32(ctx, "default", (int64_t)dflt);
+            MLIR_AppendBlockOp(ctx, dst_blk,
+                build_op(ctx, OP_TYPE_WASMSTACK_BR_TABLE, as, 3));
+            break;
+        }
         default:
             fprintf(stderr,
                 "wasm->wasmstack: unsupported opcode 0x%02x in function '%s' "
@@ -628,6 +1223,47 @@ MLIR_OpHandle mlir_wasm_to_wasmstack(MLIR_Context *ctx,
         NULL, 0, NULL, 0, NULL, 0, NULL, 0, out_regs, 1,
         MLIR_CreateLocationUnknown(ctx, (string){0}),
         MLIR_INVALID_HANDLE, (string){0}, -1);
+
+    // Emit module-level globals (the wasm GLOBAL section).
+    for (uint32_t i = 0; i < m.n_globals; i++) {
+        MLIR_AttributeHandle as[4];
+        as[0] = attr_i32(ctx, "global_idx", (int64_t)i);
+        as[1] = attr_i32(ctx, "valtype", (int64_t)m.globals[i].valtype);
+        as[2] = attr_b(ctx, "mut", m.globals[i].mut != 0);
+        as[3] = attr_i64(ctx, "init_value", m.globals[i].init_value);
+        MLIR_AppendBlockOp(ctx, out_body,
+            build_op(ctx, OP_TYPE_WASMSTACK_GLOBAL_DECL, as, 4));
+    }
+
+    // Emit module-level data segments (the wasm DATA section).
+    for (uint32_t i = 0; i < m.n_data_segs; i++) {
+        MLIR_AttributeHandle as[3];
+        as[0] = attr_i32(ctx, "offset", (int64_t)m.data_segs[i].offset);
+        as[1] = attr_s(ctx, "init_data",
+            (const char *)m.data_segs[i].data, m.data_segs[i].size);
+        as[2] = attr_i32(ctx, "size", (int64_t)m.data_segs[i].size);
+        MLIR_AppendBlockOp(ctx, out_body,
+            build_op(ctx, OP_TYPE_WASMSTACK_DATA_SEGMENT, as, 3));
+    }
+
+    // Emit module-level function-pointer table entries (the wasm ELEM
+    // section). Each entry says "wasm table slot N now holds a
+    // reference to function f". The wmir lowering uses these to build
+    // call_indirect dispatchers keyed on the actual wasm table slot
+    // (rather than an auto-interned slot — that mismatch would make
+    // the slot value the program sees at runtime not match the slot
+    // the dispatcher expects).
+    for (uint32_t k = 0; k < m.n_elem_funcs; k++) {
+        uint32_t fi = m.elem_funcs[k];
+        if (fi == UINT32_MAX) continue;
+        if (fi >= m.n_funcs || !m.funcs[fi].name) continue;
+        MLIR_AttributeHandle as[2];
+        as[0] = attr_i32(ctx, "slot", (int64_t)k);
+        as[1] = attr_s(ctx, "target", m.funcs[fi].name,
+            strlen(m.funcs[fi].name));
+        MLIR_AppendBlockOp(ctx, out_body,
+            build_op(ctx, OP_TYPE_WASMSTACK_FUNC_ADDR_DECL, as, 2));
+    }
 
     for (uint32_t i = 0; i < m.n_funcs; i++) {
         MLIR_OpHandle op = convert_func(ctx, arena, &m, i);

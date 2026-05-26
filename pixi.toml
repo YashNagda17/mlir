@@ -386,6 +386,7 @@ verify_tinyc_native_upstream_identical = { cmd = "python examples/tinyc/verify_n
 [feature.upstream.target.osx-arm64.tasks]
 test_tinyc_macho = { cmd = "TINYC=./tinyc_native TINYC_TARGET=macho TINYC_LOWERING=native python examples/tinyc/run_tinyc_tests.py", depends-on = ["build_tinyc_native"], description = "Run tinyC example compiler tests against the WASM->Mach-O ARM64 backend (Darwin/arm64 only)" }
 test_tinyc_macho_wmir = { cmd = "TINYC=./tinyc_native TINYC_TARGET=macho TINYC_LOWERING=native TINYC_MACHO_BACKEND=wmir python examples/tinyc/run_tinyc_tests.py", depends-on = ["build_tinyc_native"], description = "Run tinyC example compiler tests against the experimental wasmssa->wmir->aarch64->Mach-O backend (Darwin/arm64 only)" }
+test_tinyc_macho_wmir_via_wasm = { cmd = "TINYC=./tinyc_native TINYC_TARGET=macho TINYC_LOWERING=native TINYC_MACHO_BACKEND=wmir_via_wasm python examples/tinyc/run_tinyc_tests.py", depends-on = ["build_tinyc_native"], description = "Run tinyC example compiler tests through wasm-emit + wasm-ld + wasm-lifter -> wmir -> aarch64 -> Mach-O (Darwin/arm64 only)" }
 
 [feature.wasm.target.osx-arm64.tasks]
 selfhost_tinyc_macho_stage1 = { cmd = "bash examples/tinyc/selfhost_tinyc_macho.sh tinyc.wasm tinyc_stage1_macho selfhost_macho_stage1", depends-on = ["build_tinyc_wasm"], description = "Self-host stage 1 (macho): drive tinyc.wasm under wasmtime to recompile every tinyc source and link them into tinyc_stage1_macho (Darwin/arm64 only)" }
