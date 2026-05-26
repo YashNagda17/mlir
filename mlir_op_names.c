@@ -245,6 +245,7 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_AARCH64_STR_W:        return str_lit("aarch64.str_w");
         case OP_TYPE_AARCH64_LDR_X:        return str_lit("aarch64.ldr_x");
         case OP_TYPE_AARCH64_STR_X:        return str_lit("aarch64.str_x");
+        case OP_TYPE_AARCH64_STRB_IMM:     return str_lit("aarch64.strb_imm");
         case OP_TYPE_AARCH64_ADRP_DATA:    return str_lit("aarch64.adrp_data");
         case OP_TYPE_AARCH64_ADD_DATA_LO:  return str_lit("aarch64.add_data_lo");
         case OP_TYPE_AARCH64_PROLOGUE:     return str_lit("aarch64.prologue");

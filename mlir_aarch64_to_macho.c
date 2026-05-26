@@ -320,6 +320,11 @@ static uint32_t arm64_str_x_uoff(uint8_t rt, uint8_t rn, uint16_t off_bytes) {
     return 0xf9000000u | (((uint32_t)(off_bytes >> 3) & 0xfffu) << 10)
                        | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
 }
+// STRB Wt, [Xn, #pimm]  (1-byte store, unscaled imm12).
+static uint32_t arm64_strb_imm(uint8_t rt, uint8_t rn, uint16_t off_bytes) {
+    return 0x39000000u | (((uint32_t)off_bytes & 0xfffu) << 10)
+                       | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
+}
 // MUL Wd, Wn, Wm == MADD Wd, Wn, Wm, WZR
 //   W base: 0x1B007C00, X base: 0x9B007C00
 static uint32_t arm64_mul(uint8_t rd, uint8_t rn, uint8_t rm, bool sf) {
@@ -651,6 +656,13 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
                 uint8_t  rn = (uint8_t)attr_i(op, "rn");
                 uint16_t of = (uint16_t)attr_i(op, "off_bytes");
                 emit_word(&out->code, arm64_str_x_uoff(rt, rn, of));
+                break;
+            }
+            case OP_TYPE_AARCH64_STRB_IMM: {
+                uint8_t  rt = (uint8_t)attr_i(op, "rt");
+                uint8_t  rn = (uint8_t)attr_i(op, "rn");
+                uint16_t of = (uint16_t)attr_i(op, "off_bytes");
+                emit_word(&out->code, arm64_strb_imm(rt, rn, of));
                 break;
             }
             case OP_TYPE_AARCH64_MUL: {

@@ -156,6 +156,46 @@ static void emit_svc(MLIR_Context *ctx, MLIR_BlockHandle blk, uint16_t imm16) {
 static void emit_ret(MLIR_Context *ctx, MLIR_BlockHandle blk) {
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_RET, NULL, 0));
 }
+static void emit_mov_x(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                       uint8_t rd, uint8_t rn) {
+    MLIR_AttributeHandle a[2];
+    a[0] = attr_i32(ctx, "rd", rd);
+    a[1] = attr_i32(ctx, "rn", rn);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_MOV_X, a, 2));
+}
+static void emit_add_imm(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                         uint8_t rd, uint8_t rn, uint16_t imm12, bool sf) {
+    MLIR_AttributeHandle a[4];
+    a[0] = attr_i32(ctx, "rd", rd);
+    a[1] = attr_i32(ctx, "rn", rn);
+    a[2] = attr_i32(ctx, "imm12", imm12);
+    a[3] = attr_b(ctx, "sf", sf);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_ADD_IMM, a, 4));
+}
+static void emit_sub_imm(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                         uint8_t rd, uint8_t rn, uint16_t imm12, bool sf) {
+    MLIR_AttributeHandle a[4];
+    a[0] = attr_i32(ctx, "rd", rd);
+    a[1] = attr_i32(ctx, "rn", rn);
+    a[2] = attr_i32(ctx, "imm12", imm12);
+    a[3] = attr_b(ctx, "sf", sf);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_SUB_IMM, a, 4));
+}
+static void emit_b_cond(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                        uint8_t cond, MLIR_BlockHandle target) {
+    MLIR_AttributeHandle a[1];
+    a[0] = attr_i32(ctx, "cond", cond);
+    MLIR_AppendBlockOp(ctx, blk,
+        build_branch_op(ctx, OP_TYPE_AARCH64_B_COND, a, 1, target));
+}
+static void emit_strb_imm(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                          uint8_t rt, uint8_t rn, uint16_t off_bytes) {
+    MLIR_AttributeHandle a[3];
+    a[0] = attr_i32(ctx, "rt", rt);
+    a[1] = attr_i32(ctx, "rn", rn);
+    a[2] = attr_i32(ctx, "off_bytes", off_bytes);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_STRB_IMM, a, 3));
+}
 static void emit_brk(MLIR_Context *ctx, MLIR_BlockHandle blk, uint16_t imm16) {
     MLIR_AttributeHandle a[1];
     a[0] = attr_i32(ctx, "imm16", imm16);
@@ -893,12 +933,174 @@ static MLIR_OpHandle synth_start(MLIR_Context *ctx, string main_name,
 }
 
 // =============================================================================
+// Synthesise printI64(x0: i64) -> void by formatting digits into a
+// 32-byte stack buffer and writing via the macOS BSD `write` syscall
+// (SYS_write = 4, x16 = 4, svc #0x80). Handles negative numbers (with a
+// leading '-') for values where -v is representable; INT64_MIN is a
+// known corner case left unhandled.
+//
+// Block layout:
+//   entry           prologue; cmp x0, #0; b.ge ^pos
+//   neg             mov x10, #1; sub x0, xzr, x0; b ^pos
+//   pos             add x11, sp, #24; b ^loop
+//   loop            divmod by 10; strb digit; cbnz x0, ^loop; b ^after
+//   after           cbz x10, ^skip; strb '-'; b ^skip
+//   skip            compute count; setup x0/x1/x2/x16; svc; epilogue; ret
+// =============================================================================
+static MLIR_OpHandle synth_print_i64(MLIR_Context *ctx) {
+    MLIR_RegionHandle region = MLIR_CreateRegion(ctx);
+    MLIR_BlockHandle entry = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bneg  = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bpos  = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bloop = MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bafter= MLIR_CreateBlock(ctx);
+    MLIR_BlockHandle bskip = MLIR_CreateBlock(ctx);
+    MLIR_AppendRegionBlock(ctx, region, entry);
+    MLIR_AppendRegionBlock(ctx, region, bneg);
+    MLIR_AppendRegionBlock(ctx, region, bpos);
+    MLIR_AppendRegionBlock(ctx, region, bloop);
+    MLIR_AppendRegionBlock(ctx, region, bafter);
+    MLIR_AppendRegionBlock(ctx, region, bskip);
+
+    emit_prologue(ctx, entry, /*frame_size=*/32);
+    // Default x10 = 0 (no sign). The neg-path overrides this with 1.
+    emit_movz(ctx, entry, /*rd=*/10, /*imm16=*/0, /*hw=*/0, /*sf=*/true);
+    emit_cmp_imm(ctx, entry, /*rn=*/0, /*imm12=*/0, /*sf=*/true);
+    emit_b_cond(ctx, entry, COND_GE, bpos);
+    emit_b(ctx, entry, bneg);
+
+    emit_movz(ctx, bneg, /*rd=*/10, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
+    // sub Xd, XZR, Xn -> Xd = -Xn   (rn=31 = XZR for shifted-register form)
+    {
+        MLIR_AttributeHandle a[4];
+        a[0] = attr_i32(ctx, "rd", 0);
+        a[1] = attr_i32(ctx, "rn", 31);
+        a[2] = attr_i32(ctx, "rm", 0);
+        a[3] = attr_b(ctx, "sf", true);
+        MLIR_AppendBlockOp(ctx, bneg,
+            build_op(ctx, OP_TYPE_AARCH64_SUB_REG, a, 4));
+    }
+    emit_b(ctx, bneg, bpos);
+
+    // bpos: x11 = sp + 24  (one past end of digit buffer)
+    emit_add_imm(ctx, bpos, /*rd=*/11, /*rn=*/31, /*imm12=*/24, /*sf=*/true);
+    emit_b(ctx, bpos, bloop);
+
+    // bloop: divide by 10, store digit, dec ptr, loop while non-zero
+    emit_movz(ctx, bloop, /*rd=*/12, /*imm16=*/10, /*hw=*/0, /*sf=*/true);
+    // udiv x13, x0, x12
+    {
+        MLIR_AttributeHandle a[4];
+        a[0] = attr_i32(ctx, "rd", 13);
+        a[1] = attr_i32(ctx, "rn", 0);
+        a[2] = attr_i32(ctx, "rm", 12);
+        a[3] = attr_b(ctx, "sf", true);
+        MLIR_AppendBlockOp(ctx, bloop,
+            build_op(ctx, OP_TYPE_AARCH64_UDIV, a, 4));
+    }
+    // msub x14, x13, x12, x0  -> x14 = x0 - x13*x12 = x0 % 10
+    {
+        MLIR_AttributeHandle a[5];
+        a[0] = attr_i32(ctx, "rd", 14);
+        a[1] = attr_i32(ctx, "rn", 13);
+        a[2] = attr_i32(ctx, "rm", 12);
+        a[3] = attr_i32(ctx, "ra", 0);
+        a[4] = attr_b(ctx, "sf", true);
+        MLIR_AppendBlockOp(ctx, bloop,
+            build_op(ctx, OP_TYPE_AARCH64_MSUB, a, 5));
+    }
+    // add w14, w14, #'0'
+    emit_add_imm(ctx, bloop, /*rd=*/14, /*rn=*/14,
+                 /*imm12=*/0x30, /*sf=*/false);
+    // sub x11, x11, #1
+    emit_sub_imm(ctx, bloop, /*rd=*/11, /*rn=*/11,
+                 /*imm12=*/1, /*sf=*/true);
+    // strb w14, [x11, #0]
+    emit_strb_imm(ctx, bloop, /*rt=*/14, /*rn=*/11, /*off=*/0);
+    // mov x0, x13
+    emit_mov_x(ctx, bloop, /*rd=*/0, /*rn=*/13);
+    // cbnz x0, ^loop
+    emit_cbnz(ctx, bloop, /*rt=*/0, /*sf=*/true, bloop);
+    emit_b(ctx, bloop, bafter);
+
+    // bafter: if x10 == 0, jump to skip; else prepend '-'
+    emit_cbz(ctx, bafter, /*rt=*/10, /*sf=*/true, bskip);
+    emit_movz(ctx, bafter, /*rd=*/14, /*imm16=*/0x2d, /*hw=*/0, /*sf=*/false);
+    emit_sub_imm(ctx, bafter, /*rd=*/11, /*rn=*/11,
+                 /*imm12=*/1, /*sf=*/true);
+    emit_strb_imm(ctx, bafter, /*rt=*/14, /*rn=*/11, /*off=*/0);
+    emit_b(ctx, bafter, bskip);
+
+    // bskip: setup syscall write(1, x11, count); count = (sp+24) - x11
+    emit_add_imm(ctx, bskip, /*rd=*/12, /*rn=*/31,
+                 /*imm12=*/24, /*sf=*/true);
+    // sub x2, x12, x11
+    {
+        MLIR_AttributeHandle a[4];
+        a[0] = attr_i32(ctx, "rd", 2);
+        a[1] = attr_i32(ctx, "rn", 12);
+        a[2] = attr_i32(ctx, "rm", 11);
+        a[3] = attr_b(ctx, "sf", true);
+        MLIR_AppendBlockOp(ctx, bskip,
+            build_op(ctx, OP_TYPE_AARCH64_SUB_REG, a, 4));
+    }
+    emit_movz(ctx, bskip, /*rd=*/0, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
+    emit_mov_x(ctx, bskip, /*rd=*/1, /*rn=*/11);
+    emit_movz(ctx, bskip, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
+    emit_svc(ctx, bskip, 0x80);
+    emit_epilogue(ctx, bskip, /*frame_size=*/32);
+    emit_ret(ctx, bskip);
+
+    MLIR_AttributeHandle attrs[1];
+    attrs[0] = attr_s(ctx, "sym_name", "printI64", 8);
+    MLIR_RegionHandle regs[1] = { region };
+    return MLIR_CreateOp(ctx, OP_TYPE_AARCH64_FUNC,
+        op_type_to_string(OP_TYPE_AARCH64_FUNC),
+        attrs, 1, NULL, 0, NULL, 0, NULL, 0, regs, 1,
+        MLIR_CreateLocationUnknown(ctx, (string){0}),
+        MLIR_INVALID_HANDLE, (string){0}, -1);
+}
+
+// =============================================================================
+// Synthesise printNewline() -> void by writing a single '\n' via the BSD
+// write syscall. Uses one byte of the 16-byte stack frame as the buffer.
+// =============================================================================
+static MLIR_OpHandle synth_print_newline(MLIR_Context *ctx) {
+    MLIR_RegionHandle region = MLIR_CreateRegion(ctx);
+    MLIR_BlockHandle blk = MLIR_CreateBlock(ctx);
+    MLIR_AppendRegionBlock(ctx, region, blk);
+
+    emit_prologue(ctx, blk, /*frame_size=*/16);
+    emit_movz(ctx, blk, /*rd=*/9, /*imm16=*/0x0a, /*hw=*/0, /*sf=*/false);
+    emit_strb_imm(ctx, blk, /*rt=*/9, /*rn=*/31, /*off=*/0);
+    emit_movz(ctx, blk, /*rd=*/0, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
+    // x1 = sp  ->  add x1, sp, #0
+    emit_add_imm(ctx, blk, /*rd=*/1, /*rn=*/31, /*imm12=*/0, /*sf=*/true);
+    emit_movz(ctx, blk, /*rd=*/2, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
+    emit_movz(ctx, blk, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
+    emit_svc(ctx, blk, 0x80);
+    emit_epilogue(ctx, blk, /*frame_size=*/16);
+    emit_ret(ctx, blk);
+
+    MLIR_AttributeHandle attrs[1];
+    attrs[0] = attr_s(ctx, "sym_name", "printNewline", 12);
+    MLIR_RegionHandle regs[1] = { region };
+    return MLIR_CreateOp(ctx, OP_TYPE_AARCH64_FUNC,
+        op_type_to_string(OP_TYPE_AARCH64_FUNC),
+        attrs, 1, NULL, 0, NULL, 0, NULL, 0, regs, 1,
+        MLIR_CreateLocationUnknown(ctx, (string){0}),
+        MLIR_INVALID_HANDLE, (string){0}, -1);
+}
+
+// =============================================================================
 // Walk the module to compute the highest global_idx referenced and
 // whether linmem is touched.
 // =============================================================================
 typedef struct {
     int32_t n_globals;
     bool    uses_linmem;
+    bool    needs_printI64;
+    bool    needs_printNewline;
 } ModInfo;
 
 static void scan_block(MLIR_BlockHandle blk, ModInfo *mi) {
@@ -911,6 +1113,14 @@ static void scan_block(MLIR_BlockHandle blk, ModInfo *mi) {
             if (gi + 1 > mi->n_globals) mi->n_globals = gi + 1;
         } else if (t == OP_TYPE_WMIR_LOAD || t == OP_TYPE_WMIR_STORE) {
             mi->uses_linmem = true;
+        } else if (t == OP_TYPE_WMIR_CALL) {
+            string callee = at_s(op, "target");
+            if (callee.size == 0) callee = at_s(op, "callee");
+            if (callee.size == 8 && memcmp(callee.str, "printI64", 8) == 0)
+                mi->needs_printI64 = true;
+            if (callee.size == 12 &&
+                memcmp(callee.str, "printNewline", 12) == 0)
+                mi->needs_printNewline = true;
         }
         size_t nr = MLIR_GetOpNumRegions(op);
         for (size_t r = 0; r < nr; r++) {
@@ -993,6 +1203,17 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
         /*use_data_priv=*/false, use_globals, use_linmem);
     if (!start) return MLIR_INVALID_HANDLE;
     MLIR_AppendBlockOp(ctx, out_body, start);
+
+    if (mi.needs_printI64) {
+        MLIR_OpHandle p = synth_print_i64(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_printNewline) {
+        MLIR_OpHandle p = synth_print_newline(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
 
     return out_module;
 }
