@@ -139,10 +139,14 @@ done
 
 # wasm-ld step: produce a single linked wasm module with `_start`
 # exported. The wmir backend's --from-wasm path consumes this linked
-# module and lowers it to Mach-O directly.
+# module and lowers it to Mach-O directly. `--allow-undefined` is
+# required because tinyc's wasm32-wasi compilation produces calls to
+# WASI imports (`fd_write`, `proc_exit`, `path_open`, …) that the
+# wmir backend re-synthesises as direct libSystem syscalls; wasm-ld
+# would otherwise refuse the link with "undefined symbol" errors.
 LINKED_WASM="$STAGE_DIR/linked.wasm"
 printf '[selfhost-macho-wmir] wasm-ld -> %s\n' "$LINKED_WASM"
-wasm-ld --no-entry --export=_start \
+wasm-ld --no-entry --export=_start --allow-undefined \
     -o "$LINKED_WASM" \
     "${OBJS[@]}" "$VARARG_OBJ"
 

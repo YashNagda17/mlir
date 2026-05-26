@@ -803,17 +803,38 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
             MLIR_ValueHandle pv = MLIR_GetBlockArg(src_entry, i);
             ValueHome h;
             if (!wmir_regalloc_lookup(ra, pv, &h)) continue;
-            // Param i arrives in xI (i64) or wI (i32). Move it to
-            // its home (mov if reg, str if slot). No-op if reg==i.
-            if (h.kind == HOME_REG) {
-                if (h.idx != (uint8_t)i) emit_mov_x(ctx, entry_dst, h.idx, (uint8_t)i);
+            bool i64 = is_i64(ctx, pv);
+            if (i < 8) {
+                // Param i arrives in xI (i64) or wI (i32). Move it to
+                // its home (mov if reg, str if slot). No-op if reg==i.
+                if (h.kind == HOME_REG) {
+                    if (h.idx != (uint8_t)i)
+                        emit_mov_x(ctx, entry_dst, h.idx, (uint8_t)i);
+                } else {
+                    // i64 params must be spilled as full 8 bytes; w0..w7 alone
+                    // would drop the upper half (caused ternary_i64 regression).
+                    if (i64)
+                        emit_str_x(ctx, entry_dst, (uint8_t)i, 31, (uint16_t)(h.idx * 8u));
+                    else
+                        emit_str_w(ctx, entry_dst, (uint8_t)i, 31, (uint16_t)(h.idx * 8u));
+                }
             } else {
-                // i64 params must be spilled as full 8 bytes; w0..w7 alone
-                // would drop the upper half (caused ternary_i64 regression).
-                if (is_i64(ctx, pv))
-                    emit_str_x(ctx, entry_dst, (uint8_t)i, 31, (uint16_t)(h.idx * 8u));
-                else
-                    emit_str_w(ctx, entry_dst, (uint8_t)i, 31, (uint16_t)(h.idx * 8u));
+                // Stack-passed param: caller put it at [old_sp, #(i-8)*8],
+                // which is at [fp, #16 + (i-8)*8] from our perspective
+                // (fp -> saved x29, fp+8 -> saved x30, fp+16 -> first
+                // stack arg). Bring it into a scratch reg first, then
+                // store / move to its home.
+                uint16_t fp_off = (uint16_t)(16u + (i - 8u) * 8u);
+                uint8_t scratch = 9;
+                if (h.kind == HOME_REG) scratch = h.idx;
+                if (i64) emit_ldr_x(ctx, entry_dst, scratch, /*rn=*/29, fp_off);
+                else     emit_ldr_w(ctx, entry_dst, scratch, /*rn=*/29, fp_off);
+                if (h.kind == HOME_SLOT) {
+                    if (i64)
+                        emit_str_x(ctx, entry_dst, scratch, 31, (uint16_t)(h.idx * 8u));
+                    else
+                        emit_str_w(ctx, entry_dst, scratch, 31, (uint16_t)(h.idx * 8u));
+                }
             }
         }
     }
@@ -1245,23 +1266,65 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
             }
             case OP_TYPE_WMIR_CALL: {
                 size_t na = MLIR_GetOpNumOperands(op);
-                if (na > 8) {
+                // Args 0..7 go in x0..x7. Args 8+ are passed on the
+                // stack at [sp, #(k-8)*8]. The PCS requires SP to remain
+                // 16-byte aligned across the call.
+                size_t stack_args = (na > 8) ? na - 8 : 0;
+                size_t reg_args   = (na > 8) ? 8 : na;
+                uint32_t stack_bytes =
+                    (uint32_t)((stack_args * 8u + 15u) & ~(size_t)15);
+                if (stack_bytes > 0xfff) {
                     fprintf(stderr,
-                        "wmir->aarch64: wmir.call with %zu args (>8) not "
-                        "yet supported\n", na);
+                        "wmir->aarch64: wmir.call needs %u bytes of stack "
+                        "args (>4080)\n", stack_bytes);
                     wmir_regalloc_free(ra); bm_free(&bm);
                     return MLIR_INVALID_HANDLE;
                 }
                 // ABI arg regs x0..x7 are outside our allocation pool
                 // (which is x11..x18), so no operand's home register
-                // can collide with the target arg reg. We can simply
-                // mov / ldr each one into place in source order.
-                for (size_t k = 0; k < na; k++) {
+                // can collide with the target arg reg. Load reg args
+                // FIRST while SP is still at its "local slots" position.
+                for (size_t k = 0; k < reg_args; k++) {
                     ld_operand_into_fixed(ctx, dst_blk, ra, op, k, (uint8_t)k);
+                }
+                if (stack_bytes > 0) {
+                    // Shift SP down to expose the outgoing-arg area.
+                    emit_sub_imm(ctx, dst_blk, /*rd=*/31, /*rn=*/31,
+                                 (uint16_t)stack_bytes, /*sf=*/true);
+                    // Now [sp, #0..stack_bytes-1] is the outgoing arg
+                    // area, and any HOME_SLOT operand sits at
+                    // [sp, #stack_bytes + slot*8] because we moved sp.
+                    for (size_t k = 8; k < na; k++) {
+                        MLIR_ValueHandle v = MLIR_GetOpOperand(op, k);
+                        ValueHome h;
+                        if (!wmir_regalloc_lookup(ra, v, &h)) {
+                            fprintf(stderr,
+                                "wmir->aarch64: unbound operand %zu in call\n", k);
+                            wmir_regalloc_free(ra); bm_free(&bm);
+                            return MLIR_INVALID_HANDLE;
+                        }
+                        bool i64 = is_i64(ctx, v);
+                        uint8_t src_reg;
+                        if (h.kind == HOME_REG) {
+                            src_reg = h.idx;
+                        } else {
+                            src_reg = 9;
+                            uint16_t off = (uint16_t)(stack_bytes + h.idx * 8u);
+                            if (i64) emit_ldr_x(ctx, dst_blk, src_reg, 31, off);
+                            else     emit_ldr_w(ctx, dst_blk, src_reg, 31, off);
+                        }
+                        uint16_t dst_off = (uint16_t)((k - 8) * 8u);
+                        if (i64) emit_str_x(ctx, dst_blk, src_reg, 31, dst_off);
+                        else     emit_str_w(ctx, dst_blk, src_reg, 31, dst_off);
+                    }
                 }
                 string callee = at_s(op, "target");
                 if (callee.size == 0) callee = at_s(op, "callee");
                 emit_bl(ctx, dst_blk, callee);
+                if (stack_bytes > 0) {
+                    emit_add_imm(ctx, dst_blk, /*rd=*/31, /*rn=*/31,
+                                 (uint16_t)stack_bytes, /*sf=*/true);
+                }
                 if (MLIR_GetOpNumResults(op) > 0) {
                     // Result arrives in x0; persist to its home.
                     st_result_from_fixed(ctx, dst_blk, ra, op, 0, 0);

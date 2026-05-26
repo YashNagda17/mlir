@@ -941,20 +941,35 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
             return false;
         }
         size_t no = MLIR_GetOpNumOperands(src_op);
-        MLIR_ValueHandle ops[16];
-        if (no > 16) {
-            fprintf(stderr, "wmir: wasmssa.call with >16 args unsupported\n");
-            return false;
+        MLIR_ValueHandle *ops = NULL;
+        MLIR_ValueHandle ops_inline[16];
+        if (no <= 16) {
+            ops = ops_inline;
+        } else {
+            ops = (MLIR_ValueHandle *)malloc(no * sizeof(MLIR_ValueHandle));
+            if (!ops) {
+                fprintf(stderr, "wmir: oom allocating wasmssa.call operands\n");
+                return false;
+            }
         }
         for (size_t k = 0; k < no; k++) {
             if (!vmap_get(L->vmap, MLIR_GetOpOperand(src_op, k), &ops[k])) {
-                fprintf(stderr, "wmir: unbound operand on wasmssa.call\n");
+                MLIR_ValueHandle ov = MLIR_GetOpOperand(src_op, k);
+                MLIR_TypeHandle ot = MLIR_GetValueType(ov);
+                string ots = MLIR_GetTypeString(ctx, ot);
+                fprintf(stderr,
+                    "wmir: unbound operand %zu/%zu on wasmssa.call "
+                    "(target='%.*s', operand_type='%.*s')\n",
+                    k, no, (int)callee.size, callee.str,
+                    (int)ots.size, ots.str);
+                if (ops != ops_inline) free(ops);
                 return false;
             }
         }
         size_t nr = MLIR_GetOpNumResults(src_op);
         if (nr > 1) {
             fprintf(stderr, "wmir: wasmssa.call multi-result not yet supported\n");
+            if (ops != ops_inline) free(ops);
             return false;
         }
         MLIR_AttributeHandle attrs[1];
@@ -972,6 +987,7 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
             attrs, 1, res_ty, nr, res, ops, no);
         L_append(L, out);
         if (nr == 1) vmap_set(L->vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        if (ops != ops_inline) free(ops);
         return true;
     }
 
@@ -1012,20 +1028,31 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
             fprintf(stderr, "wmir: wasmssa.call_indirect with no operands\n");
             return false;
         }
-        MLIR_ValueHandle ops_in[16];
-        if (no > 16) {
-            fprintf(stderr,
-                "wmir: wasmssa.call_indirect with >16 operands unsupported\n");
-            return false;
+        MLIR_ValueHandle ops_in_inline[16];
+        MLIR_ValueHandle ops_out_inline[16];
+        MLIR_ValueHandle *ops_in;
+        MLIR_ValueHandle *ops_out;
+        bool ops_heap = no > 16;
+        if (ops_heap) {
+            ops_in  = (MLIR_ValueHandle *)malloc(no * sizeof(MLIR_ValueHandle));
+            ops_out = (MLIR_ValueHandle *)malloc(no * sizeof(MLIR_ValueHandle));
+            if (!ops_in || !ops_out) {
+                fprintf(stderr, "wmir: oom allocating call_indirect operands\n");
+                free(ops_in); free(ops_out);
+                return false;
+            }
+        } else {
+            ops_in  = ops_in_inline;
+            ops_out = ops_out_inline;
         }
         for (size_t k = 0; k < no; k++) {
             if (!vmap_get(L->vmap, MLIR_GetOpOperand(src_op, k), &ops_in[k])) {
                 fprintf(stderr, "wmir: unbound operand on wasmssa.call_indirect\n");
+                if (ops_heap) { free(ops_in); free(ops_out); }
                 return false;
             }
         }
         // Slot is last; reorder to (slot, args...).
-        MLIR_ValueHandle ops_out[16];
         ops_out[0] = ops_in[no - 1];
         for (size_t k = 0; k + 1 < no; k++) ops_out[1 + k] = ops_in[k];
 
@@ -1046,6 +1073,7 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         if (nlen <= 0 || (size_t)nlen >= name_cap) {
             fprintf(stderr, "wmir: call_indirect dispatcher name too long\n");
             free(name_buf);
+            if (ops_heap) { free(ops_in); free(ops_out); }
             return false;
         }
 
@@ -1053,6 +1081,7 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         if (nr > 1) {
             fprintf(stderr,
                 "wmir: wasmssa.call_indirect multi-result not supported\n");
+            if (ops_heap) { free(ops_in); free(ops_out); }
             return false;
         }
         MLIR_AttributeHandle attrs[1];
@@ -1070,6 +1099,7 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
             attrs, 1, res_ty, nr, res, ops_out, no);
         L_append(L, out);
         if (nr == 1) vmap_set(L->vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        if (ops_heap) { free(ops_in); free(ops_out); }
         return true;
     }
 
