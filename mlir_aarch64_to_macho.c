@@ -325,6 +325,11 @@ static uint32_t arm64_strb_imm(uint8_t rt, uint8_t rn, uint16_t off_bytes) {
     return 0x39000000u | (((uint32_t)off_bytes & 0xfffu) << 10)
                        | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
 }
+// LDRB Wt, [Xn, #pimm] (1-byte zero-extend load, unscaled imm12).
+static uint32_t arm64_ldrb_imm(uint8_t rt, uint8_t rn, uint16_t off_bytes) {
+    return 0x39400000u | (((uint32_t)off_bytes & 0xfffu) << 10)
+                       | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
+}
 // MUL Wd, Wn, Wm == MADD Wd, Wn, Wm, WZR
 //   W base: 0x1B007C00, X base: 0x9B007C00
 static uint32_t arm64_mul(uint8_t rd, uint8_t rn, uint8_t rm, bool sf) {
@@ -394,6 +399,18 @@ static uint32_t arm64_asrv(uint8_t rd, uint8_t rn, uint8_t rm, bool sf) {
 // SXTW Xd, Wn  ==  SBFM Xd, Xn, #0, #31 :: 0x93407C00 | Rn<<5 | Rd
 static uint32_t arm64_sxtw(uint8_t rd, uint8_t rn) {
     return 0x93407c00u | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rd & 0x1f);
+}
+// SXTB Wd, Wn  == SBFM Wd, Wn, #0, #7   :: 0x13001C00 | Rn<<5 | Rd
+// SXTB Xd, Wn  == SBFM Xd, Xn, #0, #7   :: 0x93401C00 | Rn<<5 | Rd
+static uint32_t arm64_sxtb(uint8_t rd, uint8_t rn, bool sf) {
+    uint32_t base = sf ? 0x93401c00u : 0x13001c00u;
+    return base | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rd & 0x1f);
+}
+// SXTH Wd, Wn  == SBFM Wd, Wn, #0, #15  :: 0x13003C00 | Rn<<5 | Rd
+// SXTH Xd, Wn  == SBFM Xd, Xn, #0, #15  :: 0x93403C00 | Rn<<5 | Rd
+static uint32_t arm64_sxth(uint8_t rd, uint8_t rn, bool sf) {
+    uint32_t base = sf ? 0x93403c00u : 0x13003c00u;
+    return base | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rd & 0x1f);
 }
 // UXTW: zero-extend W to X. == ORR Wd, WZR, Wn (writes to W which zeros
 // the upper half of X). 0x2A0003E0 | Rn<<16 | Rd  (sf=0).
@@ -665,6 +682,13 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
                 emit_word(&out->code, arm64_strb_imm(rt, rn, of));
                 break;
             }
+            case OP_TYPE_AARCH64_LDRB_IMM: {
+                uint8_t  rt = (uint8_t)attr_i(op, "rt");
+                uint8_t  rn = (uint8_t)attr_i(op, "rn");
+                uint16_t of = (uint16_t)attr_i(op, "off_bytes");
+                emit_word(&out->code, arm64_ldrb_imm(rt, rn, of));
+                break;
+            }
             case OP_TYPE_AARCH64_MUL: {
                 uint8_t rd = (uint8_t)attr_i(op, "rd");
                 uint8_t rn = (uint8_t)attr_i(op, "rn");
@@ -750,6 +774,20 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
                 uint8_t rd = (uint8_t)attr_i(op, "rd");
                 uint8_t rn = (uint8_t)attr_i(op, "rn");
                 emit_word(&out->code, arm64_sxtw(rd, rn));
+                break;
+            }
+            case OP_TYPE_AARCH64_SXTB: {
+                uint8_t rd = (uint8_t)attr_i(op, "rd");
+                uint8_t rn = (uint8_t)attr_i(op, "rn");
+                bool    sf = attr_b(op, "sf");
+                emit_word(&out->code, arm64_sxtb(rd, rn, sf));
+                break;
+            }
+            case OP_TYPE_AARCH64_SXTH: {
+                uint8_t rd = (uint8_t)attr_i(op, "rd");
+                uint8_t rn = (uint8_t)attr_i(op, "rn");
+                bool    sf = attr_b(op, "sf");
+                emit_word(&out->code, arm64_sxth(rd, rn, sf));
                 break;
             }
             case OP_TYPE_AARCH64_UXTW: {
@@ -954,28 +992,56 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     EmittedFunc *efs = (EmittedFunc *)calloc(n_top, sizeof(EmittedFunc));
     size_t n_funcs = 0;
     size_t start_idx = (size_t)-1;
+    // -----------------------------------------------------------------
+    // Walk top-level for data_init ops first: collect the contributions
+    // to the linmem __DATA section. linmem_init_size is the high-water
+    // mark across all (offset+size) records.
+    // -----------------------------------------------------------------
+    typedef struct { uint32_t offset; string bytes; } LinInit;
+    LinInit  *inits = NULL;
+    size_t    n_inits = 0;
+    uint32_t  linmem_init_size = 0;
     for (size_t i = 0; i < n_top; i++) {
         MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
-        if (MLIR_GetOpType(op) != OP_TYPE_AARCH64_FUNC) {
+        if (MLIR_GetOpType(op) != OP_TYPE_AARCH64_DATA_INIT) continue;
+        int64_t off = attr_i(op, "offset");
+        string  bs  = attr_s(op, "init_data");
+        inits = (LinInit *)realloc(inits, (n_inits + 1) * sizeof(LinInit));
+        inits[n_inits].offset = (uint32_t)off;
+        inits[n_inits].bytes  = bs;
+        n_inits++;
+        uint32_t end = (uint32_t)off + (uint32_t)bs.size;
+        if (end > linmem_init_size) linmem_init_size = end;
+    }
+    if (linmem_init_size > 0) {
+        // Round up to 16 for ARM64 alignment expectations.
+        linmem_init_size = (linmem_init_size + 15u) & ~15u;
+    }
+
+    for (size_t i = 0; i < n_top; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
+        MLIR_OpType ot = MLIR_GetOpType(op);
+        if (ot == OP_TYPE_AARCH64_DATA_INIT) continue;
+        if (ot != OP_TYPE_AARCH64_FUNC) {
             string nm = MLIR_GetOpName(op);
             fprintf(stderr,
                 "aarch64->macho: unexpected top-level op '%.*s'\n",
                 (int)nm.size, nm.str);
-            free(efs); return false;
+            free(efs); free(inits); return false;
         }
         if (!emit_aarch64_func(op, &efs[n_funcs])) {
             for (size_t k = 0; k <= n_funcs; k++) {
                 free(efs[k].code.data); free(efs[k].relocs); free(efs[k].dr);
                 free(efs[k].br); free(efs[k].bp);
             }
-            free(efs); return false;
+            free(efs); free(inits); return false;
         }
         if (!patch_branches(&efs[n_funcs])) {
             for (size_t k = 0; k <= n_funcs; k++) {
                 free(efs[k].code.data); free(efs[k].relocs); free(efs[k].dr);
                 free(efs[k].br); free(efs[k].bp);
             }
-            free(efs); return false;
+            free(efs); free(inits); return false;
         }
         if (efs[n_funcs].name.size == 6
             && memcmp(efs[n_funcs].name.str, "_start", 6) == 0) {
@@ -989,7 +1055,7 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
             free(efs[k].code.data); free(efs[k].relocs); free(efs[k].dr);
             free(efs[k].br); free(efs[k].bp);
         }
-        free(efs); return false;
+        free(efs); free(inits); return false;
     }
 
     // -----------------------------------------------------------------
@@ -1053,9 +1119,15 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     const uint32_t stub_size = 12;
     const uint32_t got_size  = n_stubs * 8;
 
-    // sizeofcmds varies with __DATA presence. The 232 increment is 72
-    // (segment header) + 2*80 (two sections: __data + __linmem_bss).
-    uint32_t data_seg_lc_size = has_data_seg ? (72u + 2u * 80u) : 0u;
+    // sizeofcmds varies with __DATA presence. Section count grows to 3
+    // when we have __linmem_init bytes (file-backed init data overlaying
+    // the start of linmem). Each section adds 80 bytes to the load cmd.
+    uint32_t n_data_sections  = 0;
+    if (has_data_seg) n_data_sections = 2;
+    if (linmem_init_size > 0) n_data_sections = 3;
+    uint32_t data_seg_lc_size = has_data_seg
+        ? (72u + n_data_sections * 80u)
+        : 0u;
     const uint32_t n_cmds      = has_data_seg ? 18u : 17u;
     const uint32_t sizeofcmds  = 976u + data_seg_lc_size;
     uint32_t text_section_off  = (32u + sizeofcmds + 15u) & ~15u;
@@ -1072,14 +1144,18 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     const uint64_t data_const_vm_base   = TEXT_VM_BASE + text_seg_size;
     const uint32_t data_const_file_base = text_seg_size;
 
-    // __DATA segment (between __DATA_CONST and __LINKEDIT). Two sections:
-    //   __data        S_REGULAR (file-backed): data_priv (32B) + globals
-    //   __linmem_bss  S_ZEROFILL: linmem_size bytes of zeros
-    uint32_t data_seg_payload    = data_priv_size + globals_padded;
+    // __DATA segment (between __DATA_CONST and __LINKEDIT). Up to 3
+    // sections:
+    //   __data        S_REGULAR  (file-backed): data_priv (32B) + globals
+    //   __linmem_init S_REGULAR  (file-backed): initialised linmem bytes
+    //                                            (only if linmem_init_size > 0)
+    //   __linmem_bss  S_ZEROFILL: rest of linmem (zero-filled)
+    uint32_t data_section_payload = data_priv_size + globals_padded;
+    uint32_t data_seg_payload    = data_section_payload + linmem_init_size;
     uint64_t data_seg_filesize_v = has_data_seg
         ? (((uint64_t)data_seg_payload + (VMSEG_SIZE - 1u)) & ~(uint64_t)(VMSEG_SIZE - 1u))
         : 0u;
-    uint64_t data_seg_vmpayload  = (uint64_t)data_seg_payload + linmem_size;
+    uint64_t data_seg_vmpayload  = (uint64_t)data_section_payload + linmem_size;
     uint64_t data_seg_vmsize     = has_data_seg
         ? ((data_seg_vmpayload + (VMSEG_SIZE - 1u)) & ~(uint64_t)(VMSEG_SIZE - 1u))
         : 0u;
@@ -1089,6 +1165,9 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     const uint64_t data_priv_vmaddr = data_vm_base;
     const uint64_t globals_vmaddr   = data_priv_vmaddr + data_priv_size;
     const uint64_t linmem_vmaddr    = globals_vmaddr + globals_padded;
+    const uint64_t linmem_bss_vmaddr= linmem_vmaddr + linmem_init_size;
+    const uint64_t linmem_bss_vmsize= (linmem_size > linmem_init_size)
+        ? (linmem_size - linmem_init_size) : 0;
 
     const uint64_t linkedit_vm_base   = has_data_seg
         ? (data_vm_base + data_seg_vmsize)
@@ -1200,11 +1279,14 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         buf_le32(&img, 0);
     }
 
-    // LC_SEGMENT_64 __DATA (optional). Two sections:
-    //   __data        : S_REGULAR, file-backed, holds data_priv + globals.
-    //   __linmem_bss  : S_ZEROFILL, holds the linear memory.
+    // LC_SEGMENT_64 __DATA (optional). Up to three sections:
+    //   __data        : S_REGULAR  , file-backed, data_priv + globals
+    //   __linmem_init : S_REGULAR  , file-backed, initialised linmem bytes
+    //                                (only present if linmem_init_size > 0)
+    //   __linmem_bss  : S_ZEROFILL , rest of linear memory
     if (has_data_seg) {
-        buf_le32(&img, LC_SEGMENT_64); buf_le32(&img, 72u + 2u * 80u);
+        buf_le32(&img, LC_SEGMENT_64);
+        buf_le32(&img, 72u + n_data_sections * 80u);
         { static const char SEG[16] = "__DATA"; buf_append(&img, SEG, 16); }
         buf_le64(&img, data_vm_base);
         buf_le64(&img, data_seg_vmsize);
@@ -1212,16 +1294,28 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         buf_le64(&img, data_seg_filesize_v);
         buf_le32(&img, VM_PROT_READ | VM_PROT_WRITE);
         buf_le32(&img, VM_PROT_READ | VM_PROT_WRITE);
-        buf_le32(&img, 2);
+        buf_le32(&img, n_data_sections);
         buf_le32(&img, 0);
         {
             static const char SN[16] = "__data";
             static const char SG[16] = "__DATA";
             buf_append(&img, SN, 16); buf_append(&img, SG, 16);
             buf_le64(&img, data_vm_base);
-            buf_le64(&img, (uint64_t)data_seg_payload);
+            buf_le64(&img, (uint64_t)data_section_payload);
             buf_le32(&img, data_file_base);
             buf_le32(&img, 3);                // align = 2^3 = 8
+            buf_le32(&img, 0); buf_le32(&img, 0);
+            buf_le32(&img, 0);                // S_REGULAR
+            buf_le32(&img, 0); buf_le32(&img, 0); buf_le32(&img, 0);
+        }
+        if (linmem_init_size > 0) {
+            static const char SN[16] = "__linmem_init";
+            static const char SG[16] = "__DATA";
+            buf_append(&img, SN, 16); buf_append(&img, SG, 16);
+            buf_le64(&img, linmem_vmaddr);
+            buf_le64(&img, (uint64_t)linmem_init_size);
+            buf_le32(&img, data_file_base + data_section_payload);
+            buf_le32(&img, 4);                // align = 2^4 = 16
             buf_le32(&img, 0); buf_le32(&img, 0);
             buf_le32(&img, 0);                // S_REGULAR
             buf_le32(&img, 0); buf_le32(&img, 0); buf_le32(&img, 0);
@@ -1230,8 +1324,8 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
             static const char SN[16] = "__linmem_bss";
             static const char SG[16] = "__DATA";
             buf_append(&img, SN, 16); buf_append(&img, SG, 16);
-            buf_le64(&img, linmem_vmaddr);
-            buf_le64(&img, linmem_size);
+            buf_le64(&img, linmem_bss_vmaddr);
+            buf_le64(&img, linmem_bss_vmsize);
             buf_le32(&img, 0);                // offset = 0 (zerofill)
             buf_le32(&img, 3);
             buf_le32(&img, 0); buf_le32(&img, 0);
@@ -1338,9 +1432,9 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     // linkedit_file_base).
 
     // -----------------------------------------------------------------
-    // __DATA file content (if any): data_priv (32 zero bytes) followed
-    // by globals. The __linmem_bss section is S_ZEROFILL so it
-    // contributes only to vmsize, not filesize.
+    // __DATA file content (if any): __data section (data_priv + globals)
+    // followed by __linmem_init bytes overlaid by offset. __linmem_bss
+    // is S_ZEROFILL so contributes only to vmsize.
     // -----------------------------------------------------------------
     if (has_data_seg) {
         buf_pad_to(&img, data_file_base);
@@ -1354,6 +1448,28 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         // Pad globals to 16.
         while ((img.len - (data_file_base + data_priv_size)) < globals_padded) {
             buf_u8(&img, 0);
+        }
+        // __linmem_init section: zero-initialise the whole window then
+        // overlay each data_init record's bytes at its (wasm-offset
+        // relative) position. The first valid wasm data offset is
+        // WASM_DATA_BASE (= 1024); offsets are absolute within linmem,
+        // so the file slot for offset O is data_file_base +
+        // data_section_payload + (O - 0). Since x28 (linmem base) points
+        // at linmem_vmaddr which corresponds to wasm offset 0, the data
+        // we lay down at section start is wasm offset 0.
+        if (linmem_init_size > 0) {
+            uint32_t init_start = (uint32_t)img.len;
+            for (uint32_t k = 0; k < linmem_init_size; k++) buf_u8(&img, 0);
+            for (size_t k = 0; k < n_inits; k++) {
+                uint32_t off = inits[k].offset;
+                string   bs  = inits[k].bytes;
+                if ((uint32_t)(off + bs.size) > linmem_init_size) {
+                    fprintf(stderr,
+                        "aarch64->macho: data_init overflows init region\n");
+                    free(efs); free(inits); free(img.data); return false;
+                }
+                memcpy(img.data + init_start + off, bs.str, bs.size);
+            }
         }
         // Pad to data_seg_filesize (VMSEG boundary).
         buf_pad_to(&img, data_file_base + (uint32_t)data_seg_filesize_v);
@@ -1382,7 +1498,7 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
                 for (size_t k2 = 0; k2 < n_funcs; k2++) {
                     free(efs[k2].code.data); free(efs[k2].relocs); free(efs[k2].dr);
                 }
-                free(efs); free(img.data); return false;
+                free(efs); free(inits); free(img.data); return false;
             }
             uint64_t src_pc = TEXT_VM_BASE + (uint64_t)text_section_off
                             + (uint64_t)efs[i].text_off + (uint64_t)dr->fn_off;
@@ -1650,6 +1766,7 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         free(efs[i].bp);
     }
     free(efs);
+    free(inits);
 
     *out_data = img.data;
     *out_size = img.len;

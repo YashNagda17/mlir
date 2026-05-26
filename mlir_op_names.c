@@ -217,6 +217,7 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_WMIR_COND_BR:    return str_lit("wmir.cond_br");
         case OP_TYPE_WMIR_UNREACHABLE:return str_lit("wmir.unreachable");
         case OP_TYPE_WMIR_SELECT:     return str_lit("wmir.select");
+        case OP_TYPE_WMIR_DATA_INIT:  return str_lit("wmir.data_init");
         // aarch64 dialect
         case OP_TYPE_AARCH64_FUNC:         return str_lit("aarch64.func");
         case OP_TYPE_AARCH64_MOVZ:         return str_lit("aarch64.movz");
@@ -240,12 +241,15 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_AARCH64_LSR_REG:      return str_lit("aarch64.lsr_reg");
         case OP_TYPE_AARCH64_ASR_REG:      return str_lit("aarch64.asr_reg");
         case OP_TYPE_AARCH64_SXTW:         return str_lit("aarch64.sxtw");
+        case OP_TYPE_AARCH64_SXTB:         return str_lit("aarch64.sxtb");
+        case OP_TYPE_AARCH64_SXTH:         return str_lit("aarch64.sxth");
         case OP_TYPE_AARCH64_UXTW:         return str_lit("aarch64.uxtw");
         case OP_TYPE_AARCH64_LDR_W:        return str_lit("aarch64.ldr_w");
         case OP_TYPE_AARCH64_STR_W:        return str_lit("aarch64.str_w");
         case OP_TYPE_AARCH64_LDR_X:        return str_lit("aarch64.ldr_x");
         case OP_TYPE_AARCH64_STR_X:        return str_lit("aarch64.str_x");
         case OP_TYPE_AARCH64_STRB_IMM:     return str_lit("aarch64.strb_imm");
+        case OP_TYPE_AARCH64_LDRB_IMM:     return str_lit("aarch64.ldrb_imm");
         case OP_TYPE_AARCH64_ADRP_DATA:    return str_lit("aarch64.adrp_data");
         case OP_TYPE_AARCH64_ADD_DATA_LO:  return str_lit("aarch64.add_data_lo");
         case OP_TYPE_AARCH64_PROLOGUE:     return str_lit("aarch64.prologue");
@@ -260,6 +264,7 @@ string op_type_to_string(MLIR_OpType type) {
         case OP_TYPE_AARCH64_CBNZ:         return str_lit("aarch64.cbnz");
         case OP_TYPE_AARCH64_LABEL:        return str_lit("aarch64.label");
         case OP_TYPE_AARCH64_BRK:          return str_lit("aarch64.brk");
+        case OP_TYPE_AARCH64_DATA_INIT:    return str_lit("aarch64.data_init");
         default: return str_lit("unknown");
     }
 }

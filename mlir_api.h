@@ -364,6 +364,10 @@ typedef enum {
     OP_TYPE_WMIR_UNREACHABLE,
     // 3-operand select. result = cond != 0 ? a : b.
     OP_TYPE_WMIR_SELECT,
+    // Module-level: a slice of bytes to place at the given offset within
+    // linmem at link time. Lowers 1:1 to aarch64.data_init.
+    //   attrs: sym_name (string, debug), offset (i32), init_data (string).
+    OP_TYPE_WMIR_DATA_INIT,
 
     // -------------------------------------------------------------------------
     // aarch64 dialect — 1:1 with the AArch64 instruction encoding. The
@@ -397,12 +401,15 @@ typedef enum {
     OP_TYPE_AARCH64_LSR_REG,  // lsrv Wd|Xd, Wn|Xn, Wm|Xm
     OP_TYPE_AARCH64_ASR_REG,  // asrv Wd|Xd, Wn|Xn, Wm|Xm
     OP_TYPE_AARCH64_SXTW,     // sxtw Xd, Wn  (alias for SBFM)
+    OP_TYPE_AARCH64_SXTB,     // sxtb Wd|Xd, Wn  (sign-extend low byte)
+    OP_TYPE_AARCH64_SXTH,     // sxth Wd|Xd, Wn  (sign-extend low half)
     OP_TYPE_AARCH64_UXTW,     // mov  Wd, Wn  (== orr Wd, WZR, Wn ; zero-extends)
     OP_TYPE_AARCH64_LDR_W,    // ldr Wd, [Xn, #imm] (i32 unsigned-offset)
     OP_TYPE_AARCH64_STR_W,    // str Wd, [Xn, #imm] (i32 unsigned-offset)
     OP_TYPE_AARCH64_LDR_X,    // ldr Xd, [Xn, #imm] (i64 unsigned-offset)
     OP_TYPE_AARCH64_STR_X,    // str Xd, [Xn, #imm] (i64 unsigned-offset)
     OP_TYPE_AARCH64_STRB_IMM, // strb Wt, [Xn, #imm12] (1-byte unscaled)
+    OP_TYPE_AARCH64_LDRB_IMM, // ldrb Wt, [Xn, #imm12] (1-byte zero-extend)
     // Pseudo: ADRP+ADD pair that resolves to the runtime base address
     // of one of the predeclared __DATA regions (vmctx, globals, linmem).
     // The macho backend patches the encoded PC-relative immediates
@@ -431,6 +438,12 @@ typedef enum {
     OP_TYPE_AARCH64_CBNZ,       // cbnz Wn, <label>
     OP_TYPE_AARCH64_LABEL,      // pseudo: marks a position; emits 0 bytes
     OP_TYPE_AARCH64_BRK,        // brk #imm16 (trap)
+    // Module-level: a slice of bytes to overlay onto the linmem __DATA
+    // section at the given offset. The macho backend gathers all of
+    // these into a single file-backed section that precedes the
+    // zero-fill portion of linmem.
+    //   attrs: sym_name (string, debug), offset (i32), init_data (string).
+    OP_TYPE_AARCH64_DATA_INIT,
 
     OP_TYPE_COUNT
 } MLIR_OpType;

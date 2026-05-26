@@ -169,6 +169,35 @@ typedef struct {
     bool             is_loop;
 } Frame;
 
+// Module-level layout of import_global data in linmem. Used to lower
+// wasmssa.addressof to a wmir.const that yields the wasm linear-memory
+// offset of the named symbol.
+typedef struct {
+    string   *names;
+    int32_t  *offsets;
+    size_t    n, cap;
+} OffsetMap;
+
+static void omap_add(OffsetMap *m, string name, int32_t off) {
+    if (m->n == m->cap) {
+        m->cap = m->cap ? m->cap * 2 : 8;
+        m->names   = (string  *)realloc(m->names,   m->cap * sizeof(string));
+        m->offsets = (int32_t *)realloc(m->offsets, m->cap * sizeof(int32_t));
+    }
+    m->names[m->n]   = name;
+    m->offsets[m->n] = off;
+    m->n++;
+}
+static int omap_get(const OffsetMap *m, string name, int32_t *out) {
+    for (size_t i = 0; i < m->n; i++) {
+        if (m->names[i].size == name.size &&
+            memcmp(m->names[i].str, name.str, name.size) == 0) {
+            *out = m->offsets[i]; return 1;
+        }
+    }
+    return 0;
+}
+
 typedef struct {
     MLIR_Context     *ctx;
     MLIR_RegionHandle dst_region;
@@ -177,6 +206,7 @@ typedef struct {
     Frame            *frames;
     size_t            n_frames, c_frames;
     bool              cur_terminated; // last appended op was a terminator
+    const OffsetMap  *globals;        // module-level data globals offset map
 } Lowerer;
 
 static void L_push_frame(Lowerer *L, MLIR_BlockHandle target,
@@ -423,13 +453,31 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         }
         MLIR_OpType k;
         MLIR_TypeHandle rt;
+        int32_t src_bits = 0; // 0 == default (handled per-op)
         switch (opc) {
         case 0xa7: k = OP_TYPE_WMIR_TRUNC;
                    rt = MLIR_CreateTypeInteger(ctx, 32, true); break;
         case 0xac: k = OP_TYPE_WMIR_SEXT;
-                   rt = MLIR_CreateTypeInteger(ctx, 64, true); break;
+                   rt = MLIR_CreateTypeInteger(ctx, 64, true);
+                   src_bits = 32; break;
         case 0xad: k = OP_TYPE_WMIR_ZEXT;
-                   rt = MLIR_CreateTypeInteger(ctx, 64, true); break;
+                   rt = MLIR_CreateTypeInteger(ctx, 64, true);
+                   src_bits = 32; break;
+        case 0xc0: k = OP_TYPE_WMIR_SEXT;
+                   rt = MLIR_CreateTypeInteger(ctx, 32, true);
+                   src_bits = 8; break;
+        case 0xc1: k = OP_TYPE_WMIR_SEXT;
+                   rt = MLIR_CreateTypeInteger(ctx, 32, true);
+                   src_bits = 16; break;
+        case 0xc2: k = OP_TYPE_WMIR_SEXT;
+                   rt = MLIR_CreateTypeInteger(ctx, 64, true);
+                   src_bits = 8; break;
+        case 0xc3: k = OP_TYPE_WMIR_SEXT;
+                   rt = MLIR_CreateTypeInteger(ctx, 64, true);
+                   src_bits = 16; break;
+        case 0xc4: k = OP_TYPE_WMIR_SEXT;
+                   rt = MLIR_CreateTypeInteger(ctx, 64, true);
+                   src_bits = 32; break;
         default:
             fprintf(stderr,
                 "wmir: wasmssa.unop opcode 0x%llx not yet supported\n",
@@ -441,8 +489,36 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
             MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, rt,
                 (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}))
         };
+        MLIR_AttributeHandle attrs[1];
+        size_t na = 0;
+        if (src_bits) attrs[na++] = attr_i32(ctx, "src_bits", src_bits);
         MLIR_OpHandle out = build_op_simple(ctx, k,
-            NULL, 0, res_ty, 1, res, &a, 1);
+            attrs, na, res_ty, 1, res, &a, 1);
+        L_append(L, out);
+        vmap_set(L->vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        return true;
+    }
+
+    // wasmssa.addressof {target = ".str.N"} -> wmir.const i32 = <offset>.
+    // The offset has been pre-assigned by the module-level walk that
+    // also emitted wmir.data_init ops. Unknown targets are an error.
+    case OP_TYPE_WASMSSA_ADDRESSOF: {
+        string tgt = at_s(src_op, "target");
+        int32_t off;
+        if (!L->globals || !omap_get(L->globals, tgt, &off)) {
+            fprintf(stderr,
+                "wmir: wasmssa.addressof unknown global '%.*s'\n",
+                (int)tgt.size, tgt.str);
+            return false;
+        }
+        MLIR_AttributeHandle attrs[1] = { attr_i32(ctx, "value", off) };
+        MLIR_TypeHandle res_ty[1] = { MLIR_CreateTypeInteger(ctx, 32, true) };
+        MLIR_ValueHandle res[1] = {
+            MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, res_ty[0],
+                (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}))
+        };
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_CONST,
+            attrs, 1, res_ty, 1, res, NULL, 0);
         L_append(L, out);
         vmap_set(L->vmap, MLIR_GetOpResult(src_op, 0), res[0]);
         return true;
@@ -507,8 +583,15 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         int64_t off = at_i(src_op, "memory_offset");
         int64_t sz  = at_i(src_op, "mem_size_bytes");
         uint8_t vt  = (uint8_t)at_i(src_op, "valtype");
-        bool ok = (sz == 4 && vt == WT_I32) ||
-                  (sz == 8 && vt == WT_I64);
+        // Accept any (size, valtype) the operand-side semantics allow.
+        // Result type is whatever valtype dictates — for sub-word loads
+        // (sz < width) the load is zero-extended into the result. f32/
+        // f64 are modelled as i32/i64 bit patterns at the wmir level.
+        bool ok =
+            (vt == WT_I32 && (sz == 1 || sz == 2 || sz == 4)) ||
+            (vt == WT_I64 && (sz == 1 || sz == 2 || sz == 4 || sz == 8)) ||
+            (vt == WT_F32 && sz == 4) ||
+            (vt == WT_F64 && sz == 8);
         if (!ok) {
             fprintf(stderr,
                 "wmir: wasmssa.load mem_size=%lld valtype=%u not yet supported\n",
@@ -524,9 +607,10 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
             attr_i32(ctx, "memory_offset", off),
             attr_i32(ctx, "mem_size",      sz),
         };
+        bool is64 = (vt == WT_I64 || vt == WT_F64);
         MLIR_TypeHandle res_ty[1] = {
-            (vt == WT_I64) ? MLIR_CreateTypeInteger(ctx, 64, true)
-                           : MLIR_CreateTypeInteger(ctx, 32, true)
+            is64 ? MLIR_CreateTypeInteger(ctx, 64, true)
+                 : MLIR_CreateTypeInteger(ctx, 32, true)
         };
         MLIR_ValueHandle res[1] = {
             MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, res_ty[0],
@@ -544,8 +628,11 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         int64_t off = at_i(src_op, "memory_offset");
         int64_t sz  = at_i(src_op, "mem_size_bytes");
         uint8_t vt  = (uint8_t)at_i(src_op, "valtype");
-        bool ok = (sz == 4 && vt == WT_I32) ||
-                  (sz == 8 && vt == WT_I64);
+        bool ok =
+            (vt == WT_I32 && (sz == 1 || sz == 2 || sz == 4)) ||
+            (vt == WT_I64 && (sz == 1 || sz == 2 || sz == 4 || sz == 8)) ||
+            (vt == WT_F32 && sz == 4) ||
+            (vt == WT_F64 && sz == 8);
         if (!ok) {
             fprintf(stderr,
                 "wmir: wasmssa.store mem_size=%lld valtype=%u not yet supported\n",
@@ -891,7 +978,8 @@ static bool lower_region(Lowerer *L, MLIR_RegionHandle r) {
 // =============================================================================
 // Lower one wasmssa.func to one wmir.func.
 // =============================================================================
-static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
+static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
+                                const OffsetMap *globals) {
     string name      = at_s(src, "sym_name");
     bool   exported  = at_b(src, "exported");
     string pt        = at_s(src, "param_types");
@@ -918,6 +1006,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     L.dst_region = dst_region;
     L.cur        = entry;
     L.vmap       = &vmap;
+    L.globals    = globals;
 
     size_t n_params = MLIR_GetBlockNumArgs(src_blk);
     for (size_t i = 0; i < n_params; i++) {
@@ -974,7 +1063,41 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
         MLIR_CreateLocationUnknown(ctx, (string){0}),
         MLIR_INVALID_HANDLE, (string){0}, -1);
 
+    // -----------------------------------------------------------------
+    // First pass: walk import_global ops and assign each a fixed offset
+    // in linmem starting at WASM_DATA_BASE (matches wasm-ld's default
+    // global-base of 1024). Honour the global's align_pow attribute.
+    // Emit one wmir.data_init at module level per global and build a
+    // name -> offset table for the later wasmssa.addressof handler.
+    // -----------------------------------------------------------------
+    enum { WASM_DATA_BASE = 1024 };
+    OffsetMap globals = {0};
+    int32_t cursor = (int32_t)WASM_DATA_BASE;
     size_t n_top = MLIR_GetBlockNumOps(mb);
+    for (size_t i = 0; i < n_top; i++) {
+        MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
+        if (MLIR_GetOpType(top) != OP_TYPE_WASMSSA_IMPORT_GLOBAL) continue;
+        string sn = at_s(top, "sym_name");
+        string id = at_s(top, "init_data");
+        int64_t sz = at_i(top, "size");
+        int64_t ap = at_i(top, "align_pow");
+        if (sz <= 0) sz = (int64_t)id.size;
+        int32_t align = (ap > 0) ? (int32_t)(1 << ap) : 1;
+        cursor = (cursor + align - 1) & ~(align - 1);
+        omap_add(&globals, sn, cursor);
+        MLIR_AttributeHandle a[3];
+        a[0] = attr_s  (ctx, "sym_name",  sn.str, sn.size);
+        a[1] = attr_i32(ctx, "offset",    cursor);
+        a[2] = attr_s  (ctx, "init_data", id.str, id.size);
+        MLIR_OpHandle di = MLIR_CreateOp(ctx, OP_TYPE_WMIR_DATA_INIT,
+            op_type_to_string(OP_TYPE_WMIR_DATA_INIT),
+            a, 3, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+            MLIR_CreateLocationUnknown(ctx, (string){0}),
+            MLIR_INVALID_HANDLE, (string){0}, -1);
+        MLIR_AppendBlockOp(ctx, out_body, di);
+        cursor += (int32_t)sz;
+    }
+
     for (size_t i = 0; i < n_top; i++) {
         MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
         MLIR_OpType t = MLIR_GetOpType(top);
@@ -983,8 +1106,11 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
             continue;
         }
         if (t == OP_TYPE_WASMSSA_FUNC) {
-            MLIR_OpHandle out_op = lower_func(ctx, top);
-            if (!out_op) return MLIR_INVALID_HANDLE;
+            MLIR_OpHandle out_op = lower_func(ctx, top, &globals);
+            if (!out_op) {
+                free(globals.names); free(globals.offsets);
+                return MLIR_INVALID_HANDLE;
+            }
             MLIR_AppendBlockOp(ctx, out_body, out_op);
             continue;
         }
@@ -992,7 +1118,9 @@ MLIR_OpHandle mlir_wasmssa_to_wmir(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
         fprintf(stderr,
             "wmir lowering: unexpected top-level op '%.*s'\n",
             (int)nm.size, nm.str);
+        free(globals.names); free(globals.offsets);
         return MLIR_INVALID_HANDLE;
     }
+    free(globals.names); free(globals.offsets);
     return out_module;
 }
