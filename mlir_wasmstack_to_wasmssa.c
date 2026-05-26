@@ -52,12 +52,29 @@
 // helper that gets re-synthesised; in that case the wasmstack.func's
 // body is discarded and the function is lifted as an import_func
 // declaration.
+//
+// Notable absence: malloc/free. The corec-stdlib selfhost path
+// compiles a real malloc that tags each block with a size header so
+// realloc can find the old block size; the wmir synth_malloc is a
+// header-less bump allocator. If we discarded the user body and let
+// synth_malloc shadow the corec malloc, realloc would read garbage
+// out of the missing header. The wmir backend's `user_provides_*`
+// gate (see ModInfo in mlir_wmir_to_aarch64.c) suppresses the synth
+// helpers when the user already provides them, so leaving the user
+// body in place is correct.
+//
+// strlen/strcmp/memcmp/memchr remain in the list because the wasm
+// `loop` lowering currently miscompiles their natural CFG (the
+// fall-through path from `br_if` back-edges incorrectly returns to
+// the loop top instead of leaving it), which manifests as an
+// infinite loop / SIGBUS at runtime. Once the loop lowering is
+// fixed these can move out of the synth list too.
 // =============================================================================
 static bool is_synth_helper(string nm) {
     static const char *kHelpers[] = {
         "printI64", "printNewline", "printStr", "printf",
         "printF32", "printF64",
-        "malloc", "free", "strlen", "strcmp", "memcmp", "memchr",
+        "strlen", "strcmp", "memcmp", "memchr",
         "fd_write", "proc_exit",
         "tinyc_va_arg_i32", "tinyc_va_arg_i64", "tinyc_va_arg_ptr",
         "tinyc_va_arg_struct", "tinyc_va_arg_f64",

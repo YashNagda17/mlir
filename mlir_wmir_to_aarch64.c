@@ -3959,6 +3959,21 @@ typedef struct {
     bool    needs_args_sizes_get;
     bool    needs_environ_get;
     bool    needs_environ_sizes_get;
+    // user_provides_* are set when the wmir module already defines a
+    // function with the corresponding name. Synth helpers must NOT be
+    // emitted in that case — they would shadow the user's function and
+    // (worse) be picked as the first match by the mach-o backend's
+    // name-based reloc resolver. tinyc selfhost compiles
+    // corec-stdlib/stdlib.c which provides malloc/free/realloc;
+    // synth_malloc is a header-less bump allocator, so realloc's
+    // `hdr->size` read would land on uninitialised bytes if synth_malloc
+    // shadowed the real malloc.
+    bool    user_provides_malloc;
+    bool    user_provides_free;
+    bool    user_provides_strlen;
+    bool    user_provides_strcmp;
+    bool    user_provides_memcmp;
+    bool    user_provides_memchr;
 } ModInfo;
 
 static void scan_block(MLIR_BlockHandle blk, ModInfo *mi) {
@@ -4034,6 +4049,30 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
 
     ModInfo mi = {0};
     scan_block(mb, &mi);
+
+    // Scan top-level WMIR_FUNC ops to record which "helper" names the
+    // user wasm module already provides. We must not synthesize over
+    // these or the mach-o name-based reloc resolver will pick the
+    // synth (header-less bump allocator) and break realloc, which
+    // expects a header-bearing malloc.
+    {
+        size_t n_pre = MLIR_GetBlockNumOps(mb);
+        for (size_t i = 0; i < n_pre; i++) {
+            MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
+            if (MLIR_GetOpType(top) != OP_TYPE_WMIR_FUNC) continue;
+            string sn = at_s(top, "sym_name");
+            #define EQ_LIT2(s, lit) \
+                ((s).size == (sizeof(lit) - 1) && \
+                 memcmp((s).str, (lit), sizeof(lit) - 1) == 0)
+            if (EQ_LIT2(sn, "malloc")) mi.user_provides_malloc = true;
+            if (EQ_LIT2(sn, "free"))   mi.user_provides_free   = true;
+            if (EQ_LIT2(sn, "strlen")) mi.user_provides_strlen = true;
+            if (EQ_LIT2(sn, "strcmp")) mi.user_provides_strcmp = true;
+            if (EQ_LIT2(sn, "memcmp")) mi.user_provides_memcmp = true;
+            if (EQ_LIT2(sn, "memchr")) mi.user_provides_memchr = true;
+            #undef EQ_LIT2
+        }
+    }
 
     uint32_t n_globals = (uint32_t)mi.n_globals;
     uint64_t global0_init = DEFAULT_STACK_SIZE;
@@ -4157,32 +4196,32 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_malloc) {
+    if (mi.needs_malloc && !mi.user_provides_malloc) {
         MLIR_OpHandle p = synth_malloc(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_free) {
+    if (mi.needs_free && !mi.user_provides_free) {
         MLIR_OpHandle p = synth_free(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_strlen) {
+    if (mi.needs_strlen && !mi.user_provides_strlen) {
         MLIR_OpHandle p = synth_strlen(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_strcmp) {
+    if (mi.needs_strcmp && !mi.user_provides_strcmp) {
         MLIR_OpHandle p = synth_strcmp(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_memcmp) {
+    if (mi.needs_memcmp && !mi.user_provides_memcmp) {
         MLIR_OpHandle p = synth_memcmp(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_memchr) {
+    if (mi.needs_memchr && !mi.user_provides_memchr) {
         MLIR_OpHandle p = synth_memchr(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
