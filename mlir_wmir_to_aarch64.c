@@ -1499,9 +1499,447 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
 }
 
 // =============================================================================
-// Walk the module to compute the highest global_idx referenced and
-// whether linmem is touched.
+// Helper: emit a function header for a leaf-ish synthesised helper.
+// Creates the region, appends `entry` as the first block, emits the
+// 16-byte-frame prologue, and returns the entry block.
 // =============================================================================
+static MLIR_RegionHandle synth_leaf_begin(MLIR_Context *ctx,
+                                         MLIR_BlockHandle *entry_out,
+                                         uint16_t frame_size) {
+    MLIR_RegionHandle region = MLIR_CreateRegion(ctx);
+    MLIR_BlockHandle entry = MLIR_CreateBlock(ctx);
+    MLIR_AppendRegionBlock(ctx, region, entry);
+    emit_prologue(ctx, entry, frame_size);
+    *entry_out = entry;
+    return region;
+}
+static MLIR_OpHandle synth_leaf_finish(MLIR_Context *ctx,
+                                      MLIR_RegionHandle region,
+                                      const char *name, size_t name_len) {
+    MLIR_AttributeHandle attrs[1];
+    attrs[0] = attr_s(ctx, "sym_name", name, name_len);
+    MLIR_RegionHandle regs[1] = { region };
+    return MLIR_CreateOp(ctx, OP_TYPE_AARCH64_FUNC,
+        op_type_to_string(OP_TYPE_AARCH64_FUNC),
+        attrs, 1, NULL, 0, NULL, 0, NULL, 0, regs, 1,
+        MLIR_CreateLocationUnknown(ctx, (string){0}),
+        MLIR_INVALID_HANDLE, (string){0}, -1);
+}
+
+// =============================================================================
+// Linmem layout convention for synthesised libc helpers:
+//
+//   [ 0..15 ]   reserved (matches the wasm/wasm-ld preamble)
+//   [16..19]    `malloc_heap_off` — 4-byte counter, the next free byte
+//               offset within the synthesised heap. Initialised lazily
+//               to MALLOC_HEAP_BASE on the first malloc call (zero is
+//               the sentinel "uninitialised" value).
+//   [20..1023]  reserved
+//   [ 1024 .. WASM_DATA_BASE + linmem_init_size ] static data globals
+//   [ ... .. MALLOC_HEAP_BASE )                  BSS-equivalent zero pages
+//   [ MALLOC_HEAP_BASE .. MALLOC_HEAP_TOP )      bump-allocated heap
+//   [ MALLOC_HEAP_TOP .. DEFAULT_STACK_SIZE )    free / wasm stack
+//
+// MALLOC_HEAP_BASE = 1 MiB and MALLOC_HEAP_TOP = 2 MiB. That leaves the
+// upper 2 MiB of linmem for the wasm stack (global 0 starts at the very
+// top, growing down). 1 MiB of heap is plenty for the tinyC test suite.
+// =============================================================================
+enum {
+    MALLOC_HEAP_OFF_SLOT = 16,
+    MALLOC_HEAP_BASE_BYTES = 1u * 1024u * 1024u,
+};
+
+// -----------------------------------------------------------------------------
+// malloc(i32 size) -> i32: bump-allocate (size+15 & ~15) bytes from the
+// synthesised heap, return the wasm offset. No error path — overflow
+// silently wraps for now; tinyC tests never come close to the cap.
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_malloc(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry, init_done;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    init_done = MLIR_CreateBlock(ctx);
+    MLIR_AppendRegionBlock(ctx, region, init_done);
+
+    // w9 = *heap_off (load from linmem[16])
+    emit_ldr_w(ctx, entry, /*rt=*/9, /*rn=*/28,
+               /*off=*/MALLOC_HEAP_OFF_SLOT);
+    // If zero, initialise; else fall through to init_done.
+    emit_cbnz(ctx, entry, /*rt=*/9, /*sf=*/false, init_done);
+    // movz w9, #16, lsl #16  -> 0x100000 = 1 MiB
+    emit_movz(ctx, entry, /*rd=*/9,
+              /*imm16=*/MALLOC_HEAP_BASE_BYTES >> 16,
+              /*hw=*/1, /*sf=*/false);
+    emit_b(ctx, entry, init_done);
+
+    // init_done: align w9 up to 16, advance heap_off, return aligned w9.
+    emit_add_imm(ctx, init_done, /*rd=*/9, /*rn=*/9,
+                 /*imm12=*/15, /*sf=*/false);
+    emit_movz(ctx, init_done, /*rd=*/12, /*imm16=*/4, /*hw=*/0, /*sf=*/false);
+    emit_3reg(ctx, init_done, OP_TYPE_AARCH64_LSR_REG,
+              /*rd=*/9, /*rn=*/9, /*rm=*/12, /*sf=*/false);
+    emit_3reg(ctx, init_done, OP_TYPE_AARCH64_LSL_REG,
+              /*rd=*/9, /*rn=*/9, /*rm=*/12, /*sf=*/false);
+    // w10 = aligned + size
+    emit_add_reg(ctx, init_done, /*rd=*/10, /*rn=*/9, /*rm=*/0, /*sf=*/false);
+    emit_str_w(ctx, init_done, /*rt=*/10, /*rn=*/28,
+               /*off=*/MALLOC_HEAP_OFF_SLOT);
+    // Return aligned offset.
+    emit_mov_x(ctx, init_done, /*rd=*/0, /*rn=*/9);
+    emit_epilogue(ctx, init_done, /*frame_size=*/16);
+    emit_ret(ctx, init_done);
+
+    return synth_leaf_finish(ctx, region, "malloc", 6);
+}
+
+// -----------------------------------------------------------------------------
+// free(i32 p): no-op (the bump allocator never reclaims).
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_free(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    emit_epilogue(ctx, entry, /*frame_size=*/16);
+    emit_ret(ctx, entry);
+    return synth_leaf_finish(ctx, region, "free", 4);
+}
+
+// -----------------------------------------------------------------------------
+// strlen(i32 ofs) -> i32. Walks until NUL, returns scanned count.
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_strlen(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry, loop, done;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    loop = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, loop);
+    done = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, done);
+
+    // x9 = host ptr; x10 = scan cursor
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 9);
+        a[1] = attr_i32(ctx, "rn", 0);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/9, /*rn=*/28, /*rm=*/9, /*sf=*/true);
+    emit_mov_x(ctx, entry, /*rd=*/10, /*rn=*/9);
+    emit_b(ctx, entry, loop);
+
+    emit_ldrb_imm(ctx, loop, /*rt=*/11, /*rn=*/10, /*off=*/0);
+    emit_cbz(ctx, loop, /*rt=*/11, /*sf=*/false, done);
+    emit_add_imm(ctx, loop, /*rd=*/10, /*rn=*/10, /*imm12=*/1, /*sf=*/true);
+    emit_b(ctx, loop, loop);
+
+    // w0 = w10 - w9  (length fits in 32 bits)
+    emit_sub_reg(ctx, done, /*rd=*/0, /*rn=*/10, /*rm=*/9, /*sf=*/false);
+    emit_epilogue(ctx, done, /*frame_size=*/16);
+    emit_ret(ctx, done);
+
+    return synth_leaf_finish(ctx, region, "strlen", 6);
+}
+
+// -----------------------------------------------------------------------------
+// strcmp(i32 a_ofs, i32 b_ofs) -> i32. Returns (unsigned char)*a - (unsigned
+// char)*b at the first mismatch, or 0 at both NULs.
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_strcmp(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry, loop, diff, equal;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    loop  = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, loop);
+    diff  = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, diff);
+    equal = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, equal);
+
+    // x9 = host(a); x10 = host(b)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 9); a[1] = attr_i32(ctx, "rn", 0);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/9, /*rn=*/28, /*rm=*/9, /*sf=*/true);
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 10); a[1] = attr_i32(ctx, "rn", 1);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
+    emit_b(ctx, entry, loop);
+
+    emit_ldrb_imm(ctx, loop, /*rt=*/11, /*rn=*/9,  /*off=*/0);
+    emit_ldrb_imm(ctx, loop, /*rt=*/12, /*rn=*/10, /*off=*/0);
+    emit_cmp_reg(ctx, loop, /*rn=*/11, /*rm=*/12, /*sf=*/false);
+    emit_b_cond(ctx, loop, COND_NE, diff);
+    emit_cbz(ctx, loop, /*rt=*/11, /*sf=*/false, equal);
+    emit_add_imm(ctx, loop, /*rd=*/9,  /*rn=*/9,  /*imm12=*/1, /*sf=*/true);
+    emit_add_imm(ctx, loop, /*rd=*/10, /*rn=*/10, /*imm12=*/1, /*sf=*/true);
+    emit_b(ctx, loop, loop);
+
+    emit_sub_reg(ctx, diff, /*rd=*/0, /*rn=*/11, /*rm=*/12, /*sf=*/false);
+    emit_epilogue(ctx, diff, /*frame_size=*/16);
+    emit_ret(ctx, diff);
+
+    emit_movz(ctx, equal, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_epilogue(ctx, equal, /*frame_size=*/16);
+    emit_ret(ctx, equal);
+
+    return synth_leaf_finish(ctx, region, "strcmp", 6);
+}
+
+// -----------------------------------------------------------------------------
+// memcmp(i32 a_ofs, i32 b_ofs, i32 n) -> i32. Same as strcmp but bounded.
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_memcmp(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry, loop, diff, equal;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    loop  = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, loop);
+    diff  = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, diff);
+    equal = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, equal);
+
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 9); a[1] = attr_i32(ctx, "rn", 0);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/9, /*rn=*/28, /*rm=*/9, /*sf=*/true);
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 10); a[1] = attr_i32(ctx, "rn", 1);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
+    emit_b(ctx, entry, loop);
+
+    // if n == 0: equal
+    emit_cbz(ctx, loop, /*rt=*/2, /*sf=*/false, equal);
+    emit_ldrb_imm(ctx, loop, /*rt=*/11, /*rn=*/9,  /*off=*/0);
+    emit_ldrb_imm(ctx, loop, /*rt=*/12, /*rn=*/10, /*off=*/0);
+    emit_cmp_reg(ctx, loop, /*rn=*/11, /*rm=*/12, /*sf=*/false);
+    emit_b_cond(ctx, loop, COND_NE, diff);
+    emit_add_imm(ctx, loop, /*rd=*/9,  /*rn=*/9,  /*imm12=*/1, /*sf=*/true);
+    emit_add_imm(ctx, loop, /*rd=*/10, /*rn=*/10, /*imm12=*/1, /*sf=*/true);
+    emit_sub_imm(ctx, loop, /*rd=*/2,  /*rn=*/2,  /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, loop, loop);
+
+    emit_sub_reg(ctx, diff, /*rd=*/0, /*rn=*/11, /*rm=*/12, /*sf=*/false);
+    emit_epilogue(ctx, diff, /*frame_size=*/16);
+    emit_ret(ctx, diff);
+
+    emit_movz(ctx, equal, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_epilogue(ctx, equal, /*frame_size=*/16);
+    emit_ret(ctx, equal);
+
+    return synth_leaf_finish(ctx, region, "memcmp", 6);
+}
+
+// -----------------------------------------------------------------------------
+// memchr(i32 p_ofs, i32 c, i32 n) -> i32 (offset or 0 == NULL).
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_memchr(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry, loop, match, nomatch;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    loop    = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, loop);
+    match   = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, match);
+    nomatch = MLIR_CreateBlock(ctx);
+    MLIR_AppendRegionBlock(ctx, region, nomatch);
+
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 9); a[1] = attr_i32(ctx, "rn", 0);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/9, /*rn=*/28, /*rm=*/9, /*sf=*/true);
+    emit_b(ctx, entry, loop);
+
+    emit_cbz(ctx, loop, /*rt=*/2, /*sf=*/false, nomatch);
+    emit_ldrb_imm(ctx, loop, /*rt=*/11, /*rn=*/9, /*off=*/0);
+    emit_cmp_reg(ctx, loop, /*rn=*/11, /*rm=*/1, /*sf=*/false);
+    emit_b_cond(ctx, loop, COND_EQ, match);
+    emit_add_imm(ctx, loop, /*rd=*/9, /*rn=*/9, /*imm12=*/1, /*sf=*/true);
+    emit_sub_imm(ctx, loop, /*rd=*/2, /*rn=*/2, /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, loop, loop);
+
+    // Return offset = host - linmem_base, truncated to i32.
+    emit_sub_reg(ctx, match, /*rd=*/0, /*rn=*/9, /*rm=*/28, /*sf=*/false);
+    emit_epilogue(ctx, match, /*frame_size=*/16);
+    emit_ret(ctx, match);
+
+    emit_movz(ctx, nomatch, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_epilogue(ctx, nomatch, /*frame_size=*/16);
+    emit_ret(ctx, nomatch);
+
+    return synth_leaf_finish(ctx, region, "memchr", 6);
+}
+
+// -----------------------------------------------------------------------------
+// fd_write(i32 fd, i32 iovs_ofs, i32 iovs_len, i32 nwritten_ofs) -> i32 errno
+//
+// Iterates `iovs_len` (ptr, len) pairs starting at linmem[iovs_ofs] and
+// issues a write(2) syscall per chunk. We do not currently write back to
+// `nwritten_ofs` (no tinyC test cares about the byte count); returns 0
+// on success.
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_fd_write(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry, loop, done;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    loop = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, loop);
+    done = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, done);
+
+    // Stash fd in x19 (we clobber x0 for the syscall on each iteration).
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 19); a[1] = attr_i32(ctx, "rn", 0);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    // x9 = host(iovs)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 9); a[1] = attr_i32(ctx, "rn", 1);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/9, /*rn=*/28, /*rm=*/9, /*sf=*/true);
+    // x20 = iovs_len
+    emit_mov_x(ctx, entry, /*rd=*/20, /*rn=*/2);
+    emit_b(ctx, entry, loop);
+
+    emit_cbz(ctx, loop, /*rt=*/20, /*sf=*/false, done);
+    // w11 = ptr offset, w12 = len
+    emit_ldr_w(ctx, loop, /*rt=*/11, /*rn=*/9, /*off=*/0);
+    emit_ldr_w(ctx, loop, /*rt=*/12, /*rn=*/9, /*off=*/4);
+    // x11 = host(ptr)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 11); a[1] = attr_i32(ctx, "rn", 11);
+        MLIR_AppendBlockOp(ctx, loop,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, loop, /*rd=*/11, /*rn=*/28, /*rm=*/11, /*sf=*/true);
+    // write(fd=x19, buf=x11, count=x12)
+    emit_mov_x(ctx, loop, /*rd=*/0, /*rn=*/19);
+    emit_mov_x(ctx, loop, /*rd=*/1, /*rn=*/11);
+    emit_mov_x(ctx, loop, /*rd=*/2, /*rn=*/12);
+    emit_movz(ctx, loop, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
+    emit_svc(ctx, loop, 0x80);
+    // Advance: iovs += 8, len -= 1
+    emit_add_imm(ctx, loop, /*rd=*/9,  /*rn=*/9,  /*imm12=*/8, /*sf=*/true);
+    emit_sub_imm(ctx, loop, /*rd=*/20, /*rn=*/20, /*imm12=*/1, /*sf=*/false);
+    emit_b(ctx, loop, loop);
+
+    emit_movz(ctx, done, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_epilogue(ctx, done, /*frame_size=*/16);
+    emit_ret(ctx, done);
+
+    return synth_leaf_finish(ctx, region, "fd_write", 8);
+}
+
+// -----------------------------------------------------------------------------
+// tinyc_va_arg_i32(i32 ap_ofs) -> i32: read i32 at *ap, advance *ap by 4.
+// `ap` is a wasm offset to a 4-byte cell that itself stores the current
+// va_list cursor (a wasm offset to the next arg in linmem).
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_tinyc_va_arg_i32(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    // x9 = host(ap)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 9); a[1] = attr_i32(ctx, "rn", 0);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/9, /*rn=*/28, /*rm=*/9, /*sf=*/true);
+    // w10 = *ap
+    emit_ldr_w(ctx, entry, /*rt=*/10, /*rn=*/9, /*off=*/0);
+    // x11 = host(*ap)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 11); a[1] = attr_i32(ctx, "rn", 10);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/11, /*rn=*/28, /*rm=*/11, /*sf=*/true);
+    emit_ldr_w(ctx, entry, /*rt=*/0, /*rn=*/11, /*off=*/0);
+    // *ap += 4
+    emit_add_imm(ctx, entry, /*rd=*/10, /*rn=*/10, /*imm12=*/4, /*sf=*/false);
+    emit_str_w(ctx, entry, /*rt=*/10, /*rn=*/9, /*off=*/0);
+    emit_epilogue(ctx, entry, /*frame_size=*/16);
+    emit_ret(ctx, entry);
+    return synth_leaf_finish(ctx, region, "tinyc_va_arg_i32", 16);
+}
+
+// -----------------------------------------------------------------------------
+// tinyc_va_arg_i64(i32 ap_ofs) -> i64: align *ap up to 8, read 8 bytes,
+// advance *ap by 8.
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_tinyc_va_arg_i64(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    // x9 = host(ap)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 9); a[1] = attr_i32(ctx, "rn", 0);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/9, /*rn=*/28, /*rm=*/9, /*sf=*/true);
+    // w10 = *ap; align up to 8.
+    emit_ldr_w(ctx, entry, /*rt=*/10, /*rn=*/9, /*off=*/0);
+    emit_add_imm(ctx, entry, /*rd=*/10, /*rn=*/10, /*imm12=*/7, /*sf=*/false);
+    emit_movz(ctx, entry, /*rd=*/12, /*imm16=*/3, /*hw=*/0, /*sf=*/false);
+    emit_3reg(ctx, entry, OP_TYPE_AARCH64_LSR_REG,
+              /*rd=*/10, /*rn=*/10, /*rm=*/12, /*sf=*/false);
+    emit_3reg(ctx, entry, OP_TYPE_AARCH64_LSL_REG,
+              /*rd=*/10, /*rn=*/10, /*rm=*/12, /*sf=*/false);
+    // x11 = host(*ap)
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 11); a[1] = attr_i32(ctx, "rn", 10);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/11, /*rn=*/28, /*rm=*/11, /*sf=*/true);
+    emit_ldr_x(ctx, entry, /*rt=*/0, /*rn=*/11, /*off=*/0);
+    // *ap = aligned + 8
+    emit_add_imm(ctx, entry, /*rd=*/10, /*rn=*/10, /*imm12=*/8, /*sf=*/false);
+    emit_str_w(ctx, entry, /*rt=*/10, /*rn=*/9, /*off=*/0);
+    emit_epilogue(ctx, entry, /*frame_size=*/16);
+    emit_ret(ctx, entry);
+    return synth_leaf_finish(ctx, region, "tinyc_va_arg_i64", 16);
+}
+
+// -----------------------------------------------------------------------------
+// tinyc_va_arg_ptr(i32 ap_ofs) -> i32: same as i32 (wasm32 pointers are i32).
+// -----------------------------------------------------------------------------
+static MLIR_OpHandle synth_tinyc_va_arg_ptr(MLIR_Context *ctx) {
+    MLIR_BlockHandle entry;
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 9); a[1] = attr_i32(ctx, "rn", 0);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/9, /*rn=*/28, /*rm=*/9, /*sf=*/true);
+    emit_ldr_w(ctx, entry, /*rt=*/10, /*rn=*/9, /*off=*/0);
+    {
+        MLIR_AttributeHandle a[2];
+        a[0] = attr_i32(ctx, "rd", 11); a[1] = attr_i32(ctx, "rn", 10);
+        MLIR_AppendBlockOp(ctx, entry,
+            build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
+    }
+    emit_add_reg(ctx, entry, /*rd=*/11, /*rn=*/28, /*rm=*/11, /*sf=*/true);
+    emit_ldr_w(ctx, entry, /*rt=*/0, /*rn=*/11, /*off=*/0);
+    emit_add_imm(ctx, entry, /*rd=*/10, /*rn=*/10, /*imm12=*/4, /*sf=*/false);
+    emit_str_w(ctx, entry, /*rt=*/10, /*rn=*/9, /*off=*/0);
+    emit_epilogue(ctx, entry, /*frame_size=*/16);
+    emit_ret(ctx, entry);
+    return synth_leaf_finish(ctx, region, "tinyc_va_arg_ptr", 16);
+}
+
+
 typedef struct {
     int32_t n_globals;
     bool    uses_linmem;
@@ -1509,6 +1947,16 @@ typedef struct {
     bool    needs_printNewline;
     bool    needs_printStr;
     bool    needs_printf;
+    bool    needs_malloc;
+    bool    needs_free;
+    bool    needs_strlen;
+    bool    needs_strcmp;
+    bool    needs_memcmp;
+    bool    needs_memchr;
+    bool    needs_fd_write;
+    bool    needs_va_arg_i32;
+    bool    needs_va_arg_i64;
+    bool    needs_va_arg_ptr;
 } ModInfo;
 
 static void scan_block(MLIR_BlockHandle blk, ModInfo *mi) {
@@ -1529,15 +1977,24 @@ static void scan_block(MLIR_BlockHandle blk, ModInfo *mi) {
         } else if (t == OP_TYPE_WMIR_CALL) {
             string callee = at_s(op, "target");
             if (callee.size == 0) callee = at_s(op, "callee");
-            if (callee.size == 8 && memcmp(callee.str, "printI64", 8) == 0)
-                mi->needs_printI64 = true;
-            if (callee.size == 12 &&
-                memcmp(callee.str, "printNewline", 12) == 0)
-                mi->needs_printNewline = true;
-            if (callee.size == 8 && memcmp(callee.str, "printStr", 8) == 0)
-                mi->needs_printStr = true;
-            if (callee.size == 6 && memcmp(callee.str, "printf", 6) == 0)
-                mi->needs_printf = true;
+            #define EQ_LIT(s, lit) \
+                ((s).size == (sizeof(lit) - 1) && \
+                 memcmp((s).str, (lit), sizeof(lit) - 1) == 0)
+            if (EQ_LIT(callee, "printI64"))      mi->needs_printI64    = true;
+            if (EQ_LIT(callee, "printNewline"))  mi->needs_printNewline = true;
+            if (EQ_LIT(callee, "printStr"))      mi->needs_printStr    = true;
+            if (EQ_LIT(callee, "printf"))        mi->needs_printf      = true;
+            if (EQ_LIT(callee, "malloc"))        mi->needs_malloc      = true;
+            if (EQ_LIT(callee, "free"))          mi->needs_free        = true;
+            if (EQ_LIT(callee, "strlen"))        mi->needs_strlen      = true;
+            if (EQ_LIT(callee, "strcmp"))        mi->needs_strcmp      = true;
+            if (EQ_LIT(callee, "memcmp"))        mi->needs_memcmp      = true;
+            if (EQ_LIT(callee, "memchr"))        mi->needs_memchr      = true;
+            if (EQ_LIT(callee, "fd_write"))      mi->needs_fd_write    = true;
+            if (EQ_LIT(callee, "tinyc_va_arg_i32")) mi->needs_va_arg_i32 = true;
+            if (EQ_LIT(callee, "tinyc_va_arg_i64")) mi->needs_va_arg_i64 = true;
+            if (EQ_LIT(callee, "tinyc_va_arg_ptr")) mi->needs_va_arg_ptr = true;
+            #undef EQ_LIT
         }
         size_t nr = MLIR_GetOpNumRegions(op);
         for (size_t r = 0; r < nr; r++) {
@@ -1633,7 +2090,11 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
     }
 
     bool use_globals = n_globals > 0;
-    bool use_linmem  = mi.uses_linmem || mi.needs_printStr || mi.needs_printf;
+    bool use_linmem  = mi.uses_linmem || mi.needs_printStr || mi.needs_printf ||
+        mi.needs_malloc || mi.needs_free || mi.needs_strlen ||
+        mi.needs_strcmp || mi.needs_memcmp || mi.needs_memchr ||
+        mi.needs_fd_write || mi.needs_va_arg_i32 || mi.needs_va_arg_i64 ||
+        mi.needs_va_arg_ptr;
     MLIR_OpHandle start = synth_start(ctx, entry_name,
         /*use_data_priv=*/false, use_globals, use_linmem);
     if (!start) return MLIR_INVALID_HANDLE;
@@ -1656,6 +2117,56 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
     }
     if (mi.needs_printf) {
         MLIR_OpHandle p = synth_printf(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_malloc) {
+        MLIR_OpHandle p = synth_malloc(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_free) {
+        MLIR_OpHandle p = synth_free(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_strlen) {
+        MLIR_OpHandle p = synth_strlen(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_strcmp) {
+        MLIR_OpHandle p = synth_strcmp(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_memcmp) {
+        MLIR_OpHandle p = synth_memcmp(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_memchr) {
+        MLIR_OpHandle p = synth_memchr(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_fd_write) {
+        MLIR_OpHandle p = synth_fd_write(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_va_arg_i32) {
+        MLIR_OpHandle p = synth_tinyc_va_arg_i32(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_va_arg_i64) {
+        MLIR_OpHandle p = synth_tinyc_va_arg_i64(ctx);
+        if (!p) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, p);
+    }
+    if (mi.needs_va_arg_ptr) {
+        MLIR_OpHandle p = synth_tinyc_va_arg_ptr(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
