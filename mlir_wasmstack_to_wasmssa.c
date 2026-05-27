@@ -63,18 +63,18 @@
 // helpers when the user already provides them, so leaving the user
 // body in place is correct.
 //
-// strlen/strcmp/memcmp/memchr remain in the list because the wasm
-// `loop` lowering currently miscompiles their natural CFG (the
-// fall-through path from `br_if` back-edges incorrectly returns to
-// the loop top instead of leaving it), which manifests as an
-// infinite loop / SIGBUS at runtime. Once the loop lowering is
-// fixed these can move out of the synth list too.
+// strlen/strcmp/memcmp/memchr used to be in this list as a workaround
+// for a wasm `loop` lowering bug where the implicit fall-off-end
+// branched back to the loop header instead of the post-loop exit.
+// That bug is now fixed in mlir_wasmssa_to_wmir.c (the loop frame
+// tracks `br_target` and `fall_target` separately so block_return
+// targets the correct exit). These four lifted bodies are now used
+// in preference to the hand-coded synth versions.
 // =============================================================================
 static bool is_synth_helper(string nm) {
     static const char *kHelpers[] = {
         "printI64", "printNewline", "printStr", "printf",
         "printF32", "printF64",
-        "strlen", "strcmp", "memcmp", "memchr",
         "fd_write", "proc_exit",
         "tinyc_va_arg_i32", "tinyc_va_arg_i64", "tinyc_va_arg_ptr",
         "tinyc_va_arg_struct", "tinyc_va_arg_f64",
