@@ -195,14 +195,32 @@ static int vmap_get(VMap *m, MLIR_ValueHandle k, MLIR_ValueHandle *out) {
 // =============================================================================
 // Frame stack for resolving wasmssa.br {depth=N}. Each enclosing
 // block / loop / if pushes one frame; depth=0 refers to the innermost.
-//   * For wasmssa.block / wasmssa.if: br targets the merge block.
-//   * For wasmssa.loop:               br targets the loop header.
-// The number of target block args is recorded so we can sanity-check
-// operand counts when lowering wasmssa.br.
+//
+// Two targets must be tracked separately:
+//   * `br_target`   — destination of `wasmssa.br` / `wasmssa.br_if` at this
+//                     depth. For block/if it is the merge block; for loop
+//                     it is the loop HEADER (so `br depth=0` continues
+//                     the loop, per wasm spec).
+//   * `fall_target` — destination of `wasmssa.block_return` (the implicit
+//                     fall-off-end terminator emitted by the lifter at
+//                     every region's end). For block/if it is the merge
+//                     block (same as br_target); for loop it is the
+//                     POST-LOOP exit block, so falling off the end of a
+//                     loop exits the loop instead of looping forever.
+//
+// `n_args` records the number of operands on the br/br_if path (block
+// args of br_target) so the lowering can sanity-check operand counts.
+// `n_fall_args` records the number of operands on the fall-off path
+// (block args of fall_target); for loops this is always 0 because
+// wasm loops cannot produce values via fall-through (the verifier
+// requires falling off a value-producing loop to be unreachable, and
+// in practice tinyc never produces such loops).
 // =============================================================================
 typedef struct {
-    MLIR_BlockHandle target;
+    MLIR_BlockHandle br_target;
+    MLIR_BlockHandle fall_target;
     size_t           n_args;
+    size_t           n_fall_args;
     bool             is_loop;
 } Frame;
 
@@ -331,15 +349,18 @@ typedef struct {
     const FuncSigMap *sigs;           // func name -> signature
 } Lowerer;
 
-static void L_push_frame(Lowerer *L, MLIR_BlockHandle target,
-                         size_t n_args, bool is_loop) {
+static void L_push_frame(Lowerer *L, MLIR_BlockHandle br_target,
+                         MLIR_BlockHandle fall_target,
+                         size_t n_args, size_t n_fall_args, bool is_loop) {
     if (L->n_frames == L->c_frames) {
         L->c_frames = L->c_frames ? L->c_frames * 2 : 4;
         L->frames = (Frame *)realloc(L->frames, L->c_frames * sizeof(Frame));
     }
-    L->frames[L->n_frames].target  = target;
-    L->frames[L->n_frames].n_args  = n_args;
-    L->frames[L->n_frames].is_loop = is_loop;
+    L->frames[L->n_frames].br_target   = br_target;
+    L->frames[L->n_frames].fall_target = fall_target;
+    L->frames[L->n_frames].n_args      = n_args;
+    L->frames[L->n_frames].n_fall_args = n_fall_args;
+    L->frames[L->n_frames].is_loop     = is_loop;
     L->n_frames++;
 }
 static void L_pop_frame(Lowerer *L) { L->n_frames--; }
@@ -842,6 +863,44 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         return true;
     }
 
+    case OP_TYPE_WASMSSA_LOCAL_GET: {
+        uint8_t vt = (uint8_t)at_i(src_op, "valtype");
+        int64_t idx = at_i(src_op, "local_idx");
+        MLIR_AttributeHandle attrs[2] = {
+            attr_i32(ctx, "local_idx", idx),
+            attr_i32(ctx, "valtype",   vt),
+        };
+        MLIR_TypeHandle res_ty[1] = { vt_to_type(ctx, vt) };
+        MLIR_ValueHandle res[1] = {
+            MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, res_ty[0],
+                (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}))
+        };
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_LOCAL_GET,
+            attrs, 2, res_ty, 1, res, NULL, 0);
+        L_append(L, out);
+        vmap_set(L->vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_LOCAL_SET: {
+        uint8_t vt = (uint8_t)at_i(src_op, "valtype");
+        int64_t idx = at_i(src_op, "local_idx");
+        MLIR_ValueHandle v;
+        if (!vmap_get(L->vmap, MLIR_GetOpOperand(src_op, 0), &v)) {
+            fprintf(stderr, "wmir: unbound operand on wasmssa.local_set\n");
+            return false;
+        }
+        MLIR_AttributeHandle attrs[2] = {
+            attr_i32(ctx, "local_idx", idx),
+            attr_i32(ctx, "valtype",   vt),
+        };
+        MLIR_ValueHandle ops[1] = { v };
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_LOCAL_SET,
+            attrs, 2, NULL, 0, NULL, ops, 1);
+        L_append(L, out);
+        return true;
+    }
+
     case OP_TYPE_WASMSSA_GLOBAL_SET: {
         int64_t idx = at_i(src_op, "global_idx");
         MLIR_ValueHandle v;
@@ -1170,7 +1229,9 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
     }
 
     case OP_TYPE_WASMSSA_BR: {
-        // wasmssa.br(%v...) {depth=D}: jump to frames[top-D].target.
+        // wasmssa.br(%v...) {depth=D}: jump to frames[top-D].br_target.
+        // For loop frames this targets the loop header (continue);
+        // for block/if frames this targets the merge block (exit).
         int64_t depth = at_i(src_op, "depth");
         if (depth < 0 || (size_t)depth >= L->n_frames) {
             fprintf(stderr,
@@ -1191,16 +1252,17 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
                 return false;
             }
         }
-        L_emit_br(L, f->target, args, no);
+        L_emit_br(L, f->br_target, args, no);
         return true;
     }
 
     case OP_TYPE_WASMSSA_BR_IF: {
         // wasmssa.br_if(%cond) {depth=D}: if cond != 0, jump to
-        // frames[top-D].target with no operands; otherwise fall through.
-        // The lifter emits value-carrying conditional branches as
-        // `wasmssa.if (%cond) { wasmssa.br D (vals) }` so we only ever
-        // see br_if with the bare cond and zero operands here.
+        // frames[top-D].br_target with no operands; otherwise fall
+        // through. The lifter emits value-carrying conditional
+        // branches as `wasmssa.if (%cond) { wasmssa.br D (vals) }`
+        // so we only ever see br_if with the bare cond and zero
+        // operands here.
         int64_t depth = at_i(src_op, "depth");
         if (depth < 0 || (size_t)depth >= L->n_frames) {
             fprintf(stderr,
@@ -1216,15 +1278,26 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
             return false;
         }
         MLIR_BlockHandle fall = L_new_block(L);
-        L_emit_cond_br(L, cond, f->target, fall);
+        L_emit_cond_br(L, cond, f->br_target, fall);
         L->cur = fall;
         L->cur_terminated = false;
         return true;
     }
 
     case OP_TYPE_WASMSSA_BLOCK_RETURN: {
-        // Terminator of the innermost wasmssa.block / .if region.
-        // Targets the topmost frame's exit block.
+        // Terminator of the innermost wasmssa.block / .loop / .if
+        // region. Always emitted by the lifter at every region's
+        // end; semantically means "fall off end of region".
+        //
+        // For block/if frames: fall_target == merge (same as br_target).
+        // For loop frames:     fall_target == post-loop exit block
+        //                      (DIFFERENT from br_target = header).
+        //
+        // Using f->br_target here used to cause an infinite loop in
+        // any function whose body is `loop ... br_if 0 ... end`,
+        // because the implicit fall-off-end would branch back to the
+        // loop header instead of exiting. See e.g. strlen, strcmp,
+        // memcmp, memchr — and any inlined-loop tinyc helper.
         if (L->n_frames == 0) {
             fprintf(stderr, "wmir: wasmssa.block_return with no frame\n");
             return false;
@@ -1243,7 +1316,7 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
                 return false;
             }
         }
-        L_emit_br(L, f->target, args, no);
+        L_emit_br(L, f->fall_target, args, no);
         return true;
     }
 
@@ -1266,7 +1339,7 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
             fprintf(stderr, "wmir: wasmssa.block has no region\n");
             return false;
         }
-        L_push_frame(L, merge, n_results, /*is_loop=*/false);
+        L_push_frame(L, merge, merge, n_results, n_results, /*is_loop=*/false);
         bool saved_term = L->cur_terminated;
         L->cur_terminated = false;
         if (!lower_region(L, MLIR_GetOpRegion(src_op, 0))) {
@@ -1324,7 +1397,7 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         // then-region
         L->cur = then_blk;
         L->cur_terminated = false;
-        L_push_frame(L, merge, n_results, /*is_loop=*/false);
+        L_push_frame(L, merge, merge, n_results, n_results, /*is_loop=*/false);
         if (!lower_region(L, MLIR_GetOpRegion(src_op, 0))) {
             L_pop_frame(L);
             return false;
@@ -1338,7 +1411,7 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         if (has_else) {
             L->cur = else_blk;
             L->cur_terminated = false;
-            L_push_frame(L, merge, n_results, /*is_loop=*/false);
+            L_push_frame(L, merge, merge, n_results, n_results, /*is_loop=*/false);
             if (!lower_region(L, MLIR_GetOpRegion(src_op, 1))) {
                 L_pop_frame(L);
                 return false;
@@ -1400,18 +1473,34 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
 
         L_emit_br(L, header, init_args, no);
 
+        // Create post-loop fall-through block BEFORE pushing the frame,
+        // so that any `wasmssa.block_return` inside the loop body (the
+        // implicit fall-off-end terminator emitted by the lifter) can
+        // target it. Using the header here used to cause an infinite
+        // loop in any function whose body is `loop ... br_if 0 ... end`,
+        // because the implicit fall-off-end would branch back to the
+        // loop header instead of exiting.
+        //
+        // NOTE: post has no block args. wasmssa.loop with non-zero
+        // result arity (a loop producing values via fall-through) is
+        // not currently supported — tinyc never generates such loops.
+        MLIR_BlockHandle post = L_new_block(L);
+
         L->cur = header;
         L->cur_terminated = false;
-        L_push_frame(L, header, n_loop_args, /*is_loop=*/true);
+        L_push_frame(L, /*br_target=*/header, /*fall_target=*/post,
+                     n_loop_args, /*n_fall_args=*/0, /*is_loop=*/true);
         if (!lower_region(L, loop_region)) {
             L_pop_frame(L);
             return false;
         }
         L_pop_frame(L);
 
-        // Post-loop fall-through block. If the body terminated explicitly
-        // (br/return/unreachable), this block is dead but harmless.
-        MLIR_BlockHandle post = L_new_block(L);
+        // If the body fell through without emitting a terminator,
+        // branch to post explicitly. (This path is hit when the body
+        // ends with a non-terminator op; the lifter normally appends
+        // a block_return at end-of-region, which already lowers to a
+        // br to post.)
         if (!L->cur_terminated) {
             L_emit_br(L, post, NULL, 0);
         }
@@ -1456,6 +1545,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     bool   exported  = at_b(src, "exported");
     string pt        = at_s(src, "param_types");
     string rt        = at_s(src, "result_types");
+    string lt        = at_s(src, "local_types");
 
     if (MLIR_GetOpNumRegions(src) < 1) {
         fprintf(stderr, "wmir lowering: wasmssa.func has no region\n");
@@ -1507,6 +1597,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     attrs[na++] = attr_s(ctx, "sym_name",     name.str, name.size);
     attrs[na++] = attr_s(ctx, "param_types",  pt.str,   pt.size);
     attrs[na++] = attr_s(ctx, "result_types", rt.str,   rt.size);
+    attrs[na++] = attr_s(ctx, "local_types",  lt.str,   lt.size);
     attrs[na++] = attr_b(ctx, "exported",     exported);
 
     MLIR_RegionHandle regs[1] = { dst_region };

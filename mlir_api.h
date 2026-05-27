@@ -260,6 +260,16 @@ typedef enum {
     // pops args + table-index and dispatches via wasm `call_indirect`.
     OP_TYPE_WASMSSA_FUNC_ADDR,
     OP_TYPE_WASMSSA_CALL_INDIRECT,
+    // Wasm function-locals access. Each function has a fixed set of
+    // typed locals (params + declared locals). LOCAL_GET reads slot
+    // `local_idx`, LOCAL_SET writes it. Locals are NEVER address-taken
+    // in wasm semantics, so they live in a native (non-linmem) stack
+    // frame that the wmir->aarch64 backend allocates. The lifter used
+    // to spill them into linmem cells (8 bytes each), which inflated
+    // the wasm stack by ~20x and forced unrealistic stack-size grows.
+    //   attrs: valtype (i32 byte: i32|i64|f32|f64), local_idx (i32).
+    OP_TYPE_WASMSSA_LOCAL_GET,
+    OP_TYPE_WASMSSA_LOCAL_SET,
     // WebAssembly memory instructions: `memory.size` (0x3F 0x00) and
     // `memory.grow` (0x40 0x00). MEMORY_SIZE has no operands and an i32
     // result (size in pages). MEMORY_GROW takes one i32 operand (pages
@@ -370,6 +380,11 @@ typedef enum {
     // wmir->aarch64 lowering adds linmem_base + zext(offset).
     OP_TYPE_WMIR_LOAD,
     OP_TYPE_WMIR_STORE,
+    // Wasm function-locals access on the native (non-linmem) stack
+    // frame. See OP_TYPE_WASMSSA_LOCAL_GET/SET for rationale.
+    //   attrs: valtype (i32 byte), local_idx (i32).
+    OP_TYPE_WMIR_LOCAL_GET,
+    OP_TYPE_WMIR_LOCAL_SET,
     // Direct function call by symbol name.
     OP_TYPE_WMIR_CALL,
     // Integer compare. `pred` attribute is one of:

@@ -57,17 +57,17 @@ enum {
     DEFAULT_STACK_SIZE        = 4u * 1024u * 1024u,
     DEFAULT_GLOBAL_BASE_OFFS  = 1024u,
     WASM_PAGE_SIZE            = 65536u,
-    // Maximum linmem size, in wasm pages (64 KiB each). We pre-reserve
-    // this much virtual address space as a zero-fill BSS section in the
-    // Mach-O envelope; macOS lazily commits pages as they are touched,
-    // so the on-disk binary size is unaffected. The wasm-side
-    // `memory.size` / `memory.grow` then bump a counter against this
-    // cap, mirroring real WASI semantics. 4096 pages = 256 MiB; small
-    // enough that dyld is happy with the __DATA segment vmsize, large
-    // enough for the entire tinyC test suite. Selfhost (which needs
-    // much more) bumps this via the upstream wasm-backend's path or
-    // via a per-module override (TODO).
-    MAX_LINMEM_PAGES          = 24576u,
+    // Maximum linmem size, in wasm pages (64 KiB each). We allocate
+    // this much heap memory via libSystem mmap at startup (see
+    // synth_start), so the binary's static segments stay tiny and
+    // we are not constrained by macOS dyld shared-cache placement.
+    //
+    // 65536 pages = 4 GiB — the wasm32 architectural maximum. macOS
+    // arm64 happily mmap()s a 4 GiB anonymous private region; we get
+    // a host pointer that x28 holds for the lifetime of the program.
+    // Stage1 tinyc selfhost peaks around 2 GiB linmem when compiling
+    // emit.c so the headroom matters.
+    MAX_LINMEM_PAGES          = 65536u,
     // Slot offsets within linmem used by synthesised libc shims.
     // See the full linmem-layout doc later in the file. Hoisted here
     // because lowering of `memory.size` / `memory.grow` (which uses
@@ -823,6 +823,15 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     string name     = at_s(src, "sym_name");
     bool   exported = at_b(src, "exported");
     string pt       = at_s(src, "param_types");
+    // `local_types` carries the wasm valtype byte (i32=0x7f, i64=0x7e,
+    // f32=0x7d, f64=0x7c) for every wasm local (params first, then
+    // declared locals). We store each local in an 8-byte cell on the
+    // native AArch64 stack frame, contiguous and immediately above
+    // the register-allocator spill slots. `locals_bytes` extends
+    // `frame_size`; wmir.local_get / wmir.local_set address their slot
+    // via [sp, #(spill_bytes + idx*8)].
+    string lt = at_s(src, "local_types");
+    uint32_t locals_count = (uint32_t)(lt.size / 2);  // hex-encoded
 
     if (MLIR_GetOpNumRegions(src) < 1) {
         fprintf(stderr, "wmir->aarch64: wmir.func has no region\n");
@@ -843,8 +852,14 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 (int)name.size, name.str);
         return MLIR_INVALID_HANDLE;
     }
-    uint32_t frame_size = (uint32_t)ra->n_slots * 8u;
+    uint32_t spill_bytes  = (uint32_t)ra->n_slots * 8u;
+    uint32_t locals_bytes = locals_count * 8u;
+    uint32_t frame_size   = spill_bytes + locals_bytes;
     frame_size = (frame_size + 15u) & ~15u;
+    if (getenv("WMIR_DEBUG_FRAMES")) {
+        fprintf(stderr, "wmir-frame: %.*s spill=%u locals=%u total=%u\n",
+                (int)name.size, name.str, spill_bytes, locals_bytes, frame_size);
+    }
     // SUB SP, SP, #imm12 [LSL #12] supports up to ~16 MiB. The LDR/STR
     // helpers above transparently rematerialise large offsets via x16,
     // so any frame that fits the prologue's reach is reachable from
@@ -1363,6 +1378,27 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 emit_str_w(ctx, dst_blk, r0, 27, (uint32_t)(gi * 8));
                 break;
             }
+            case OP_TYPE_WMIR_LOCAL_GET: {
+                int64_t idx = at_i(op, "local_idx");
+                uint8_t vt  = (uint8_t)at_i(op, "valtype");
+                bool i64 = (vt == 0x7e || vt == 0x7c); // i64 / f64
+                uint32_t off = spill_bytes + (uint32_t)idx * 8u;
+                uint8_t rd = PICK_RES(9, 0);
+                if (i64) emit_ldr_x(ctx, dst_blk, rd, /*rn=*/31, off);
+                else     emit_ldr_w(ctx, dst_blk, rd, /*rn=*/31, off);
+                ST_RESULT(rd, 0);
+                break;
+            }
+            case OP_TYPE_WMIR_LOCAL_SET: {
+                int64_t idx = at_i(op, "local_idx");
+                uint8_t vt  = (uint8_t)at_i(op, "valtype");
+                bool i64 = (vt == 0x7e || vt == 0x7c); // i64 / f64
+                uint8_t r0 = LD_OPERAND(9, 0);
+                uint32_t off = spill_bytes + (uint32_t)idx * 8u;
+                if (i64) emit_str_x(ctx, dst_blk, r0, /*rn=*/31, off);
+                else     emit_str_w(ctx, dst_blk, r0, /*rn=*/31, off);
+                break;
+            }
             case OP_TYPE_WMIR_LOAD: {
                 int64_t off = at_i(op, "memory_offset");
                 int64_t sz  = at_i(op, "mem_size");
@@ -1569,11 +1605,21 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
 }
 
 // =============================================================================
-// _start synthesis. Sets up x26/x27/x28 then calls main, then svc-exits.
+// _start synthesis. Sets up x26/x27/x28 then calls main, then libSystem-exits.
+//
+// `x28` (the wasm linmem base register) is populated by calling libSystem
+// `mmap` for `linmem_size_bytes` of anonymous RW memory. The initial bytes
+// of linmem (from wasm data segments) live in a file-backed
+// `__linmem_template` section in __DATA; we memcpy them into the freshly
+// mmap'd region. This avoids reserving multi-GiB of zerofill in the
+// Mach-O envelope (which collides with the dyld shared cache on macOS
+// arm64 once linmem exceeds ~1.875 GiB above __TEXT).
 // =============================================================================
 static MLIR_OpHandle synth_start(MLIR_Context *ctx, string main_name,
                                  bool use_data_priv, bool use_globals,
-                                 bool use_linmem) {
+                                 bool use_linmem,
+                                 uint32_t linmem_init_size,
+                                 uint64_t linmem_size_bytes) {
     MLIR_RegionHandle region = MLIR_CreateRegion(ctx);
     MLIR_BlockHandle blk = MLIR_CreateBlock(ctx);
     MLIR_AppendRegionBlock(ctx, region, blk);
@@ -1587,30 +1633,57 @@ static MLIR_OpHandle synth_start(MLIR_Context *ctx, string main_name,
         emit_add_data_lo(ctx, blk, 27, 27, "globals");
     }
     if (use_linmem) {
-        emit_adrp_data(ctx, blk, 28, "linmem");
-        emit_add_data_lo(ctx, blk, 28, 28, "linmem");
-        // Stash argc / argv (host pointer) into linmem so the WASI
-        // args_get / args_sizes_get shims can recover them. macOS uses
-        // LC_MAIN: dyld calls our entry as `int main(argc, argv, envp,
-        // apple)` with argc in x0 and argv in x1 (standard C ABI), NOT
-        // via the kernel-style user stack layout (which has argc at
-        // [sp,#0]; that layout is only used for LC_UNIXTHREAD entries).
-        // Done BEFORE the bl so the callee can read them. Offsets must
-        // match ARGC_SLOT/ARGV_SLOT (defined later in the file alongside
-        // the linmem layout doc).
-        emit_str_w   (ctx, blk, /*rt=*/ 0, /*rn=*/28, /*off=*/40);
-        emit_str_x   (ctx, blk, /*rt=*/ 1, /*rn=*/28, /*off=*/48);
+        // Stash dyld-supplied argc (w0) / argv (x1) into the local
+        // frame across the mmap/memcpy calls (which clobber x0..x7).
+        // 16-byte frame: [sp,#0]=argc, [sp,#8]=argv.
+        emit_prologue(ctx, blk, /*frame_size=*/16);
+        emit_str_w(ctx, blk, /*rt=*/0, /*rn=*/31, /*off=*/0);
+        emit_str_x(ctx, blk, /*rt=*/1, /*rn=*/31, /*off=*/8);
+
+        // mmap(NULL, linmem_size_bytes, PROT_READ|PROT_WRITE,
+        //      MAP_ANON|MAP_PRIVATE, -1, 0) -> x0
+        emit_mov_imm64(ctx, blk, /*rd=*/0, 0);
+        emit_mov_imm64(ctx, blk, /*rd=*/1, linmem_size_bytes);
+        emit_mov_imm32(ctx, blk, /*rd=*/2, 3);            // PROT_READ|PROT_WRITE
+        emit_mov_imm32(ctx, blk, /*rd=*/3, 0x1002);       // MAP_ANON|MAP_PRIVATE
+        emit_mov_imm32(ctx, blk, /*rd=*/4, 0xffffffffu);  // fd = -1
+        emit_mov_imm64(ctx, blk, /*rd=*/5, 0);
+        emit_bl(ctx, blk, str_lit("_mmap"));
+        emit_mov_x(ctx, blk, /*rd=*/28, /*rn=*/0);
+
+        if (linmem_init_size > 0) {
+            // memcpy(x28, __linmem_template, linmem_init_size)
+            emit_mov_x(ctx, blk, /*rd=*/0, /*rn=*/28);
+            emit_adrp_data(ctx, blk, 1, "linmem_template");
+            emit_add_data_lo(ctx, blk, 1, 1, "linmem_template");
+            emit_mov_imm64(ctx, blk, /*rd=*/2, (uint64_t)linmem_init_size);
+            emit_bl(ctx, blk, str_lit("_memcpy"));
+        }
+
         // Initialise mem_pages slot with the static page count. The
         // `wmir.memory_size` op loads from this slot, and
         // `wmir.memory_grow` updates it (capped at MAX_LINMEM_PAGES).
-        // See the linmem layout doc for MEM_PAGES_SLOT.
         emit_mov_imm32(ctx, blk, /*rd=*/9, g_linmem_pages);
-        emit_str_w   (ctx, blk, /*rt=*/ 9, /*rn=*/28, /*off=*/24);
+        emit_str_w(ctx, blk, /*rt=*/9, /*rn=*/28, /*off=*/24);
+
+        // Stash argc / argv (host pointer) into linmem so the WASI
+        // args_get / args_sizes_get shims can recover them. macOS uses
+        // LC_MAIN: dyld calls our entry as `int main(argc, argv, envp,
+        // apple)` with argc in x0 and argv in x1 (standard C ABI).
+        // Reload from the saved frame slots since the mmap/memcpy
+        // calls clobbered x0/x1.
+        emit_ldr_w(ctx, blk, /*rt=*/0, /*rn=*/31, /*off=*/0);
+        emit_ldr_x(ctx, blk, /*rt=*/1, /*rn=*/31, /*off=*/8);
+        emit_str_w(ctx, blk, /*rt=*/0, /*rn=*/28, /*off=*/40);
+        emit_str_x(ctx, blk, /*rt=*/1, /*rn=*/28, /*off=*/48);
+
+        emit_epilogue(ctx, blk, /*frame_size=*/16);
     }
 
     emit_bl(ctx, blk, main_name);
-    emit_movz(ctx, blk, /*rd=*/16, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, blk, 0x80);
+    // After main returns, exit with x0 (main's return value) as the
+    // status code. Calls libSystem _exit; noreturn.
+    emit_bl(ctx, blk, str_lit("_exit"));
 
     MLIR_AttributeHandle attrs[2];
     size_t na = 0;
@@ -1739,8 +1812,7 @@ static MLIR_OpHandle synth_print_i64(MLIR_Context *ctx) {
     }
     emit_movz(ctx, bskip, /*rd=*/0, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
     emit_mov_x(ctx, bskip, /*rd=*/1, /*rn=*/11);
-    emit_movz(ctx, bskip, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, bskip, 0x80);
+    emit_bl(ctx, bskip, str_lit("_write"));
     emit_epilogue(ctx, bskip, /*frame_size=*/32);
     emit_ret(ctx, bskip);
 
@@ -1770,8 +1842,7 @@ static MLIR_OpHandle synth_print_newline(MLIR_Context *ctx) {
     // x1 = sp  ->  add x1, sp, #0
     emit_add_imm(ctx, blk, /*rd=*/1, /*rn=*/31, /*imm12=*/0, /*sf=*/true);
     emit_movz(ctx, blk, /*rd=*/2, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_movz(ctx, blk, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, blk, 0x80);
+    emit_bl(ctx, blk, str_lit("_write"));
     emit_epilogue(ctx, blk, /*frame_size=*/16);
     emit_ret(ctx, blk);
 
@@ -1831,8 +1902,7 @@ static MLIR_OpHandle synth_print_str(MLIR_Context *ctx) {
     emit_sub_reg(ctx, bdone, /*rd=*/2, /*rn=*/11, /*rm=*/10, /*sf=*/true);
     emit_mov_x(ctx, bdone, /*rd=*/1, /*rn=*/10);
     emit_movz(ctx, bdone, /*rd=*/0, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_movz(ctx, bdone, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, bdone, 0x80);
+    emit_bl(ctx, bdone, str_lit("_write"));
     // Append '\n' (matches runtime.c semantics: printStr always emits
     // a trailing newline). Reuse the prologue stack slot at [sp, #0].
     emit_movz(ctx, bdone, /*rd=*/9, /*imm16=*/0x0a, /*hw=*/0, /*sf=*/false);
@@ -1840,8 +1910,7 @@ static MLIR_OpHandle synth_print_str(MLIR_Context *ctx) {
     emit_movz(ctx, bdone, /*rd=*/0, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
     emit_add_imm(ctx, bdone, /*rd=*/1, /*rn=*/31, /*imm12=*/0, /*sf=*/true);
     emit_movz(ctx, bdone, /*rd=*/2, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_movz(ctx, bdone, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, bdone, 0x80);
+    emit_bl(ctx, bdone, str_lit("_write"));
     emit_epilogue(ctx, bdone, /*frame_size=*/16);
     emit_ret(ctx, bdone);
 
@@ -1864,8 +1933,7 @@ static void emit_write_stdout(MLIR_Context *ctx, MLIR_BlockHandle blk,
     if (len_reg != 2) emit_mov_x(ctx, blk, /*rd=*/2, /*rn=*/len_reg);
     if (ptr_reg != 1) emit_mov_x(ctx, blk, /*rd=*/1, /*rn=*/ptr_reg);
     emit_movz(ctx, blk, /*rd=*/0,  /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_movz(ctx, blk, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, blk, 0x80);
+    emit_bl(ctx, blk, str_lit("_write"));
 }
 
 // =============================================================================
@@ -1976,8 +2044,7 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     emit_movz(ctx, write_lit, /*rd=*/2, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
     emit_add_imm(ctx, write_lit, /*rd=*/1, /*rn=*/31, /*imm12=*/0, /*sf=*/true);
     emit_movz(ctx, write_lit, /*rd=*/0,  /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_movz(ctx, write_lit, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, write_lit, 0x80);
+    emit_bl(ctx, write_lit, str_lit("_write"));
     emit_b(ctx, write_lit, loop_top);
 
     // ---------- saw_pct ----------
@@ -2035,8 +2102,7 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     emit_movz(ctx, spec_pct, /*rd=*/2, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
     emit_add_imm(ctx, spec_pct, /*rd=*/1, /*rn=*/31, /*imm12=*/0, /*sf=*/true);
     emit_movz(ctx, spec_pct, /*rd=*/0,  /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_movz(ctx, spec_pct, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, spec_pct, 0x80);
+    emit_bl(ctx, spec_pct, str_lit("_write"));
     emit_b(ctx, spec_pct, loop_top);
 
     // ---------- spec_decimal ----------
@@ -2108,8 +2174,7 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     emit_sub_reg(ctx, spec_s_done, /*rd=*/2, /*rn=*/11, /*rm=*/10, /*sf=*/true);
     emit_mov_x(ctx, spec_s_done, /*rd=*/1, /*rn=*/10);
     emit_movz(ctx, spec_s_done, /*rd=*/0,  /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_movz(ctx, spec_s_done, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, spec_s_done, 0x80);
+    emit_bl(ctx, spec_s_done, str_lit("_write"));
     emit_b(ctx, spec_s_done, loop_top);
 
     // ---------- spec_c ----------
@@ -2121,8 +2186,7 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     emit_movz(ctx, spec_c, /*rd=*/2, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
     emit_add_imm(ctx, spec_c, /*rd=*/1, /*rn=*/31, /*imm12=*/0, /*sf=*/true);
     emit_movz(ctx, spec_c, /*rd=*/0,  /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_movz(ctx, spec_c, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, spec_c, 0x80);
+    emit_bl(ctx, spec_c, str_lit("_write"));
     emit_b(ctx, spec_c, loop_top);
 
     // ---------- spec_f ----------
@@ -2504,8 +2568,7 @@ static MLIR_OpHandle synth_fd_write(MLIR_Context *ctx) {
     emit_mov_x(ctx, loop, /*rd=*/0, /*rn=*/19);
     emit_mov_x(ctx, loop, /*rd=*/1, /*rn=*/11);
     emit_mov_x(ctx, loop, /*rd=*/2, /*rn=*/12);
-    emit_movz(ctx, loop, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, loop, 0x80);
+    emit_bl(ctx, loop, str_lit("_write"));
     // Accumulate bytes-written. x0 holds ssize_t (negative on error). We
     // intentionally don't branch on error here — the simplest tinyc
     // pipelines all just call write to a known-good fd, and dropping a
@@ -2539,19 +2602,20 @@ static MLIR_OpHandle synth_fd_write(MLIR_Context *ctx) {
 }
 
 // -----------------------------------------------------------------------------
-// WASI proc_exit(i32 exit_code) -> noreturn: x16=1, svc #0x80.
+// WASI proc_exit(i32 exit_code) -> noreturn: bl _exit.
 // Used by the wasm->wasmstack->wasmssa lifter pipeline: wasm-ld synthesises
 // a `_start` that calls `__original_main` then `proc_exit`, and the lifter
 // preserves that call. The C-frontend pipeline doesn't generate this call
-// at all (the wmir backend's own synth_start does the syscall directly).
+// at all (the wmir backend's own synth_start does the libSystem call
+// directly).
 // -----------------------------------------------------------------------------
 static MLIR_OpHandle synth_proc_exit(MLIR_Context *ctx) {
     MLIR_BlockHandle entry;
     MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
-    // exit_code already in x0/w0 per AAPCS; just set syscall # and trap.
-    emit_movz(ctx, entry, /*rd=*/16, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, entry, 0x80);
-    // Unreachable, but emit a clean ret for IR well-formedness.
+    // exit_code already in x0/w0 per AAPCS; call libSystem _exit which
+    // is noreturn. The bl never returns but we emit a clean epilogue +
+    // ret for IR well-formedness.
+    emit_bl(ctx, entry, str_lit("_exit"));
     emit_epilogue(ctx, entry, /*frame_size=*/16);
     emit_ret(ctx, entry);
     return synth_leaf_finish(ctx, region, "proc_exit", 9);
@@ -3250,8 +3314,7 @@ static MLIR_OpHandle synth_print_f64(MLIR_Context *ctx) {
     emit_movz(ctx, bdo_write, /*rd=*/0, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
     emit_mov_x(ctx, bdo_write, /*rd=*/1, /*rn=*/13);
     emit_mov_x(ctx, bdo_write, /*rd=*/2, /*rn=*/9);
-    emit_movz(ctx, bdo_write, /*rd=*/16, /*imm16=*/4, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, bdo_write, 0x80);
+    emit_bl(ctx, bdo_write, str_lit("_write"));
     emit_epilogue(ctx, bdo_write, /*frame_size=*/96);
     emit_ret(ctx, bdo_write);
 
@@ -3572,8 +3635,7 @@ static MLIR_OpHandle synth_fd_close(MLIR_Context *ctx) {
     MLIR_BlockHandle entry;
     MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
     // x0 already has fd (low 32 bits valid). svc clobbers x16.
-    emit_movz(ctx, entry, /*rd=*/16, /*imm16=*/6, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, entry, 0x80);
+    emit_bl(ctx, entry, str_lit("_close"));
     emit_movz(ctx, entry, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
     emit_epilogue(ctx, entry, /*frame_size=*/16);
     emit_ret(ctx, entry);
@@ -3626,8 +3688,7 @@ static MLIR_OpHandle synth_fd_read(MLIR_Context *ctx) {
     emit_mov_x(ctx, loop, /*rd=*/0, /*rn=*/19);
     emit_mov_x(ctx, loop, /*rd=*/1, /*rn=*/11);
     emit_mov_x(ctx, loop, /*rd=*/2, /*rn=*/12);
-    emit_movz(ctx, loop, /*rd=*/16, /*imm16=*/3, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, loop, 0x80);
+    emit_bl(ctx, loop, str_lit("_read"));
     // x0 = bytes read (or -errno). Check sign bit.
     emit_cmp_imm(ctx, loop, /*rn=*/0, /*imm12=*/0, /*sf=*/false);
     emit_b_cond(ctx, loop, COND_LT, err);
@@ -3687,8 +3748,7 @@ static MLIR_OpHandle synth_fd_seek(MLIR_Context *ctx) {
         a[0] = attr_i32(ctx, "rd", 2); a[1] = attr_i32(ctx, "rn", 2);
         MLIR_AppendBlockOp(ctx, entry, build_op(ctx, OP_TYPE_AARCH64_UXTW, a, 2));
     }
-    emit_movz(ctx, entry, /*rd=*/16, /*imm16=*/199, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, entry, 0x80);
+    emit_bl(ctx, entry, str_lit("_lseek"));
     // x0 = new offset on success, or -1 on error (kernel returns -1 with
     // C flag set). Check sign bit on the 64-bit result.
     emit_cmp_imm(ctx, entry, /*rn=*/0, /*imm12=*/0, /*sf=*/true);
@@ -3734,8 +3794,7 @@ static MLIR_OpHandle synth_fd_tell(MLIR_Context *ctx) {
     }
     emit_movz(ctx, entry, /*rd=*/1, /*imm16=*/0, /*hw=*/0, /*sf=*/true);
     emit_movz(ctx, entry, /*rd=*/2, /*imm16=*/1, /*hw=*/0, /*sf=*/true);
-    emit_movz(ctx, entry, /*rd=*/16, /*imm16=*/199, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, entry, 0x80);
+    emit_bl(ctx, entry, str_lit("_lseek"));
     emit_cmp_imm(ctx, entry, /*rn=*/0, /*imm12=*/0, /*sf=*/true);
     emit_b_cond(ctx, entry, COND_LT, err);
     emit_b(ctx, entry, ok);
@@ -3901,8 +3960,7 @@ static MLIR_OpHandle synth_path_open(MLIR_Context *ctx) {
     emit_add_imm(ctx, do_open, /*rd=*/0, /*rn=*/31, /*imm12=*/0, /*sf=*/true);
     emit_mov_x(ctx, do_open, /*rd=*/1, /*rn=*/14);
     emit_movz(ctx, do_open, /*rd=*/2, /*imm16=*/0x1a4, /*hw=*/0, /*sf=*/true);
-    emit_movz(ctx, do_open, /*rd=*/16, /*imm16=*/5, /*hw=*/0, /*sf=*/true);
-    emit_svc(ctx, do_open, 0x80);
+    emit_bl(ctx, do_open, str_lit("_open"));
     emit_cmp_imm(ctx, do_open, /*rn=*/0, /*imm12=*/0, /*sf=*/false);
     emit_b_cond(ctx, do_open, COND_LT, err);
     emit_b(ctx, do_open, ok);
@@ -3959,6 +4017,21 @@ typedef struct {
     bool    needs_args_sizes_get;
     bool    needs_environ_get;
     bool    needs_environ_sizes_get;
+    // user_provides_* are set when the wmir module already defines a
+    // function with the corresponding name. Synth helpers must NOT be
+    // emitted in that case — they would shadow the user's function and
+    // (worse) be picked as the first match by the mach-o backend's
+    // name-based reloc resolver. tinyc selfhost compiles
+    // corec-stdlib/stdlib.c which provides malloc/free/realloc;
+    // synth_malloc is a header-less bump allocator, so realloc's
+    // `hdr->size` read would land on uninitialised bytes if synth_malloc
+    // shadowed the real malloc.
+    bool    user_provides_malloc;
+    bool    user_provides_free;
+    bool    user_provides_strlen;
+    bool    user_provides_strcmp;
+    bool    user_provides_memcmp;
+    bool    user_provides_memchr;
 } ModInfo;
 
 static void scan_block(MLIR_BlockHandle blk, ModInfo *mi) {
@@ -4035,6 +4108,30 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
     ModInfo mi = {0};
     scan_block(mb, &mi);
 
+    // Scan top-level WMIR_FUNC ops to record which "helper" names the
+    // user wasm module already provides. We must not synthesize over
+    // these or the mach-o name-based reloc resolver will pick the
+    // synth (header-less bump allocator) and break realloc, which
+    // expects a header-bearing malloc.
+    {
+        size_t n_pre = MLIR_GetBlockNumOps(mb);
+        for (size_t i = 0; i < n_pre; i++) {
+            MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
+            if (MLIR_GetOpType(top) != OP_TYPE_WMIR_FUNC) continue;
+            string sn = at_s(top, "sym_name");
+            #define EQ_LIT2(s, lit) \
+                ((s).size == (sizeof(lit) - 1) && \
+                 memcmp((s).str, (lit), sizeof(lit) - 1) == 0)
+            if (EQ_LIT2(sn, "malloc")) mi.user_provides_malloc = true;
+            if (EQ_LIT2(sn, "free"))   mi.user_provides_free   = true;
+            if (EQ_LIT2(sn, "strlen")) mi.user_provides_strlen = true;
+            if (EQ_LIT2(sn, "strcmp")) mi.user_provides_strcmp = true;
+            if (EQ_LIT2(sn, "memcmp")) mi.user_provides_memcmp = true;
+            if (EQ_LIT2(sn, "memchr")) mi.user_provides_memchr = true;
+            #undef EQ_LIT2
+        }
+    }
+
     uint32_t n_globals = (uint32_t)mi.n_globals;
     uint64_t global0_init = DEFAULT_STACK_SIZE;
     uint64_t lm_bytes = (uint64_t)DEFAULT_STACK_SIZE + DEFAULT_GLOBAL_BASE_OFFS;
@@ -4081,6 +4178,12 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
 
     string entry_name = {0};
 
+    // Track the high-water mark of the data_init records so synth_start
+    // can emit a `memcpy(linmem, __linmem_template, init_size)` of the
+    // right size after mmap'ing linmem. Rounded up to 16 to match what
+    // the macho backend pads the __linmem_template section to.
+    uint32_t linmem_init_size = 0;
+
     size_t n_top = MLIR_GetBlockNumOps(mb);
     for (size_t i = 0; i < n_top; i++) {
         MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
@@ -4091,6 +4194,8 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
             string sn = at_s(top, "sym_name");
             string id = at_s(top, "init_data");
             int64_t off = at_i(top, "offset");
+            uint32_t end = (uint32_t)off + (uint32_t)id.size;
+            if (end > linmem_init_size) linmem_init_size = end;
             MLIR_AttributeHandle a[3];
             a[0] = attr_s  (ctx, "sym_name",  sn.str, sn.size);
             a[1] = attr_i32(ctx, "offset",    off);
@@ -4132,8 +4237,13 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
         mi.needs_fd_write || mi.needs_va_arg_i32 || mi.needs_va_arg_i64 ||
         mi.needs_va_arg_ptr || mi.needs_va_arg_struct ||
         mi.needs_va_arg_f64;
+    if (linmem_init_size > 0) {
+        linmem_init_size = (linmem_init_size + 15u) & ~15u;
+    }
     MLIR_OpHandle start = synth_start(ctx, entry_name,
-        /*use_data_priv=*/false, use_globals, use_linmem);
+        /*use_data_priv=*/false, use_globals, use_linmem,
+        /*linmem_init_size=*/linmem_init_size,
+        /*linmem_size_bytes=*/(uint64_t)MAX_LINMEM_PAGES * WASM_PAGE_SIZE);
     if (!start) return MLIR_INVALID_HANDLE;
     MLIR_AppendBlockOp(ctx, out_body, start);
 
@@ -4157,32 +4267,32 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_malloc) {
+    if (mi.needs_malloc && !mi.user_provides_malloc) {
         MLIR_OpHandle p = synth_malloc(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_free) {
+    if (mi.needs_free && !mi.user_provides_free) {
         MLIR_OpHandle p = synth_free(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_strlen) {
+    if (mi.needs_strlen && !mi.user_provides_strlen) {
         MLIR_OpHandle p = synth_strlen(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_strcmp) {
+    if (mi.needs_strcmp && !mi.user_provides_strcmp) {
         MLIR_OpHandle p = synth_strcmp(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_memcmp) {
+    if (mi.needs_memcmp && !mi.user_provides_memcmp) {
         MLIR_OpHandle p = synth_memcmp(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);
     }
-    if (mi.needs_memchr) {
+    if (mi.needs_memchr && !mi.user_provides_memchr) {
         MLIR_OpHandle p = synth_memchr(ctx);
         if (!p) return MLIR_INVALID_HANDLE;
         MLIR_AppendBlockOp(ctx, out_body, p);

@@ -632,6 +632,77 @@ static string attr_s(MLIR_OpHandle op, const char *name) {
     return a ? MLIR_GetAttributeString(a) : (string){0};
 }
 
+// =============================================================================
+// libSystem stub table.
+//
+// macOS only commits to libSystem.B.dylib as a stable ABI; raw BSD
+// syscalls (`svc #0x80`) are private/unstable. Every external call the
+// backend wants to make therefore goes through a `bl _<name>` to a
+// PC-relative stub in __TEXT,__stubs that does `ADRP x16, GOT_page;
+// LDR x16, [x16, GOT_lo12]; BR x16`. dyld fills the corresponding
+// __DATA_CONST,__got slot at load time via chained fixups.
+//
+// LibSysSym enumerates every libSystem symbol the wmir backend may
+// reference from its synth_* shims. The actual set used by any given
+// program is discovered by walking BL relocs after function emission
+// (see `n_libsys_stubs` further down). Enum order matters: it controls
+// the dense stub index assigned to each symbol, which in turn
+// determines the order of entries in __stubs / __got / chained-fixups
+// imports / dysymtab indirect-syms.
+//
+// The lookup helpers are written as if/else cascades rather than as a
+// `static const char *names[N] = {...};` table because tinyc (which
+// must compile this file for selfhost) does not yet support string-
+// literal initialisers in global arrays of `char *`, nor `sizeof(arr)`
+// in a constant expression.
+// =============================================================================
+typedef enum {
+    LS_EXIT  = 0,
+    LS_WRITE,
+    LS_READ,
+    LS_OPEN,
+    LS_CLOSE,
+    LS_LSEEK,
+    LS_ERRNO,
+    LS_MMAP,
+    LS_MEMCPY
+} LibSysSym;
+#define LS_COUNT 9
+
+static const char *libsys_name(int sym) {
+    if (sym == LS_EXIT)   return "_exit";
+    if (sym == LS_WRITE)  return "_write";
+    if (sym == LS_READ)   return "_read";
+    if (sym == LS_OPEN)   return "_open";
+    if (sym == LS_CLOSE)  return "_close";
+    if (sym == LS_LSEEK)  return "_lseek";
+    if (sym == LS_ERRNO)  return "___error";
+    if (sym == LS_MMAP)   return "_mmap";
+    if (sym == LS_MEMCPY) return "_memcpy";
+    return "";
+}
+
+// Returns the LibSysSym value matching `callee`, or -1 if `callee` is
+// not a known libSystem symbol.
+static int libsys_lookup(string callee) {
+    for (int i = 0; i < LS_COUNT; i++) {
+        const char *nm = libsys_name(i);
+        size_t kl = strlen(nm);
+        if (callee.size == kl && memcmp(callee.str, nm, kl) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Per-translation registry: which LibSysSym values are referenced, and
+// in what dense order. Populated by a discovery pass before layout.
+typedef struct {
+    bool     used[LS_COUNT];
+    uint32_t stub_index[LS_COUNT];   // dense index, valid iff used[i]
+    uint32_t n_stubs;                 // total libSystem symbols used
+} LibSysRegistry;
+
 static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
     out->name     = attr_s(fn, "sym_name");
     out->exported = attr_b(fn, "exported");
@@ -1250,22 +1321,60 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     while (text_size % 4) text_size++;
 
     // -----------------------------------------------------------------
+    // Discovery pass: walk every BL reloc and record which libSystem
+    // names are referenced. Each unique referenced name gets a dense
+    // stub index in first-seen order, which determines its position
+    // in __stubs / __got / chained-fixups imports / dysymtab
+    // indirect-syms.
+    //
+    // Done BEFORE layout because n_libsys_stubs feeds into
+    // stubs_size, got_size, sizeofcmds (via section count and load-cmd
+    // body sizes), and the strtab. Done AFTER text layout because
+    // unreachable BL relocs in functions that ended up at non-zero
+    // text_off are still real references that need stubs.
+    // -----------------------------------------------------------------
+    LibSysRegistry libsys = {0};
+    for (size_t i = 0; i < n_funcs; i++) {
+        for (size_t k = 0; k < efs[i].n_relocs; k++) {
+            BlReloc *r = &efs[i].relocs[k];
+            int ls = libsys_lookup(r->callee);
+            if (ls < 0) continue;
+            if (!libsys.used[ls]) {
+                libsys.used[ls] = true;
+                libsys.stub_index[ls] = libsys.n_stubs++;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Patch `bl` PC-relative displacements. Each reloc identifies its
-    // callee by symbol name; resolve against the local table only —
-    // first-light has no inter-module calls.
+    // callee by symbol name. Resolve against (in order):
+    //   1. local functions  — branch to efs[j].text_off
+    //   2. libSystem stubs   — branch to text_size + stub_index * 12
+    // anything else is a hard error (no inter-module-text linking yet).
     // -----------------------------------------------------------------
     for (size_t i = 0; i < n_funcs; i++) {
         for (size_t k = 0; k < efs[i].n_relocs; k++) {
             BlReloc *r = &efs[i].relocs[k];
-            size_t   tgt = (size_t)-1;
+            uint32_t dst_pc;
+            bool resolved = false;
             for (size_t j = 0; j < n_funcs; j++) {
                 if (efs[j].name.size == r->callee.size
                     && memcmp(efs[j].name.str, r->callee.str,
                               r->callee.size) == 0) {
-                    tgt = j; break;
+                    dst_pc = efs[j].text_off;
+                    resolved = true;
+                    break;
                 }
             }
-            if (tgt == (size_t)-1) {
+            if (!resolved) {
+                int ls = libsys_lookup(r->callee);
+                if (ls >= 0 && libsys.used[ls]) {
+                    dst_pc = text_size + libsys.stub_index[ls] * 12u;
+                    resolved = true;
+                }
+            }
+            if (!resolved) {
                 fprintf(stderr,
                     "aarch64->macho: bl to unknown symbol '%.*s'\n",
                     (int)r->callee.size, r->callee.str);
@@ -1276,7 +1385,6 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
                 free(efs); return false;
             }
             uint32_t src_pc = efs[i].text_off + r->fn_off;
-            uint32_t dst_pc = efs[tgt].text_off;
             int32_t  rel    = (int32_t)dst_pc - (int32_t)src_pc;
             int32_t  imm26  = rel >> 2;
             uint32_t insn   = arm64_bl(imm26);
@@ -1288,21 +1396,23 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     }
 
     // -----------------------------------------------------------------
-    // Layout constants. This is the macho_exit reference layout
-    // (n_stubs == 0, no __DATA segment). See mlir_wasm_to_macho.c for
-    // the full annotated walk-through; the load-command list here
-    // matches that file's `macho_exit` shape byte-for-byte.
+    // Layout constants. n_stubs is the count of libSystem imports the
+    // BL discovery pass found. See mlir_wasm_to_macho.c for the full
+    // annotated walk-through of the load-command shape.
     // -----------------------------------------------------------------
-    const uint32_t n_stubs = 0;
+    const uint32_t n_stubs = libsys.n_stubs;
     const uint32_t stub_size = 12;
     const uint32_t got_size  = n_stubs * 8;
 
-    // sizeofcmds varies with __DATA presence. Section count grows to 3
-    // when we have __linmem_init bytes (file-backed init data overlaying
-    // the start of linmem). Each section adds 80 bytes to the load cmd.
+    // sizeofcmds varies with __DATA presence. We use up to 2 sections in
+    // __DATA: __data + __linmem_template. Linear memory itself is
+    // allocated dynamically by `_start` via mmap (see synth_start in
+    // mlir_wmir_to_aarch64.c), so the binary no longer reserves a
+    // multi-GiB __linmem_bss zerofill section — that placement is
+    // incompatible with the dyld shared cache on macOS arm64.
     uint32_t n_data_sections  = 0;
-    if (has_data_seg) n_data_sections = 2;
-    if (linmem_init_size > 0) n_data_sections = 3;
+    if (has_data_seg) n_data_sections = 1;
+    if (linmem_init_size > 0) n_data_sections = 2;
     uint32_t data_seg_lc_size = has_data_seg
         ? (72u + n_data_sections * 80u)
         : 0u;
@@ -1322,30 +1432,25 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     const uint64_t data_const_vm_base   = TEXT_VM_BASE + text_seg_size;
     const uint32_t data_const_file_base = text_seg_size;
 
-    // __DATA segment (between __DATA_CONST and __LINKEDIT). Up to 3
-    // sections:
-    //   __data        S_REGULAR  (file-backed): data_priv (32B) + globals
-    //   __linmem_init S_REGULAR  (file-backed): initialised linmem bytes
-    //                                            (only if linmem_init_size > 0)
-    //   __linmem_bss  S_ZEROFILL: rest of linmem (zero-filled)
+    // __DATA segment (between __DATA_CONST and __LINKEDIT). Up to 2
+    // sections, all file-backed and laid out sequentially:
+    //   __data            S_REGULAR: data_priv (32B) + globals
+    //   __linmem_template S_REGULAR: byte-for-byte image of the wasm
+    //                                data segments; copied into the
+    //                                mmap-allocated linmem by `_start`
+    //                                (only present if linmem_init_size > 0)
     uint32_t data_section_payload = data_priv_size + globals_padded;
     uint32_t data_seg_payload    = data_section_payload + linmem_init_size;
     uint64_t data_seg_filesize_v = has_data_seg
         ? (((uint64_t)data_seg_payload + (VMSEG_SIZE - 1u)) & ~(uint64_t)(VMSEG_SIZE - 1u))
         : 0u;
-    uint64_t data_seg_vmpayload  = (uint64_t)data_section_payload + linmem_size;
-    uint64_t data_seg_vmsize     = has_data_seg
-        ? ((data_seg_vmpayload + (VMSEG_SIZE - 1u)) & ~(uint64_t)(VMSEG_SIZE - 1u))
-        : 0u;
+    uint64_t data_seg_vmsize     = data_seg_filesize_v;
 
-    const uint64_t data_vm_base    = data_const_vm_base + VMSEG_SIZE;
-    const uint32_t data_file_base  = data_const_file_base + VMSEG_SIZE;
-    const uint64_t data_priv_vmaddr = data_vm_base;
-    const uint64_t globals_vmaddr   = data_priv_vmaddr + data_priv_size;
-    const uint64_t linmem_vmaddr    = globals_vmaddr + globals_padded;
-    const uint64_t linmem_bss_vmaddr= linmem_vmaddr + linmem_init_size;
-    const uint64_t linmem_bss_vmsize= (linmem_size > linmem_init_size)
-        ? (linmem_size - linmem_init_size) : 0;
+    const uint64_t data_vm_base       = data_const_vm_base + VMSEG_SIZE;
+    const uint32_t data_file_base     = data_const_file_base + VMSEG_SIZE;
+    const uint64_t data_priv_vmaddr   = data_vm_base;
+    const uint64_t globals_vmaddr     = data_priv_vmaddr + data_priv_size;
+    const uint64_t linmem_tpl_vmaddr  = globals_vmaddr + globals_padded;
 
     const uint64_t linkedit_vm_base   = has_data_seg
         ? (data_vm_base + data_seg_vmsize)
@@ -1457,11 +1562,10 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         buf_le32(&img, 0);
     }
 
-    // LC_SEGMENT_64 __DATA (optional). Up to three sections:
-    //   __data        : S_REGULAR  , file-backed, data_priv + globals
-    //   __linmem_init : S_REGULAR  , file-backed, initialised linmem bytes
-    //                                (only present if linmem_init_size > 0)
-    //   __linmem_bss  : S_ZEROFILL , rest of linear memory
+    // LC_SEGMENT_64 __DATA (optional). Up to two sections, both
+    // file-backed and laid out sequentially:
+    //   __data            : data_priv + globals
+    //   __linmem_template : init bytes copied by `_start` into mmap'd linmem
     if (has_data_seg) {
         buf_le32(&img, LC_SEGMENT_64);
         buf_le32(&img, 72u + n_data_sections * 80u);
@@ -1487,27 +1591,15 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
             buf_le32(&img, 0); buf_le32(&img, 0); buf_le32(&img, 0);
         }
         if (linmem_init_size > 0) {
-            static const char SN[16] = "__linmem_init";
+            static const char SN[16] = "__linmem_tpl";
             static const char SG[16] = "__DATA";
             buf_append(&img, SN, 16); buf_append(&img, SG, 16);
-            buf_le64(&img, linmem_vmaddr);
+            buf_le64(&img, linmem_tpl_vmaddr);
             buf_le64(&img, (uint64_t)linmem_init_size);
             buf_le32(&img, data_file_base + data_section_payload);
             buf_le32(&img, 4);                // align = 2^4 = 16
             buf_le32(&img, 0); buf_le32(&img, 0);
             buf_le32(&img, 0);                // S_REGULAR
-            buf_le32(&img, 0); buf_le32(&img, 0); buf_le32(&img, 0);
-        }
-        {
-            static const char SN[16] = "__linmem_bss";
-            static const char SG[16] = "__DATA";
-            buf_append(&img, SN, 16); buf_append(&img, SG, 16);
-            buf_le64(&img, linmem_bss_vmaddr);
-            buf_le64(&img, linmem_bss_vmsize);
-            buf_le32(&img, 0);                // offset = 0 (zerofill)
-            buf_le32(&img, 3);
-            buf_le32(&img, 0); buf_le32(&img, 0);
-            buf_le32(&img, 1);                // S_ZEROFILL
             buf_le32(&img, 0); buf_le32(&img, 0); buf_le32(&img, 0);
         }
     }
@@ -1567,9 +1659,18 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     buf_le64(&img, 0);
 
     // LC_MAIN
+    // Initial stack size: 256 MB. This is large because the wmir
+    // backend currently doesn't promote wasm locals to physical
+    // registers — every local lives in an 8-byte stack cell, and
+    // the regalloc spills aggressively (no live-range splitting).
+    // Real-world tinyc functions like emit_expr end up with ~225 KB
+    // per-call frames, so the parser only gets ~35 levels of
+    // recursion on the macOS default 8 MB stack and OOMs on
+    // deeply-nested expressions. 256 MB gives ~1100 emit_expr
+    // levels which is plenty for tinyc's selfhost workload.
     buf_le32(&img, LC_MAIN); buf_le32(&img, 24);
     buf_le64(&img, (uint64_t)text_section_off);
-    buf_le64(&img, 32ULL * 1024 * 1024);
+    buf_le64(&img, 256ULL * 1024 * 1024);
 
     // LC_LOAD_DYLIB libSystem (kept so the load-command layout matches
     // the macho_exit reference even though we don't import anything).
@@ -1599,20 +1700,55 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         buf_append(&img, efs[i].code.data, efs[i].code.len);
     }
     buf_pad_to(&img, stubs_off);
-    // __stubs empty.
+
+    // __stubs: one ADRP/LDR/BR triple per libSystem import. Stub `i`
+    // points at __got slot `i`; dyld populates the slot at load time
+    // via the chained-fixups blob we emit below.
+    {
+        uint64_t data_const_vm_base_64 = TEXT_VM_BASE + (uint64_t)text_seg_size;
+        for (uint32_t i = 0; i < n_stubs; i++) {
+            uint64_t got_target = data_const_vm_base_64 + 8ULL * i;
+            uint64_t stub_addr  = TEXT_VM_BASE + (uint64_t)stubs_off
+                                + (uint64_t)i * stub_size;
+            uint64_t page_dst   = got_target & ~0xfffULL;
+            uint64_t page_src   = stub_addr  & ~0xfffULL;
+            int64_t  page_diff  = (int64_t)(page_dst - page_src);
+            int64_t  page_imm   = page_diff >> 12;
+            uint32_t immlo = (uint32_t)(page_imm & 0x3);
+            uint32_t immhi = (uint32_t)((page_imm >> 2) & 0x7ffff);
+            uint32_t adrp  = 0x90000010u | (immlo << 29) | (immhi << 5);
+            uint32_t lo12  = (uint32_t)(got_target & 0xfffu);
+            uint32_t ldr   = 0xf9400210u | (((lo12 >> 3) & 0xfffu) << 10);
+            uint32_t br    = 0xd61f0200u;  // br x16
+            buf_le32(&img, adrp);
+            buf_le32(&img, ldr);
+            buf_le32(&img, br);
+        }
+    }
     buf_pad_to(&img, cstring_off);
     // __cstring empty.
 
     // Pad to __DATA_CONST.
     buf_pad_to(&img, data_const_file_base);
-    // __got empty (zero bytes written; the segment file size is
-    // VMSEG_SIZE, padded below when we pad to data_file_base or
-    // linkedit_file_base).
+    // __got: one chained-fixup-format pointer per libSystem import. The
+    // format is DYLD_CHAINED_PTR_64_OFFSET (pointer_format=6). Layout
+    // (LSB-first):
+    //   bits  0..23   ordinal (= imports[] index)
+    //   bits 24..31   addend
+    //   bits 32..50   reserved
+    //   bits 51..62   next (stride 4; step 2 to reach the next 8B slot)
+    //   bit      63   bind (1)
+    for (uint32_t i = 0; i < n_stubs; i++) {
+        uint64_t v = (1ULL << 63) | (uint64_t)i;
+        if (i + 1 < n_stubs) v |= (2ULL << 51);
+        buf_le64(&img, v);
+    }
 
     // -----------------------------------------------------------------
     // __DATA file content (if any): __data section (data_priv + globals)
-    // followed by __linmem_init bytes overlaid by offset. __linmem_bss
-    // is S_ZEROFILL so contributes only to vmsize.
+    // followed by __linmem_template bytes (file-backed wasm init data
+    // that `_start` will memcpy into mmap'd linmem). No zerofill — the
+    // remainder of linmem is anonymous mmap'd RAM.
     // -----------------------------------------------------------------
     if (has_data_seg) {
         buf_pad_to(&img, data_file_base);
@@ -1627,14 +1763,10 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         while ((img.len - (data_file_base + data_priv_size)) < globals_padded) {
             buf_u8(&img, 0);
         }
-        // __linmem_init section: zero-initialise the whole window then
-        // overlay each data_init record's bytes at its (wasm-offset
-        // relative) position. The first valid wasm data offset is
-        // WASM_DATA_BASE (= 1024); offsets are absolute within linmem,
-        // so the file slot for offset O is data_file_base +
-        // data_section_payload + (O - 0). Since x28 (linmem base) points
-        // at linmem_vmaddr which corresponds to wasm offset 0, the data
-        // we lay down at section start is wasm offset 0.
+        // __linmem_template section: zero-initialise the whole window
+        // then overlay each data_init record's bytes at its
+        // (wasm-offset relative) position. _start memcpys this into
+        // mmap'd linmem at runtime.
         if (linmem_init_size > 0) {
             uint32_t init_start = (uint32_t)img.len;
             for (uint32_t k = 0; k < linmem_init_size; k++) buf_u8(&img, 0);
@@ -1667,8 +1799,8 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
                 dst_vm = data_priv_vmaddr;
             } else if (dr->kind.size == 7 && memcmp(dr->kind.str, "globals", 7) == 0) {
                 dst_vm = globals_vmaddr;
-            } else if (dr->kind.size == 6 && memcmp(dr->kind.str, "linmem", 6) == 0) {
-                dst_vm = linmem_vmaddr;
+            } else if (dr->kind.size == 15 && memcmp(dr->kind.str, "linmem_template", 15) == 0) {
+                dst_vm = linmem_tpl_vmaddr;
             } else {
                 fprintf(stderr,
                     "aarch64->macho: unknown data reloc kind '%.*s'\n",
@@ -1729,13 +1861,65 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     buf_le64(&img, (uint64_t)data_const_file_base);
     buf_le32(&img, 0);
     buf_le16(&img, 1);
-    buf_le16(&img, 0xffff);                // page_start[0] = DYLD_CHAINED_PTR_START_NONE
+    // page_start[0]: 0 = chain starts at byte 0 of the page; 0xffff =
+    // DYLD_CHAINED_PTR_START_NONE (no fixups on this page). When n_stubs
+    // is 0 there's nothing to fix up so we mark the page as having no
+    // chain to avoid dyld walking uninitialised bytes.
+    buf_le16(&img, n_stubs > 0 ? 0 : 0xffff);
 
-    // imports table: empty (n_stubs = 0).
-    // symbols table: leading 0 + trailing pad.
+    // imports table: one DYLD_CHAINED_IMPORT (4B) per stub.
+    //   bits  0..7   lib_ordinal (= 1 for libSystem.B.dylib, the only
+    //                  LC_LOAD_DYLIB load command)
+    //   bit       8  weak_import (0)
+    //   bits  9..31  name_offset into symbols table
+    //
+    // For each stub_index i, we find which libsys name has stub_index==i
+    // and emit it in that order — the linker builds the chained-fixup
+    // chain in this order, so import[i] must match GOT slot i.
+    uint32_t libsys_name_offsets[LS_COUNT] = {0};
+    {
+        // Pre-compute the byte offset of each libsys name in the
+        // symbol-names blob. Leading 0 byte is at offset 0; first name
+        // at offset 1.
+        uint32_t off = 1;  // skip the leading 0
+        for (uint32_t i = 0; i < n_stubs; i++) {
+            // Find which libsys name has stub_index == i.
+            for (size_t k = 0; k < LS_COUNT; k++) {
+                if (libsys.used[k] && libsys.stub_index[k] == i) {
+                    libsys_name_offsets[k] = off;
+                    off += (uint32_t)strlen(libsys_name(k)) + 1u;
+                    break;
+                }
+            }
+        }
+    }
+    for (uint32_t i = 0; i < n_stubs; i++) {
+        for (size_t k = 0; k < LS_COUNT; k++) {
+            if (libsys.used[k] && libsys.stub_index[k] == i) {
+                uint32_t lib_ordinal = 1;
+                uint32_t name_off    = libsys_name_offsets[k];
+                buf_le32(&img,
+                    (lib_ordinal & 0xffu)
+                    | ((name_off & 0x7fffffu) << 9));
+                break;
+            }
+        }
+    }
+
+    // symbols table: leading 0, then each used libsys name in
+    // stub-index order, NUL-terminated. Padded to multiple of 8 below.
     buf_u8(&img, 0);
-    buf_u8(&img, 0);
-    buf_u8(&img, 0);
+    for (uint32_t i = 0; i < n_stubs; i++) {
+        for (size_t k = 0; k < LS_COUNT; k++) {
+            if (libsys.used[k] && libsys.stub_index[k] == i) {
+                const char *nm = libsys_name(k);
+                size_t nl = strlen(nm);
+                for (size_t j = 0; j < nl; j++) buf_u8(&img, (uint8_t)nm[j]);
+                buf_u8(&img, 0);
+                break;
+            }
+        }
+    }
     while ((img.len - chained_start) % 8) buf_u8(&img, 0);
     uint32_t chained_size = (uint32_t)(img.len - chained_start);
 
@@ -1768,11 +1952,27 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     uint32_t fs_size = (uint32_t)(img.len - fs_start);
 
     // ---- symtab + strtab ----
+    // Layout: [defined syms (mh, main)] + [undef syms (libsys imports)],
+    // then strtab. Undef syms come AFTER defined ones because LC_DYSYMTAB
+    // describes them as contiguous ranges (iundefsym = 2 for our two
+    // defined syms). Indirect-syms references __stubs section, one
+    // entry per stub, pointing at the symtab index of its undef sym.
     Buf strtab = {0};
     buf_u8(&strtab, 0x20);
     buf_u8(&strtab, 0x00);
     uint32_t str_mh   = (uint32_t)strtab.len; buf_cstr(&strtab, "__mh_execute_header");
     uint32_t str_main = (uint32_t)strtab.len; buf_cstr(&strtab, "_main");
+    // libsys symbol names in stub-index order.
+    uint32_t libsys_str_off[LS_COUNT] = {0};
+    for (uint32_t i = 0; i < n_stubs; i++) {
+        for (size_t k = 0; k < LS_COUNT; k++) {
+            if (libsys.used[k] && libsys.stub_index[k] == i) {
+                libsys_str_off[k] = (uint32_t)strtab.len;
+                buf_cstr(&strtab, libsys_name(k));
+                break;
+            }
+        }
+    }
     while (strtab.len % 8) buf_u8(&strtab, 0);
 
     Buf symtab = {0};
@@ -1786,12 +1986,36 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     buf_u8(&symtab, 0x0f); buf_u8(&symtab, 1);
     buf_le16(&symtab, 0x0000);
     buf_le64(&symtab, TEXT_VM_BASE + text_section_off);
+    // libsys undefs (n_type=N_UNDF|N_EXT=0x01, n_sect=0, n_desc=lib_ordinal<<8,
+    // n_value=0). Order MUST match stub_index so indirect-syms can
+    // point at symtab index (2 + stub_index).
+    for (uint32_t i = 0; i < n_stubs; i++) {
+        for (size_t k = 0; k < LS_COUNT; k++) {
+            if (libsys.used[k] && libsys.stub_index[k] == i) {
+                buf_le32(&symtab, libsys_str_off[k]);
+                buf_u8(&symtab, 0x01);          // N_UNDF | N_EXT
+                buf_u8(&symtab, 0);             // n_sect = NO_SECT
+                // n_desc: lib_ordinal in high byte (libSystem = 1).
+                // Bits: REFERENCE_FLAG_UNDEFINED_NON_LAZY (0) + ordinal.
+                buf_le16(&symtab, (uint16_t)(1u << 8));
+                buf_le64(&symtab, 0);
+                break;
+            }
+        }
+    }
 
-    uint32_t n_syms       = 2;
-    uint32_t n_undefs     = 0;
+    uint32_t n_syms       = 2u + n_stubs;
+    uint32_t n_undefs     = n_stubs;
     uint32_t iundefsym    = 2;
 
+    // Indirect-symbols table: 2*n_stubs entries. The first n_stubs are
+    // for the __got section (reserved1=0 in the section header); the
+    // next n_stubs are for __stubs (reserved1=n_stubs). Both blocks
+    // hold the same values: indirect_sym[i] = symtab index of the
+    // undef sym that backs slot i. Our undefs start at symtab[2].
     Buf indsyms = {0};
+    for (uint32_t i = 0; i < n_stubs; i++) buf_le32(&indsyms, 2u + i);  // GOT
+    for (uint32_t i = 0; i < n_stubs; i++) buf_le32(&indsyms, 2u + i);  // stubs
 
     size_t symtab_off  = img.len;
     buf_append(&img, symtab.data, symtab.len);

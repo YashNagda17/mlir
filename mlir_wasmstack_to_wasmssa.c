@@ -52,12 +52,29 @@
 // helper that gets re-synthesised; in that case the wasmstack.func's
 // body is discarded and the function is lifted as an import_func
 // declaration.
+//
+// Notable absence: malloc/free. The corec-stdlib selfhost path
+// compiles a real malloc that tags each block with a size header so
+// realloc can find the old block size; the wmir synth_malloc is a
+// header-less bump allocator. If we discarded the user body and let
+// synth_malloc shadow the corec malloc, realloc would read garbage
+// out of the missing header. The wmir backend's `user_provides_*`
+// gate (see ModInfo in mlir_wmir_to_aarch64.c) suppresses the synth
+// helpers when the user already provides them, so leaving the user
+// body in place is correct.
+//
+// strlen/strcmp/memcmp/memchr used to be in this list as a workaround
+// for a wasm `loop` lowering bug where the implicit fall-off-end
+// branched back to the loop header instead of the post-loop exit.
+// That bug is now fixed in mlir_wasmssa_to_wmir.c (the loop frame
+// tracks `br_target` and `fall_target` separately so block_return
+// targets the correct exit). These four lifted bodies are now used
+// in preference to the hand-coded synth versions.
 // =============================================================================
 static bool is_synth_helper(string nm) {
     static const char *kHelpers[] = {
         "printI64", "printNewline", "printStr", "printf",
         "printF32", "printF64",
-        "malloc", "free", "strlen", "strcmp", "memcmp", "memchr",
         "fd_write", "proc_exit",
         "tinyc_va_arg_i32", "tinyc_va_arg_i64", "tinyc_va_arg_ptr",
         "tinyc_va_arg_struct", "tinyc_va_arg_f64",
@@ -224,17 +241,7 @@ static MLIR_OpHandle build_op_region(MLIR_Context *ctx, MLIR_OpType t,
         MLIR_INVALID_HANDLE, (string){0}, -1);
 }
 
-// Wasm valtype byte -> bytes per cell as actually stored. We use 8 byte
-// cells for every local so 32- and 64-bit values share the same slot
-// stride and the address math is `base + 8*idx`.
-#define LOCAL_CELL_BYTES 8
-static uint32_t vt_byte_size(uint8_t vt) {
-    switch (vt) {
-    case WT_I32: case WT_F32: return 4;
-    case WT_I64: case WT_F64: return 8;
-    default: return 4;  // fall-back, treat ref types as i32-sized
-    }
-}
+
 
 // =============================================================================
 // Sibling-scope lookup (callee signatures). We do a linear scan because
@@ -324,18 +331,14 @@ typedef struct {
     Arena            *arena;
     MLIR_BlockHandle  siblings;
 
-    // Locals are spilled to a stack-allocated region in linmem to keep
-    // SSA correctness across blocks (wasm-ld emits local.set inside
-    // conditional regions, which would otherwise require phi nodes).
-    // Each local cell is 8 bytes (max of i32/i64/f32/f64).
-    // F->local_offs[i] = byte offset of cell i within the locals area.
-    // local.get/set/tee become wasmssa.load/store(%locals_bp,
-    // memory_offset = local_offs[i]).
-    uint32_t         *local_offs;
-    size_t            nl_total;
+    // Wasm function locals (params followed by declared locals). These
+    // are NOT spilled into linmem: lifter emits wasmssa.local_get/set
+    // ops carrying `local_idx`, which the wmir->aarch64 backend lowers
+    // to ldr/str on the native stack frame. (The old design spilled
+    // every local into an 8-byte linmem cell, which inflated wasm SP
+    // usage by ~20x and forced unrealistic stack-size grows.)
+    uint32_t          nl_total;
     uint8_t          *local_types;
-    MLIR_ValueHandle  locals_bp;        // %bp: wasm i32 ptr to locals area
-    uint32_t          locals_size;      // total size of locals area (bytes)
 
     size_t            nr;
     uint8_t          *result_types;
@@ -370,65 +373,37 @@ static bool pop_n(FnCtx *F, size_t n, MLIR_ValueHandle *args) {
 }
 
 // -----------------------------------------------------------------------------
-// Locals-as-memory helpers. Each wasm local is backed by an 8-byte cell
-// in a stack-allocated region of linmem pointed to by F->locals_bp.
-// Using memory (instead of carrying SSA values directly) sidesteps the
-// need for phi/block-arg construction across blocks — wasm-ld output
-// freely mutates locals inside conditional regions.
+// Locals-as-frame-slots helpers. Each wasm local lives in a slot on the
+// native AArch64 stack frame (allocated by the wmir->aarch64 prologue).
+// The lifter just emits wasmssa.local_get / wasmssa.local_set ops
+// carrying `local_idx`; downstream lowering allocates and addresses
+// the slots. Locals are NEVER address-taken in wasm, so we don't need
+// to expose any pointer to them.
 // -----------------------------------------------------------------------------
 static MLIR_ValueHandle emit_local_load(FnCtx *F, uint32_t li) {
     uint8_t vt = F->local_types[li];
-    MLIR_AttributeHandle as[4];
+    MLIR_AttributeHandle as[2];
     as[0] = attr_i32(F->ctx, "valtype", vt);
-    as[1] = attr_i32(F->ctx, "memory_offset", (int64_t)F->local_offs[li]);
-    as[2] = attr_i32(F->ctx, "memory_align_log2", vt_byte_size(vt) == 8 ? 3 : 2);
-    as[3] = attr_i32(F->ctx, "mem_size_bytes", (int64_t)vt_byte_size(vt));
-    MLIR_ValueHandle ops[1] = { F->locals_bp };
+    as[1] = attr_i32(F->ctx, "local_idx", (int64_t)li);
     MLIR_TypeHandle ty = vt_to_type(F->ctx, vt);
     MLIR_ValueHandle rv;
-    emit(F, build_op_1res(F->ctx, OP_TYPE_WASMSSA_LOAD,
-        as, 4, ops, 1, ty, &rv));
+    emit(F, build_op_1res(F->ctx, OP_TYPE_WASMSSA_LOCAL_GET,
+        as, 2, NULL, 0, ty, &rv));
     return rv;
 }
 static void emit_local_store(FnCtx *F, uint32_t li, MLIR_ValueHandle val) {
     uint8_t vt = F->local_types[li];
-    MLIR_AttributeHandle as[4];
+    MLIR_AttributeHandle as[2];
     as[0] = attr_i32(F->ctx, "valtype", vt);
-    as[1] = attr_i32(F->ctx, "memory_offset", (int64_t)F->local_offs[li]);
-    as[2] = attr_i32(F->ctx, "memory_align_log2", vt_byte_size(vt) == 8 ? 3 : 2);
-    as[3] = attr_i32(F->ctx, "mem_size_bytes", (int64_t)vt_byte_size(vt));
-    MLIR_ValueHandle ops[2] = { F->locals_bp, val };
-    emit(F, build_op_no_res(F->ctx, OP_TYPE_WASMSSA_STORE,
-        as, 4, ops, 2));
+    as[1] = attr_i32(F->ctx, "local_idx", (int64_t)li);
+    MLIR_ValueHandle ops[1] = { val };
+    emit(F, build_op_no_res(F->ctx, OP_TYPE_WASMSSA_LOCAL_SET,
+        as, 2, ops, 1));
 }
 
-// Restore wasm SP (global 0) by adding F->locals_size back to F->locals_bp.
-// Emitted before every wasmssa.return op and before the implicit fall-off-
-// the-end return.
-static void emit_locals_pop(FnCtx *F) {
-    if (F->locals_size == 0) return;
-    // %sz = const i32 locals_size
-    MLIR_AttributeHandle cas[2];
-    cas[0] = attr_i32(F->ctx, "valtype", WT_I32);
-    cas[1] = attr_i64(F->ctx, "value", (int64_t)F->locals_size);
-    MLIR_ValueHandle sz;
-    emit(F, build_op_1res(F->ctx, OP_TYPE_WASMSSA_CONST,
-        cas, 2, NULL, 0, vt_to_type(F->ctx, WT_I32), &sz));
-    // %restored = add locals_bp, sz
-    MLIR_AttributeHandle aas[1];
-    aas[0] = attr_i32(F->ctx, "valtype", WT_I32);
-    MLIR_ValueHandle aops[2] = { F->locals_bp, sz };
-    MLIR_ValueHandle restored;
-    emit(F, build_op_1res(F->ctx, OP_TYPE_WASMSSA_ADD,
-        aas, 1, aops, 2, vt_to_type(F->ctx, WT_I32), &restored));
-    // global_set 0 = restored
-    MLIR_AttributeHandle gas[2];
-    gas[0] = attr_i32(F->ctx, "valtype", WT_I32);
-    gas[1] = attr_i32(F->ctx, "global_idx", 0);
-    MLIR_ValueHandle gops[1] = { restored };
-    emit(F, build_op_no_res(F->ctx, OP_TYPE_WASMSSA_GLOBAL_SET,
-        gas, 2, gops, 1));
-}
+// (Removed emit_locals_pop: there is no wasm-SP-based locals region
+// to free anymore. The native AArch64 frame allocation/deallocation
+// is fully managed by the wmir->aarch64 prologue/epilogue.)
 
 // =============================================================================
 // Build a wasmssa.block / .loop / .if op from a populated body block.
@@ -699,7 +674,7 @@ static bool lift_body(FnCtx *F, MLIR_BlockHandle src_blk) {
         case OP_TYPE_WASMSTACK_LOCAL_GET: {
             uint32_t li = (uint32_t)at_i(bo, "local_idx");
             if (li >= F->nl_total) {
-                fprintf(stderr, "ws->ssa: local.get %u out of range (%zu)\n",
+                fprintf(stderr, "ws->ssa: local.get %u out of range (%u)\n",
                     li, F->nl_total);
                 return false;
             }
@@ -1006,7 +981,6 @@ static bool lift_body(FnCtx *F, MLIR_BlockHandle src_blk) {
             MLIR_ValueHandle *opnds = (MLIR_ValueHandle *)arena_alloc(F->arena,
                 (F->nr ? F->nr : 1) * sizeof(MLIR_ValueHandle));
             for (size_t k = F->nr; k > 0; k--) opnds[k - 1] = st_pop(&F->stack);
-            emit_locals_pop(F);
             MLIR_AttributeHandle as[1];
             as[0] = attr_i32(F->ctx, "valtype", 0);
             emit(F, build_op_no_res(F->ctx, OP_TYPE_WASMSSA_RETURN,
@@ -1100,7 +1074,6 @@ static bool lift_body(FnCtx *F, MLIR_BlockHandle src_blk) {
                 MLIR_ValueHandle *opnds = (MLIR_ValueHandle *)arena_alloc(F->arena,
                     (F->nr ? F->nr : 1) * sizeof(MLIR_ValueHandle));
                 for (size_t k = F->nr; k > 0; k--) opnds[k - 1] = st_pop(&F->stack);
-                emit_locals_pop(F);
                 MLIR_AttributeHandle as[1];
                 as[0] = attr_i32(F->ctx, "valtype", 0);
                 emit(F, build_op_no_res(F->ctx, OP_TYPE_WASMSSA_RETURN,
@@ -1301,7 +1274,6 @@ static bool lift_body(FnCtx *F, MLIR_BlockHandle src_blk) {
         MLIR_ValueHandle *opnds = (MLIR_ValueHandle *)arena_alloc(F->arena,
             (F->nr ? F->nr : 1) * sizeof(MLIR_ValueHandle));
         for (size_t k = F->nr; k > 0; k--) opnds[k - 1] = st_pop(&F->stack);
-        emit_locals_pop(F);
         MLIR_AttributeHandle as[1];
         as[0] = attr_i32(F->ctx, "valtype", 0);
         emit(F, build_op_no_res(F->ctx, OP_TYPE_WASMSSA_RETURN,
@@ -1359,23 +1331,6 @@ static MLIR_OpHandle lift_func(MLIR_Context *ctx, Arena *arena,
         param_args[i] = a;
     }
 
-    // Compute per-local byte offsets and total locals size (8-byte stride
-    // so any vt fits). Locals layout: index 0 at offset 0, index 1 at
-    // offset 8, etc. Wasm linmem grows DOWN from SP so the cells appear
-    // contiguously above the current SP.
-    uint32_t *local_offs = NULL;
-    uint32_t locals_size = 0;
-    if (nl_total) {
-        local_offs = (uint32_t *)arena_alloc(tmp,
-            nl_total * sizeof(uint32_t));
-        for (size_t i = 0; i < nl_total; i++) {
-            local_offs[i] = (uint32_t)(i * LOCAL_CELL_BYTES);
-        }
-        locals_size = (uint32_t)(nl_total * LOCAL_CELL_BYTES);
-        // Round up to 16 for stack alignment paranoia.
-        locals_size = (locals_size + 15u) & ~15u;
-    }
-
     FnCtx F = {0};
     F.ctx = ctx;
     F.arena = tmp;
@@ -1391,69 +1346,28 @@ static MLIR_OpHandle lift_func(MLIR_Context *ctx, Arena *arena,
         buf[sym_name.size] = '\0';
         g_current_fn_name = buf;
     }
-    F.nl_total = nl_total;
+    F.nl_total = (uint32_t)nl_total;
     F.local_types = locals;
-    F.local_offs = local_offs;
-    F.locals_size = locals_size;
     F.nr = nr;
     F.cur = entry;
     F.cur_terminated = false;
 
-    // Synth function prologue: allocate locals region from wasm SP
-    // (global 0). %bp = global_get(0) - locals_size; global_set(0, %bp).
-    if (locals_size > 0) {
-        MLIR_AttributeHandle ggas[2];
-        ggas[0] = attr_i32(ctx, "valtype", WT_I32);
-        ggas[1] = attr_i32(ctx, "global_idx", 0);
-        MLIR_ValueHandle sp;
-        emit(&F, build_op_1res(ctx, OP_TYPE_WASMSSA_GLOBAL_GET,
-            ggas, 2, NULL, 0, vt_to_type(ctx, WT_I32), &sp));
-
-        MLIR_AttributeHandle cas[2];
-        cas[0] = attr_i32(ctx, "valtype", WT_I32);
-        cas[1] = attr_i64(ctx, "value", (int64_t)locals_size);
-        MLIR_ValueHandle sz;
+    // Function prologue: copy params (entry block args) into their
+    // corresponding local slots, then zero-initialise non-param
+    // locals (wasm semantics). The wmir->aarch64 backend reads
+    // `local_types` off wasmssa.func to size the native frame.
+    for (size_t i = 0; i < np; i++) {
+        emit_local_store(&F, (uint32_t)i, param_args[i]);
+    }
+    for (size_t i = np; i < nl_total; i++) {
+        MLIR_AttributeHandle zas[2];
+        zas[0] = attr_i32(ctx, "valtype", locals[i]);
+        zas[1] = attr_i64(ctx, "value", 0);
+        MLIR_TypeHandle zty = vt_to_type(ctx, locals[i]);
+        MLIR_ValueHandle z;
         emit(&F, build_op_1res(ctx, OP_TYPE_WASMSSA_CONST,
-            cas, 2, NULL, 0, vt_to_type(ctx, WT_I32), &sz));
-
-        MLIR_AttributeHandle sas[1];
-        sas[0] = attr_i32(ctx, "valtype", WT_I32);
-        MLIR_ValueHandle sops[2] = { sp, sz };
-        MLIR_ValueHandle bp;
-        emit(&F, build_op_1res(ctx, OP_TYPE_WASMSSA_SUB,
-            sas, 1, sops, 2, vt_to_type(ctx, WT_I32), &bp));
-        F.locals_bp = bp;
-
-        MLIR_AttributeHandle gsas[2];
-        gsas[0] = attr_i32(ctx, "valtype", WT_I32);
-        gsas[1] = attr_i32(ctx, "global_idx", 0);
-        MLIR_ValueHandle gsops[1] = { bp };
-        emit(&F, build_op_no_res(ctx, OP_TYPE_WASMSSA_GLOBAL_SET,
-            gsas, 2, gsops, 1));
-
-        // Store each param into its local cell. Locals beyond the params
-        // are left uninitialised — wasm semantics requires them to start
-        // at zero but wasm-ld emits explicit `local.set 0` for each one
-        // before reading. (If that turns out to be wrong we can zero-
-        // initialise here.)
-        for (size_t i = 0; i < np; i++) {
-            emit_local_store(&F, (uint32_t)i, param_args[i]);
-        }
-
-        // Defensive: zero-initialise non-param locals so reads-before-
-        // writes return 0 (wasm semantics). wasm-ld usually emits an
-        // explicit `local.set` before each read anyway, but being
-        // paranoid avoids subtle bugs.
-        for (size_t i = np; i < nl_total; i++) {
-            MLIR_AttributeHandle zas[2];
-            zas[0] = attr_i32(ctx, "valtype", locals[i]);
-            zas[1] = attr_i64(ctx, "value", 0);
-            MLIR_TypeHandle zty = vt_to_type(ctx, locals[i]);
-            MLIR_ValueHandle z;
-            emit(&F, build_op_1res(ctx, OP_TYPE_WASMSSA_CONST,
-                zas, 2, NULL, 0, zty, &z));
-            emit_local_store(&F, (uint32_t)i, z);
-        }
+            zas, 2, NULL, 0, zty, &z));
+        emit_local_store(&F, (uint32_t)i, z);
     }
 
     MLIR_BlockHandle src_blk = MLIR_GetRegionBlock(MLIR_GetOpRegion(src, 0), 0);
@@ -1474,6 +1388,12 @@ static MLIR_OpHandle lift_func(MLIR_Context *ctx, Arena *arena,
     attrs[na++] = attr_s(ctx, "sym_name", sym_name.str, sym_name.size);
     attrs[na++] = attr_s(ctx, "param_types", pt_s.str, pt_s.size);
     attrs[na++] = attr_s(ctx, "result_types", rt_s.str, rt_s.size);
+    // `local_types` carries the full vt sequence for *all* locals
+    // (params first, then declared locals). The wmir->aarch64 backend
+    // reads it to size the per-function native stack frame area used
+    // for wasmssa.local_get / wasmssa.local_set ops.
+    attrs[na++] = attr_s(ctx, "local_types", local_types_s.str,
+        local_types_s.size);
     attrs[na++] = attr_b(ctx, "exported", exported);
     attrs[na++] = attr_b(ctx, "internal", false);
 

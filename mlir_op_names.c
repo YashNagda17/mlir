@@ -167,6 +167,8 @@ static string op_type_to_string_half2(MLIR_OpType type) {
         case OP_TYPE_WASMSSA_CALL_INDIRECT: return str_lit("wasmssa.call_indirect");
         case OP_TYPE_WASMSSA_MEMORY_SIZE: return str_lit("wasmssa.memory_size");
         case OP_TYPE_WASMSSA_MEMORY_GROW: return str_lit("wasmssa.memory_grow");
+        case OP_TYPE_WASMSSA_LOCAL_GET:   return str_lit("wasmssa.local_get");
+        case OP_TYPE_WASMSSA_LOCAL_SET:   return str_lit("wasmssa.local_set");
         // wasmstack dialect
         case OP_TYPE_WASMSTACK_FUNC: return str_lit("wasmstack.func");
         case OP_TYPE_WASMSTACK_IMPORT_FUNC: return str_lit("wasmstack.import_func");
@@ -230,6 +232,8 @@ static string op_type_to_string_half2(MLIR_OpType type) {
         case OP_TYPE_WMIR_GLOBAL_SET: return str_lit("wmir.global_set");
         case OP_TYPE_WMIR_LOAD:       return str_lit("wmir.load");
         case OP_TYPE_WMIR_STORE:      return str_lit("wmir.store");
+        case OP_TYPE_WMIR_LOCAL_GET:  return str_lit("wmir.local_get");
+        case OP_TYPE_WMIR_LOCAL_SET:  return str_lit("wmir.local_set");
         case OP_TYPE_WMIR_CALL:       return str_lit("wmir.call");
         case OP_TYPE_WMIR_ICMP:       return str_lit("wmir.icmp");
         case OP_TYPE_WMIR_EQZ:        return str_lit("wmir.eqz");
