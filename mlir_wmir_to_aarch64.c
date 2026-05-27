@@ -823,6 +823,15 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     string name     = at_s(src, "sym_name");
     bool   exported = at_b(src, "exported");
     string pt       = at_s(src, "param_types");
+    // `local_types` carries the wasm valtype byte (i32=0x7f, i64=0x7e,
+    // f32=0x7d, f64=0x7c) for every wasm local (params first, then
+    // declared locals). We store each local in an 8-byte cell on the
+    // native AArch64 stack frame, contiguous and immediately above
+    // the register-allocator spill slots. `locals_bytes` extends
+    // `frame_size`; wmir.local_get / wmir.local_set address their slot
+    // via [sp, #(spill_bytes + idx*8)].
+    string lt = at_s(src, "local_types");
+    uint32_t locals_count = (uint32_t)(lt.size / 2);  // hex-encoded
 
     if (MLIR_GetOpNumRegions(src) < 1) {
         fprintf(stderr, "wmir->aarch64: wmir.func has no region\n");
@@ -843,7 +852,9 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 (int)name.size, name.str);
         return MLIR_INVALID_HANDLE;
     }
-    uint32_t frame_size = (uint32_t)ra->n_slots * 8u;
+    uint32_t spill_bytes  = (uint32_t)ra->n_slots * 8u;
+    uint32_t locals_bytes = locals_count * 8u;
+    uint32_t frame_size   = spill_bytes + locals_bytes;
     frame_size = (frame_size + 15u) & ~15u;
     // SUB SP, SP, #imm12 [LSL #12] supports up to ~16 MiB. The LDR/STR
     // helpers above transparently rematerialise large offsets via x16,
@@ -1361,6 +1372,27 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 int64_t gi = at_i(op, "global_idx");
                 uint8_t r0 = LD_OPERAND(9, 0);
                 emit_str_w(ctx, dst_blk, r0, 27, (uint32_t)(gi * 8));
+                break;
+            }
+            case OP_TYPE_WMIR_LOCAL_GET: {
+                int64_t idx = at_i(op, "local_idx");
+                uint8_t vt  = (uint8_t)at_i(op, "valtype");
+                bool i64 = (vt == 0x7e || vt == 0x7c); // i64 / f64
+                uint32_t off = spill_bytes + (uint32_t)idx * 8u;
+                uint8_t rd = PICK_RES(9, 0);
+                if (i64) emit_ldr_x(ctx, dst_blk, rd, /*rn=*/31, off);
+                else     emit_ldr_w(ctx, dst_blk, rd, /*rn=*/31, off);
+                ST_RESULT(rd, 0);
+                break;
+            }
+            case OP_TYPE_WMIR_LOCAL_SET: {
+                int64_t idx = at_i(op, "local_idx");
+                uint8_t vt  = (uint8_t)at_i(op, "valtype");
+                bool i64 = (vt == 0x7e || vt == 0x7c); // i64 / f64
+                uint8_t r0 = LD_OPERAND(9, 0);
+                uint32_t off = spill_bytes + (uint32_t)idx * 8u;
+                if (i64) emit_str_x(ctx, dst_blk, r0, /*rn=*/31, off);
+                else     emit_str_w(ctx, dst_blk, r0, /*rn=*/31, off);
                 break;
             }
             case OP_TYPE_WMIR_LOAD: {

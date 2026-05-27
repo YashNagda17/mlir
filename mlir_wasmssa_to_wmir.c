@@ -842,6 +842,44 @@ static bool lower_wasmssa_op(Lowerer *L, MLIR_OpHandle src_op) {
         return true;
     }
 
+    case OP_TYPE_WASMSSA_LOCAL_GET: {
+        uint8_t vt = (uint8_t)at_i(src_op, "valtype");
+        int64_t idx = at_i(src_op, "local_idx");
+        MLIR_AttributeHandle attrs[2] = {
+            attr_i32(ctx, "local_idx", idx),
+            attr_i32(ctx, "valtype",   vt),
+        };
+        MLIR_TypeHandle res_ty[1] = { vt_to_type(ctx, vt) };
+        MLIR_ValueHandle res[1] = {
+            MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0, res_ty[0],
+                (string){0}, MLIR_CreateLocationUnknown(ctx, (string){0}))
+        };
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_LOCAL_GET,
+            attrs, 2, res_ty, 1, res, NULL, 0);
+        L_append(L, out);
+        vmap_set(L->vmap, MLIR_GetOpResult(src_op, 0), res[0]);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_LOCAL_SET: {
+        uint8_t vt = (uint8_t)at_i(src_op, "valtype");
+        int64_t idx = at_i(src_op, "local_idx");
+        MLIR_ValueHandle v;
+        if (!vmap_get(L->vmap, MLIR_GetOpOperand(src_op, 0), &v)) {
+            fprintf(stderr, "wmir: unbound operand on wasmssa.local_set\n");
+            return false;
+        }
+        MLIR_AttributeHandle attrs[2] = {
+            attr_i32(ctx, "local_idx", idx),
+            attr_i32(ctx, "valtype",   vt),
+        };
+        MLIR_ValueHandle ops[1] = { v };
+        MLIR_OpHandle out = build_op_simple(ctx, OP_TYPE_WMIR_LOCAL_SET,
+            attrs, 2, NULL, 0, NULL, ops, 1);
+        L_append(L, out);
+        return true;
+    }
+
     case OP_TYPE_WASMSSA_GLOBAL_SET: {
         int64_t idx = at_i(src_op, "global_idx");
         MLIR_ValueHandle v;
@@ -1456,6 +1494,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     bool   exported  = at_b(src, "exported");
     string pt        = at_s(src, "param_types");
     string rt        = at_s(src, "result_types");
+    string lt        = at_s(src, "local_types");
 
     if (MLIR_GetOpNumRegions(src) < 1) {
         fprintf(stderr, "wmir lowering: wasmssa.func has no region\n");
@@ -1507,6 +1546,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     attrs[na++] = attr_s(ctx, "sym_name",     name.str, name.size);
     attrs[na++] = attr_s(ctx, "param_types",  pt.str,   pt.size);
     attrs[na++] = attr_s(ctx, "result_types", rt.str,   rt.size);
+    attrs[na++] = attr_s(ctx, "local_types",  lt.str,   lt.size);
     attrs[na++] = attr_b(ctx, "exported",     exported);
 
     MLIR_RegionHandle regs[1] = { dst_region };
