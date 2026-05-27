@@ -57,23 +57,17 @@ enum {
     DEFAULT_STACK_SIZE        = 4u * 1024u * 1024u,
     DEFAULT_GLOBAL_BASE_OFFS  = 1024u,
     WASM_PAGE_SIZE            = 65536u,
-    // Maximum linmem size, in wasm pages (64 KiB each). We pre-reserve
-    // this much virtual address space as a zero-fill BSS section in the
-    // Mach-O envelope; macOS lazily commits pages as they are touched,
-    // so the on-disk binary size is unaffected. The wasm-side
-    // `memory.size` / `memory.grow` then bump a counter against this
-    // cap, mirroring real WASI semantics.
+    // Maximum linmem size, in wasm pages (64 KiB each). We allocate
+    // this much heap memory via libSystem mmap at startup (see
+    // synth_start), so the binary's static segments stay tiny and
+    // we are not constrained by macOS dyld shared-cache placement.
     //
-    // 49152 pages = 3 GiB — enough headroom for stage1 tinyc to
-    // selfhost emit.c (~1.88 GiB linmem needed). Anything larger
-    // than ~3.5 GiB pushes the __DATA segment past addresses dyld
-    // is willing to load on macOS.
-    // macOS arm64 dyld shared cache typically begins around
-    // 0x180000000, so __LINKEDIT must end before that. Our __TEXT
-    // starts at 0x100000000 and __DATA follows it; with a small
-    // header that leaves ~2 GiB - 32 KiB for the __DATA segment.
-    // 30720 pages = 1.875 GiB is the practical ceiling.
-    MAX_LINMEM_PAGES          = 30720u,
+    // 65536 pages = 4 GiB — the wasm32 architectural maximum. macOS
+    // arm64 happily mmap()s a 4 GiB anonymous private region; we get
+    // a host pointer that x28 holds for the lifetime of the program.
+    // Stage1 tinyc selfhost peaks around 2 GiB linmem when compiling
+    // emit.c so the headroom matters.
+    MAX_LINMEM_PAGES          = 65536u,
     // Slot offsets within linmem used by synthesised libc shims.
     // See the full linmem-layout doc later in the file. Hoisted here
     // because lowering of `memory.size` / `memory.grow` (which uses
@@ -1611,11 +1605,21 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
 }
 
 // =============================================================================
-// _start synthesis. Sets up x26/x27/x28 then calls main, then svc-exits.
+// _start synthesis. Sets up x26/x27/x28 then calls main, then libSystem-exits.
+//
+// `x28` (the wasm linmem base register) is populated by calling libSystem
+// `mmap` for `linmem_size_bytes` of anonymous RW memory. The initial bytes
+// of linmem (from wasm data segments) live in a file-backed
+// `__linmem_template` section in __DATA; we memcpy them into the freshly
+// mmap'd region. This avoids reserving multi-GiB of zerofill in the
+// Mach-O envelope (which collides with the dyld shared cache on macOS
+// arm64 once linmem exceeds ~1.875 GiB above __TEXT).
 // =============================================================================
 static MLIR_OpHandle synth_start(MLIR_Context *ctx, string main_name,
                                  bool use_data_priv, bool use_globals,
-                                 bool use_linmem) {
+                                 bool use_linmem,
+                                 uint32_t linmem_init_size,
+                                 uint64_t linmem_size_bytes) {
     MLIR_RegionHandle region = MLIR_CreateRegion(ctx);
     MLIR_BlockHandle blk = MLIR_CreateBlock(ctx);
     MLIR_AppendRegionBlock(ctx, region, blk);
@@ -1629,25 +1633,51 @@ static MLIR_OpHandle synth_start(MLIR_Context *ctx, string main_name,
         emit_add_data_lo(ctx, blk, 27, 27, "globals");
     }
     if (use_linmem) {
-        emit_adrp_data(ctx, blk, 28, "linmem");
-        emit_add_data_lo(ctx, blk, 28, 28, "linmem");
-        // Stash argc / argv (host pointer) into linmem so the WASI
-        // args_get / args_sizes_get shims can recover them. macOS uses
-        // LC_MAIN: dyld calls our entry as `int main(argc, argv, envp,
-        // apple)` with argc in x0 and argv in x1 (standard C ABI), NOT
-        // via the kernel-style user stack layout (which has argc at
-        // [sp,#0]; that layout is only used for LC_UNIXTHREAD entries).
-        // Done BEFORE the bl so the callee can read them. Offsets must
-        // match ARGC_SLOT/ARGV_SLOT (defined later in the file alongside
-        // the linmem layout doc).
-        emit_str_w   (ctx, blk, /*rt=*/ 0, /*rn=*/28, /*off=*/40);
-        emit_str_x   (ctx, blk, /*rt=*/ 1, /*rn=*/28, /*off=*/48);
+        // Stash dyld-supplied argc (w0) / argv (x1) into the local
+        // frame across the mmap/memcpy calls (which clobber x0..x7).
+        // 16-byte frame: [sp,#0]=argc, [sp,#8]=argv.
+        emit_prologue(ctx, blk, /*frame_size=*/16);
+        emit_str_w(ctx, blk, /*rt=*/0, /*rn=*/31, /*off=*/0);
+        emit_str_x(ctx, blk, /*rt=*/1, /*rn=*/31, /*off=*/8);
+
+        // mmap(NULL, linmem_size_bytes, PROT_READ|PROT_WRITE,
+        //      MAP_ANON|MAP_PRIVATE, -1, 0) -> x0
+        emit_mov_imm64(ctx, blk, /*rd=*/0, 0);
+        emit_mov_imm64(ctx, blk, /*rd=*/1, linmem_size_bytes);
+        emit_mov_imm32(ctx, blk, /*rd=*/2, 3);            // PROT_READ|PROT_WRITE
+        emit_mov_imm32(ctx, blk, /*rd=*/3, 0x1002);       // MAP_ANON|MAP_PRIVATE
+        emit_mov_imm32(ctx, blk, /*rd=*/4, 0xffffffffu);  // fd = -1
+        emit_mov_imm64(ctx, blk, /*rd=*/5, 0);
+        emit_bl(ctx, blk, str_lit("_mmap"));
+        emit_mov_x(ctx, blk, /*rd=*/28, /*rn=*/0);
+
+        if (linmem_init_size > 0) {
+            // memcpy(x28, __linmem_template, linmem_init_size)
+            emit_mov_x(ctx, blk, /*rd=*/0, /*rn=*/28);
+            emit_adrp_data(ctx, blk, 1, "linmem_template");
+            emit_add_data_lo(ctx, blk, 1, 1, "linmem_template");
+            emit_mov_imm64(ctx, blk, /*rd=*/2, (uint64_t)linmem_init_size);
+            emit_bl(ctx, blk, str_lit("_memcpy"));
+        }
+
         // Initialise mem_pages slot with the static page count. The
         // `wmir.memory_size` op loads from this slot, and
         // `wmir.memory_grow` updates it (capped at MAX_LINMEM_PAGES).
-        // See the linmem layout doc for MEM_PAGES_SLOT.
         emit_mov_imm32(ctx, blk, /*rd=*/9, g_linmem_pages);
-        emit_str_w   (ctx, blk, /*rt=*/ 9, /*rn=*/28, /*off=*/24);
+        emit_str_w(ctx, blk, /*rt=*/9, /*rn=*/28, /*off=*/24);
+
+        // Stash argc / argv (host pointer) into linmem so the WASI
+        // args_get / args_sizes_get shims can recover them. macOS uses
+        // LC_MAIN: dyld calls our entry as `int main(argc, argv, envp,
+        // apple)` with argc in x0 and argv in x1 (standard C ABI).
+        // Reload from the saved frame slots since the mmap/memcpy
+        // calls clobbered x0/x1.
+        emit_ldr_w(ctx, blk, /*rt=*/0, /*rn=*/31, /*off=*/0);
+        emit_ldr_x(ctx, blk, /*rt=*/1, /*rn=*/31, /*off=*/8);
+        emit_str_w(ctx, blk, /*rt=*/0, /*rn=*/28, /*off=*/40);
+        emit_str_x(ctx, blk, /*rt=*/1, /*rn=*/28, /*off=*/48);
+
+        emit_epilogue(ctx, blk, /*frame_size=*/16);
     }
 
     emit_bl(ctx, blk, main_name);
@@ -4148,6 +4178,12 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
 
     string entry_name = {0};
 
+    // Track the high-water mark of the data_init records so synth_start
+    // can emit a `memcpy(linmem, __linmem_template, init_size)` of the
+    // right size after mmap'ing linmem. Rounded up to 16 to match what
+    // the macho backend pads the __linmem_template section to.
+    uint32_t linmem_init_size = 0;
+
     size_t n_top = MLIR_GetBlockNumOps(mb);
     for (size_t i = 0; i < n_top; i++) {
         MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
@@ -4158,6 +4194,8 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
             string sn = at_s(top, "sym_name");
             string id = at_s(top, "init_data");
             int64_t off = at_i(top, "offset");
+            uint32_t end = (uint32_t)off + (uint32_t)id.size;
+            if (end > linmem_init_size) linmem_init_size = end;
             MLIR_AttributeHandle a[3];
             a[0] = attr_s  (ctx, "sym_name",  sn.str, sn.size);
             a[1] = attr_i32(ctx, "offset",    off);
@@ -4199,8 +4237,13 @@ MLIR_OpHandle mlir_wmir_to_aarch64(MLIR_Context *ctx, MLIR_OpHandle wmir_module)
         mi.needs_fd_write || mi.needs_va_arg_i32 || mi.needs_va_arg_i64 ||
         mi.needs_va_arg_ptr || mi.needs_va_arg_struct ||
         mi.needs_va_arg_f64;
+    if (linmem_init_size > 0) {
+        linmem_init_size = (linmem_init_size + 15u) & ~15u;
+    }
     MLIR_OpHandle start = synth_start(ctx, entry_name,
-        /*use_data_priv=*/false, use_globals, use_linmem);
+        /*use_data_priv=*/false, use_globals, use_linmem,
+        /*linmem_init_size=*/linmem_init_size,
+        /*linmem_size_bytes=*/(uint64_t)MAX_LINMEM_PAGES * WASM_PAGE_SIZE);
     if (!start) return MLIR_INVALID_HANDLE;
     MLIR_AppendBlockOp(ctx, out_body, start);
 

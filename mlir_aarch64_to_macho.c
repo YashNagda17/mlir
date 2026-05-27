@@ -663,18 +663,22 @@ typedef enum {
     LS_OPEN,
     LS_CLOSE,
     LS_LSEEK,
-    LS_ERRNO
+    LS_ERRNO,
+    LS_MMAP,
+    LS_MEMCPY
 } LibSysSym;
-#define LS_COUNT 7
+#define LS_COUNT 9
 
 static const char *libsys_name(int sym) {
-    if (sym == LS_EXIT)  return "_exit";
-    if (sym == LS_WRITE) return "_write";
-    if (sym == LS_READ)  return "_read";
-    if (sym == LS_OPEN)  return "_open";
-    if (sym == LS_CLOSE) return "_close";
-    if (sym == LS_LSEEK) return "_lseek";
-    if (sym == LS_ERRNO) return "___error";
+    if (sym == LS_EXIT)   return "_exit";
+    if (sym == LS_WRITE)  return "_write";
+    if (sym == LS_READ)   return "_read";
+    if (sym == LS_OPEN)   return "_open";
+    if (sym == LS_CLOSE)  return "_close";
+    if (sym == LS_LSEEK)  return "_lseek";
+    if (sym == LS_ERRNO)  return "___error";
+    if (sym == LS_MMAP)   return "_mmap";
+    if (sym == LS_MEMCPY) return "_memcpy";
     return "";
 }
 
@@ -1400,12 +1404,15 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     const uint32_t stub_size = 12;
     const uint32_t got_size  = n_stubs * 8;
 
-    // sizeofcmds varies with __DATA presence. Section count grows to 3
-    // when we have __linmem_init bytes (file-backed init data overlaying
-    // the start of linmem). Each section adds 80 bytes to the load cmd.
+    // sizeofcmds varies with __DATA presence. We use up to 2 sections in
+    // __DATA: __data + __linmem_template. Linear memory itself is
+    // allocated dynamically by `_start` via mmap (see synth_start in
+    // mlir_wmir_to_aarch64.c), so the binary no longer reserves a
+    // multi-GiB __linmem_bss zerofill section — that placement is
+    // incompatible with the dyld shared cache on macOS arm64.
     uint32_t n_data_sections  = 0;
-    if (has_data_seg) n_data_sections = 2;
-    if (linmem_init_size > 0) n_data_sections = 3;
+    if (has_data_seg) n_data_sections = 1;
+    if (linmem_init_size > 0) n_data_sections = 2;
     uint32_t data_seg_lc_size = has_data_seg
         ? (72u + n_data_sections * 80u)
         : 0u;
@@ -1425,30 +1432,25 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     const uint64_t data_const_vm_base   = TEXT_VM_BASE + text_seg_size;
     const uint32_t data_const_file_base = text_seg_size;
 
-    // __DATA segment (between __DATA_CONST and __LINKEDIT). Up to 3
-    // sections:
-    //   __data        S_REGULAR  (file-backed): data_priv (32B) + globals
-    //   __linmem_init S_REGULAR  (file-backed): initialised linmem bytes
-    //                                            (only if linmem_init_size > 0)
-    //   __linmem_bss  S_ZEROFILL: rest of linmem (zero-filled)
+    // __DATA segment (between __DATA_CONST and __LINKEDIT). Up to 2
+    // sections, all file-backed and laid out sequentially:
+    //   __data            S_REGULAR: data_priv (32B) + globals
+    //   __linmem_template S_REGULAR: byte-for-byte image of the wasm
+    //                                data segments; copied into the
+    //                                mmap-allocated linmem by `_start`
+    //                                (only present if linmem_init_size > 0)
     uint32_t data_section_payload = data_priv_size + globals_padded;
     uint32_t data_seg_payload    = data_section_payload + linmem_init_size;
     uint64_t data_seg_filesize_v = has_data_seg
         ? (((uint64_t)data_seg_payload + (VMSEG_SIZE - 1u)) & ~(uint64_t)(VMSEG_SIZE - 1u))
         : 0u;
-    uint64_t data_seg_vmpayload  = (uint64_t)data_section_payload + linmem_size;
-    uint64_t data_seg_vmsize     = has_data_seg
-        ? ((data_seg_vmpayload + (VMSEG_SIZE - 1u)) & ~(uint64_t)(VMSEG_SIZE - 1u))
-        : 0u;
+    uint64_t data_seg_vmsize     = data_seg_filesize_v;
 
-    const uint64_t data_vm_base    = data_const_vm_base + VMSEG_SIZE;
-    const uint32_t data_file_base  = data_const_file_base + VMSEG_SIZE;
-    const uint64_t data_priv_vmaddr = data_vm_base;
-    const uint64_t globals_vmaddr   = data_priv_vmaddr + data_priv_size;
-    const uint64_t linmem_vmaddr    = globals_vmaddr + globals_padded;
-    const uint64_t linmem_bss_vmaddr= linmem_vmaddr + linmem_init_size;
-    const uint64_t linmem_bss_vmsize= (linmem_size > linmem_init_size)
-        ? (linmem_size - linmem_init_size) : 0;
+    const uint64_t data_vm_base       = data_const_vm_base + VMSEG_SIZE;
+    const uint32_t data_file_base     = data_const_file_base + VMSEG_SIZE;
+    const uint64_t data_priv_vmaddr   = data_vm_base;
+    const uint64_t globals_vmaddr     = data_priv_vmaddr + data_priv_size;
+    const uint64_t linmem_tpl_vmaddr  = globals_vmaddr + globals_padded;
 
     const uint64_t linkedit_vm_base   = has_data_seg
         ? (data_vm_base + data_seg_vmsize)
@@ -1560,11 +1562,10 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         buf_le32(&img, 0);
     }
 
-    // LC_SEGMENT_64 __DATA (optional). Up to three sections:
-    //   __data        : S_REGULAR  , file-backed, data_priv + globals
-    //   __linmem_init : S_REGULAR  , file-backed, initialised linmem bytes
-    //                                (only present if linmem_init_size > 0)
-    //   __linmem_bss  : S_ZEROFILL , rest of linear memory
+    // LC_SEGMENT_64 __DATA (optional). Up to two sections, both
+    // file-backed and laid out sequentially:
+    //   __data            : data_priv + globals
+    //   __linmem_template : init bytes copied by `_start` into mmap'd linmem
     if (has_data_seg) {
         buf_le32(&img, LC_SEGMENT_64);
         buf_le32(&img, 72u + n_data_sections * 80u);
@@ -1590,27 +1591,15 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
             buf_le32(&img, 0); buf_le32(&img, 0); buf_le32(&img, 0);
         }
         if (linmem_init_size > 0) {
-            static const char SN[16] = "__linmem_init";
+            static const char SN[16] = "__linmem_tpl";
             static const char SG[16] = "__DATA";
             buf_append(&img, SN, 16); buf_append(&img, SG, 16);
-            buf_le64(&img, linmem_vmaddr);
+            buf_le64(&img, linmem_tpl_vmaddr);
             buf_le64(&img, (uint64_t)linmem_init_size);
             buf_le32(&img, data_file_base + data_section_payload);
             buf_le32(&img, 4);                // align = 2^4 = 16
             buf_le32(&img, 0); buf_le32(&img, 0);
             buf_le32(&img, 0);                // S_REGULAR
-            buf_le32(&img, 0); buf_le32(&img, 0); buf_le32(&img, 0);
-        }
-        {
-            static const char SN[16] = "__linmem_bss";
-            static const char SG[16] = "__DATA";
-            buf_append(&img, SN, 16); buf_append(&img, SG, 16);
-            buf_le64(&img, linmem_bss_vmaddr);
-            buf_le64(&img, linmem_bss_vmsize);
-            buf_le32(&img, 0);                // offset = 0 (zerofill)
-            buf_le32(&img, 3);
-            buf_le32(&img, 0); buf_le32(&img, 0);
-            buf_le32(&img, 1);                // S_ZEROFILL
             buf_le32(&img, 0); buf_le32(&img, 0); buf_le32(&img, 0);
         }
     }
@@ -1757,8 +1746,9 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
 
     // -----------------------------------------------------------------
     // __DATA file content (if any): __data section (data_priv + globals)
-    // followed by __linmem_init bytes overlaid by offset. __linmem_bss
-    // is S_ZEROFILL so contributes only to vmsize.
+    // followed by __linmem_template bytes (file-backed wasm init data
+    // that `_start` will memcpy into mmap'd linmem). No zerofill — the
+    // remainder of linmem is anonymous mmap'd RAM.
     // -----------------------------------------------------------------
     if (has_data_seg) {
         buf_pad_to(&img, data_file_base);
@@ -1773,14 +1763,10 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         while ((img.len - (data_file_base + data_priv_size)) < globals_padded) {
             buf_u8(&img, 0);
         }
-        // __linmem_init section: zero-initialise the whole window then
-        // overlay each data_init record's bytes at its (wasm-offset
-        // relative) position. The first valid wasm data offset is
-        // WASM_DATA_BASE (= 1024); offsets are absolute within linmem,
-        // so the file slot for offset O is data_file_base +
-        // data_section_payload + (O - 0). Since x28 (linmem base) points
-        // at linmem_vmaddr which corresponds to wasm offset 0, the data
-        // we lay down at section start is wasm offset 0.
+        // __linmem_template section: zero-initialise the whole window
+        // then overlay each data_init record's bytes at its
+        // (wasm-offset relative) position. _start memcpys this into
+        // mmap'd linmem at runtime.
         if (linmem_init_size > 0) {
             uint32_t init_start = (uint32_t)img.len;
             for (uint32_t k = 0; k < linmem_init_size; k++) buf_u8(&img, 0);
@@ -1813,8 +1799,8 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
                 dst_vm = data_priv_vmaddr;
             } else if (dr->kind.size == 7 && memcmp(dr->kind.str, "globals", 7) == 0) {
                 dst_vm = globals_vmaddr;
-            } else if (dr->kind.size == 6 && memcmp(dr->kind.str, "linmem", 6) == 0) {
-                dst_vm = linmem_vmaddr;
+            } else if (dr->kind.size == 15 && memcmp(dr->kind.str, "linmem_template", 15) == 0) {
+                dst_vm = linmem_tpl_vmaddr;
             } else {
                 fprintf(stderr,
                     "aarch64->macho: unknown data reloc kind '%.*s'\n",
