@@ -162,6 +162,21 @@ static MLIR_TypeHandle normalise_carrier(MLIR_Context *ctx, MLIR_TypeHandle ty) 
         return MLIR_CreateTypeInteger(ctx, 32, true);
     if (ts.size == 3 && memcmp(ts.str, "f64", 3) == 0)
         return MLIR_CreateTypeInteger(ctx, 64, true);
+    // Re-create integer carriers in the *current* context arena rather than
+    // returning the input handle. The input type lives in the wasmssa
+    // module's arena, which the wasm->macho pipeline frees right after this
+    // pass; handing that handle to a wmir value would leave it dangling. A
+    // fresh CreateTypeInteger interns into the current (wmir) arena so the
+    // produced module is self-contained. Integer types print as "i{width}".
+    if (ts.size >= 2 && ts.str[0] == 'i') {
+        int64_t w = 0;
+        bool ok = true;
+        for (size_t i = 1; i < ts.size; i++) {
+            if (ts.str[i] < '0' || ts.str[i] > '9') { ok = false; break; }
+            w = w * 10 + (ts.str[i] - '0');
+        }
+        if (ok && w > 0) return MLIR_CreateTypeInteger(ctx, (uint32_t)w, true);
+    }
     return ty;
 }
 

@@ -345,7 +345,12 @@ static inline MLIR_OpHandle alloc_op(MLIR_Context *ctx, IR_Op op) {
     IR_Op *slot = arena_new(ctx->arena, IR_Op);
     *slot = op;
     MLIR_OpHandle h = (MLIR_OpHandle)(uintptr_t)slot;
-    register_op(ctx, h);
+    // g_all_ops is only consulted by MLIR_ReplaceAllUsesOfValue (def-use).
+    // When tracking is disabled (e.g. the wasm->macho pipeline) skip it: it
+    // saves memory and, crucially, avoids dangling g_all_ops entries when the
+    // pipeline frees an intermediate module's arena between passes.
+    if (!ctx->no_def_use_tracking)
+        register_op(ctx, h);
     return h;
 }
 
@@ -473,6 +478,18 @@ static inline MLIR_AttributeHandle alloc_attr_obj(MLIR_Context *ctx, IR_Attribut
     return (MLIR_AttributeHandle)(uintptr_t)slot;
 }
 
+// Copy `s` into ctx->arena so the returned string is owned by the context's
+// arena rather than aliasing caller-provided memory. Multi-pass pipelines
+// (wasm->macho) free intermediate arenas between passes, so any string stored
+// in an IR object that must outlive its producing pass has to live in the
+// destination arena. Empty/NULL strings are returned unchanged.
+static inline string arena_dup_str(MLIR_Context *ctx, string s) {
+    if (!ctx || !ctx->arena || s.size == 0 || !s.str) return s;
+    char *p = arena_new_array(ctx->arena, char, s.size);
+    memcpy(p, s.str, s.size);
+    return (string){ p, s.size };
+}
+
 static inline MLIR_LocationHandle alloc_loc(MLIR_Context *ctx, IR_Location l) {
     if (!ctx || !ctx->arena) return MLIR_INVALID_HANDLE;
     IR_Location *slot = arena_new(ctx->arena, IR_Location);
@@ -533,25 +550,33 @@ MLIR_OpHandle MLIR_CreateOpWithSuccessors(
     DUP(op.operands, op.n_operands, operands, n_operands, MLIR_ValueHandle);
     DUP(op.regions, op.n_regions, regions, n_regions, MLIR_RegionHandle);
     DUP(op.successors, op.n_successors, successors, n_successors, MLIR_BlockHandle);
+    // The def-use chains (operand_uses / successor_operand_uses + UseNodes)
+    // are only consulted by the cf->scf and lower-to-LLVM passes. Contexts
+    // that opt out (e.g. the wasm->macho pipeline) skip these allocations
+    // entirely, which is the dominant per-op memory cost on that path.
+    bool track_uses = !(ctx && ctx->no_def_use_tracking);
     if (n_successors > 0 && arena) {
         op.successor_operands = arena_new_array(arena, MLIR_ValueHandle *, n_successors);
         op.n_successor_operands = arena_new_array(arena, uint64_t, n_successors);
-        op.successor_operand_uses = arena_new_array(arena, UseSlot, n_successors);
+        if (track_uses)
+            op.successor_operand_uses = arena_new_array(arena, UseSlot, n_successors);
         for (size_t s = 0; s < n_successors; s++) {
             uint64_t cnt = n_successor_operands ? (uint64_t)n_successor_operands[s] : 0;
             op.n_successor_operands[s] = cnt;
             if (cnt > 0 && successor_operands && successor_operands[s]) {
                 op.successor_operands[s] = arena_new_array(arena, MLIR_ValueHandle, cnt);
                 memcpy(op.successor_operands[s], successor_operands[s], cnt * sizeof(MLIR_ValueHandle));
-                op.successor_operand_uses[s].arr = arena_new_array(arena, UseNode *, cnt);
-                for (size_t k = 0; k < cnt; k++) op.successor_operand_uses[s].arr[k] = NULL;
+                if (track_uses) {
+                    op.successor_operand_uses[s].arr = arena_new_array(arena, UseNode *, cnt);
+                    for (size_t k = 0; k < cnt; k++) op.successor_operand_uses[s].arr[k] = NULL;
+                }
             } else {
                 op.successor_operands[s] = NULL;
-                op.successor_operand_uses[s].arr = NULL;
+                if (track_uses) op.successor_operand_uses[s].arr = NULL;
             }
         }
     }
-    if (n_operands > 0 && arena) {
+    if (n_operands > 0 && arena && track_uses) {
         op.operand_uses = arena_new_array(arena, UseNode *, n_operands);
         for (size_t i = 0; i < n_operands; i++) op.operand_uses[i] = NULL;
     }
@@ -566,7 +591,7 @@ MLIR_OpHandle MLIR_CreateOpWithSuccessors(
     // Wire up def-use chains for every operand slot we just copied. We do
     // this after alloc_op so each UseNode carries the final op handle.
     IR_Op *stored = resolve_op(handle);
-    if (stored) {
+    if (stored && track_uses) {
         for (size_t i = 0; i < stored->n_operands; i++) {
             stored->operand_uses[i] = use_register_operand(
                 ctx, handle, stored->operands[i], (uint32_t)i);
@@ -1147,6 +1172,20 @@ static MLIR_TypeHandle intern_llvm_struct(MLIR_Context *ctx, string name) {
     return h;
 }
 
+// Drop all process-wide intern/registry state so it no longer references any
+// arena. Used by multi-pass pipelines (e.g. wasm->macho) right before they
+// switch ctx->arena to a fresh arena and free the previous one: any cached
+// handles pointed into the about-to-be-freed arena, and the dedup caches must
+// start empty so the next pass re-interns its types/structs into the new
+// arena (making that pass's module self-contained). Safe to call only when no
+// live consumer still depends on the old def-use registry.
+void MLIR_ResetInternRegistry(void) {
+    g_all_ops = NULL;      g_n_all_ops = 0;   g_cap_all_ops = 0;
+    g_type_handles = NULL; g_n_types = 0;     g_cap_types = 0;
+    g_struct_handles = NULL; g_struct_names = NULL;
+    g_n_structs = 0;       g_cap_structs = 0;
+}
+
 MLIR_TypeHandle MLIR_CreateTypeLLVMStructIdentified(MLIR_Context *ctx, string name) {
     return intern_llvm_struct(ctx, name);
 }
@@ -1453,8 +1492,8 @@ MLIR_AttributeHandle MLIR_CreateAttributeInteger(MLIR_Context *ctx, string name,
 MLIR_AttributeHandle MLIR_CreateAttributeString(MLIR_Context *ctx, string name, string value) {
     IR_Attribute a = {0};
     a.kind = ATTR_KIND_STRING;
-    a.name = name;
-    a.data.string_value = value;
+    a.name = arena_dup_str(ctx, name);
+    a.data.string_value = arena_dup_str(ctx, value);
     return alloc_attr_obj(ctx, a);
 }
 
