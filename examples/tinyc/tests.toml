@@ -976,6 +976,11 @@ expected_stdout = """\
 """
 
 [[test]]
+name = "union_sizeof"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "OK\n"
+
+[[test]]
 name = "re2c_keyword_longest_match"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "OK\n"
