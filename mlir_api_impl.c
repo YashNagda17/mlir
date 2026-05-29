@@ -171,6 +171,17 @@ typedef struct IR_Value {
     uint32_t n_uses;
 } IR_Value;
 
+// Rarely-used op metadata consulted only by the classic printer and the
+// parser roundtrip (trailing comments, the unnumbered location def, and the
+// recorded source line). The wasm->macho lift path never sets these, so we
+// store them in a side struct that is allocated lazily and left NULL on the
+// hot path, keeping IR_Op compact (op count dominates peak memory there).
+typedef struct IR_OpAux {
+    MLIR_LocationHandle unnumbered_loc_def;
+    string trailing_comment;
+    int32_t source_line_start;
+} IR_OpAux;
+
 typedef struct IR_Op {
     // 32-bit fields grouped to avoid padding. Counts and line numbers never
     // approach 2^32, so uint32_t is ample and keeps IR_Op compact — the op
@@ -194,15 +205,13 @@ typedef struct IR_Op {
     string opname;
     MLIR_ValueHandle *results;
     MLIR_LocationHandle location;
-    MLIR_LocationHandle unnumbered_loc_def;
-    string trailing_comment;
+    IR_OpAux *aux;
     MLIR_BlockHandle parent_block;
     uint32_t n_result_types;
     uint32_t n_attributes;
     uint32_t n_regions;
     uint32_t n_successors;
     uint32_t n_results;
-    int32_t source_line_start;
 } IR_Op;
 
 typedef struct IR_Block {
@@ -585,9 +594,17 @@ MLIR_OpHandle MLIR_CreateOpWithSuccessors(
     }
     #undef DUP
     op.location = location;
-    op.unnumbered_loc_def = unnumbered_loc_def;
-    op.trailing_comment = trailing_comment;
-    op.source_line_start = source_line_start;
+    // Only allocate the aux metadata block when something diverges from the
+    // defaults the getters return. The wasm->macho lift always passes
+    // defaults here, so aux stays NULL on the hot path.
+    if (arena && (unnumbered_loc_def != MLIR_INVALID_HANDLE ||
+                  trailing_comment.size != 0 || source_line_start != -1)) {
+        IR_OpAux *aux = arena_new_array(arena, IR_OpAux, 1);
+        aux->unnumbered_loc_def = unnumbered_loc_def;
+        aux->trailing_comment = trailing_comment;
+        aux->source_line_start = (int32_t)source_line_start;
+        op.aux = aux;
+    }
 
     MLIR_OpHandle handle = alloc_op(ctx, op);
 
@@ -772,7 +789,7 @@ MLIR_RegionHandle MLIR_GetOpRegion(MLIR_OpHandle oh, size_t idx) {
 
 string MLIR_GetOpTrailingComment(MLIR_OpHandle oh) {
     IR_Op *op = resolve_op(oh);
-    return op ? op->trailing_comment : str_lit("");
+    return (op && op->aux) ? op->aux->trailing_comment : str_lit("");
 }
 
 size_t MLIR_GetOpNumAttributes(MLIR_OpHandle oh) {
@@ -1658,12 +1675,12 @@ void MLIR_AppendOpAttribute(MLIR_Context *ctx, MLIR_OpHandle oh, MLIR_AttributeH
 
 int64_t MLIR_GetOpSourceLineStart(MLIR_OpHandle oh) {
     IR_Op *op = resolve_op(oh);
-    return op ? op->source_line_start : -1;
+    return (op && op->aux) ? op->aux->source_line_start : -1;
 }
 
 MLIR_LocationHandle MLIR_GetOpUnnumberedLocationDef(MLIR_OpHandle oh) {
     IR_Op *op = resolve_op(oh);
-    return op ? op->unnumbered_loc_def : MLIR_INVALID_HANDLE;
+    return (op && op->aux) ? op->aux->unnumbered_loc_def : MLIR_INVALID_HANDLE;
 }
 
 // Attribute accessors
