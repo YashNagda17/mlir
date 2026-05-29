@@ -179,6 +179,10 @@ typedef struct IR_Value {
 typedef struct IR_OpAux {
     MLIR_LocationHandle unnumbered_loc_def;
     string trailing_comment;
+    // Non-canonical op name (only for OP_TYPE_UNREGISTERED / custom ops whose
+    // textual name differs from op_type_to_string(op_type)). NULL str means
+    // the name is derivable from op_type and is not stored.
+    string opname;
     int32_t source_line_start;
 } IR_OpAux;
 
@@ -202,7 +206,6 @@ typedef struct IR_Op {
     // successor_operand_uses[s].arr[i] mirrors successor_operands[s][i].
     UseSlot *successor_operand_uses;
     uint64_t *n_successor_operands;
-    string opname;
     MLIR_ValueHandle *results;
     MLIR_LocationHandle location;
     IR_OpAux *aux;
@@ -544,7 +547,6 @@ MLIR_OpHandle MLIR_CreateOpWithSuccessors(
 
     IR_Op op = {0};
     op.op_type = type;
-    op.opname = opname;
     Arena *arena = ctx ? ctx->arena : NULL;
     // The lowering pass (and other callers) frequently builds these arrays
     // on the stack and hands them to us; copy into the arena so they
@@ -596,12 +598,15 @@ MLIR_OpHandle MLIR_CreateOpWithSuccessors(
     op.location = location;
     // Only allocate the aux metadata block when something diverges from the
     // defaults the getters return. The wasm->macho lift always passes
-    // defaults here, so aux stays NULL on the hot path.
-    if (arena && (unnumbered_loc_def != MLIR_INVALID_HANDLE ||
+    // defaults here (and op names that match op_type_to_string), so aux stays
+    // NULL on the hot path.
+    bool store_name = !str_eq(opname, op_type_to_string(type));
+    if (arena && (store_name || unnumbered_loc_def != MLIR_INVALID_HANDLE ||
                   trailing_comment.size != 0 || source_line_start != -1)) {
         IR_OpAux *aux = arena_new_array(arena, IR_OpAux, 1);
         aux->unnumbered_loc_def = unnumbered_loc_def;
         aux->trailing_comment = trailing_comment;
+        aux->opname = store_name ? opname : (string){0};
         aux->source_line_start = (int32_t)source_line_start;
         op.aux = aux;
     }
@@ -844,12 +849,16 @@ MLIR_LocationHandle MLIR_GetOpLocation(MLIR_OpHandle oh) {
 
 string MLIR_GetOpName(MLIR_OpHandle oh) {
     IR_Op *op = resolve_op(oh);
-    return op ? op->opname : str_lit("");
+    if (!op) return str_lit("");
+    if (op->aux && op->aux->opname.str) return op->aux->opname;
+    return op_type_to_string(op->op_type);
 }
 
 string MLIR_GetOpName_string(MLIR_OpHandle oh) {
     IR_Op *op = resolve_op(oh);
-    return op ? op->opname : str_lit("");
+    if (!op) return str_lit("");
+    if (op->aux && op->aux->opname.str) return op->aux->opname;
+    return op_type_to_string(op->op_type);
 }
 
 size_t MLIR_GetOpNumResultTypes(MLIR_OpHandle oh) {
