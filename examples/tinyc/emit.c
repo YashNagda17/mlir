@@ -793,6 +793,7 @@ typedef struct {
 static EVal emit_expr(E *e, Scope *sc, Expr *ex);
 static int64_t type_size(E *e, Type t);
 static int64_t type_align(E *e, Type t);
+static int64_t c_sizeof_expr(E *e, Scope *sc, Expr *ex);
 // Compute the single-blob representation tinyc uses to lay a `union` out
 // with all members overlapping at offset 0: an array of `*count` elements
 // of `*elem` (an integer type whose width equals the union's alignment),
@@ -2137,6 +2138,8 @@ static bool ast_fold_int(E *e, Scope *sc, Expr *ex, int64_t *out) {
                 }
                 ty = infer_expr_type(e, sc, ex->lhs);
                 if (ty.kind == TY_VOID) return false;
+                *out = (int64_t)(int32_t)c_sizeof_expr(e, sc, ex->lhs);
+                return true;
             } else {
                 if (ex->cast_type.kind == TY_VOID) return false;
                 ty = ex->cast_type;
@@ -2490,6 +2493,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     EMIT_ERR(e, "sizeof of unsupported expression");
                     r.val = emit_const_i32(e, 1); return r;
                 }
+                r.val = emit_const_i32(e, c_sizeof_expr(e, sc, ex->lhs)); return r;
             } else {
                 ty = ex->cast_type;
                 if (ty.kind == TY_VOID) {
@@ -5493,6 +5497,21 @@ static int64_t type_size(E *e, Type t) {
         return off * t.array_len;
     }
     return 0;
+}
+// C-level `sizeof` of an expression operand. tinyc represents an indexed
+// element of a `char`/`unsigned char` array as a 4-byte i32 rvalue, so
+// infer_expr_type + type_size would wrongly report 4; C mandates 1 for a
+// char element. Detect that case directly off the array type and report 1
+// without perturbing infer_expr_type's rvalue type (which feeds _Generic
+// matching and other callers) or type_size (which drives struct layout,
+// where scalar char stays a 4-byte i32). All other operands defer to
+// type_size, preserving tinyc's prior sizeof behavior exactly.
+static int64_t c_sizeof_expr(E *e, Scope *sc, Expr *ex) {
+    if (ex->kind == EX_INDEX) {
+        Type base = infer_expr_type(e, sc, ex->lhs);
+        if (base.kind == TY_ARRAY_I32 && base.array_elem_is_i8) return 1;
+    }
+    return type_size(e, infer_expr_type(e, sc, ex));
 }
 static int64_t type_align(E *e, Type t) {
     int64_t ptr_a = e->target_wasm32 ? 4 : 8;
