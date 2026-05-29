@@ -1303,3 +1303,8 @@ expected_stdout = "1\n35\n0\n255\n42\n"
 name = "ptr_cast_unsigned_compare"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "OK\n"
+
+[[test]]
+name = "sizeof_deref_in_own_init"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "OK\n"
