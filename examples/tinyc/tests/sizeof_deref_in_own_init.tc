@@ -1,0 +1,24 @@
+extern int printf(const char *fmt, ...);
+
+// Regression: sizeof(*p) used inside p's OWN initializer must evaluate to
+// sizeof(the pointee type), not the pointer/word size. tinyc previously
+// computed sizeof(*p) as 4 (word size) when p was referenced inside its own
+// declarator initializer, so `T *p = alloc(sizeof(*p))` under-allocated.
+
+typedef struct { int a, b, c, d, e; } S;  // 20 bytes
+
+static unsigned long g_req;
+static char g_buf[256];
+
+void *record_size(unsigned long n) { g_req = n; return g_buf; }
+
+int main(void) {
+    S *p = record_size(sizeof(*p));
+    (void)p;
+    if (g_req != sizeof(S)) {
+        printf("FAIL got=%lu want=%lu\n", g_req, (unsigned long)sizeof(S));
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}

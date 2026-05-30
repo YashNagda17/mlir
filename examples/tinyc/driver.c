@@ -320,7 +320,16 @@ int app_main(void) {
         translate_to_wasm_fn = MLIR_TranslateModuleToWasm;
     }
 
-    Arena *arena = arena_create(64 * 1024 * 1024);
+    // Size IR-arena chunks so the *total* buddy request (this 64 MiB data
+    // area plus the arena_chunk header, alignment padding, and the buddy
+    // block header) stays just under 64 MiB and therefore fits in a single
+    // 64 MiB (power-of-two) buddy block. A bare 64 MiB request spills a few
+    // dozen bytes past 2^26 and forces buddy to round up to a 128 MiB block,
+    // wasting ~50% of every chunk. On the host that waste is only virtual
+    // (untouched pages never become resident), but on the wasm32 path the
+    // doubled block reservations push the linear-memory high-water past the
+    // hard 4 GiB cap, so this halves linmem use on the self-host lift.
+    Arena *arena = arena_create(64 * 1024 * 1024 - 64 * 1024);
     MLIR_Context ctx = {0};
     MLIR_SetArenaAllocator(&ctx, arena);
 
@@ -331,6 +340,11 @@ int app_main(void) {
     // for this path: wasmstack / wasmssa (for inspection), wmir,
     // aarch64, and macho with --macho-backend=wmir.
     if (from_wasm_path) {
+        // The wasm -> wasmstack -> wasmssa -> wmir -> aarch64 -> macho
+        // pipeline never queries def-use chains, so skip building them.
+        // This removes the dominant per-op memory overhead and is required
+        // to fit the stage1 self-lift under the 4 GiB wasm32 linmem cap.
+        ctx.no_def_use_tracking = true;
         string wasm_buf = read_file_ok(arena, str_from_cstr_view(from_wasm_path));
         // read_file_ok appends a trailing NUL — strip it for the lifter,
         // which expects the exact wasm file size.
@@ -377,12 +391,27 @@ int app_main(void) {
                 }
                 out_fw = MLIR_PrintOperationGeneric(&ctx, a64);
             } else if (emit_macho) {
+                // Move the wmir (and later aarch64/macho) IR into a fresh
+                // arena, then free the wasmstack/wasmssa arena. The wmir pass
+                // rebuilds every type/attribute/location/value fresh (see
+                // normalise_carrier), so once the intern registry is reset the
+                // produced module references nothing in the old arena and it
+                // can be released. This keeps the early modules from coexisting
+                // with the (larger) aarch64 module, cutting peak RSS by roughly
+                // the size of wasmstack + wasmssa.
+                Arena *late_arena = arena_create(64 * 1024 * 1024 - 64 * 1024);
+                MLIR_SetArenaAllocator(&ctx, late_arena);
+                MLIR_ResetInternRegistry();
                 MLIR_OpHandle wmir = mlir_wasmssa_to_wmir(&ctx, ssa);
                 if (wmir == MLIR_INVALID_HANDLE) {
+                    arena_destroy(late_arena);
                     arena_destroy(arena);
                     arena_destroy(boot_arena);
                     return 1;
                 }
+                // wasmstack + wasmssa + the input wasm bytes are now dead.
+                arena_destroy(arena);
+                arena = late_arena;
                 MLIR_OpHandle a64 = mlir_wmir_to_aarch64(&ctx, wmir);
                 if (a64 == MLIR_INVALID_HANDLE) {
                     arena_destroy(arena);

@@ -793,6 +793,15 @@ typedef struct {
 static EVal emit_expr(E *e, Scope *sc, Expr *ex);
 static int64_t type_size(E *e, Type t);
 static int64_t type_align(E *e, Type t);
+static int64_t c_sizeof_expr(E *e, Scope *sc, Expr *ex);
+// Compute the single-blob representation tinyc uses to lay a `union` out
+// with all members overlapping at offset 0: an array of `*count` elements
+// of `*elem` (an integer type whose width equals the union's alignment),
+// sized to cover the union's largest member. Used by type_size,
+// init_struct_types, emit_struct_zero and emit_struct_copy_path so that
+// they all agree on the union layout.
+static void union_blob_layout(E *e, StructDef *sd, MLIR_TypeHandle *elem,
+                              int64_t *elem_size, int64_t *count);
 static Type infer_expr_type(E *e, Scope *sc, Expr *ex);
 static void emit_struct_zero(E *e, MLIR_ValueHandle base, MLIR_TypeHandle source_elem,
                              StructDef *sd, int32_t *prefix, size_t n_prefix);
@@ -1887,6 +1896,24 @@ static MLIR_ValueHandle resolve_struct_source(E *e, Scope *sc, Expr *arg, Struct
 static void emit_struct_copy_path(E *e, MLIR_ValueHandle dst, MLIR_ValueHandle src,
                                   MLIR_TypeHandle source_elem, StructDef *sd,
                                   int32_t *prefix, size_t n_prefix) {
+    if (sd->is_union) {
+        // The union's llvm body is a single blob field (index 0) of
+        // `count` alignment-wide integers. Copy the blob element by element.
+        MLIR_TypeHandle uelem; int64_t ues, uc;
+        union_blob_layout(e, sd, &uelem, &ues, &uc);
+        for (int64_t j = 0; j < uc; j++) {
+            size_t total = n_prefix + 2;
+            int32_t *p2 = arena_new_array(e->arena, int32_t, total);
+            for (size_t k = 0; k < n_prefix; k++) p2[k] = prefix[k];
+            p2[n_prefix] = 0;
+            p2[n_prefix + 1] = (int32_t)j;
+            MLIR_ValueHandle sp = emit_gep(e, src, source_elem, p2, total, NULL, 0);
+            MLIR_ValueHandle val = emit_load_v(e, sp, uelem);
+            MLIR_ValueHandle dp = emit_gep(e, dst, source_elem, p2, total, NULL, 0);
+            emit_store_v(e, val, dp);
+        }
+        return;
+    }
     for (size_t i = 0; i < sd->fields.size; i++) {
         Type ft = sd->fields.data[i].type;
         size_t n_path = n_prefix + 1;
@@ -2111,6 +2138,8 @@ static bool ast_fold_int(E *e, Scope *sc, Expr *ex, int64_t *out) {
                 }
                 ty = infer_expr_type(e, sc, ex->lhs);
                 if (ty.kind == TY_VOID) return false;
+                *out = (int64_t)(int32_t)c_sizeof_expr(e, sc, ex->lhs);
+                return true;
             } else {
                 if (ex->cast_type.kind == TY_VOID) return false;
                 ty = ex->cast_type;
@@ -2464,6 +2493,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     EMIT_ERR(e, "sizeof of unsupported expression");
                     r.val = emit_const_i32(e, 1); return r;
                 }
+                r.val = emit_const_i32(e, c_sizeof_expr(e, sc, ex->lhs)); return r;
             } else {
                 ty = ex->cast_type;
                 if (ty.kind == TY_VOID) {
@@ -2512,8 +2542,9 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     // `unsigned` C type — otherwise an i32 value with
                     // its top bit set (e.g. `(int64_t)<uint32_t>` with
                     // bit 31 set) sign-extends to a huge "negative"
-                    // i64. The cast itself doesn't change signedness,
-                    // so propagate `is_unsigned` to the widened value.
+                    // i64. The widening decision uses the SOURCE
+                    // signedness; the result's signedness is the cast
+                    // target's (set below).
                     v.val = v.is_unsigned ? emit_extui_i32_to_i64(e, v.val)
                                           : emit_extsi_i32_to_i64(e, v.val);
                     v.is_i64 = true;
@@ -2521,6 +2552,10 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     v.val = emit_trunci_i64_to_i32(e, v.val);
                     v.is_i64 = false;
                 }
+                // A cast to an unsigned integer type yields an unsigned
+                // value: subsequent comparisons / div / shr must use the
+                // unsigned form (e.g. `(unsigned long)x >= CONST`).
+                v.is_unsigned = ex->cast_type.int_unsigned;
                 return v;
             }
             // Pointer-to-integer cast: emit llvm.ptrtoint, then optionally
@@ -2544,6 +2579,9 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     v.val = emit_trunci_i64_to_i32(e, v.val);
                     v.is_i64 = false;
                 }
+                // `(uintptr_t)p` / `(unsigned long)p` produce an unsigned
+                // integer: select unsigned comparisons / div / shr below.
+                v.is_unsigned = ex->cast_type.int_unsigned;
                 return v;
             }
             // Pointer-to-pointer cast: opaque !llvm.ptr is universal, so
@@ -3924,6 +3962,25 @@ static void emit_block(E *e, Scope *sc, VecStmtPtr body);
 // Zero-initialize a struct local field-by-field.
 static void emit_struct_zero(E *e, MLIR_ValueHandle base, MLIR_TypeHandle source_elem,
                              StructDef *sd, int32_t *prefix, size_t n_prefix) {
+    if (sd->is_union) {
+        // The union's llvm body is a single blob field (index 0) of
+        // `count` alignment-wide integers. Zero each blob element.
+        MLIR_TypeHandle uelem; int64_t ues, uc;
+        union_blob_layout(e, sd, &uelem, &ues, &uc);
+        MLIR_ValueHandle z = (ues == 8) ? emit_const_i64(e, 0)
+                           : (ues == 1) ? emit_const_i8(e, 0)
+                                        : emit_const_i32(e, 0);
+        for (int64_t j = 0; j < uc; j++) {
+            size_t total = n_prefix + 2;
+            int32_t *p2 = arena_new_array(e->arena, int32_t, total);
+            for (size_t k = 0; k < n_prefix; k++) p2[k] = prefix[k];
+            p2[n_prefix] = 0;
+            p2[n_prefix + 1] = (int32_t)j;
+            MLIR_ValueHandle p = emit_gep(e, base, source_elem, p2, total, NULL, 0);
+            emit_store_v(e, z, p);
+        }
+        return;
+    }
     for (size_t i = 0; i < sd->fields.size; i++) {
         Type ft = sd->fields.data[i].type;
         size_t n_path = n_prefix + 1;
@@ -4091,14 +4148,20 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
             resolve_array_len(e, sc, &st->decl_type);
             sy->type.array_len = st->decl_type.array_len;
 
+            // C semantics: an identifier's scope begins immediately after its
+            // declarator, so it is visible inside its own initializer (e.g.
+            // `T *p = alloc(sizeof(*p))`). Register the symbol now, before the
+            // initializer is emitted, so type/size queries on it resolve
+            // correctly. (The static-global case above has already returned.)
+            sy->next = sc->head;
+            sc->head = sy;
+
             if (st->decl_type.kind == TY_VA_LIST) {
                 // Allocate a 32-byte buffer (sufficient for x86_64-SysV
                 // and aarch64 va_list layouts on Linux/macOS/Windows). We
                 // hand out the pointer; va_start/va_arg/va_end consume it.
                 MLIR_TypeHandle buf_ty = MLIR_CreateTypeLLVMArray(e->ctx, e->i8, 32);
                 sy->addr = emit_alloca(e, buf_ty);
-                sy->next = sc->head;
-                sc->head = sy;
                 break;
             }
             if (st->decl_type.kind == TY_PTR_I32 || st->decl_type.kind == TY_PTR_VOID ||
@@ -4201,8 +4264,6 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                                 emit_store_v(e, z8, p);
                             }
                         }
-                        sy->next = sc->head;
-                        sc->head = sy;
                         return;
                     }
                     // Support `= {0}` (zero-initialize) by zeroing every
@@ -4471,8 +4532,6 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                         if (sig && sig->ret.type.kind == TY_STRUCT &&
                             sig->ret.sdef == sd) {
                             emit_flat_call(e, sc, sig, st->decl_init->args, NULL, sy->addr);
-                            sy->next = sc->head;
-                            sc->head = sy;
                             return;
                         }
                     }
@@ -4485,8 +4544,6 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                             e, sc, st->decl_init, &src_sd);
                         if (src != MLIR_INVALID_HANDLE && src_sd == sd) {
                             emit_struct_copy(e, sy->addr, src, sd);
-                            sy->next = sc->head;
-                            sc->head = sy;
                             return;
                         }
                     }
@@ -4629,8 +4686,6 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                     emit_store_v(e, emit_const_i32(e, 0), sy->addr);
                 }
             }
-            sy->next = sc->head;
-            sc->head = sy;
             return;
         }
         case ST_RETURN: {
@@ -5398,6 +5453,11 @@ static int64_t type_size(E *e, Type t) {
     if (t.kind == TY_STRUCT) {
         StructDef *sd = find_struct(e, t.struct_name);
         if (!sd) return 0;
+        if (sd->is_union) {
+            MLIR_TypeHandle elem; int64_t es, c;
+            union_blob_layout(e, sd, &elem, &es, &c);
+            return es * c;
+        }
         int64_t off = 0, max_align = 1;
         for (size_t i = 0; i < sd->fields.size; i++) {
             Type ft = sd->fields.data[i].type;
@@ -5419,6 +5479,11 @@ static int64_t type_size(E *e, Type t) {
         // that returned 0 for the array's element size.
         StructDef *sd = find_struct(e, t.struct_name);
         if (!sd) return 0;
+        if (sd->is_union) {
+            MLIR_TypeHandle elem; int64_t es, c;
+            union_blob_layout(e, sd, &elem, &es, &c);
+            return es * c * t.array_len;
+        }
         int64_t off = 0, max_align = 1;
         for (size_t i = 0; i < sd->fields.size; i++) {
             Type ft = sd->fields.data[i].type;
@@ -5432,6 +5497,21 @@ static int64_t type_size(E *e, Type t) {
         return off * t.array_len;
     }
     return 0;
+}
+// C-level `sizeof` of an expression operand. tinyc represents an indexed
+// element of a `char`/`unsigned char` array as a 4-byte i32 rvalue, so
+// infer_expr_type + type_size would wrongly report 4; C mandates 1 for a
+// char element. Detect that case directly off the array type and report 1
+// without perturbing infer_expr_type's rvalue type (which feeds _Generic
+// matching and other callers) or type_size (which drives struct layout,
+// where scalar char stays a 4-byte i32). All other operands defer to
+// type_size, preserving tinyc's prior sizeof behavior exactly.
+static int64_t c_sizeof_expr(E *e, Scope *sc, Expr *ex) {
+    if (ex->kind == EX_INDEX) {
+        Type base = infer_expr_type(e, sc, ex->lhs);
+        if (base.kind == TY_ARRAY_I32 && base.array_elem_is_i8) return 1;
+    }
+    return type_size(e, infer_expr_type(e, sc, ex));
 }
 static int64_t type_align(E *e, Type t) {
     int64_t ptr_a = e->target_wasm32 ? 4 : 8;
@@ -5459,7 +5539,29 @@ static int64_t type_align(E *e, Type t) {
     return 1;
 }
 
-// Detect by-value cycles in struct definitions (TY_STRUCT field edges
+static void union_blob_layout(E *e, StructDef *sd, MLIR_TypeHandle *elem,
+                              int64_t *elem_size, int64_t *count) {
+    int64_t max_sz = 0, max_al = 1;
+    for (size_t i = 0; i < sd->fields.size; i++) {
+        Type ft = sd->fields.data[i].type;
+        int64_t s = type_size(e, ft);
+        int64_t a = type_align(e, ft);
+        if (s > max_sz) max_sz = s;
+        if (a > max_al) max_al = a;
+    }
+    MLIR_TypeHandle et;
+    int64_t es;
+    if (max_al >= 8) { et = e->i64; es = 8; }
+    else if (max_al >= 4) { et = e->i32; es = 4; }
+    else { et = e->i8; es = 1; }
+    int64_t c = (max_sz + es - 1) / es;
+    if (c < 1) c = 1;
+    *elem = et;
+    *elem_size = es;
+    *count = c;
+}
+
+
 // only; pointer fields don't count). Standard 3-color DFS.
 static bool struct_cycle_dfs(E *e, StructDef *sd, int *color, StructDef **stack, int depth) {
     e->cur_line = sd->line;
@@ -5515,6 +5617,19 @@ static void init_struct_types(E *e) {
     for (size_t i = 0; i < e->n_struct_types; i++) {
         StructDef *sd = e->struct_types[i].sd;
         e->cur_line = sd->line;
+        if (sd->is_union) {
+            // A union overlaps all members at offset 0. Emit its body as a
+            // single blob field (array of alignment-wide integers) sized to
+            // the largest member, so the llvm.struct size equals max(member
+            // sizes) rather than their sum. All union member accesses are
+            // normalised to offset 0 elsewhere (see walk_struct_lhs).
+            MLIR_TypeHandle uelem; int64_t ues, uc;
+            union_blob_layout(e, sd, &uelem, &ues, &uc);
+            MLIR_TypeHandle *ubody = arena_new_array(e->arena, MLIR_TypeHandle, 1);
+            ubody[0] = MLIR_CreateTypeLLVMArray(e->ctx, uelem, (uint64_t)uc);
+            MLIR_SetTypeLLVMStructBody(e->ctx, e->struct_types[i].ty, ubody, 1);
+            continue;
+        }
         size_t n = sd->fields.size;
         MLIR_TypeHandle *body = arena_new_array(e->arena, MLIR_TypeHandle, n ? n : 1);
         for (size_t k = 0; k < n; k++) {

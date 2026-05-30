@@ -30,6 +30,14 @@ typedef uintptr_t MLIR_LocationHandle;
 
 typedef struct MLIR_Context {
     Arena *arena;
+    // When true, MLIR_CreateOp* skips building the per-operand def-use
+    // chains (UseNode allocations + the parallel operand_uses /
+    // successor_operand_uses arrays). The def-use machinery is only needed
+    // by the cf->scf and lower-to-LLVM passes; the wasm -> wasmstack ->
+    // wasmssa -> wmir -> aarch64 -> macho pipeline never queries uses, so
+    // disabling it there removes a large per-op memory overhead. Defaults
+    // to false (tracking on) so all existing callers are unaffected.
+    bool no_def_use_tracking;
 } MLIR_Context;
 
 typedef struct MLIR_LocationMap {
@@ -545,6 +553,10 @@ string MLIR_MLIR_OpTypeToString(MLIR_OpType type);
 void MLIR_InitApi(MLIR_Context *ctx, MLIR_OpHandle root);
 void MLIR_SetArenaAllocator(MLIR_Context *ctx, Arena *arena);
 Arena *MLIR_GetArenaAllocator(MLIR_Context *ctx);
+// Drops process-wide intern/registry state (type & struct dedup caches and the
+// def-use op registry). Multi-pass pipelines call this right before switching
+// to a fresh arena and freeing the previous one. See implementation comment.
+void MLIR_ResetInternRegistry(void);
 
 // -----------------------------------------------------------------------------
 // Operation API

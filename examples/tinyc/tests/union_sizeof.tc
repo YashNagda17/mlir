@@ -1,0 +1,36 @@
+extern int printf(const char *fmt, ...);
+
+// tinyc miscompiles sizeof of a union: it SUMS the member sizes (laying
+// members out sequentially) instead of taking the MAX. A struct containing
+// a union is therefore grossly over-sized. The largest member here is
+// `arr` ({pointer, long}), so a struct with the union must have the same
+// size as the same struct with the union replaced by just that member.
+// (All members share the same alignment so the comparison is valid on both
+// 32-bit and 64-bit targets.)
+
+typedef struct {
+    int kind;
+    union {
+        long i;
+        char *s;
+        int b;
+        struct { int *p; long n; } arr;
+    } data;
+    int tag;
+} Box;
+
+typedef struct {
+    int kind;
+    struct { int *p; long n; } data;
+    int tag;
+} BoxMax;
+
+int main(void) {
+    if (sizeof(Box) != sizeof(BoxMax)) {
+        printf("FAIL 1: sizeof(Box)=%d sizeof(BoxMax)=%d\n",
+               (int)sizeof(Box), (int)sizeof(BoxMax));
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
