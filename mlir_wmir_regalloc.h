@@ -9,15 +9,22 @@
 //      SSA value compute its live interval [def_pos, last_use_pos]
 //      and the `crosses_call` flag.
 //   3. Allocate: walk live intervals in start-position order. Pool =
-//      {x11..x18}. A value with `crosses_call=true` always goes to a
-//      stack slot (v1 doesn't yet use callee-saved registers). When
-//      all pool regs are busy at a def point, evict the active
-//      interval with the latest end position and spill it.
+//      caller-saved {x12..x15} plus callee-saved {x19..x26}. A value
+//      whose live range crosses a call may use only the call-safe
+//      callee-saved registers x24/x25 (the other callee-saved regs are
+//      clobbered by hand-written runtime helpers); otherwise it falls
+//      back to a stack slot. When all eligible pool regs are busy at a
+//      def point, evict the active interval with the latest end
+//      position and spill it. Callee-saved registers are preferred last
+//      (caller-saved first) so leaf/call-light functions pay no
+//      save/restore cost. The set of callee-saved registers actually
+//      assigned is reported via `used_callee_mask` so the lowering can
+//      save/restore exactly those in the prologue/epilogue.
 //
-// FP values (f32/f64), values whose live range crosses a call, and
-// any value the lowering reads/writes through a fixed register (e.g.
-// call args in x0..x7) all map to stack slots — same as today. The
-// allocator is invisible to those code paths.
+// FP values (f32/f64), call-crossing values that cannot get x24/x25,
+// and any value the lowering reads/writes through a fixed register
+// (e.g. call args in x0..x7) map to stack slots. The allocator is
+// invisible to those code paths.
 
 #ifndef MLIR_WMIR_REGALLOC_H
 #define MLIR_WMIR_REGALLOC_H
@@ -62,6 +69,12 @@ typedef struct {
     // Number of 8-byte stack slots allocated. Frame size in bytes
     // (before 16-byte alignment) is `n_slots * 8`.
     uint32_t          n_slots;
+    // Bitmask of callee-saved registers actually assigned to a value.
+    // Bit i (0..7) corresponds to physical register x(19+i). The
+    // lowering must save these in the prologue and restore them in the
+    // epilogue. Zero for leaf functions that only needed caller-saved
+    // registers.
+    uint32_t          used_callee_mask;
 } WmirRegAlloc;
 
 // Compute the assignment for one `wmir.func` op. Returns a heap-

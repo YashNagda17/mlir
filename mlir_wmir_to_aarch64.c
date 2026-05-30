@@ -21,12 +21,15 @@
 //   * `wmir.br ^bb(%v1, %v2)` lowers to a sequence of `ldr/str` pairs
 //     that copy each operand into the target block's argument slot,
 //     followed by an unconditional `aarch64.b`.
-//   * `wmir.cond_br %c, ^t, ^f` (no successor args; the wasmssa->wmir
-//     pass arranges that cond_br targets never receive operands)
-//     lowers to:
+//   * `wmir.cond_br %c, ^t, ^f` lowers to:
 //         ldr w9, [sp, #cond_slot]
 //         cbnz w9, ^t
 //         b    ^f
+//     Either successor may carry block-arg operands (mem2reg promotes
+//     loop-carried locals to phis that ride conditional edges). When so,
+//     the taken edge is split through a landing pad that performs its
+//     parallel copies before branching to ^t; the fall-through copies are
+//     emitted inline after the cbnz (the condition is dead by then).
 //
 // Module-level metadata (n_globals, linmem_size, …) is attached as
 // attributes on the aarch64 builtin.module so the downstream Mach-O
@@ -229,6 +232,18 @@ static void emit_ldrb_imm(MLIR_Context *ctx, MLIR_BlockHandle blk,
     a[2] = attr_i32(ctx, "off_bytes", off_bytes);
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_LDRB_IMM, a, 3));
 }
+// Register-offset load/store: <op> Rt, [Xn, Xm, LSL #0]. Fuses the
+// linmem-base + index addition into the memory access itself, so a
+// wasm load/store with a zero static offset becomes a single
+// instruction instead of `add` + offset-0 access.
+static void emit_ldst_reg(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                          MLIR_OpType t, uint8_t rt, uint8_t rn, uint8_t rm) {
+    MLIR_AttributeHandle a[3];
+    a[0] = attr_i32(ctx, "rt", rt);
+    a[1] = attr_i32(ctx, "rn", rn);
+    a[2] = attr_i32(ctx, "rm", rm);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, t, a, 3));
+}
 static void emit_brk(MLIR_Context *ctx, MLIR_BlockHandle blk, uint16_t imm16) {
     MLIR_AttributeHandle a[1];
     a[0] = attr_i32(ctx, "imm16", imm16);
@@ -385,6 +400,23 @@ static void emit_epilogue(MLIR_Context *ctx, MLIR_BlockHandle blk,
     MLIR_AttributeHandle a[1];
     a[0] = attr_i32(ctx, "frame_size", (int32_t)frame_size);
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_EPILOGUE, a, 1));
+}
+// Save (restore=false) or restore (restore=true) the callee-saved
+// registers x19..x26 selected by `mask` (bit i -> x(19+i)) to/from
+// their reserved area at [sp, #base + j*8], where j counts the set
+// bits in increasing register order. Used to make register-allocated
+// wmir functions honour the AAPCS callee-saved contract.
+static void emit_callee_saves(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                              uint32_t mask, uint32_t base, bool restore) {
+    uint32_t j = 0;
+    for (uint32_t r = 19; r <= 26; r++) {
+        if (mask & (1u << (r - 19))) {
+            uint32_t off = base + j * 8u;
+            if (restore) emit_ldr_x(ctx, blk, (uint8_t)r, 31, off);
+            else         emit_str_x(ctx, blk, (uint8_t)r, 31, off);
+            j++;
+        }
+    }
 }
 static void emit_cmp_reg(MLIR_Context *ctx, MLIR_BlockHandle blk,
                          uint8_t rn, uint8_t rm, bool sf) {
@@ -854,7 +886,15 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     }
     uint32_t spill_bytes  = (uint32_t)ra->n_slots * 8u;
     uint32_t locals_bytes = locals_count * 8u;
-    uint32_t frame_size   = spill_bytes + locals_bytes;
+    // Callee-saved registers x19..x26 the allocator used are saved in a
+    // reserved area at the TOP of the frame (above spill slots and
+    // locals, which the rest of the lowering addresses from sp).
+    uint32_t callee_save_base = spill_bytes + locals_bytes;
+    uint32_t callee_mask  = ra->used_callee_mask;
+    uint32_t callee_count = 0;
+    for (uint32_t m = callee_mask; m; m >>= 1) callee_count += (m & 1u);
+    uint32_t callee_bytes = callee_count * 8u;
+    uint32_t frame_size   = callee_save_base + callee_bytes;
     frame_size = (frame_size + 15u) & ~15u;
     if (getenv("WMIR_DEBUG_FRAMES")) {
         fprintf(stderr, "wmir-frame: %.*s spill=%u locals=%u total=%u\n",
@@ -885,6 +925,9 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
 
     // ---------- Entry prologue + parameter spill.
     emit_prologue(ctx, entry_dst, frame_size);
+    // Save the caller's callee-saved registers before the param moves
+    // below may overwrite any whose home is a callee-saved register.
+    emit_callee_saves(ctx, entry_dst, callee_mask, callee_save_base, /*restore=*/false);
     {
         MLIR_BlockHandle src_entry = MLIR_GetRegionBlock(src_region, 0);
         size_t n_params = MLIR_GetBlockNumArgs(src_entry);
@@ -1404,10 +1447,19 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 int64_t sz  = at_i(op, "mem_size");
                 if (sz == 0) sz = 4;
                 uint8_t r0 = LD_OPERAND(9, 0);
+                uint8_t rd = PICK_RES(9, 0);
+                if (off == 0) {
+                    // Fuse: addr = linmem(x28) + r0 done by the load itself.
+                    MLIR_OpType t = (sz == 8) ? OP_TYPE_AARCH64_LDR_X_REG
+                                  : (sz == 1) ? OP_TYPE_AARCH64_LDRB_REG
+                                              : OP_TYPE_AARCH64_LDR_W_REG;
+                    emit_ldst_reg(ctx, dst_blk, t, rd, /*rn=*/28, /*rm=*/r0);
+                    ST_RESULT(rd, 0);
+                    break;
+                }
                 // x10 is scratch (not in pool, not r0). Use it for the
                 // heap-addr computation: addr = linmem(x28) + r0.
                 emit_add_reg(ctx, dst_blk, 10, 28, r0, /*sf=*/true);
-                uint8_t rd = PICK_RES(9, 0);
                 if (sz == 8) {
                     emit_ldr_x(ctx, dst_blk, rd, 10, (uint32_t)off);
                 } else if (sz == 1) {
@@ -1426,6 +1478,13 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 uint8_t r1 = LD_OPERAND(11, 1);  // value (use x11 scratch
                                                  // to leave x10 free for
                                                  // the heap_addr compute)
+                if (off == 0) {
+                    MLIR_OpType t = (sz == 8) ? OP_TYPE_AARCH64_STR_X_REG
+                                  : (sz == 1) ? OP_TYPE_AARCH64_STRB_REG
+                                              : OP_TYPE_AARCH64_STR_W_REG;
+                    emit_ldst_reg(ctx, dst_blk, t, r1, /*rn=*/28, /*rm=*/r0);
+                    break;
+                }
                 emit_add_reg(ctx, dst_blk, 10, 28, r0, /*sf=*/true);
                 if (sz == 8) {
                     emit_str_x(ctx, dst_blk, r1, 10, (uint32_t)off);
@@ -1515,6 +1574,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 if (no == 1) {
                     ld_operand_into_fixed(ctx, dst_blk, ra, op, 0, /*reg=*/0);
                 }
+                emit_callee_saves(ctx, dst_blk, callee_mask, callee_save_base, /*restore=*/true);
                 emit_epilogue(ctx, dst_blk, frame_size);
                 emit_ret(ctx, dst_blk);
                 break;
@@ -1549,7 +1609,9 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 break;
             }
             case OP_TYPE_WMIR_COND_BR: {
-                // Two successors, no successor operands by construction.
+                // Two successors. Either may carry block-arg operands
+                // (mem2reg promotes loop-carried locals to phis that ride
+                // on conditional back-edges / exits).
                 if (MLIR_GetOpNumSuccessors(op) < 2) {
                     fprintf(stderr,
                         "wmir->aarch64: wmir.cond_br needs 2 successors\n");
@@ -1566,9 +1628,38 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                     wmir_regalloc_free(ra); bm_free(&bm);
                     return MLIR_INVALID_HANDLE;
                 }
+                size_t n_t = MLIR_GetOpNumSuccessorOperands(op, 0);
+                size_t n_f = MLIR_GetOpNumSuccessorOperands(op, 1);
+                if (n_t != MLIR_GetBlockNumArgs(t_src) ||
+                    n_f != MLIR_GetBlockNumArgs(f_src)) {
+                    fprintf(stderr,
+                        "wmir->aarch64: wmir.cond_br operand counts "
+                        "(%zu,%zu) != target arg counts (%zu,%zu)\n",
+                        n_t, n_f, MLIR_GetBlockNumArgs(t_src),
+                        MLIR_GetBlockNumArgs(f_src));
+                    wmir_regalloc_free(ra); bm_free(&bm);
+                    return MLIR_INVALID_HANDLE;
+                }
+                // Read the condition BEFORE any block-arg copies so the
+                // parallel copies (which may overwrite the condition's
+                // register home) cannot clobber it.
                 uint8_t r0 = LD_OPERAND(9, 0);
-                emit_cbnz(ctx, dst_blk, r0, /*sf=*/false, t_dst);
-                emit_b(ctx, dst_blk, f_dst);
+                if (n_t == 0 && n_f == 0) {
+                    emit_cbnz(ctx, dst_blk, r0, /*sf=*/false, t_dst);
+                    emit_b(ctx, dst_blk, f_dst);
+                } else {
+                    // The taken edge needs its copies on the taken path
+                    // only, so split it through a landing pad. The
+                    // fall-through (F) copies are emitted inline after the
+                    // cbnz, where the condition register is already dead.
+                    MLIR_BlockHandle land = MLIR_CreateBlock(ctx);
+                    MLIR_AppendRegionBlock(ctx, dst_region, land);
+                    emit_cbnz(ctx, dst_blk, r0, /*sf=*/false, land);
+                    emit_branch_arg_copies(ctx, dst_blk, ra, op, 1, f_src);
+                    emit_b(ctx, dst_blk, f_dst);
+                    emit_branch_arg_copies(ctx, land, ra, op, 0, t_src);
+                    emit_b(ctx, land, t_dst);
+                }
                 break;
             }
             default: {
@@ -1597,11 +1688,12 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     attrs[naf++] = attr_s(ctx, "param_types", pt.str, pt.size);
 
     MLIR_RegionHandle regs[1] = { dst_region };
-    return MLIR_CreateOp(ctx, OP_TYPE_AARCH64_FUNC,
+    MLIR_OpHandle a64_op = MLIR_CreateOp(ctx, OP_TYPE_AARCH64_FUNC,
         op_type_to_string(OP_TYPE_AARCH64_FUNC),
         attrs, naf, NULL, 0, NULL, 0, NULL, 0, regs, 1,
         MLIR_CreateLocationUnknown(ctx, (string){0}),
         MLIR_INVALID_HANDLE, (string){0}, -1);
+    return a64_op;
 }
 
 // =============================================================================

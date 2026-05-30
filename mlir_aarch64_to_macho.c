@@ -339,6 +339,33 @@ static uint32_t arm64_ldrb_imm(uint8_t rt, uint8_t rn, uint16_t off_bytes) {
     return 0x39400000u | (((uint32_t)off_bytes & 0xfffu) << 10)
                        | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
 }
+// ---- register-offset loads/stores: <op> Rt, [Xn, Xm, LSL #0] -------
+// Rm is a full 64-bit X register (wasm i32 indices are already
+// zero-extended into the high half), so option=LSL(011), S=0.
+static uint32_t arm64_ldr_w_reg(uint8_t rt, uint8_t rn, uint8_t rm) {
+    return 0xb8606800u | ((uint32_t)(rm & 0x1f) << 16)
+                       | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
+}
+static uint32_t arm64_str_w_reg(uint8_t rt, uint8_t rn, uint8_t rm) {
+    return 0xb8206800u | ((uint32_t)(rm & 0x1f) << 16)
+                       | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
+}
+static uint32_t arm64_ldr_x_reg(uint8_t rt, uint8_t rn, uint8_t rm) {
+    return 0xf8606800u | ((uint32_t)(rm & 0x1f) << 16)
+                       | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
+}
+static uint32_t arm64_str_x_reg(uint8_t rt, uint8_t rn, uint8_t rm) {
+    return 0xf8206800u | ((uint32_t)(rm & 0x1f) << 16)
+                       | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
+}
+static uint32_t arm64_ldrb_reg(uint8_t rt, uint8_t rn, uint8_t rm) {
+    return 0x38606800u | ((uint32_t)(rm & 0x1f) << 16)
+                       | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
+}
+static uint32_t arm64_strb_reg(uint8_t rt, uint8_t rn, uint8_t rm) {
+    return 0x38206800u | ((uint32_t)(rm & 0x1f) << 16)
+                       | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rt & 0x1f);
+}
 // MUL Wd, Wn, Wm == MADD Wd, Wn, Wm, WZR
 //   W base: 0x1B007C00, X base: 0x9B007C00
 static uint32_t arm64_mul(uint8_t rd, uint8_t rn, uint8_t rm, bool sf) {
@@ -858,6 +885,48 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
                 uint8_t  rn = (uint8_t)attr_i(op, "rn");
                 uint16_t of = (uint16_t)attr_i(op, "off_bytes");
                 emit_word(&out->code, arm64_ldrb_imm(rt, rn, of));
+                break;
+            }
+            case OP_TYPE_AARCH64_LDR_W_REG: {
+                uint8_t rt = (uint8_t)attr_i(op, "rt");
+                uint8_t rn = (uint8_t)attr_i(op, "rn");
+                uint8_t rm = (uint8_t)attr_i(op, "rm");
+                emit_word(&out->code, arm64_ldr_w_reg(rt, rn, rm));
+                break;
+            }
+            case OP_TYPE_AARCH64_STR_W_REG: {
+                uint8_t rt = (uint8_t)attr_i(op, "rt");
+                uint8_t rn = (uint8_t)attr_i(op, "rn");
+                uint8_t rm = (uint8_t)attr_i(op, "rm");
+                emit_word(&out->code, arm64_str_w_reg(rt, rn, rm));
+                break;
+            }
+            case OP_TYPE_AARCH64_LDR_X_REG: {
+                uint8_t rt = (uint8_t)attr_i(op, "rt");
+                uint8_t rn = (uint8_t)attr_i(op, "rn");
+                uint8_t rm = (uint8_t)attr_i(op, "rm");
+                emit_word(&out->code, arm64_ldr_x_reg(rt, rn, rm));
+                break;
+            }
+            case OP_TYPE_AARCH64_STR_X_REG: {
+                uint8_t rt = (uint8_t)attr_i(op, "rt");
+                uint8_t rn = (uint8_t)attr_i(op, "rn");
+                uint8_t rm = (uint8_t)attr_i(op, "rm");
+                emit_word(&out->code, arm64_str_x_reg(rt, rn, rm));
+                break;
+            }
+            case OP_TYPE_AARCH64_LDRB_REG: {
+                uint8_t rt = (uint8_t)attr_i(op, "rt");
+                uint8_t rn = (uint8_t)attr_i(op, "rn");
+                uint8_t rm = (uint8_t)attr_i(op, "rm");
+                emit_word(&out->code, arm64_ldrb_reg(rt, rn, rm));
+                break;
+            }
+            case OP_TYPE_AARCH64_STRB_REG: {
+                uint8_t rt = (uint8_t)attr_i(op, "rt");
+                uint8_t rn = (uint8_t)attr_i(op, "rn");
+                uint8_t rm = (uint8_t)attr_i(op, "rm");
+                emit_word(&out->code, arm64_strb_reg(rt, rn, rm));
                 break;
             }
             case OP_TYPE_AARCH64_MUL: {
