@@ -477,6 +477,12 @@ typedef enum {
     OP_TYPE_AARCH64_STR_X,    // str Xd, [Xn, #imm] (i64 unsigned-offset)
     OP_TYPE_AARCH64_STRB_IMM, // strb Wt, [Xn, #imm12] (1-byte unscaled)
     OP_TYPE_AARCH64_LDRB_IMM, // ldrb Wt, [Xn, #imm12] (1-byte zero-extend)
+    OP_TYPE_AARCH64_LDR_W_REG,  // ldr  Wt, [Xn, Xm, LSL #0]
+    OP_TYPE_AARCH64_STR_W_REG,  // str  Wt, [Xn, Xm, LSL #0]
+    OP_TYPE_AARCH64_LDR_X_REG,  // ldr  Xt, [Xn, Xm, LSL #0]
+    OP_TYPE_AARCH64_STR_X_REG,  // str  Xt, [Xn, Xm, LSL #0]
+    OP_TYPE_AARCH64_LDRB_REG,   // ldrb Wt, [Xn, Xm, LSL #0]
+    OP_TYPE_AARCH64_STRB_REG,   // strb Wt, [Xn, Xm, LSL #0]
     // Pseudo: ADRP+ADD pair that resolves to the runtime base address
     // of one of the predeclared __DATA regions (vmctx, globals, linmem).
     // The macho backend patches the encoded PC-relative immediates

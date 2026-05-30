@@ -229,6 +229,18 @@ static void emit_ldrb_imm(MLIR_Context *ctx, MLIR_BlockHandle blk,
     a[2] = attr_i32(ctx, "off_bytes", off_bytes);
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_LDRB_IMM, a, 3));
 }
+// Register-offset load/store: <op> Rt, [Xn, Xm, LSL #0]. Fuses the
+// linmem-base + index addition into the memory access itself, so a
+// wasm load/store with a zero static offset becomes a single
+// instruction instead of `add` + offset-0 access.
+static void emit_ldst_reg(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                          MLIR_OpType t, uint8_t rt, uint8_t rn, uint8_t rm) {
+    MLIR_AttributeHandle a[3];
+    a[0] = attr_i32(ctx, "rt", rt);
+    a[1] = attr_i32(ctx, "rn", rn);
+    a[2] = attr_i32(ctx, "rm", rm);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, t, a, 3));
+}
 static void emit_brk(MLIR_Context *ctx, MLIR_BlockHandle blk, uint16_t imm16) {
     MLIR_AttributeHandle a[1];
     a[0] = attr_i32(ctx, "imm16", imm16);
@@ -1432,10 +1444,19 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 int64_t sz  = at_i(op, "mem_size");
                 if (sz == 0) sz = 4;
                 uint8_t r0 = LD_OPERAND(9, 0);
+                uint8_t rd = PICK_RES(9, 0);
+                if (off == 0) {
+                    // Fuse: addr = linmem(x28) + r0 done by the load itself.
+                    MLIR_OpType t = (sz == 8) ? OP_TYPE_AARCH64_LDR_X_REG
+                                  : (sz == 1) ? OP_TYPE_AARCH64_LDRB_REG
+                                              : OP_TYPE_AARCH64_LDR_W_REG;
+                    emit_ldst_reg(ctx, dst_blk, t, rd, /*rn=*/28, /*rm=*/r0);
+                    ST_RESULT(rd, 0);
+                    break;
+                }
                 // x10 is scratch (not in pool, not r0). Use it for the
                 // heap-addr computation: addr = linmem(x28) + r0.
                 emit_add_reg(ctx, dst_blk, 10, 28, r0, /*sf=*/true);
-                uint8_t rd = PICK_RES(9, 0);
                 if (sz == 8) {
                     emit_ldr_x(ctx, dst_blk, rd, 10, (uint32_t)off);
                 } else if (sz == 1) {
@@ -1454,6 +1475,13 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 uint8_t r1 = LD_OPERAND(11, 1);  // value (use x11 scratch
                                                  // to leave x10 free for
                                                  // the heap_addr compute)
+                if (off == 0) {
+                    MLIR_OpType t = (sz == 8) ? OP_TYPE_AARCH64_STR_X_REG
+                                  : (sz == 1) ? OP_TYPE_AARCH64_STRB_REG
+                                              : OP_TYPE_AARCH64_STR_W_REG;
+                    emit_ldst_reg(ctx, dst_blk, t, r1, /*rn=*/28, /*rm=*/r0);
+                    break;
+                }
                 emit_add_reg(ctx, dst_blk, 10, 28, r0, /*sf=*/true);
                 if (sz == 8) {
                     emit_str_x(ctx, dst_blk, r1, 10, (uint32_t)off);

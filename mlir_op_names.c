@@ -280,6 +280,12 @@ static string op_type_to_string_half2(MLIR_OpType type) {
         case OP_TYPE_AARCH64_STR_X:        return str_lit("aarch64.str_x");
         case OP_TYPE_AARCH64_STRB_IMM:     return str_lit("aarch64.strb_imm");
         case OP_TYPE_AARCH64_LDRB_IMM:     return str_lit("aarch64.ldrb_imm");
+        case OP_TYPE_AARCH64_LDR_W_REG:    return str_lit("aarch64.ldr_w_reg");
+        case OP_TYPE_AARCH64_STR_W_REG:    return str_lit("aarch64.str_w_reg");
+        case OP_TYPE_AARCH64_LDR_X_REG:    return str_lit("aarch64.ldr_x_reg");
+        case OP_TYPE_AARCH64_STR_X_REG:    return str_lit("aarch64.str_x_reg");
+        case OP_TYPE_AARCH64_LDRB_REG:     return str_lit("aarch64.ldrb_reg");
+        case OP_TYPE_AARCH64_STRB_REG:     return str_lit("aarch64.strb_reg");
         case OP_TYPE_AARCH64_ADRP_DATA:    return str_lit("aarch64.adrp_data");
         case OP_TYPE_AARCH64_ADD_DATA_LO:  return str_lit("aarch64.add_data_lo");
         case OP_TYPE_AARCH64_PROLOGUE:     return str_lit("aarch64.prologue");
