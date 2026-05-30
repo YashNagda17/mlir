@@ -386,6 +386,23 @@ static void emit_epilogue(MLIR_Context *ctx, MLIR_BlockHandle blk,
     a[0] = attr_i32(ctx, "frame_size", (int32_t)frame_size);
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_EPILOGUE, a, 1));
 }
+// Save (restore=false) or restore (restore=true) the callee-saved
+// registers x19..x26 selected by `mask` (bit i -> x(19+i)) to/from
+// their reserved area at [sp, #base + j*8], where j counts the set
+// bits in increasing register order. Used to make register-allocated
+// wmir functions honour the AAPCS callee-saved contract.
+static void emit_callee_saves(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                              uint32_t mask, uint32_t base, bool restore) {
+    uint32_t j = 0;
+    for (uint32_t r = 19; r <= 26; r++) {
+        if (mask & (1u << (r - 19))) {
+            uint32_t off = base + j * 8u;
+            if (restore) emit_ldr_x(ctx, blk, (uint8_t)r, 31, off);
+            else         emit_str_x(ctx, blk, (uint8_t)r, 31, off);
+            j++;
+        }
+    }
+}
 static void emit_cmp_reg(MLIR_Context *ctx, MLIR_BlockHandle blk,
                          uint8_t rn, uint8_t rm, bool sf) {
     MLIR_AttributeHandle a[3];
@@ -854,7 +871,15 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     }
     uint32_t spill_bytes  = (uint32_t)ra->n_slots * 8u;
     uint32_t locals_bytes = locals_count * 8u;
-    uint32_t frame_size   = spill_bytes + locals_bytes;
+    // Callee-saved registers x19..x26 the allocator used are saved in a
+    // reserved area at the TOP of the frame (above spill slots and
+    // locals, which the rest of the lowering addresses from sp).
+    uint32_t callee_save_base = spill_bytes + locals_bytes;
+    uint32_t callee_mask  = ra->used_callee_mask;
+    uint32_t callee_count = 0;
+    for (uint32_t m = callee_mask; m; m >>= 1) callee_count += (m & 1u);
+    uint32_t callee_bytes = callee_count * 8u;
+    uint32_t frame_size   = callee_save_base + callee_bytes;
     frame_size = (frame_size + 15u) & ~15u;
     if (getenv("WMIR_DEBUG_FRAMES")) {
         fprintf(stderr, "wmir-frame: %.*s spill=%u locals=%u total=%u\n",
@@ -885,6 +910,9 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
 
     // ---------- Entry prologue + parameter spill.
     emit_prologue(ctx, entry_dst, frame_size);
+    // Save the caller's callee-saved registers before the param moves
+    // below may overwrite any whose home is a callee-saved register.
+    emit_callee_saves(ctx, entry_dst, callee_mask, callee_save_base, /*restore=*/false);
     {
         MLIR_BlockHandle src_entry = MLIR_GetRegionBlock(src_region, 0);
         size_t n_params = MLIR_GetBlockNumArgs(src_entry);
@@ -1515,6 +1543,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 if (no == 1) {
                     ld_operand_into_fixed(ctx, dst_blk, ra, op, 0, /*reg=*/0);
                 }
+                emit_callee_saves(ctx, dst_blk, callee_mask, callee_save_base, /*restore=*/true);
                 emit_epilogue(ctx, dst_blk, frame_size);
                 emit_ret(ctx, dst_blk);
                 break;

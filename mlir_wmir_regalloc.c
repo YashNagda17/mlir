@@ -439,12 +439,36 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
     // x16/x17 are IP0/IP1 — the "intra-procedure-call scratch" regs
     // that linker veneers/stubs may freely clobber. Until our linker
     // is provably stub-free we exclude them too for safety.
-    // Effective pool: x12..x15 → 4-deep.
+    // x27/x28 hold the globals and linear-memory bases; x29/x30 are
+    // fp/lr. The remaining callee-saved registers x19..x26 are added
+    // to the pool: they survive calls (the AAPCS guarantees callees
+    // preserve them) and are saved/restored once per function in the
+    // prologue/epilogue. Caller-saved x12..x15 come first so they are
+    // preferred and leaf/call-light functions reach for callee-saved
+    // registers only under pressure.
+    //
+    // A value whose live range CROSSES A CALL (`crosses_call`) can only
+    // be kept in a register that every possible callee is guaranteed to
+    // preserve. External functions honour the AAPCS (x19..x28 saved),
+    // but a handful of hand-written runtime helpers in the lowering
+    // (the print/format/_start shims) clobber x19..x23 and x26 without
+    // saving them. Only x24 and x25 are touched by no helper, so they
+    // are the sole call-safe registers; call-crossing values may use
+    // ONLY x24/x25 (else they fall back to a stack slot). They are
+    // placed last in the pool so non-crossing values prefer the others
+    // and leave x24/x25 available for the call-crossing case.
+    // Effective pool: x12..x15, x19..x23, x26, then x24, x25 → 12-deep.
     //
     // To disable register allocation entirely (debugging aid that
     // forces every value to a stack slot), set WMIR_NO_REGALLOC=1
     // in the environment.
-    static const uint8_t POOL[] = { 12, 13, 14, 15 };
+    static const uint8_t POOL[] = { 12, 13, 14, 15,
+                                    19, 20, 21, 22, 23, 26,
+                                    24, 25 };
+    // Parallel marker: is POOL[i] safe to hold a value across a call?
+    static const bool POOL_CALLSAFE[] = { 0, 0, 0, 0,
+                                          0, 0, 0, 0, 0, 0,
+                                          1, 1 };
     size_t POOL_N = sizeof(POOL) / sizeof(POOL[0]);
     if (getenv("WMIR_NO_REGALLOC")) POOL_N = 0;
 
@@ -519,10 +543,11 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
             }
         }
 
-        // Pin to slot if FP, no use, or crosses a call.
+        // Pin to slot if FP or never used. Call-crossing values are NOT
+        // pinned here — they may use the call-safe registers (x24/x25);
+        // `callee_only` below restricts them to that subset.
         bool force_slot =
             !vp->is_int ||
-            vp->crosses_call ||
             vp->last_use_pos <= vp->def_pos;  // dead-on-def: still needs a slot for correctness
 
         if (force_slot) {
@@ -533,10 +558,16 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
             continue;
         }
 
-        // Find a free pool reg.
+        // A value live across a call may only occupy a call-safe
+        // register (x24/x25). A non-crossing value may use any pool reg.
+        bool callee_only = vp->crosses_call;
+
+        // Find a free, eligible pool reg.
         int found = -1;
         for (size_t i = 0; i < POOL_N; i++) {
-            if (!reg_busy[i]) { found = (int)i; break; }
+            if (reg_busy[i]) continue;
+            if (callee_only && !POOL_CALLSAFE[i]) continue;
+            found = (int)i; break;
         }
         if (found >= 0) {
             uint8_t reg = POOL[found];
@@ -547,16 +578,17 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
             continue;
         }
 
-        // Pool full. Evict the active interval with the latest end,
-        // unless the current value ends even later (in which case
-        // we spill it instead).
-        size_t evict_a = 0;
-        uint32_t evict_end = vinfo[active[0].vi].last_use_pos;
-        for (size_t a = 1; a < n_active; a++) {
+        // No free eligible reg. Among the active intervals occupying an
+        // ELIGIBLE register, evict the one with the latest end — unless
+        // the current value ends even later (then spill it to a slot).
+        size_t   evict_a   = (size_t)-1;
+        uint32_t evict_end = 0;
+        for (size_t a = 0; a < n_active; a++) {
+            if (callee_only && !POOL_CALLSAFE[active[a].pool_idx]) continue;
             uint32_t e = vinfo[active[a].vi].last_use_pos;
-            if (e > evict_end) { evict_end = e; evict_a = a; }
+            if (evict_a == (size_t)-1 || e > evict_end) { evict_end = e; evict_a = a; }
         }
-        if (evict_end > vp->last_use_pos) {
+        if (evict_a != (size_t)-1 && evict_end > vp->last_use_pos) {
             // Spill the evicted one; take its register.
             uint32_t evict_vi  = active[evict_a].vi;
             uint8_t  reg       = active[evict_a].reg;
@@ -578,6 +610,17 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
     }
 
     ra->n_slots = next_slot;
+
+    // Record which callee-saved registers (x19..x26) were actually
+    // assigned, so the lowering can save/restore exactly those.
+    ra->used_callee_mask = 0;
+    for (size_t i = 0; i < ra->n_values; i++) {
+        if (ra->homes[i].kind == HOME_REG) {
+            uint32_t reg = ra->homes[i].idx;
+            if (reg >= 19 && reg <= 26)
+                ra->used_callee_mask |= 1u << (reg - 19);
+        }
+    }
 
     // Build the O(1) lookup index over the now-populated values array.
     {
