@@ -53,6 +53,12 @@ typedef struct {
     ValueHome        *homes;
     size_t            n_values;
     size_t            cap;
+    // Hash index: value handle -> index into values/homes (open addressing,
+    // linear probing, power-of-two size, key 0 == empty). Built once after
+    // allocation so `wmir_regalloc_lookup` is O(1) instead of O(n_values).
+    MLIR_ValueHandle *hkeys;
+    uint32_t         *hidx;
+    size_t            hcap;
     // Number of 8-byte stack slots allocated. Frame size in bytes
     // (before 16-byte alignment) is `n_slots * 8`.
     uint32_t          n_slots;

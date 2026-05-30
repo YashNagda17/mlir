@@ -66,28 +66,58 @@ static bool value_is_int(MLIR_Context *ctx, MLIR_ValueHandle v) {
 // =============================================================================
 // Value -> internal index map. Built once per function.
 // =============================================================================
+// Open-addressing hash table (linear probing). Key 0 (MLIR_INVALID_HANDLE)
+// marks an empty slot; SSA value handles are always non-zero. Only get/set by
+// key are used (never iterated for output), so probe order is irrelevant to
+// determinism. Uses only 32-bit-safe arithmetic for the wasm32 self-host.
 typedef struct {
-    MLIR_ValueHandle *vs;
+    MLIR_ValueHandle *keys;  // 0 == empty
     uint32_t         *idx;   // index into the value table
     size_t            n, cap;
 } VMap;
 
+static uint32_t vmap_hash(MLIR_ValueHandle v) {
+    uint32_t h = (uint32_t)v ^ (uint32_t)(v >> 16);
+    h ^= h >> 15; h *= 2654435761u; h ^= h >> 13;
+    return h;
+}
+static void vmap_put_raw(MLIR_ValueHandle *keys, uint32_t *idx, size_t cap,
+                         MLIR_ValueHandle v, uint32_t i) {
+    size_t mask = cap - 1;
+    size_t p = (size_t)vmap_hash(v) & mask;
+    while (keys[p] != 0) p = (p + 1) & mask;
+    keys[p] = v; idx[p] = i;
+}
+static void vmap_grow(VMap *m) {
+    size_t nc = m->cap ? m->cap * 2 : 64;
+    MLIR_ValueHandle *nk = calloc(nc, sizeof(*nk));
+    uint32_t         *ni = malloc(nc * sizeof(*ni));
+    for (size_t i = 0; i < m->cap; i++)
+        if (m->keys[i] != 0) vmap_put_raw(nk, ni, nc, m->keys[i], m->idx[i]);
+    free(m->keys); free(m->idx);
+    m->keys = nk; m->idx = ni; m->cap = nc;
+}
 static void vmap_set(VMap *m, MLIR_ValueHandle v, uint32_t i) {
-    if (m->n == m->cap) {
-        size_t nc = m->cap ? m->cap * 2 : 32;
-        m->vs  = realloc(m->vs,  nc * sizeof(*m->vs));
-        m->idx = realloc(m->idx, nc * sizeof(*m->idx));
-        m->cap = nc;
+    if (m->cap == 0 || (m->n + 1) * 4 >= m->cap * 3) vmap_grow(m);
+    size_t mask = m->cap - 1;
+    size_t p = (size_t)vmap_hash(v) & mask;
+    while (m->keys[p] != 0) {
+        if (m->keys[p] == v) { m->idx[p] = i; return; }
+        p = (p + 1) & mask;
     }
-    m->vs[m->n] = v; m->idx[m->n] = i; m->n++;
+    m->keys[p] = v; m->idx[p] = i; m->n++;
 }
 static bool vmap_get(const VMap *m, MLIR_ValueHandle v, uint32_t *out) {
-    for (size_t i = 0; i < m->n; i++) {
-        if (m->vs[i] == v) { *out = m->idx[i]; return true; }
+    if (m->cap == 0) return false;
+    size_t mask = m->cap - 1;
+    size_t p = (size_t)vmap_hash(v) & mask;
+    while (m->keys[p] != 0) {
+        if (m->keys[p] == v) { *out = m->idx[p]; return true; }
+        p = (p + 1) & mask;
     }
     return false;
 }
-static void vmap_free(VMap *m) { free(m->vs); free(m->idx); memset(m, 0, sizeof(*m)); }
+static void vmap_free(VMap *m) { free(m->keys); free(m->idx); memset(m, 0, sizeof(*m)); }
 
 // =============================================================================
 // Per-block index map.
@@ -428,14 +458,28 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
     // Order values by def_pos.
     uint32_t *order = calloc(n_values, sizeof(uint32_t));
     for (uint32_t i = 0; i < n_values; i++) order[i] = i;
-    // Stable selection sort — n_values is small in practice (a few
-    // hundred typical), simpler than a full qsort plumb.
-    for (uint32_t i = 0; i + 1 < n_values; i++) {
-        uint32_t best = i;
-        for (uint32_t j = i + 1; j < n_values; j++) {
-            if (vinfo[order[j]].def_pos < vinfo[order[best]].def_pos) best = j;
+    // Stable bottom-up merge sort by def_pos (ties keep original index
+    // order, matching the previous stable selection sort). O(n log n) —
+    // n_values can be large in self-host functions.
+    {
+        uint32_t *tmp = calloc(n_values, sizeof(uint32_t));
+        for (size_t width = 1; width < n_values; width *= 2) {
+            for (size_t lo = 0; lo < n_values; lo += 2 * width) {
+                size_t mid = lo + width;       if (mid > n_values) mid = n_values;
+                size_t hi  = lo + 2 * width;   if (hi  > n_values) hi  = n_values;
+                size_t a = lo, b = mid, o = lo;
+                while (a < mid && b < hi) {
+                    if (vinfo[order[b]].def_pos < vinfo[order[a]].def_pos)
+                        tmp[o++] = order[b++];
+                    else
+                        tmp[o++] = order[a++];
+                }
+                while (a < mid) tmp[o++] = order[a++];
+                while (b < hi)  tmp[o++] = order[b++];
+            }
+            uint32_t *sw = order; order = tmp; tmp = sw;
         }
-        if (best != i) { uint32_t t = order[i]; order[i] = order[best]; order[best] = t; }
+        free(tmp);
     }
 
     // Active list of intervals currently occupying a pool register.
@@ -535,6 +579,22 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
 
     ra->n_slots = next_slot;
 
+    // Build the O(1) lookup index over the now-populated values array.
+    {
+        size_t hc = 16;
+        while (hc < ra->n_values * 2) hc *= 2;
+        ra->hcap  = hc;
+        ra->hkeys = calloc(hc, sizeof(*ra->hkeys));
+        ra->hidx  = malloc(hc * sizeof(*ra->hidx));
+        size_t mask = hc - 1;
+        for (size_t i = 0; i < ra->n_values; i++) {
+            MLIR_ValueHandle v = ra->values[i];
+            size_t p = (size_t)vmap_hash(v) & mask;
+            while (ra->hkeys[p] != 0) p = (p + 1) & mask;
+            ra->hkeys[p] = v; ra->hidx[p] = (uint32_t)i;
+        }
+    }
+
     free(order); free(active); free(reg_busy);
     free(live_in); free(live_out); free(gen); free(kill); free(scratch);
     free(block_first_pos); free(block_last_pos); free(blocks);
@@ -557,8 +617,12 @@ fail_slot_overflow:
 bool wmir_regalloc_lookup(const WmirRegAlloc *ra,
                           MLIR_ValueHandle v,
                           ValueHome *out) {
-    for (size_t i = 0; i < ra->n_values; i++) {
-        if (ra->values[i] == v) { *out = ra->homes[i]; return true; }
+    if (ra->hcap == 0) return false;
+    size_t mask = ra->hcap - 1;
+    size_t p = (size_t)vmap_hash(v) & mask;
+    while (ra->hkeys[p] != 0) {
+        if (ra->hkeys[p] == v) { *out = ra->homes[ra->hidx[p]]; return true; }
+        p = (p + 1) & mask;
     }
     return false;
 }
@@ -567,5 +631,7 @@ void wmir_regalloc_free(WmirRegAlloc *ra) {
     if (!ra) return;
     free(ra->values);
     free(ra->homes);
+    free(ra->hkeys);
+    free(ra->hidx);
     free(ra);
 }

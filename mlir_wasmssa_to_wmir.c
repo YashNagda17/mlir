@@ -182,27 +182,84 @@ static MLIR_TypeHandle normalise_carrier(MLIR_Context *ctx, MLIR_TypeHandle ty) 
 
 // =============================================================================
 // SSA value remapping: each wasmssa value maps to its replacement in
-// the wmir module. Linear scan; functions are small.
+// the wmir module. Open-addressing hash table (linear probing) keyed on
+// the source handle, so per-op operand lookups stay O(1). A linear scan
+// is O(n) per lookup and O(n^2) over a block; self-host functions have
+// thousands of values, so the hash table is required to keep the
+// wasmssa->wmir pass roughly linear.
+//
+// The empty-slot sentinel is MLIR_INVALID_HANDLE (0), which is never a
+// valid source value (block args and op results are always non-zero).
 // =============================================================================
 typedef struct {
-    MLIR_ValueHandle *src;
+    MLIR_ValueHandle *src;   // hash slots; 0 == empty
     MLIR_ValueHandle *dst;
-    size_t            n, cap;
+    size_t            n, cap; // cap is always a power of two (or 0)
 } VMap;
 
-static void vmap_set(VMap *m, MLIR_ValueHandle k, MLIR_ValueHandle v) {
-    if (m->n == m->cap) {
-        m->cap = m->cap ? m->cap * 2 : 16;
-        m->src = (MLIR_ValueHandle *)realloc(m->src, m->cap * sizeof(*m->src));
-        m->dst = (MLIR_ValueHandle *)realloc(m->dst, m->cap * sizeof(*m->dst));
+static size_t vmap_hash(MLIR_ValueHandle k) {
+    // 32-bit-safe integer mix (no 64-bit literals): works identically on
+    // the wasm32 self-host (uintptr_t == 32-bit) and the 64-bit host. We
+    // only ever look up by key, never iterate, so bucket order never
+    // affects the emitted module -- the self-host stays deterministic.
+    size_t h = (size_t)k;
+    h ^= h >> 15;
+    h *= 2654435761u;
+    h ^= h >> 13;
+    return h;
+}
+
+static void vmap_insert_raw(MLIR_ValueHandle *src, MLIR_ValueHandle *dst,
+                            size_t cap, MLIR_ValueHandle k,
+                            MLIR_ValueHandle v) {
+    size_t mask = cap - 1;
+    size_t i = vmap_hash(k) & mask;
+    while (src[i] != MLIR_INVALID_HANDLE && src[i] != k) {
+        i = (i + 1) & mask;
     }
-    m->src[m->n] = k;
-    m->dst[m->n] = v;
-    m->n++;
+    src[i] = k;
+    dst[i] = v;
+}
+
+static void vmap_grow(VMap *m) {
+    size_t ncap = m->cap ? m->cap * 2 : 64;
+    MLIR_ValueHandle *nsrc =
+        (MLIR_ValueHandle *)calloc(ncap, sizeof(*nsrc));
+    MLIR_ValueHandle *ndst =
+        (MLIR_ValueHandle *)malloc(ncap * sizeof(*ndst));
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->src[i] != MLIR_INVALID_HANDLE) {
+            vmap_insert_raw(nsrc, ndst, ncap, m->src[i], m->dst[i]);
+        }
+    }
+    free(m->src);
+    free(m->dst);
+    m->src = nsrc;
+    m->dst = ndst;
+    m->cap = ncap;
+}
+
+static void vmap_set(VMap *m, MLIR_ValueHandle k, MLIR_ValueHandle v) {
+    // Grow at 75% load factor to keep probe chains short.
+    if ((m->n + 1) * 4 >= m->cap * 3) {
+        vmap_grow(m);
+    }
+    size_t mask = m->cap - 1;
+    size_t i = vmap_hash(k) & mask;
+    while (m->src[i] != MLIR_INVALID_HANDLE && m->src[i] != k) {
+        i = (i + 1) & mask;
+    }
+    if (m->src[i] == MLIR_INVALID_HANDLE) m->n++;
+    m->src[i] = k;
+    m->dst[i] = v;
 }
 static int vmap_get(VMap *m, MLIR_ValueHandle k, MLIR_ValueHandle *out) {
-    for (size_t i = 0; i < m->n; i++) {
+    if (m->cap == 0) return 0;
+    size_t mask = m->cap - 1;
+    size_t i = vmap_hash(k) & mask;
+    while (m->src[i] != MLIR_INVALID_HANDLE) {
         if (m->src[i] == k) { *out = m->dst[i]; return 1; }
+        i = (i + 1) & mask;
     }
     return 0;
 }
