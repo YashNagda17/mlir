@@ -48,3 +48,4 @@ examples/tinyc/tests/*.macho
 /bench_objs/
 /verify_tinyc_out/
 examples/tinyc/__pycache__/
+/bench_frozen/
