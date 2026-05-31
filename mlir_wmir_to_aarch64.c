@@ -647,6 +647,11 @@ static uint8_t ld_operand_into(MLIR_Context *ctx, MLIR_BlockHandle blk,
         return scratch;
     }
     if (h.kind == HOME_REG) return h.idx;
+    if (h.kind == HOME_CONST) {
+        if (h.is_i64) emit_mov_imm64(ctx, blk, scratch, (uint64_t)h.cval);
+        else          emit_mov_imm32(ctx, blk, scratch, (uint32_t)h.cval);
+        return scratch;
+    }
     if (is_i64(ctx, v))
         emit_ldr_x(ctx, blk, scratch, 31, (uint32_t)(h.idx * 8u));
     else
@@ -669,6 +674,7 @@ static void st_result(MLIR_Context *ctx, MLIR_BlockHandle blk,
     MLIR_ValueHandle v = MLIR_GetOpResult(op, idx);
     ValueHome h;
     if (!wmir_regalloc_lookup(ra, v, &h)) return;
+    if (h.kind == HOME_CONST) return;  // rematerialized at use sites; no store
     if (h.kind == HOME_REG) {
         if (h.idx != produced_reg) {
             // mov dst, src. We use the X-form (mov_x): for i32 the
@@ -682,6 +688,25 @@ static void st_result(MLIR_Context *ctx, MLIR_BlockHandle blk,
         emit_str_x(ctx, blk, produced_reg, 31, (uint32_t)(h.idx * 8u));
     else
         emit_str_w(ctx, blk, produced_reg, 31, (uint32_t)(h.idx * 8u));
+}
+
+// Lever B: if operand `idx` of `op` is a rematerialized constant whose
+// value fits in an aarch64 12-bit unsigned immediate (0..4095), return
+// true and set *out. This lets add/sub/cmp fold the constant into their
+// immediate form instead of first materialising it into a scratch
+// register (which lever A's remat would otherwise force). Negative or
+// large constants are rejected (return false) and fall back to the
+// register form.
+static bool operand_const_u12(const WmirRegAlloc *ra, MLIR_OpHandle op,
+                              size_t idx, uint16_t *out) {
+    MLIR_ValueHandle v = MLIR_GetOpOperand(op, idx);
+    ValueHome h;
+    if (!wmir_regalloc_lookup(ra, v, &h)) return false;
+    if (h.kind != HOME_CONST) return false;
+    uint64_t u = h.is_i64 ? (uint64_t)h.cval : (uint64_t)(uint32_t)h.cval;
+    if (u > 0xFFFu) return false;
+    *out = (uint16_t)u;
+    return true;
 }
 
 // Force `op`'s operand `idx` into a specific physical register `reg`.
@@ -699,6 +724,11 @@ static void ld_operand_into_fixed(MLIR_Context *ctx, MLIR_BlockHandle blk,
     }
     if (h.kind == HOME_REG) {
         if (h.idx != reg) emit_mov_x(ctx, blk, reg, h.idx);
+        return;
+    }
+    if (h.kind == HOME_CONST) {
+        if (h.is_i64) emit_mov_imm64(ctx, blk, reg, (uint64_t)h.cval);
+        else          emit_mov_imm32(ctx, blk, reg, (uint32_t)h.cval);
         return;
     }
     if (is_i64(ctx, v))
@@ -757,6 +787,11 @@ static void emit_branch_arg_copies(MLIR_Context *ctx, MLIR_BlockHandle blk,
         uint8_t r = 9;
         if (pairs[k].src.kind == HOME_REG) {
             r = pairs[k].src.idx;
+        } else if (pairs[k].src.kind == HOME_CONST) {
+            if (pairs[k].src.is_i64)
+                emit_mov_imm64(ctx, blk, r, (uint64_t)pairs[k].src.cval);
+            else
+                emit_mov_imm32(ctx, blk, r, (uint32_t)pairs[k].src.cval);
         } else {
             if (pairs[k].is_i64)
                 emit_ldr_x(ctx, blk, r, 31, (uint32_t)(pairs[k].src.idx * 8u));
@@ -799,6 +834,11 @@ static void emit_branch_arg_copies(MLIR_Context *ctx, MLIR_BlockHandle blk,
                     emit_ldr_x(ctx, blk, dst_reg, 31, (uint32_t)(pairs[k].src.idx * 8u));
                 else
                     emit_ldr_w(ctx, blk, dst_reg, 31, (uint32_t)(pairs[k].src.idx * 8u));
+            } else if (pairs[k].src.kind == HOME_CONST) {
+                if (pairs[k].src.is_i64)
+                    emit_mov_imm64(ctx, blk, dst_reg, (uint64_t)pairs[k].src.cval);
+                else
+                    emit_mov_imm32(ctx, blk, dst_reg, (uint32_t)pairs[k].src.cval);
             } else {
                 if (pairs[k].src.idx != dst_reg)
                     emit_mov_x(ctx, blk, dst_reg, pairs[k].src.idx);
@@ -827,6 +867,70 @@ static void emit_branch_arg_copies(MLIR_Context *ctx, MLIR_BlockHandle blk,
 
 // =============================================================================
 // Per-function lowering.
+// =============================================================================
+// Use-count map (def-use-independent). Counts how many times each SSA value
+// appears as an operand (regular or successor block-arg) across a function's
+// wmir. Used by the icmp/eqz -> cond_br branch-fusion peephole below to prove a
+// comparison result feeds nothing but the branch. Scans operands directly, so
+// it works on the --from-wasm self-host path where global def-use tracking is
+// disabled (issue #175 memory cap).
+// =============================================================================
+typedef struct { MLIR_ValueHandle key; uint32_t cnt; } UCEnt;
+typedef struct { UCEnt *e; size_t mask; } UCMap;
+
+static size_t uc_hash(MLIR_ValueHandle k, size_t mask) {
+    return (size_t)(((uint64_t)k * 0x9E3779B97F4A7C15ull) >> 24) & mask;
+}
+static void uc_bump(UCMap *m, MLIR_ValueHandle k) {
+    if (!m->e || k == MLIR_INVALID_HANDLE) return;
+    size_t h = uc_hash(k, m->mask);
+    while (m->e[h].key != MLIR_INVALID_HANDLE && m->e[h].key != k) h = (h + 1) & m->mask;
+    m->e[h].key = k;
+    m->e[h].cnt++;
+}
+static uint32_t uc_get(const UCMap *m, MLIR_ValueHandle k) {
+    if (!m->e || k == MLIR_INVALID_HANDLE) return 0;
+    size_t h = uc_hash(k, m->mask);
+    while (m->e[h].key != MLIR_INVALID_HANDLE) {
+        if (m->e[h].key == k) return m->e[h].cnt;
+        h = (h + 1) & m->mask;
+    }
+    return 0;
+}
+static void uc_build(UCMap *m, MLIR_RegionHandle region) {
+    size_t total = 0, nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t b = 0; b < nb; b++) {
+        MLIR_BlockHandle blk = MLIR_GetRegionBlock(region, b);
+        size_t no = MLIR_GetBlockNumOps(blk);
+        for (size_t o = 0; o < no; o++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(blk, o);
+            total += MLIR_GetOpNumOperands(op);
+            size_t ns = MLIR_GetOpNumSuccessors(op);
+            for (size_t s = 0; s < ns; s++) total += MLIR_GetOpNumSuccessorOperands(op, s);
+        }
+    }
+    size_t cap = 16;
+    while (cap < total * 2 + 16) cap <<= 1;
+    m->e = (UCEnt *)calloc(cap, sizeof(UCEnt));
+    m->mask = m->e ? cap - 1 : 0;
+    if (!m->e) return;  // OOM: uc_get returns 0 -> fusion simply never fires.
+    for (size_t b = 0; b < nb; b++) {
+        MLIR_BlockHandle blk = MLIR_GetRegionBlock(region, b);
+        size_t no = MLIR_GetBlockNumOps(blk);
+        for (size_t o = 0; o < no; o++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(blk, o);
+            size_t nop = MLIR_GetOpNumOperands(op);
+            for (size_t k = 0; k < nop; k++) uc_bump(m, MLIR_GetOpOperand(op, k));
+            size_t ns = MLIR_GetOpNumSuccessors(op);
+            for (size_t s = 0; s < ns; s++) {
+                size_t nso = MLIR_GetOpNumSuccessorOperands(op, s);
+                for (size_t k = 0; k < nso; k++)
+                    uc_bump(m, MLIR_GetOpSuccessorOperand(op, s, k));
+            }
+        }
+    }
+}
+
 // =============================================================================
 static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     string name     = at_s(src, "sym_name");
@@ -861,6 +965,11 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 (int)name.size, name.str);
         return MLIR_INVALID_HANDLE;
     }
+    // Use counts for the icmp/eqz -> cond_br branch-fusion peephole. Freed on
+    // the success path below; error paths abort the whole compile so leaking
+    // there is harmless.
+    UCMap uc = {0};
+    uc_build(&uc, src_region);
     uint32_t spill_bytes  = (uint32_t)ra->n_slots * 8u;
     uint32_t locals_bytes = locals_count * 8u;
     // Callee-saved registers x19..x26 the allocator used are saved in a
@@ -966,15 +1075,23 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
             st_result(ctx, dst_blk, ra, op, (IDX), (PRODUCED_REG))
 
         size_t n_ops = MLIR_GetBlockNumOps(src_blk);
+        int pending_fuse_cond = -1;  // set by a fused icmp/eqz, consumed by cond_br
         for (size_t i = 0; i < n_ops; i++) {
             MLIR_OpHandle op = MLIR_GetBlockOp(src_blk, i);
             MLIR_OpType  t  = MLIR_GetOpType(op);
+            int fuse_cond = pending_fuse_cond;
+            pending_fuse_cond = -1;
             switch (t) {
             case OP_TYPE_WMIR_CONST: {
                 MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
                 MLIR_TypeHandle  ty = MLIR_GetValueType(r);
                 string ts = MLIR_GetTypeString(ctx, ty);
                 int64_t v = at_i(op, "value");
+                // Rematerializable int constants emit nothing here; every use
+                // re-materialises the immediate via ld_operand_into.
+                ValueHome ch;
+                if (wmir_regalloc_lookup(ra, r, &ch) && ch.kind == HOME_CONST)
+                    break;
                 uint8_t rd = PICK_RES(9, 0);
                 if (ts.size == 3 && memcmp(ts.str, "i32", 3) == 0) {
                     emit_mov_imm32(ctx, dst_blk, rd, (uint32_t)v);
@@ -1055,6 +1172,22 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
             }
             case OP_TYPE_WMIR_IADD: {
                 bool sf = is_i64(ctx, MLIR_GetOpResult(op, 0));
+                // Lever B: fold a small constant addend into `add rd,rn,#imm`.
+                // iadd is commutative, so try either operand.
+                uint16_t imm; int cidx = -1;
+                if (operand_const_u12(ra, op, 1, &imm)) cidx = 0;
+                else if (operand_const_u12(ra, op, 0, &imm)) cidx = 1;
+                if (cidx >= 0) {
+                    uint8_t rn = LD_OPERAND(10, (size_t)cidx);
+                    uint8_t rd = PICK_RES(9, 0);
+                    if (imm == 0) {
+                        if (rd != rn) emit_mov_x(ctx, dst_blk, rd, rn);
+                    } else {
+                        emit_add_imm(ctx, dst_blk, rd, rn, imm, sf);
+                    }
+                    ST_RESULT(rd, 0);
+                    break;
+                }
                 uint8_t r0 = LD_OPERAND(9, 0);
                 uint8_t r1 = LD_OPERAND(10, 1);
                 uint8_t rd = PICK_RES(9, 0);
@@ -1064,6 +1197,20 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
             }
             case OP_TYPE_WMIR_ISUB: {
                 bool sf = is_i64(ctx, MLIR_GetOpResult(op, 0));
+                // Lever B: fold a small constant subtrahend into
+                // `sub rd,rn,#imm` (operand 1 only — sub is not commutative).
+                uint16_t imm;
+                if (operand_const_u12(ra, op, 1, &imm)) {
+                    uint8_t rn = LD_OPERAND(10, 0);
+                    uint8_t rd = PICK_RES(9, 0);
+                    if (imm == 0) {
+                        if (rd != rn) emit_mov_x(ctx, dst_blk, rd, rn);
+                    } else {
+                        emit_sub_imm(ctx, dst_blk, rd, rn, imm, sf);
+                    }
+                    ST_RESULT(rd, 0);
+                    break;
+                }
                 uint8_t r0 = LD_OPERAND(9, 0);
                 uint8_t r1 = LD_OPERAND(10, 1);
                 uint8_t rd = PICK_RES(9, 0);
@@ -1236,12 +1383,32 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
             }
             case OP_TYPE_WMIR_ICMP: {
                 bool sf = is_i64(ctx, MLIR_GetOpOperand(op, 0));
-                uint8_t r0 = LD_OPERAND(9, 0);
-                uint8_t r1 = LD_OPERAND(10, 1);
-                emit_cmp_reg(ctx, dst_blk, r0, r1, sf);
                 string pred = at_s(op, "pred");
                 uint8_t cond = cond_for_pred(pred);
+                // Lever B: fold a small constant rhs into `cmp rn,#imm`.
+                uint16_t imm;
+                if (operand_const_u12(ra, op, 1, &imm)) {
+                    uint8_t r0 = LD_OPERAND(9, 0);
+                    emit_cmp_imm(ctx, dst_blk, r0, imm, sf);
+                } else {
+                    uint8_t r0 = LD_OPERAND(9, 0);
+                    uint8_t r1 = LD_OPERAND(10, 1);
+                    emit_cmp_reg(ctx, dst_blk, r0, r1, sf);
+                }
                 uint8_t rd = PICK_RES(9, 0);
+                // Lever F: if the sole use of this comparison is an
+                // immediately-following cond_br, skip the cset/store and let
+                // the cond_br branch directly on the live NZCV flags (b.<cond>).
+                if (i + 1 < n_ops) {
+                    MLIR_OpHandle nxt = MLIR_GetBlockOp(src_blk, i + 1);
+                    if (MLIR_GetOpType(nxt) == OP_TYPE_WMIR_COND_BR &&
+                        MLIR_GetOpNumOperands(nxt) >= 1 &&
+                        MLIR_GetOpOperand(nxt, 0) == MLIR_GetOpResult(op, 0) &&
+                        uc_get(&uc, MLIR_GetOpResult(op, 0)) == 1) {
+                        pending_fuse_cond = cond;
+                        break;
+                    }
+                }
                 emit_cset(ctx, dst_blk, rd, cond, /*sf=*/false);
                 ST_RESULT(rd, 0);
                 break;
@@ -1251,6 +1418,16 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 uint8_t r0 = LD_OPERAND(9, 0);
                 emit_cmp_imm(ctx, dst_blk, r0, 0, sf);
                 uint8_t rd = PICK_RES(9, 0);
+                if (i + 1 < n_ops) {
+                    MLIR_OpHandle nxt = MLIR_GetBlockOp(src_blk, i + 1);
+                    if (MLIR_GetOpType(nxt) == OP_TYPE_WMIR_COND_BR &&
+                        MLIR_GetOpNumOperands(nxt) >= 1 &&
+                        MLIR_GetOpOperand(nxt, 0) == MLIR_GetOpResult(op, 0) &&
+                        uc_get(&uc, MLIR_GetOpResult(op, 0)) == 1) {
+                        pending_fuse_cond = COND_EQ;
+                        break;
+                    }
+                }
                 emit_cset(ctx, dst_blk, rd, COND_EQ, /*sf=*/false);
                 ST_RESULT(rd, 0);
                 break;
@@ -1515,6 +1692,10 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                         uint8_t src_reg;
                         if (h.kind == HOME_REG) {
                             src_reg = h.idx;
+                        } else if (h.kind == HOME_CONST) {
+                            src_reg = 9;
+                            if (h.is_i64) emit_mov_imm64(ctx, dst_blk, src_reg, (uint64_t)h.cval);
+                            else          emit_mov_imm32(ctx, dst_blk, src_reg, (uint32_t)h.cval);
                         } else {
                             src_reg = 9;
                             uint32_t off = (uint32_t)stack_bytes + (uint32_t)h.idx * 8u;
@@ -1620,6 +1801,24 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
                 // Read the condition BEFORE any block-arg copies so the
                 // parallel copies (which may overwrite the condition's
                 // register home) cannot clobber it.
+                // Lever F: when a fused icmp/eqz precedes us, NZCV is still
+                // live (no flag-clobbering op was emitted in between), so branch
+                // directly with b.<cond> instead of reloading + cbnz.
+                if (fuse_cond >= 0) {
+                    if (n_t == 0 && n_f == 0) {
+                        emit_b_cond(ctx, dst_blk, (uint8_t)fuse_cond, t_dst);
+                        emit_b(ctx, dst_blk, f_dst);
+                    } else {
+                        MLIR_BlockHandle land = MLIR_CreateBlock(ctx);
+                        MLIR_AppendRegionBlock(ctx, dst_region, land);
+                        emit_b_cond(ctx, dst_blk, (uint8_t)fuse_cond, land);
+                        emit_branch_arg_copies(ctx, dst_blk, ra, op, 1, f_src);
+                        emit_b(ctx, dst_blk, f_dst);
+                        emit_branch_arg_copies(ctx, land, ra, op, 0, t_src);
+                        emit_b(ctx, land, t_dst);
+                    }
+                    break;
+                }
                 uint8_t r0 = LD_OPERAND(9, 0);
                 if (n_t == 0 && n_f == 0) {
                     emit_cbnz(ctx, dst_blk, r0, /*sf=*/false, t_dst);
@@ -1657,6 +1856,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
 
     wmir_regalloc_free(ra);
     bm_free(&bm);
+    free(uc.e);
 
     MLIR_AttributeHandle attrs[4];
     size_t naf = 0;
@@ -2078,6 +2278,10 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     // Prologue + 32-byte scratch frame. [sp+0] is a 1-byte buffer for
     // emitting literal chars via the write(2) syscall.
     emit_prologue(ctx, entry, /*frame_size=*/32);
+    // AAPCS: preserve the callee-saved registers this shim uses as
+    // long-lived working regs across its internal bl printI64/_write
+    // calls, so callers may keep call-crossing values in x19..x21.
+    emit_callee_saves(ctx, entry, /*mask=*/0x07, /*base=*/8, /*restore=*/false);
     // x19 = x28 + zext(w0)   (fmt cursor)
     // x20 = x28 + zext(w1)   (args cursor)
     {
@@ -2282,6 +2486,7 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     // ---------- done ----------
     // Return 0 (we don't bother tracking the actual byte count).
     emit_movz(ctx, done, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_callee_saves(ctx, done, /*mask=*/0x07, /*base=*/8, /*restore=*/true);
     emit_epilogue(ctx, done, /*frame_size=*/32);
     emit_ret(ctx, done);
 
@@ -2590,10 +2795,13 @@ static MLIR_OpHandle synth_memchr(MLIR_Context *ctx) {
 // -----------------------------------------------------------------------------
 static MLIR_OpHandle synth_fd_write(MLIR_Context *ctx) {
     MLIR_BlockHandle entry, loop, done;
-    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 32);
     loop = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, loop);
     done = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, done);
 
+    // AAPCS: preserve x19..x22 (used as loop state across the internal
+    // _write call) so callers may keep call-crossing values in them.
+    emit_callee_saves(ctx, entry, /*mask=*/0x0F, /*base=*/0, /*restore=*/false);
     // Stash fd in x19 (we clobber x0 for the syscall on each iteration).
     {
         MLIR_AttributeHandle a[2];
@@ -2664,7 +2872,8 @@ static MLIR_OpHandle synth_fd_write(MLIR_Context *ctx) {
     emit_add_reg(ctx, done, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
     emit_str_w(ctx, done, /*rt=*/21, /*rn=*/10, /*off=*/0);
     emit_movz(ctx, done, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
-    emit_epilogue(ctx, done, /*frame_size=*/16);
+    emit_callee_saves(ctx, done, /*mask=*/0x0F, /*base=*/0, /*restore=*/true);
+    emit_epilogue(ctx, done, /*frame_size=*/32);
     emit_ret(ctx, done);
 
     return synth_leaf_finish(ctx, region, "fd_write", 8);
@@ -3718,12 +3927,15 @@ static MLIR_OpHandle synth_fd_close(MLIR_Context *ctx) {
 // -----------------------------------------------------------------------------
 static MLIR_OpHandle synth_fd_read(MLIR_Context *ctx) {
     MLIR_BlockHandle entry, loop, after_rd, done, err;
-    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 32);
     loop     = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, loop);
     after_rd = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, after_rd);
     done     = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, done);
     err      = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, err);
 
+    // AAPCS: preserve x19..x22 (loop state across the internal _read call)
+    // so callers may keep call-crossing values in them.
+    emit_callee_saves(ctx, entry, /*mask=*/0x0F, /*base=*/0, /*restore=*/false);
     // Stash fd (w0) in x19, host(iovs) in x9, iovs_len in x20.
     {
         MLIR_AttributeHandle a[2];
@@ -3783,12 +3995,14 @@ static MLIR_OpHandle synth_fd_read(MLIR_Context *ctx) {
     emit_add_reg(ctx, done, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
     emit_str_w(ctx, done, /*rt=*/21, /*rn=*/10, /*off=*/0);
     emit_movz(ctx, done, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
-    emit_epilogue(ctx, done, /*frame_size=*/16);
+    emit_callee_saves(ctx, done, /*mask=*/0x0F, /*base=*/0, /*restore=*/true);
+    emit_epilogue(ctx, done, /*frame_size=*/32);
     emit_ret(ctx, done);
 
     // err: return errno (we use 8 ~ EBADF; close enough for tinyc).
     emit_movz(ctx, err, /*rd=*/0, /*imm16=*/8, /*hw=*/0, /*sf=*/false);
-    emit_epilogue(ctx, err, /*frame_size=*/16);
+    emit_callee_saves(ctx, err, /*mask=*/0x0F, /*base=*/0, /*restore=*/true);
+    emit_epilogue(ctx, err, /*frame_size=*/32);
     emit_ret(ctx, err);
 
     return synth_leaf_finish(ctx, region, "fd_read", 7);
@@ -3805,6 +4019,7 @@ static MLIR_OpHandle synth_fd_seek(MLIR_Context *ctx) {
     err = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, err);
 
     // Stash newoffset_ofs (w3) into x19 before clobbering w3.
+    emit_callee_saves(ctx, entry, /*mask=*/0x01, /*base=*/0, /*restore=*/false);
     emit_mov_x(ctx, entry, /*rd=*/19, /*rn=*/3);
     // lseek(fd=x0(uxtw), offset=x1(i64 already), whence=x2(uxtw))
     {
@@ -3833,10 +4048,12 @@ static MLIR_OpHandle synth_fd_seek(MLIR_Context *ctx) {
     emit_add_reg(ctx, ok, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
     emit_str_x(ctx, ok, /*rt=*/0, /*rn=*/10, /*off=*/0);
     emit_movz(ctx, ok, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_callee_saves(ctx, ok, /*mask=*/0x01, /*base=*/0, /*restore=*/true);
     emit_epilogue(ctx, ok, /*frame_size=*/16);
     emit_ret(ctx, ok);
 
     emit_movz(ctx, err, /*rd=*/0, /*imm16=*/8, /*hw=*/0, /*sf=*/false);
+    emit_callee_saves(ctx, err, /*mask=*/0x01, /*base=*/0, /*restore=*/true);
     emit_epilogue(ctx, err, /*frame_size=*/16);
     emit_ret(ctx, err);
 
@@ -3854,6 +4071,7 @@ static MLIR_OpHandle synth_fd_tell(MLIR_Context *ctx) {
     err = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, err);
 
     // x19 = newoffset_ofs.
+    emit_callee_saves(ctx, entry, /*mask=*/0x01, /*base=*/0, /*restore=*/false);
     emit_mov_x(ctx, entry, /*rd=*/19, /*rn=*/1);
     // lseek(fd=uxtw(w0), offset=0, whence=1).
     {
@@ -3876,10 +4094,12 @@ static MLIR_OpHandle synth_fd_tell(MLIR_Context *ctx) {
     emit_add_reg(ctx, ok, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
     emit_str_x(ctx, ok, /*rt=*/0, /*rn=*/10, /*off=*/0);
     emit_movz(ctx, ok, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_callee_saves(ctx, ok, /*mask=*/0x01, /*base=*/0, /*restore=*/true);
     emit_epilogue(ctx, ok, /*frame_size=*/16);
     emit_ret(ctx, ok);
 
     emit_movz(ctx, err, /*rd=*/0, /*imm16=*/8, /*hw=*/0, /*sf=*/false);
+    emit_callee_saves(ctx, err, /*mask=*/0x01, /*base=*/0, /*restore=*/true);
     emit_epilogue(ctx, err, /*frame_size=*/16);
     emit_ret(ctx, err);
 
@@ -3901,7 +4121,7 @@ static MLIR_OpHandle synth_path_open(MLIR_Context *ctx) {
     MLIR_BlockHandle f_check_trunc, f_check_excl, f_check_append;
     MLIR_BlockHandle f_after_w, f_done_flags;
     MLIR_BlockHandle do_open, ok, err;
-    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, /*frame=*/1024);
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, /*frame=*/1088);
     cpchk         = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, cpchk);
     cploop        = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, cploop);
     cpdone        = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, cpdone);
@@ -3923,6 +4143,9 @@ static MLIR_OpHandle synth_path_open(MLIR_Context *ctx) {
     //   x21 = oflags (we'll mask piece-by-piece for O_CREAT/TRUNC).
     //   x22 = rights (we'll mask for FD_READ / FD_WRITE).
     //   x23 = fdflags (for O_APPEND).
+    // AAPCS: the path buffer occupies [sp+0..1023]; save x19..x23 above
+    // it at [sp+1024..] so callers may keep call-crossing values in them.
+    emit_callee_saves(ctx, entry, /*mask=*/0x1F, /*base=*/1024, /*restore=*/false);
     emit_ldr_w(ctx, entry, /*rt=*/19, /*rn=*/29, /*off=*/16);
     emit_mov_x(ctx, entry, /*rd=*/20, /*rn=*/3);
     emit_mov_x(ctx, entry, /*rd=*/21, /*rn=*/4);
@@ -4043,12 +4266,14 @@ static MLIR_OpHandle synth_path_open(MLIR_Context *ctx) {
     emit_add_reg(ctx, ok, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
     emit_str_w(ctx, ok, /*rt=*/0, /*rn=*/10, /*off=*/0);
     emit_movz(ctx, ok, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
-    emit_epilogue(ctx, ok, /*frame_size=*/1024);
+    emit_callee_saves(ctx, ok, /*mask=*/0x1F, /*base=*/1024, /*restore=*/true);
+    emit_epilogue(ctx, ok, /*frame_size=*/1088);
     emit_ret(ctx, ok);
 
     // err: return 44 (WASI ENOENT). tinyc treats !=0 as failure.
     emit_movz(ctx, err, /*rd=*/0, /*imm16=*/44, /*hw=*/0, /*sf=*/false);
-    emit_epilogue(ctx, err, /*frame_size=*/1024);
+    emit_callee_saves(ctx, err, /*mask=*/0x1F, /*base=*/1024, /*restore=*/true);
+    emit_epilogue(ctx, err, /*frame_size=*/1088);
     emit_ret(ctx, err);
 
     return synth_leaf_finish(ctx, region, "path_open", 9);
