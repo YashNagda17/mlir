@@ -229,8 +229,6 @@ static unsigned type_align_bytes(MLIR_Context *ctx, MLIR_TypeHandle ty) {
 typedef struct { uintptr_t key; MLIR_ValueHandle val; } VMapEntry;
 typedef struct { uintptr_t key; uint32_t off; } AMapEntry;
 
-DEFINE_VECTOR_FOR_TYPE(VMapEntry,  VecVMap)
-DEFINE_VECTOR_FOR_TYPE(AMapEntry,  VecAMap)
 DEFINE_VECTOR_FOR_TYPE(uint8_t,    VecU8)
 
 typedef struct {
@@ -242,11 +240,16 @@ typedef struct {
     // Direct-MLIR emission state. body_block accumulates wasmssa.* ops.
     MLIR_BlockHandle  body_block;
 
-    // Map LLVM-dialect MLIR_ValueHandle -> wasmssa MLIR_ValueHandle.
-    VecVMap vmap;
+    // Map LLVM-dialect MLIR_ValueHandle -> wasmssa MLIR_ValueHandle, as an
+    // open-addressing hash table (key 0 == empty; source value handles are
+    // always non-zero). Replaces an earlier linear-scan vector that made
+    // lowering O(n^2) in the number of values per function.
+    VMapEntry *vmap;
+    size_t     vmap_cap, vmap_n;   // cap is 0 or a power of two
 
     // Map MLIR_ValueHandle (alloca result) -> shadow-stack frame offset.
-    VecAMap amap;
+    AMapEntry *amap;
+    size_t     amap_cap, amap_n;
 
     uint32_t  frame_size;
     MLIR_ValueHandle  sp_value;        // post-decrement SP, or MLIR_INVALID_HANDLE
@@ -257,23 +260,89 @@ typedef struct {
     uint32_t  va_buf_offset;      // offset within shadow frame for the variadic buffer
 } FnCtx;
 
+// Open-addressing hash maps keyed by MLIR value handles. The handle is never
+// zero, so key==0 marks an empty slot. Lookups are key-only (never iterated in
+// an output-affecting way), and the 32-bit-safe mix below is identical on the
+// wasm32 self-host (uintptr_t == 32-bit) and the 64-bit host, so the emitted
+// module stays deterministic / bit-identical across the self-host cycle.
+static size_t map_hash(uintptr_t k) {
+    size_t h = (size_t)k;
+    h ^= h >> 15;
+    h *= 2654435761u;
+    h ^= h >> 13;
+    return h;
+}
+
+static void vmap_grow(FnCtx *F) {
+    size_t ncap = F->vmap_cap ? F->vmap_cap * 2 : 32;
+    VMapEntry *nt = (VMapEntry *)arena_alloc(F->arena, ncap * sizeof(VMapEntry));
+    memset(nt, 0, ncap * sizeof(VMapEntry));
+    size_t mask = ncap - 1;
+    for (size_t i = 0; i < F->vmap_cap; i++) {
+        if (F->vmap[i].key == 0) continue;
+        size_t j = map_hash(F->vmap[i].key) & mask;
+        while (nt[j].key != 0) j = (j + 1) & mask;
+        nt[j] = F->vmap[i];
+    }
+    F->vmap = nt;
+    F->vmap_cap = ncap;
+}
 static void vmap_set(FnCtx *F, MLIR_ValueHandle k, MLIR_ValueHandle v) {
-    VMapEntry e = { (uintptr_t)k, v };
-    VecVMap_push_back(F->arena, &F->vmap, e);
+    // Grow at 75% load to keep probe chains short.
+    if ((F->vmap_n + 1) * 4 >= F->vmap_cap * 3) vmap_grow(F);
+    size_t mask = F->vmap_cap - 1;
+    size_t i = map_hash((uintptr_t)k) & mask;
+    while (F->vmap[i].key != 0) {
+        if (F->vmap[i].key == (uintptr_t)k) return;  // first insert wins
+        i = (i + 1) & mask;
+    }
+    F->vmap[i].key = (uintptr_t)k;
+    F->vmap[i].val = v;
+    F->vmap_n++;
 }
 static int vmap_get(FnCtx *F, MLIR_ValueHandle k, MLIR_ValueHandle *out) {
-    for (size_t i = 0; i < F->vmap.size; i++) {
-        if (F->vmap.data[i].key == (uintptr_t)k) { *out = F->vmap.data[i].val; return 1; }
+    if (F->vmap_cap == 0) return 0;
+    size_t mask = F->vmap_cap - 1;
+    size_t i = map_hash((uintptr_t)k) & mask;
+    while (F->vmap[i].key != 0) {
+        if (F->vmap[i].key == (uintptr_t)k) { *out = F->vmap[i].val; return 1; }
+        i = (i + 1) & mask;
     }
     return 0;
 }
+static void amap_grow(FnCtx *F) {
+    size_t ncap = F->amap_cap ? F->amap_cap * 2 : 16;
+    AMapEntry *nt = (AMapEntry *)arena_alloc(F->arena, ncap * sizeof(AMapEntry));
+    memset(nt, 0, ncap * sizeof(AMapEntry));
+    size_t mask = ncap - 1;
+    for (size_t i = 0; i < F->amap_cap; i++) {
+        if (F->amap[i].key == 0) continue;
+        size_t j = map_hash(F->amap[i].key) & mask;
+        while (nt[j].key != 0) j = (j + 1) & mask;
+        nt[j] = F->amap[i];
+    }
+    F->amap = nt;
+    F->amap_cap = ncap;
+}
 static void amap_set(FnCtx *F, MLIR_ValueHandle v, uint32_t off) {
-    AMapEntry e = { (uintptr_t)v, off };
-    VecAMap_push_back(F->arena, &F->amap, e);
+    if ((F->amap_n + 1) * 4 >= F->amap_cap * 3) amap_grow(F);
+    size_t mask = F->amap_cap - 1;
+    size_t i = map_hash((uintptr_t)v) & mask;
+    while (F->amap[i].key != 0) {
+        if (F->amap[i].key == (uintptr_t)v) return;  // first insert wins
+        i = (i + 1) & mask;
+    }
+    F->amap[i].key = (uintptr_t)v;
+    F->amap[i].off = off;
+    F->amap_n++;
 }
 static int amap_get(FnCtx *F, MLIR_ValueHandle v, uint32_t *out) {
-    for (size_t i = 0; i < F->amap.size; i++) {
-        if (F->amap.data[i].key == (uintptr_t)v) { *out = F->amap.data[i].off; return 1; }
+    if (F->amap_cap == 0) return 0;
+    size_t mask = F->amap_cap - 1;
+    size_t i = map_hash((uintptr_t)v) & mask;
+    while (F->amap[i].key != 0) {
+        if (F->amap[i].key == (uintptr_t)v) { *out = F->amap[i].off; return 1; }
+        i = (i + 1) & mask;
     }
     return 0;
 }
@@ -2295,8 +2364,6 @@ static bool lower_function(MLIR_Context *ctx, Arena *arena, ModCtx *mod,
     F.n_params = n_params;
     F.sp_value = MLIR_INVALID_HANDLE;
     F.va_list_value = MLIR_INVALID_HANDLE;
-    VecVMap_reserve(arena, &F.vmap, 16);
-    VecAMap_reserve(arena, &F.amap, 8);
 
     // If this function is variadic, sig_for_func has appended a synthetic
     // i32 va_list param at index n_params-1. The MLIR entry block only has
