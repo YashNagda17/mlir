@@ -129,6 +129,207 @@ static int64_t at_i_or(MLIR_OpHandle op, const char *name, int64_t dflt) {
     return a ? MLIR_GetAttributeInteger(a) : dflt;
 }
 
+// =============================================================================
+// Boolean-normalization peephole.
+//
+// C frontends materialise comparison results as an explicit 0/1 integer and
+// then re-test it for control flow, producing chains like
+//
+//     %b = wmir.icmp ... {pred="ult"}        ; already 0 or 1
+//     %s = wmir.select(const 1, const 0, %b) ; %b ? 1 : 0   (identity on a bool)
+//     %n = wmir.icmp(%s, const 0) {pred="ne"}; %s != 0       (identity on a bool)
+//     wmir.cond_br(%n) ...
+//
+// An optimising wasm JIT (e.g. Cranelift in wasmtime) folds these away; the
+// straight-line wmir->aarch64 backend otherwise emits a cset/csel round-trip
+// per comparison. Since both `select(1,0,c)` and `icmp_ne(b,0)` equal their
+// inner value exactly when that value is a 0/1 boolean (which the results of
+// wmir.icmp / wmir.eqz always are), we forward the inner value and let DCE
+// remove the now-dead ops. This is a full value-equivalence rewrite, valid
+// for every use — not just branches.
+// =============================================================================
+static bool simp_value_is_bool(MLIR_ValueHandle v) {
+    MLIR_OpHandle d = MLIR_GetValueDefiningOp(v);
+    if (!d) return false;
+    MLIR_OpType t = MLIR_GetOpType(d);
+    return t == OP_TYPE_WMIR_ICMP || t == OP_TYPE_WMIR_EQZ;
+}
+
+static bool simp_value_is_const(MLIR_ValueHandle v, int64_t want) {
+    MLIR_OpHandle d = MLIR_GetValueDefiningOp(v);
+    if (!d || MLIR_GetOpType(d) != OP_TYPE_WMIR_CONST) return false;
+    return at_i(d, "value") == want;
+}
+
+// Open-addressing hash map over value handles. The wmir is lowered on the
+// --from-wasm path with def-use tracking DISABLED (issue #175 memory cap), so
+// MLIR_ReplaceAllUsesOfValue / MLIR_GetValueNumUses are no-ops there. This
+// pass therefore does NOT use the global use list: it repoints operands by
+// hand and computes liveness by scanning, so it works identically with or
+// without tracking. MLIR_GetValueDefiningOp still works (def_handle is set at
+// value creation, independent of tracking).
+typedef struct { MLIR_ValueHandle key, val; } SimpEnt;
+
+static size_t simp_hash(MLIR_ValueHandle k, size_t mask) {
+    return (size_t)(((uint64_t)k * 0x9E3779B97F4A7C15ull) >> 24) & mask;
+}
+
+static void simp_put(SimpEnt *m, size_t mask, MLIR_ValueHandle k, MLIR_ValueHandle v) {
+    size_t h = simp_hash(k, mask);
+    while (m[h].key != MLIR_INVALID_HANDLE && m[h].key != k) h = (h + 1) & mask;
+    m[h].key = k;
+    m[h].val = v;
+}
+
+static MLIR_ValueHandle simp_get(SimpEnt *m, size_t mask, MLIR_ValueHandle k) {
+    size_t h = simp_hash(k, mask);
+    while (m[h].key != MLIR_INVALID_HANDLE) {
+        if (m[h].key == k) return m[h].val;
+        h = (h + 1) & mask;
+    }
+    return MLIR_INVALID_HANDLE;
+}
+
+// Follow the rewrite map transitively (select->icmp_ne->bool chains).
+static MLIR_ValueHandle simp_resolve(SimpEnt *m, size_t mask, MLIR_ValueHandle v) {
+    for (int guard = 0; guard < 64; guard++) {
+        MLIR_ValueHandle n = simp_get(m, mask, v);
+        if (n == MLIR_INVALID_HANDLE) break;
+        v = n;
+    }
+    return v;
+}
+
+// Total operand slots (regular + per-successor block-arg operands), addressable
+// by the flat index MLIR_GetOpOperand/MLIR_SetOpOperand uses.
+static size_t simp_flat_count(MLIR_OpHandle op) {
+    size_t n = MLIR_GetOpNumOperands(op);
+    size_t ns = MLIR_GetOpNumSuccessors(op);
+    for (size_t s = 0; s < ns; s++) n += MLIR_GetOpNumSuccessorOperands(op, s);
+    return n;
+}
+
+static MLIR_ValueHandle simp_flat_get(MLIR_OpHandle op, size_t i) {
+    size_t nreg = MLIR_GetOpNumOperands(op);
+    if (i < nreg) return MLIR_GetOpOperand(op, i);
+    size_t rem = i - nreg;
+    size_t ns = MLIR_GetOpNumSuccessors(op);
+    for (size_t s = 0; s < ns; s++) {
+        size_t c = MLIR_GetOpNumSuccessorOperands(op, s);
+        if (rem < c) return MLIR_GetOpSuccessorOperand(op, s, rem);
+        rem -= c;
+    }
+    return MLIR_INVALID_HANDLE;
+}
+
+static void wmir_simplify_bools(MLIR_Context *ctx, MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+
+    // Pass 1: count redundant boolean-normalisation ops so we can size the
+    // rewrite map and erase list.
+    size_t ncand = 0;
+    for (size_t bi = 0; bi < nb; bi++) {
+        MLIR_BlockHandle blk = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(blk);
+        for (size_t oi = 0; oi < no; oi++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(blk, oi);
+            MLIR_OpType t = MLIR_GetOpType(op);
+            if (t == OP_TYPE_WMIR_ICMP) {
+                string pred = at_s(op, "pred");
+                if (pred.size == 2 && pred.str[0] == 'n' && pred.str[1] == 'e') {
+                    MLIR_ValueHandle a0 = MLIR_GetOpOperand(op, 0);
+                    MLIR_ValueHandle a1 = MLIR_GetOpOperand(op, 1);
+                    if ((simp_value_is_const(a1, 0) && simp_value_is_bool(a0)) ||
+                        (simp_value_is_const(a0, 0) && simp_value_is_bool(a1)))
+                        ncand++;
+                }
+            } else if (t == OP_TYPE_WMIR_SELECT) {
+                MLIR_ValueHandle a = MLIR_GetOpOperand(op, 0);
+                MLIR_ValueHandle b = MLIR_GetOpOperand(op, 1);
+                MLIR_ValueHandle c = MLIR_GetOpOperand(op, 2);
+                if (simp_value_is_const(a, 1) && simp_value_is_const(b, 0) &&
+                    simp_value_is_bool(c))
+                    ncand++;
+            }
+        }
+    }
+    if (ncand == 0) return;
+
+    // Size the map to a power-of-two with generous headroom (<50% load).
+    size_t cap = 16;
+    while (cap < ncand * 4) cap <<= 1;
+    size_t mask = cap - 1;
+    SimpEnt *map = (SimpEnt *)calloc(cap, sizeof(*map));
+    MLIR_OpHandle *erase = (MLIR_OpHandle *)malloc(ncand * sizeof(*erase));
+    if (!map || !erase) { free(map); free(erase); return; }
+    size_t nerase = 0;
+
+    // Pass 2: record result -> inner forwardings and the ops to drop.
+    for (size_t bi = 0; bi < nb; bi++) {
+        MLIR_BlockHandle blk = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(blk);
+        for (size_t oi = 0; oi < no; oi++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(blk, oi);
+            MLIR_OpType t = MLIR_GetOpType(op);
+            MLIR_ValueHandle inner = MLIR_INVALID_HANDLE;
+            if (t == OP_TYPE_WMIR_ICMP) {
+                string pred = at_s(op, "pred");
+                if (pred.size == 2 && pred.str[0] == 'n' && pred.str[1] == 'e') {
+                    MLIR_ValueHandle a0 = MLIR_GetOpOperand(op, 0);
+                    MLIR_ValueHandle a1 = MLIR_GetOpOperand(op, 1);
+                    if (simp_value_is_const(a1, 0) && simp_value_is_bool(a0))
+                        inner = a0;
+                    else if (simp_value_is_const(a0, 0) && simp_value_is_bool(a1))
+                        inner = a1;
+                }
+            } else if (t == OP_TYPE_WMIR_SELECT) {
+                MLIR_ValueHandle a = MLIR_GetOpOperand(op, 0);
+                MLIR_ValueHandle b = MLIR_GetOpOperand(op, 1);
+                MLIR_ValueHandle c = MLIR_GetOpOperand(op, 2);
+                if (simp_value_is_const(a, 1) && simp_value_is_const(b, 0) &&
+                    simp_value_is_bool(c))
+                    inner = c;
+            }
+            if (inner != MLIR_INVALID_HANDLE) {
+                simp_put(map, mask, MLIR_GetOpResult(op, 0), inner);
+                erase[nerase++] = op;
+            }
+        }
+    }
+
+    // Pass 3: repoint every operand (regular + successor block-arg) that
+    // references a redundant result onto the resolved inner value. Because
+    // every operand of the select pre-dates the select, and every operand of
+    // the icmp_ne pre-dates it, the inner value dominates each rewritten use.
+    for (size_t bi = 0; bi < nb; bi++) {
+        MLIR_BlockHandle blk = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(blk);
+        for (size_t oi = 0; oi < no; oi++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(blk, oi);
+            size_t nf = simp_flat_count(op);
+            for (size_t i = 0; i < nf; i++) {
+                MLIR_ValueHandle cur = simp_flat_get(op, i);
+                MLIR_ValueHandle r = simp_resolve(map, mask, cur);
+                if (r != cur) MLIR_SetOpOperand(ctx, op, i, r);
+            }
+        }
+    }
+
+    // Pass 4: erase the redundant ops. After pass 3 every flat operand (regular
+    // and successor block-arg) that referenced a redundant result has been
+    // repointed onto the resolved inner value, and flat operands are the only
+    // value-use sites in wmir, so each redundant result is now dead. Erasing
+    // also splices the op out of its block so the backend never lowers it.
+    // (Orphaned wmir.const operands need no cleanup: lever A homes constants as
+    // HOME_CONST and rematerialises them at use sites, so an unused const emits
+    // no code.)
+    for (size_t k = 0; k < nerase; k++)
+        MLIR_EraseOp(ctx, erase[k]);
+
+    free(map);
+    free(erase);
+}
+
 // Translate a wasm value-type byte to the matching MLIR integer / float
 // type used inside wmir. *Note*: f32 / f64 wasm values are carried by
 // i32 / i64 bit-pattern wmir values throughout the pipeline. The actual
@@ -1671,6 +1872,11 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     bool promoted = false;
     if (lt.size > 0)
         promoted = mlir_wmir_mem2reg(ctx, dst_region, lt.str, lt.size);
+
+    // Collapse redundant boolean-normalisation chains (select(1,0,c),
+    // icmp_ne(b,0)) that the frontend emits around comparisons. Matches
+    // what an optimising wasm JIT does, shrinking hot compare/branch code.
+    wmir_simplify_bools(ctx, dst_region);
 
     MLIR_AttributeHandle attrs[6];
     size_t na = 0;
