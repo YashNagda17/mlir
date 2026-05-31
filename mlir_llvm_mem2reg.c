@@ -608,6 +608,410 @@ static void l2r_promote_region(MLIR_Context *ctx, MLIR_RegionHandle region) {
     hmap_free(&m.remap);
 }
 
+// ===========================================================================
+// SROA — scalar replacement of aggregates (runs before the scalar promotion)
+// ===========================================================================
+// tinyC materialises every C local — including aggregates like `string`,
+// `Type`, `EVal` — as one entry-block `llvm.alloca`, and accesses each field
+// via a constant-index `llvm.getelementptr` + scalar `llvm.load`/`llvm.store`.
+// The scalar mem2reg above only promotes allocas whose element type is loaded/
+// stored as a whole, so every struct local would otherwise stay in the linear-
+// memory shadow stack. This pass splits a non-escaping aggregate alloca into
+// one fresh scalar alloca per accessed leaf field, after which the scalar pass
+// promotes those scalars to SSA + block-arg phis.
+//
+// An aggregate alloca is splittable iff the ONLY uses of its pointer are
+// `llvm.getelementptr`s (as the base, operand 0) whose indices are all
+// constant, whose leading index is 0, and whose leaf type is a scalar; and the
+// ONLY uses of each such GEP result are an `llvm.load` (operand 0) or
+// `llvm.store` (operand 1) of that exact leaf type. Any other use — the
+// pointer escaping to a call/arith/store-as-value, a whole-aggregate load/
+// store, a dynamic or chained GEP, or any use inside a nested region — leaves
+// the alloca untouched.
+
+#define SROA_MAX_PATH 8
+
+typedef struct {
+    MLIR_OpHandle   op;          // the llvm.getelementptr op
+    MLIR_ValueHandle res;        // its result (the field pointer)
+    size_t          ai;          // owning aggregate-alloca index
+    MLIR_TypeHandle leaf;        // scalar leaf type at this path
+    int32_t         path[SROA_MAX_PATH];
+    int             plen;
+    bool            valid;       // path parsed & leaf is scalar
+    MLIR_ValueHandle scalar;     // assigned per-field scalar alloca (apply)
+} SroaGep;
+
+typedef struct {
+    MLIR_Context *ctx;
+    // aggregate allocas
+    MLIR_OpHandle    *a_op;
+    MLIR_BlockHandle *a_blk;
+    MLIR_ValueHandle *a_res;
+    MLIR_ValueHandle *a_size;    // alloca element-count operand
+    MLIR_TypeHandle  *a_elem;    // aggregate element type
+    MLIR_TypeHandle  *a_ptrty;   // alloca result type (!llvm.ptr)
+    bool             *a_split;   // still splittable
+    // per-alloca list of created (path -> scalar) for dedup
+    int              *a_nfield;
+    int32_t          *a_fpath;   // flat: entry e occupies [e*SROA_MAX_PATH ..]
+    int              *a_fplen;
+    MLIR_ValueHandle *a_fval;
+    int              *a_foff;    // start index into the flat field arrays
+    size_t na, acap;
+    HMap aidx;                   // alloca result -> ai
+    // geps
+    SroaGep *geps;
+    size_t   ng, gcap;
+    HMap gidx;                   // gep result -> gi
+} S;
+
+// Parse "array<i32: 0, 1, ...>" into out[]; returns false on overflow/garbage.
+static bool sroa_parse_indices(string s, int32_t *out, int cap, int *n) {
+    const char *p = s.str;
+    const char *e = s.str + s.size;
+    while (p < e && *p != ':') p++;
+    if (p >= e) return false;
+    p++; // skip ':'
+    int cnt = 0;
+    while (p < e) {
+        while (p < e && (*p == ' ' || *p == ',')) p++;
+        if (p >= e || *p == '>') break;
+        bool neg = false;
+        if (*p == '-') { neg = true; p++; }
+        if (p >= e || *p < '0' || *p > '9') return false;
+        long v = 0;
+        while (p < e && *p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+        if (neg) v = -v;
+        if (cnt >= cap) return false;
+        out[cnt++] = (int32_t)v;
+    }
+    *n = cnt;
+    return cnt > 0;
+}
+
+// Walk an aggregate type along a constant index path (path[0] must be 0, the
+// element selector for the single-object alloca). Returns the scalar leaf type
+// via *out, or false if the path is dynamic, out of range, terminates on an
+// aggregate, or is just the whole object.
+static bool sroa_leaf_type(MLIR_TypeHandle agg, const int32_t *idx, int n,
+                           MLIR_TypeHandle *out) {
+    if (n < 2 || idx[0] != 0) return false;
+    MLIR_TypeHandle cur = agg;
+    for (int i = 1; i < n; i++) {
+        int32_t c = idx[i];
+        if (c == (int32_t)0x80000000) return false; // dynamic
+        if (MLIR_IsTypeLLVMStruct(cur)) {
+            size_t nf = MLIR_GetTypeLLVMStructNumFields(cur);
+            if (c < 0 || (size_t)c >= nf) return false;
+            cur = MLIR_GetTypeLLVMStructField(cur, (size_t)c);
+        } else if (MLIR_IsTypeLLVMArray(cur)) {
+            uint64_t ne = MLIR_GetTypeLLVMArrayNumElements(cur);
+            if (c < 0 || (uint64_t)c >= ne) return false;
+            cur = MLIR_GetTypeLLVMArrayElement(cur);
+        } else {
+            return false; // indexing into a scalar
+        }
+    }
+    if (MLIR_IsTypeLLVMStruct(cur) || MLIR_IsTypeLLVMArray(cur)) return false;
+    *out = cur;
+    return true;
+}
+
+static size_t sroa_aidx(S *s, MLIR_ValueHandle v) {
+    uintptr_t a;
+    if (hmap_get(&s->aidx, (uintptr_t)v, &a)) return (size_t)a;
+    return (size_t)-1;
+}
+static size_t sroa_gidx(S *s, MLIR_ValueHandle v) {
+    uintptr_t g;
+    if (hmap_get(&s->gidx, (uintptr_t)v, &g)) return (size_t)g;
+    return (size_t)-1;
+}
+
+// Phase 1: classify direct uses of each aggregate alloca; record candidate GEPs.
+static void sroa_scan_uses(S *s, MLIR_BlockHandle blk, bool nested) {
+    size_t nops = MLIR_GetBlockNumOps(blk);
+    for (size_t j = 0; j < nops; j++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(blk, j);
+        MLIR_OpType t = MLIR_GetOpType(op);
+        size_t no = MLIR_GetOpNumOperands(op);
+        if (!nested && t == OP_TYPE_LLVM_GEP && no >= 1) {
+            size_t ai = sroa_aidx(s, MLIR_GetOpOperand(op, 0));
+            if (ai != (size_t)-1) {
+                // Any aggregate alloca appearing as a non-base operand (a
+                // dynamic-index value) would be an escape.
+                for (size_t k = 1; k < no; k++)
+                    if (sroa_aidx(s, MLIR_GetOpOperand(op, k)) != (size_t)-1)
+                        s->a_split[sroa_aidx(s, MLIR_GetOpOperand(op, k))] = false;
+                MLIR_AttributeHandle ria = MLIR_GetOpAttributeByName(op, "rawConstantIndices");
+                int32_t idx[SROA_MAX_PATH]; int nidx = 0;
+                bool okpath = ria != MLIR_INVALID_HANDLE &&
+                    sroa_parse_indices(MLIR_GetAttributeAsString(s->ctx, ria),
+                                       idx, SROA_MAX_PATH, &nidx);
+                MLIR_TypeHandle leaf = MLIR_INVALID_HANDLE;
+                // A constant-only GEP has exactly one operand (the base); every
+                // index lives in rawConstantIndices. Dynamic indices add operands.
+                bool allconst = (no == 1) && okpath;
+                bool good = allconst &&
+                    sroa_leaf_type(s->a_elem[ai], idx, nidx, &leaf);
+                if (!good) { s->a_split[ai] = false; continue; }
+                if (s->ng == s->gcap) {
+                    s->gcap = s->gcap ? s->gcap * 2 : 256;
+                    s->geps = (SroaGep *)realloc(s->geps, s->gcap * sizeof(SroaGep));
+                }
+                SroaGep *g = &s->geps[s->ng];
+                memset(g, 0, sizeof(*g));
+                g->op = op;
+                g->res = MLIR_GetOpResult(op, 0);
+                g->ai = ai;
+                g->leaf = leaf;
+                g->plen = nidx;
+                for (int k = 0; k < nidx; k++) g->path[k] = idx[k];
+                g->valid = true;
+                hmap_put(&s->gidx, (uintptr_t)g->res, (uintptr_t)s->ng);
+                s->ng++;
+                continue;
+            }
+        }
+        // Generic case: any operand that is an aggregate alloca (and is not the
+        // base of a recognised constant GEP handled above) escapes.
+        for (size_t k = 0; k < no; k++) {
+            size_t ai = sroa_aidx(s, MLIR_GetOpOperand(op, k));
+            if (ai != (size_t)-1) s->a_split[ai] = false;
+        }
+        size_t nsuc = MLIR_GetOpNumSuccessors(op);
+        for (size_t su = 0; su < nsuc; su++) {
+            size_t nso = MLIR_GetOpNumSuccessorOperands(op, su);
+            for (size_t i = 0; i < nso; i++) {
+                size_t ai = sroa_aidx(s, MLIR_GetOpSuccessorOperand(op, su, i));
+                if (ai != (size_t)-1) s->a_split[ai] = false;
+            }
+        }
+        size_t nr = MLIR_GetOpNumRegions(op);
+        for (size_t r = 0; r < nr; r++) {
+            MLIR_RegionHandle rg = MLIR_GetOpRegion(op, r);
+            size_t rnb = MLIR_GetRegionNumBlocks(rg);
+            for (size_t b = 0; b < rnb; b++)
+                sroa_scan_uses(s, MLIR_GetRegionBlock(rg, b), true);
+        }
+    }
+}
+
+// Phase 2: every use of a candidate GEP result must be a matching scalar
+// load/store; anything else disqualifies the owning alloca.
+static void sroa_scan_gep_uses(S *s, MLIR_BlockHandle blk) {
+    size_t nops = MLIR_GetBlockNumOps(blk);
+    for (size_t j = 0; j < nops; j++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(blk, j);
+        MLIR_OpType t = MLIR_GetOpType(op);
+        size_t no = MLIR_GetOpNumOperands(op);
+        for (size_t k = 0; k < no; k++) {
+            size_t gi = sroa_gidx(s, MLIR_GetOpOperand(op, k));
+            if (gi == (size_t)-1) continue;
+            SroaGep *g = &s->geps[gi];
+            bool ok = false;
+            if (t == OP_TYPE_LLVM_LOAD && k == 0)
+                ok = (MLIR_GetValueType(MLIR_GetOpResult(op, 0)) == g->leaf);
+            else if (t == OP_TYPE_LLVM_STORE && k == 1)
+                ok = (MLIR_GetValueType(MLIR_GetOpOperand(op, 0)) == g->leaf);
+            if (!ok) s->a_split[g->ai] = false;
+        }
+        size_t nsuc = MLIR_GetOpNumSuccessors(op);
+        for (size_t su = 0; su < nsuc; su++) {
+            size_t nso = MLIR_GetOpNumSuccessorOperands(op, su);
+            for (size_t i = 0; i < nso; i++) {
+                size_t gi = sroa_gidx(s, MLIR_GetOpSuccessorOperand(op, su, i));
+                if (gi != (size_t)-1) s->a_split[s->geps[gi].ai] = false;
+            }
+        }
+        size_t nr = MLIR_GetOpNumRegions(op);
+        for (size_t r = 0; r < nr; r++) {
+            MLIR_RegionHandle rg = MLIR_GetOpRegion(op, r);
+            size_t rnb = MLIR_GetRegionNumBlocks(rg);
+            for (size_t b = 0; b < rnb; b++)
+                sroa_scan_gep_uses(s, MLIR_GetRegionBlock(rg, b));
+        }
+    }
+}
+
+static size_t sroa_block_op_index(MLIR_BlockHandle blk, MLIR_OpHandle op) {
+    size_t n = MLIR_GetBlockNumOps(blk);
+    for (size_t i = 0; i < n; i++)
+        if (MLIR_GetBlockOp(blk, i) == op) return i;
+    return (size_t)-1;
+}
+
+// Get-or-create the scalar alloca for (ai, path), inserting it right after the
+// original aggregate alloca so the element-count operand still dominates it.
+static MLIR_ValueHandle sroa_field_alloca(S *s, size_t ai, const int32_t *path,
+                                          int plen, MLIR_TypeHandle leaf) {
+    int base = s->a_foff[ai];
+    for (int f = 0; f < s->a_nfield[ai]; f++) {
+        int e = base + f;
+        if (s->a_fplen[e] == plen) {
+            bool eq = true;
+            for (int k = 0; k < plen; k++)
+                if (s->a_fpath[e*SROA_MAX_PATH + k] != path[k]) { eq = false; break; }
+            if (eq) return s->a_fval[e];
+        }
+    }
+    MLIR_Context *ctx = s->ctx;
+    MLIR_LocationHandle loc = l2r_unkloc(ctx);
+    MLIR_ValueHandle res = MLIR_CreateValueOpResult(ctx, MLIR_INVALID_HANDLE, 0,
+                                                    s->a_ptrty[ai], (string){0}, loc);
+    MLIR_AttributeHandle ea = MLIR_CreateAttributeType(ctx, str_lit("elem_type"), leaf);
+    MLIR_TypeHandle rty[1] = { s->a_ptrty[ai] };
+    MLIR_ValueHandle rv[1] = { res };
+    MLIR_ValueHandle ops[1] = { s->a_size[ai] };
+    MLIR_AttributeHandle attrs[1] = { ea };
+    MLIR_OpHandle op = MLIR_CreateOp(ctx, OP_TYPE_LLVM_ALLOCA, str_lit("llvm.alloca"),
+                                     attrs, 1, rty, 1, rv, 1, ops, 1, NULL, 0,
+                                     loc, MLIR_INVALID_HANDLE, (string){0}, -1);
+    size_t at = sroa_block_op_index(s->a_blk[ai], s->a_op[ai]);
+    MLIR_InsertBlockOpAtIndex(ctx, s->a_blk[ai], op, at + 1);
+    int e = base + s->a_nfield[ai];
+    s->a_fplen[e] = plen;
+    for (int k = 0; k < plen; k++) s->a_fpath[e*SROA_MAX_PATH + k] = path[k];
+    s->a_fval[e] = res;
+    s->a_nfield[ai]++;
+    return res;
+}
+
+// Phase 4: repoint loads/stores from field GEPs to the per-field scalar alloca.
+static void sroa_rewrite(S *s, MLIR_BlockHandle blk) {
+    size_t nops = MLIR_GetBlockNumOps(blk);
+    for (size_t j = 0; j < nops; j++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(blk, j);
+        MLIR_OpType t = MLIR_GetOpType(op);
+        if (t == OP_TYPE_LLVM_LOAD) {
+            size_t gi = sroa_gidx(s, MLIR_GetOpOperand(op, 0));
+            if (gi != (size_t)-1 && s->geps[gi].scalar != MLIR_INVALID_HANDLE)
+                MLIR_SetOpOperand(s->ctx, op, 0, s->geps[gi].scalar);
+        } else if (t == OP_TYPE_LLVM_STORE && MLIR_GetOpNumOperands(op) >= 2) {
+            size_t gi = sroa_gidx(s, MLIR_GetOpOperand(op, 1));
+            if (gi != (size_t)-1 && s->geps[gi].scalar != MLIR_INVALID_HANDLE)
+                MLIR_SetOpOperand(s->ctx, op, 1, s->geps[gi].scalar);
+        }
+        size_t nr = MLIR_GetOpNumRegions(op);
+        for (size_t r = 0; r < nr; r++) {
+            MLIR_RegionHandle rg = MLIR_GetOpRegion(op, r);
+            size_t rnb = MLIR_GetRegionNumBlocks(rg);
+            for (size_t b = 0; b < rnb; b++)
+                sroa_rewrite(s, MLIR_GetRegionBlock(rg, b));
+        }
+    }
+}
+
+static void sroa_region(MLIR_Context *ctx, MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    if (nb == 0) return;
+
+    S s;
+    memset(&s, 0, sizeof(s));
+    s.ctx = ctx;
+    s.acap = 64;
+    s.a_op    = malloc(s.acap * sizeof(*s.a_op));
+    s.a_blk   = malloc(s.acap * sizeof(*s.a_blk));
+    s.a_res   = malloc(s.acap * sizeof(*s.a_res));
+    s.a_size  = malloc(s.acap * sizeof(*s.a_size));
+    s.a_elem  = malloc(s.acap * sizeof(*s.a_elem));
+    s.a_ptrty = malloc(s.acap * sizeof(*s.a_ptrty));
+    s.a_split = malloc(s.acap * sizeof(*s.a_split));
+    hmap_init(&s.aidx, 64);
+    hmap_init(&s.gidx, 256);
+
+    // Collect aggregate (struct/array) allocas with a constant element count.
+    for (size_t bi = 0; bi < nb; bi++) {
+        MLIR_BlockHandle blk = MLIR_GetRegionBlock(region, bi);
+        size_t nops = MLIR_GetBlockNumOps(blk);
+        for (size_t j = 0; j < nops; j++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(blk, j);
+            if (MLIR_GetOpType(op) != OP_TYPE_LLVM_ALLOCA) continue;
+            if (MLIR_GetOpNumOperands(op) < 1) continue;
+            MLIR_AttributeHandle ea = MLIR_GetOpAttributeByName(op, "elem_type");
+            if (ea == MLIR_INVALID_HANDLE) continue;
+            MLIR_TypeHandle et = MLIR_GetAttributeTypeValue(ea);
+            if (!MLIR_IsTypeLLVMStruct(et) && !MLIR_IsTypeLLVMArray(et)) continue;
+            if (s.na == s.acap) {
+                s.acap <<= 1;
+                s.a_op    = realloc(s.a_op,    s.acap * sizeof(*s.a_op));
+                s.a_blk   = realloc(s.a_blk,   s.acap * sizeof(*s.a_blk));
+                s.a_res   = realloc(s.a_res,   s.acap * sizeof(*s.a_res));
+                s.a_size  = realloc(s.a_size,  s.acap * sizeof(*s.a_size));
+                s.a_elem  = realloc(s.a_elem,  s.acap * sizeof(*s.a_elem));
+                s.a_ptrty = realloc(s.a_ptrty, s.acap * sizeof(*s.a_ptrty));
+                s.a_split = realloc(s.a_split, s.acap * sizeof(*s.a_split));
+            }
+            size_t ai = s.na++;
+            MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+            s.a_op[ai]    = op;
+            s.a_blk[ai]   = blk;
+            s.a_res[ai]   = res;
+            s.a_size[ai]  = MLIR_GetOpOperand(op, 0);
+            s.a_elem[ai]  = et;
+            s.a_ptrty[ai] = MLIR_GetValueType(res);
+            s.a_split[ai] = true;
+            hmap_put(&s.aidx, (uintptr_t)res, (uintptr_t)ai);
+        }
+    }
+    if (s.na == 0) goto done;
+
+    for (size_t bi = 0; bi < nb; bi++)
+        sroa_scan_uses(&s, MLIR_GetRegionBlock(region, bi), false);
+    for (size_t bi = 0; bi < nb; bi++)
+        sroa_scan_gep_uses(&s, MLIR_GetRegionBlock(region, bi));
+
+    bool any = false;
+    for (size_t ai = 0; ai < s.na; ai++)
+        if (s.a_split[ai]) { any = true; break; }
+    if (!any) goto done;
+
+    // Per-alloca field bookkeeping. Total distinct fields across all allocas is
+    // bounded by the number of candidate GEPs, so size the flat arrays at ng and
+    // give each alloca a contiguous slice sized by its own GEP count.
+    s.a_nfield = calloc(s.na, sizeof(int));
+    s.a_foff   = malloc(s.na * sizeof(int));
+    {
+        int *cnt = calloc(s.na, sizeof(int));
+        for (size_t gi = 0; gi < s.ng; gi++)
+            if (s.geps[gi].valid) cnt[s.geps[gi].ai]++;
+        int off = 0;
+        for (size_t ai = 0; ai < s.na; ai++) { s.a_foff[ai] = off; off += cnt[ai]; }
+        free(cnt);
+        size_t tot = (size_t)off + 1;
+        s.a_fpath = malloc(tot * SROA_MAX_PATH * sizeof(int32_t));
+        s.a_fplen = malloc(tot * sizeof(int));
+        s.a_fval  = malloc(tot * sizeof(*s.a_fval));
+    }
+
+    // Assign each splittable GEP its per-field scalar alloca (creating allocas).
+    for (size_t gi = 0; gi < s.ng; gi++) {
+        SroaGep *g = &s.geps[gi];
+        if (!g->valid || !s.a_split[g->ai]) { g->scalar = MLIR_INVALID_HANDLE; continue; }
+        g->scalar = sroa_field_alloca(&s, g->ai, g->path, g->plen, g->leaf);
+    }
+
+    for (size_t bi = 0; bi < nb; bi++)
+        sroa_rewrite(&s, MLIR_GetRegionBlock(region, bi));
+
+    // Erase now-dead field GEPs, then the split aggregate allocas.
+    for (size_t gi = 0; gi < s.ng; gi++) {
+        SroaGep *g = &s.geps[gi];
+        if (g->valid && s.a_split[g->ai]) MLIR_EraseOp(ctx, g->op);
+    }
+    for (size_t ai = 0; ai < s.na; ai++)
+        if (s.a_split[ai]) MLIR_EraseOp(ctx, s.a_op[ai]);
+
+    free(s.a_nfield); free(s.a_foff);
+    free(s.a_fpath); free(s.a_fplen); free(s.a_fval);
+done:
+    free(s.a_op); free(s.a_blk); free(s.a_res); free(s.a_size);
+    free(s.a_elem); free(s.a_ptrty); free(s.a_split);
+    free(s.geps);
+    hmap_free(&s.aidx); hmap_free(&s.gidx);
+}
+
 void mlir_llvm_mem2reg(MLIR_Context *ctx, MLIR_OpHandle module) {
     if (MLIR_GetOpNumRegions(module) == 0) return;
     MLIR_RegionHandle mr = MLIR_GetOpRegion(module, 0);
@@ -618,6 +1022,8 @@ void mlir_llvm_mem2reg(MLIR_Context *ctx, MLIR_OpHandle module) {
         MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
         if (MLIR_GetOpType(op) != OP_TYPE_FUNC_FUNC) continue;
         if (MLIR_GetOpNumRegions(op) == 0) continue;
-        l2r_promote_region(ctx, MLIR_GetOpRegion(op, 0));
+        MLIR_RegionHandle body = MLIR_GetOpRegion(op, 0);
+        sroa_region(ctx, body);
+        l2r_promote_region(ctx, body);
     }
 }
