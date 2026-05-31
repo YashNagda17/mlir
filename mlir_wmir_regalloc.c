@@ -509,8 +509,13 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
                                     19, 20, 21, 22, 23, 26,
                                     24, 25 };
     // Parallel marker: is POOL[i] safe to hold a value across a call?
+    // x24/x25 are call-safe because no synthesised runtime shim touches
+    // them. x19..x23 are now also call-safe: every hand-written shim that
+    // uses them (printf, fd_write, fd_read, fd_seek, fd_tell, path_open)
+    // saves/restores them per the AAPCS. x26 stays non-call-safe — it is
+    // the data_priv base register set up in synth_start.
     static const bool POOL_CALLSAFE[] = { 0, 0, 0, 0,
-                                          0, 0, 0, 0, 0, 0,
+                                          1, 1, 1, 1, 1, 0,
                                           1, 1 };
     size_t POOL_N = sizeof(POOL) / sizeof(POOL[0]);
     if (getenv("WMIR_NO_REGALLOC")) POOL_N = 0;

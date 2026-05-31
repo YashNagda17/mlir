@@ -2164,6 +2164,10 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     // Prologue + 32-byte scratch frame. [sp+0] is a 1-byte buffer for
     // emitting literal chars via the write(2) syscall.
     emit_prologue(ctx, entry, /*frame_size=*/32);
+    // AAPCS: preserve the callee-saved registers this shim uses as
+    // long-lived working regs across its internal bl printI64/_write
+    // calls, so callers may keep call-crossing values in x19..x21.
+    emit_callee_saves(ctx, entry, /*mask=*/0x07, /*base=*/8, /*restore=*/false);
     // x19 = x28 + zext(w0)   (fmt cursor)
     // x20 = x28 + zext(w1)   (args cursor)
     {
@@ -2368,6 +2372,7 @@ static MLIR_OpHandle synth_printf(MLIR_Context *ctx) {
     // ---------- done ----------
     // Return 0 (we don't bother tracking the actual byte count).
     emit_movz(ctx, done, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_callee_saves(ctx, done, /*mask=*/0x07, /*base=*/8, /*restore=*/true);
     emit_epilogue(ctx, done, /*frame_size=*/32);
     emit_ret(ctx, done);
 
@@ -2676,10 +2681,13 @@ static MLIR_OpHandle synth_memchr(MLIR_Context *ctx) {
 // -----------------------------------------------------------------------------
 static MLIR_OpHandle synth_fd_write(MLIR_Context *ctx) {
     MLIR_BlockHandle entry, loop, done;
-    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 32);
     loop = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, loop);
     done = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, done);
 
+    // AAPCS: preserve x19..x22 (used as loop state across the internal
+    // _write call) so callers may keep call-crossing values in them.
+    emit_callee_saves(ctx, entry, /*mask=*/0x0F, /*base=*/0, /*restore=*/false);
     // Stash fd in x19 (we clobber x0 for the syscall on each iteration).
     {
         MLIR_AttributeHandle a[2];
@@ -2750,7 +2758,8 @@ static MLIR_OpHandle synth_fd_write(MLIR_Context *ctx) {
     emit_add_reg(ctx, done, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
     emit_str_w(ctx, done, /*rt=*/21, /*rn=*/10, /*off=*/0);
     emit_movz(ctx, done, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
-    emit_epilogue(ctx, done, /*frame_size=*/16);
+    emit_callee_saves(ctx, done, /*mask=*/0x0F, /*base=*/0, /*restore=*/true);
+    emit_epilogue(ctx, done, /*frame_size=*/32);
     emit_ret(ctx, done);
 
     return synth_leaf_finish(ctx, region, "fd_write", 8);
@@ -3804,12 +3813,15 @@ static MLIR_OpHandle synth_fd_close(MLIR_Context *ctx) {
 // -----------------------------------------------------------------------------
 static MLIR_OpHandle synth_fd_read(MLIR_Context *ctx) {
     MLIR_BlockHandle entry, loop, after_rd, done, err;
-    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 16);
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, 32);
     loop     = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, loop);
     after_rd = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, after_rd);
     done     = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, done);
     err      = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, err);
 
+    // AAPCS: preserve x19..x22 (loop state across the internal _read call)
+    // so callers may keep call-crossing values in them.
+    emit_callee_saves(ctx, entry, /*mask=*/0x0F, /*base=*/0, /*restore=*/false);
     // Stash fd (w0) in x19, host(iovs) in x9, iovs_len in x20.
     {
         MLIR_AttributeHandle a[2];
@@ -3869,12 +3881,14 @@ static MLIR_OpHandle synth_fd_read(MLIR_Context *ctx) {
     emit_add_reg(ctx, done, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
     emit_str_w(ctx, done, /*rt=*/21, /*rn=*/10, /*off=*/0);
     emit_movz(ctx, done, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
-    emit_epilogue(ctx, done, /*frame_size=*/16);
+    emit_callee_saves(ctx, done, /*mask=*/0x0F, /*base=*/0, /*restore=*/true);
+    emit_epilogue(ctx, done, /*frame_size=*/32);
     emit_ret(ctx, done);
 
     // err: return errno (we use 8 ~ EBADF; close enough for tinyc).
     emit_movz(ctx, err, /*rd=*/0, /*imm16=*/8, /*hw=*/0, /*sf=*/false);
-    emit_epilogue(ctx, err, /*frame_size=*/16);
+    emit_callee_saves(ctx, err, /*mask=*/0x0F, /*base=*/0, /*restore=*/true);
+    emit_epilogue(ctx, err, /*frame_size=*/32);
     emit_ret(ctx, err);
 
     return synth_leaf_finish(ctx, region, "fd_read", 7);
@@ -3891,6 +3905,7 @@ static MLIR_OpHandle synth_fd_seek(MLIR_Context *ctx) {
     err = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, err);
 
     // Stash newoffset_ofs (w3) into x19 before clobbering w3.
+    emit_callee_saves(ctx, entry, /*mask=*/0x01, /*base=*/0, /*restore=*/false);
     emit_mov_x(ctx, entry, /*rd=*/19, /*rn=*/3);
     // lseek(fd=x0(uxtw), offset=x1(i64 already), whence=x2(uxtw))
     {
@@ -3919,10 +3934,12 @@ static MLIR_OpHandle synth_fd_seek(MLIR_Context *ctx) {
     emit_add_reg(ctx, ok, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
     emit_str_x(ctx, ok, /*rt=*/0, /*rn=*/10, /*off=*/0);
     emit_movz(ctx, ok, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_callee_saves(ctx, ok, /*mask=*/0x01, /*base=*/0, /*restore=*/true);
     emit_epilogue(ctx, ok, /*frame_size=*/16);
     emit_ret(ctx, ok);
 
     emit_movz(ctx, err, /*rd=*/0, /*imm16=*/8, /*hw=*/0, /*sf=*/false);
+    emit_callee_saves(ctx, err, /*mask=*/0x01, /*base=*/0, /*restore=*/true);
     emit_epilogue(ctx, err, /*frame_size=*/16);
     emit_ret(ctx, err);
 
@@ -3940,6 +3957,7 @@ static MLIR_OpHandle synth_fd_tell(MLIR_Context *ctx) {
     err = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, err);
 
     // x19 = newoffset_ofs.
+    emit_callee_saves(ctx, entry, /*mask=*/0x01, /*base=*/0, /*restore=*/false);
     emit_mov_x(ctx, entry, /*rd=*/19, /*rn=*/1);
     // lseek(fd=uxtw(w0), offset=0, whence=1).
     {
@@ -3962,10 +3980,12 @@ static MLIR_OpHandle synth_fd_tell(MLIR_Context *ctx) {
     emit_add_reg(ctx, ok, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
     emit_str_x(ctx, ok, /*rt=*/0, /*rn=*/10, /*off=*/0);
     emit_movz(ctx, ok, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
+    emit_callee_saves(ctx, ok, /*mask=*/0x01, /*base=*/0, /*restore=*/true);
     emit_epilogue(ctx, ok, /*frame_size=*/16);
     emit_ret(ctx, ok);
 
     emit_movz(ctx, err, /*rd=*/0, /*imm16=*/8, /*hw=*/0, /*sf=*/false);
+    emit_callee_saves(ctx, err, /*mask=*/0x01, /*base=*/0, /*restore=*/true);
     emit_epilogue(ctx, err, /*frame_size=*/16);
     emit_ret(ctx, err);
 
@@ -3987,7 +4007,7 @@ static MLIR_OpHandle synth_path_open(MLIR_Context *ctx) {
     MLIR_BlockHandle f_check_trunc, f_check_excl, f_check_append;
     MLIR_BlockHandle f_after_w, f_done_flags;
     MLIR_BlockHandle do_open, ok, err;
-    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, /*frame=*/1024);
+    MLIR_RegionHandle region = synth_leaf_begin(ctx, &entry, /*frame=*/1088);
     cpchk         = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, cpchk);
     cploop        = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, cploop);
     cpdone        = MLIR_CreateBlock(ctx); MLIR_AppendRegionBlock(ctx, region, cpdone);
@@ -4009,6 +4029,9 @@ static MLIR_OpHandle synth_path_open(MLIR_Context *ctx) {
     //   x21 = oflags (we'll mask piece-by-piece for O_CREAT/TRUNC).
     //   x22 = rights (we'll mask for FD_READ / FD_WRITE).
     //   x23 = fdflags (for O_APPEND).
+    // AAPCS: the path buffer occupies [sp+0..1023]; save x19..x23 above
+    // it at [sp+1024..] so callers may keep call-crossing values in them.
+    emit_callee_saves(ctx, entry, /*mask=*/0x1F, /*base=*/1024, /*restore=*/false);
     emit_ldr_w(ctx, entry, /*rt=*/19, /*rn=*/29, /*off=*/16);
     emit_mov_x(ctx, entry, /*rd=*/20, /*rn=*/3);
     emit_mov_x(ctx, entry, /*rd=*/21, /*rn=*/4);
@@ -4129,12 +4152,14 @@ static MLIR_OpHandle synth_path_open(MLIR_Context *ctx) {
     emit_add_reg(ctx, ok, /*rd=*/10, /*rn=*/28, /*rm=*/10, /*sf=*/true);
     emit_str_w(ctx, ok, /*rt=*/0, /*rn=*/10, /*off=*/0);
     emit_movz(ctx, ok, /*rd=*/0, /*imm16=*/0, /*hw=*/0, /*sf=*/false);
-    emit_epilogue(ctx, ok, /*frame_size=*/1024);
+    emit_callee_saves(ctx, ok, /*mask=*/0x1F, /*base=*/1024, /*restore=*/true);
+    emit_epilogue(ctx, ok, /*frame_size=*/1088);
     emit_ret(ctx, ok);
 
     // err: return 44 (WASI ENOENT). tinyc treats !=0 as failure.
     emit_movz(ctx, err, /*rd=*/0, /*imm16=*/44, /*hw=*/0, /*sf=*/false);
-    emit_epilogue(ctx, err, /*frame_size=*/1024);
+    emit_callee_saves(ctx, err, /*mask=*/0x1F, /*base=*/1024, /*restore=*/true);
+    emit_epilogue(ctx, err, /*frame_size=*/1088);
     emit_ret(ctx, err);
 
     return synth_leaf_finish(ctx, region, "path_open", 9);
