@@ -431,6 +431,7 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
             }
             size_t ns = MLIR_GetOpNumSuccessors(op);
             for (size_t s = 0; s < ns; s++) {
+                MLIR_BlockHandle succ = MLIR_GetOpSuccessor(op, s);
                 size_t nsop = MLIR_GetOpNumSuccessorOperands(op, s);
                 for (size_t k = 0; k < nsop; k++) {
                     uint32_t vi;
@@ -439,6 +440,20 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
                             vinfo[vi].last_use_pos = op_pos;
                         if (op_pos < vinfo[vi].first_pos)
                             vinfo[vi].first_pos = op_pos;
+                    }
+                    // The branch STORES the k-th successor operand into the
+                    // successor block's k-th block-arg home. That write
+                    // happens at THIS branch position, which for an entry
+                    // (non-back) edge precedes the block arg's own
+                    // block-entry position. Extend the block arg's interval
+                    // start to cover that write, so its spill slot is not
+                    // recycled out from under the predecessor store.
+                    {
+                        MLIR_ValueHandle arg = MLIR_GetBlockArg(succ, k);
+                        uint32_t avi;
+                        if (vmap_get(&vmap, arg, &avi) &&
+                            op_pos < vinfo[avi].first_pos)
+                            vinfo[avi].first_pos = op_pos;
                     }
                 }
             }
@@ -500,23 +515,39 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
     // ONLY x24/x25 (else they fall back to a stack slot). They are
     // placed last in the pool so non-crossing values prefer the others
     // and leave x24/x25 available for the call-crossing case.
-    // Effective pool: x12..x15, x19..x23, x26, then x24, x25 → 12-deep.
+    //
+    // x0..x8 are the AAPCS argument/result registers. They are caller-
+    // saved (every call clobbers them), so a `crosses_call` value may not
+    // live there — but the vast majority of values are short-lived and
+    // call-free, so adding x0..x8 roughly doubles the usable pool and cuts
+    // spill traffic dramatically. They are NOT scratch for ordinary op
+    // lowering (which only uses x9/x10/x11 and the x16/x17 rebase pair),
+    // and the call-arg / entry-param / call-result paths route through a
+    // general parallel-move resolver, so an operand homed in an arg reg
+    // never clobbers another live arg.
+    //
+    // Pool order: the 13 caller-saved registers (x0..x8, x12..x15) come
+    // FIRST so non-crossing values prefer them; the 8 callee-saved / call-
+    // safe registers (x19..x26) come LAST so they are reached only under
+    // pressure, leaving them available for `crosses_call` values that can
+    // live nowhere else. All of x19..x26 are call-safe: external callees
+    // honour the AAPCS, and every hand-written runtime shim saves/restores
+    // the callee-saved registers it touches (the widest, path_open, saves
+    // x19..x23; none touches x24..x26). x27/x28 hold the globals/linmem
+    // bases and x29/x30 are fp/lr, so none of those are in the pool.
+    // Effective pool: x0..x8, x12..x15, then x19..x26 → 21 registers.
     //
     // To disable register allocation entirely (debugging aid that
     // forces every value to a stack slot), set WMIR_NO_REGALLOC=1
     // in the environment.
-    static const uint8_t POOL[] = { 12, 13, 14, 15,
-                                    19, 20, 21, 22, 23, 26,
-                                    24, 25 };
+    static const uint8_t POOL[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8,
+                                    12, 13, 14, 15,
+                                    19, 20, 21, 22, 23, 24, 25, 26 };
     // Parallel marker: is POOL[i] safe to hold a value across a call?
-    // x24/x25 are call-safe because no synthesised runtime shim touches
-    // them. x19..x23 are now also call-safe: every hand-written shim that
-    // uses them (printf, fd_write, fd_read, fd_seek, fd_tell, path_open)
-    // saves/restores them per the AAPCS. x26 stays non-call-safe — it is
-    // the data_priv base register set up in synth_start.
-    static const bool POOL_CALLSAFE[] = { 0, 0, 0, 0,
-                                          1, 1, 1, 1, 1, 0,
-                                          1, 1 };
+    // The 13 caller-saved entries are NOT; the 8 callee-saved entries are.
+    static const bool POOL_CALLSAFE[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                          0, 0, 0, 0,
+                                          1, 1, 1, 1, 1, 1, 1, 1 };
     size_t POOL_N = sizeof(POOL) / sizeof(POOL[0]);
     if (getenv("WMIR_NO_REGALLOC")) POOL_N = 0;
 
@@ -565,6 +596,48 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
     const uint32_t MAX_SLOTS = 1u << 24;  // 128 MiB frame — way beyond
                                           // any reasonable function.
 
+    // Spill-slot reuse. A slot occupied by a value whose last use is in
+    // the past can be handed to a later spill: the two never overlap, so
+    // sharing the slot is safe (same non-overlap invariant the register
+    // active-list relies on). Without this, `next_slot` grows to the
+    // TOTAL number of values ever spilled in the function rather than the
+    // PEAK number live at once. Big frames push spill-slot byte offsets
+    // past aarch64's scaled imm12 load/store range, forcing the lowering
+    // onto the expensive rebase path (movz/movk + add to synthesise the
+    // address — several extra instructions per spill access). Reuse keeps
+    // the frame ≈ peak-simultaneous spills so most offsets stay in range.
+    typedef struct { uint32_t slot; uint32_t end; } SlotLive;
+    SlotLive *sactive   = malloc((n_values ? n_values : 1) * sizeof(SlotLive));
+    size_t    n_sactive = 0;
+    uint32_t *free_slots = malloc((n_values ? n_values : 1) * sizeof(uint32_t));
+    size_t    n_free    = 0;
+    bool      no_reuse  = getenv("WMIR_NO_SLOT_REUSE") != NULL;
+    // Allocate a spill slot for a value whose last use is at `end_pos`,
+    // preferring a retired slot from the free list. Registers it in the
+    // active-slot list so it can be reclaimed once `end_pos` passes.
+    // SAFE ONLY for values that start at the current position (their slot
+    // live range is [now .. end]); reused slots are guaranteed free as of
+    // `now`. Use TAKE_SLOT_FRESH for a value whose interval starts in the
+    // past (an evicted value), which must not pull a slot reclaimed only
+    // relative to the current position.
+    #define TAKE_SLOT(DST, END) do {                                  \
+            if (!no_reuse && n_free > 0) { (DST) = free_slots[--n_free]; } \
+            else {                                                    \
+                if (next_slot >= MAX_SLOTS) goto fail_slot_overflow;  \
+                (DST) = next_slot++;                                  \
+            }                                                         \
+            sactive[n_sactive].slot = (DST);                          \
+            sactive[n_sactive].end  = (END);                          \
+            n_sactive++;                                              \
+        } while (0)
+    #define TAKE_SLOT_FRESH(DST, END) do {                            \
+            if (next_slot >= MAX_SLOTS) goto fail_slot_overflow;      \
+            (DST) = next_slot++;                                      \
+            sactive[n_sactive].slot = (DST);                          \
+            sactive[n_sactive].end  = (END);                          \
+            n_sactive++;                                              \
+        } while (0)
+
     for (uint32_t k = 0; k < n_values; k++) {
         uint32_t vi = order[k];
         VInfo *vp = &vinfo[vi];
@@ -591,6 +664,18 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
             }
         }
 
+        // Reclaim spill slots whose occupant's last use is now in the
+        // past, returning them to the free list for reuse (same invariant
+        // as the register retire above).
+        for (size_t s = 0; s < n_sactive; ) {
+            if (sactive[s].end < vp->first_pos) {
+                free_slots[n_free++] = sactive[s].slot;
+                sactive[s] = sactive[--n_sactive];
+            } else {
+                s++;
+            }
+        }
+
         // Rematerializable constants never occupy a register or slot.
         if (vp->is_const) {
             ra->homes[vi].kind   = HOME_CONST;
@@ -608,9 +693,7 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
 
         if (force_slot) {
             ra->homes[vi].kind = HOME_SLOT;
-            if (next_slot >= MAX_SLOTS) goto fail_slot_overflow;
-            ra->homes[vi].idx  = next_slot;
-            next_slot++;
+            TAKE_SLOT(ra->homes[vi].idx, vp->last_use_pos);
             continue;
         }
 
@@ -650,22 +733,42 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
             uint8_t  reg       = active[evict_a].reg;
             uint8_t  pool_idx  = active[evict_a].pool_idx;
             ra->homes[evict_vi].kind = HOME_SLOT;
-            if (next_slot >= MAX_SLOTS) goto fail_slot_overflow;
-            ra->homes[evict_vi].idx  = next_slot;
-            next_slot++;
+            TAKE_SLOT_FRESH(ra->homes[evict_vi].idx, vinfo[evict_vi].last_use_pos);
             active[evict_a] = (Active){ vi, reg, pool_idx };
             ra->homes[vi].kind = HOME_REG;
             ra->homes[vi].idx  = reg;
         } else {
             // Spill the current value.
             ra->homes[vi].kind = HOME_SLOT;
-            if (next_slot >= MAX_SLOTS) goto fail_slot_overflow;
-            ra->homes[vi].idx  = next_slot;
-            next_slot++;
+            TAKE_SLOT(ra->homes[vi].idx, vp->last_use_pos);
         }
     }
 
     ra->n_slots = next_slot;
+    #undef TAKE_SLOT
+    #undef TAKE_SLOT_FRESH
+
+    if (getenv("WMIR_CHECK_SLOTS")) {
+        // O(n^2) debug check: no two values sharing a spill slot may have
+        // overlapping live intervals [first_pos, last_use_pos].
+        for (uint32_t i = 0; i < n_values; i++) {
+            if (ra->homes[i].kind != HOME_SLOT) continue;
+            if (vinfo[i].first_pos == UINT32_MAX) continue;
+            for (uint32_t j = i + 1; j < n_values; j++) {
+                if (ra->homes[j].kind != HOME_SLOT) continue;
+                if (ra->homes[j].idx != ra->homes[i].idx) continue;
+                if (vinfo[j].first_pos == UINT32_MAX) continue;
+                uint32_t af = vinfo[i].first_pos, al = vinfo[i].last_use_pos;
+                uint32_t bf = vinfo[j].first_pos, bl = vinfo[j].last_use_pos;
+                if (af <= bl && bf <= al) {
+                    fprintf(stderr,
+                        "WMIR_CHECK_SLOTS: slot %u shared by overlapping "
+                        "values: [%u,%u] and [%u,%u]\n",
+                        ra->homes[i].idx, af, al, bf, bl);
+                }
+            }
+        }
+    }
 
     // Record which callee-saved registers (x19..x26) were actually
     // assigned, so the lowering can save/restore exactly those.
@@ -695,6 +798,7 @@ WmirRegAlloc *wmir_regalloc_run(MLIR_Context *ctx, MLIR_OpHandle func) {
     }
 
     free(order); free(active); free(reg_busy);
+    free(sactive); free(free_slots);
     free(live_in); free(live_out); free(gen); free(kill); free(scratch);
     free(block_first_pos); free(block_last_pos); free(blocks);
     free(vinfo);
@@ -705,6 +809,7 @@ fail_slot_overflow:
     fprintf(stderr, "wmir_regalloc: more than %u slots — frame too large\n",
         (unsigned)MAX_SLOTS);
     free(order); free(active); free(reg_busy);
+    free(sactive); free(free_slots);
     free(live_in); free(live_out); free(gen); free(kill); free(scratch);
     free(block_first_pos); free(block_last_pos); free(blocks);
     free(vinfo);
