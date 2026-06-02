@@ -419,6 +419,8 @@ def main():
                          "-o", str(exe)]
             if MACHO_BACKEND == "wmir":
                 tinyc_cmd.append("--macho-backend=wmir")
+            elif MACHO_BACKEND == "llvm":
+                tinyc_cmd.append("--macho-backend=llvm")
             else:
                 tinyc_cmd.append(f"--wasm-runtime-obj={wasm_runtime_obj}")
                 tinyc_cmd.append(f"--wasm-runtime-obj={wasm_start_obj}")
