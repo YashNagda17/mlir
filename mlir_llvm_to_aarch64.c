@@ -107,6 +107,64 @@ static void emit_add_data_lo(MLIR_Context *ctx, MLIR_BlockHandle blk,
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_ADD_DATA_LO, a, 4));
 }
 
+// ---- Floating-point op builders (mirror the wmir->aarch64 backend) --------
+// FMOV between a GP and a V register. dir_to_v=true: GP->V; false: V->GP.
+// sf=true picks X<->D (moves all 64 bits); sf=false picks W<->S.
+static void emit_fmov_gp_v(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                           bool dir_to_v, bool sf, uint8_t rd, uint8_t rn) {
+    MLIR_AttributeHandle a[4];
+    a[0] = attr_b  (ctx, "dir_to_v", dir_to_v);
+    a[1] = attr_b  (ctx, "sf",       sf);
+    a[2] = attr_i32(ctx, "rd",       rd);
+    a[3] = attr_i32(ctx, "rn",       rn);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_FMOV_GP_V, a, 4));
+}
+// FADD/FSUB/FMUL/FDIV on V registers. kind = "fadd"|"fsub"|"fmul"|"fdiv".
+static void emit_fp_binop(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                          const char *kind, int fwidth,
+                          uint8_t rd, uint8_t rn, uint8_t rm) {
+    MLIR_AttributeHandle a[5];
+    a[0] = attr_s  (ctx, "kind",   kind, strlen(kind));
+    a[1] = attr_i32(ctx, "fwidth", fwidth);
+    a[2] = attr_i32(ctx, "rd",     rd);
+    a[3] = attr_i32(ctx, "rn",     rn);
+    a[4] = attr_i32(ctx, "rm",     rm);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_FP_BINOP, a, 5));
+}
+// FNEG/FABS/FSQRT on V registers.
+static void emit_fp_unop(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                         const char *kind, int fwidth,
+                         uint8_t rd, uint8_t rn) {
+    MLIR_AttributeHandle a[4];
+    a[0] = attr_s  (ctx, "kind",   kind, strlen(kind));
+    a[1] = attr_i32(ctx, "fwidth", fwidth);
+    a[2] = attr_i32(ctx, "rd",     rd);
+    a[3] = attr_i32(ctx, "rn",     rn);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_FP_UNOP, a, 4));
+}
+// FCMP Sn/Dn, Sm/Dm (sets NZCV, no result reg).
+static void emit_fcmp(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                      int fwidth, uint8_t rn, uint8_t rm) {
+    MLIR_AttributeHandle a[3];
+    a[0] = attr_i32(ctx, "fwidth", fwidth);
+    a[1] = attr_i32(ctx, "rn",     rn);
+    a[2] = attr_i32(ctx, "rm",     rm);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_FCMP, a, 3));
+}
+// FP conversion. kind ∈ {"f2f","f2i","i2f"}; sign matters for f2i/i2f only.
+static void emit_fp_cvt(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                        const char *kind, int src_w, int dst_w,
+                        bool sign, uint8_t rd, uint8_t rn) {
+    MLIR_AttributeHandle a[6];
+    a[0] = attr_s  (ctx, "kind",  kind, strlen(kind));
+    a[1] = attr_i32(ctx, "src_w", src_w);
+    a[2] = attr_i32(ctx, "dst_w", dst_w);
+    a[3] = attr_b  (ctx, "sign",  sign);
+    a[4] = attr_i32(ctx, "rd",    rd);
+    a[5] = attr_i32(ctx, "rn",    rn);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_FP_CVT, a, 6));
+}
+
 // Materialise a 64-bit immediate into `rd` with a movz + movk chain,
 // emitting only the non-zero 16-bit lanes (movz seeds the lowest lane so
 // a zero value still produces `movz rd, #0`).
@@ -294,6 +352,29 @@ static int int_type_bits(MLIR_Context *ctx, MLIR_ValueHandle v) {
         w = w * 10 + (s.str[i] - '0');
     }
     return w;
+}
+
+// FP width of an f32/f64-typed value: 32, 64, or 0 if not a float type.
+static int fp_width(MLIR_Context *ctx, MLIR_ValueHandle v) {
+    string s = MLIR_GetTypeString(ctx, MLIR_GetValueType(v));
+    if (s.size == 3 && memcmp(s.str, "f32", 3) == 0) return 32;
+    if (s.size == 3 && memcmp(s.str, "f64", 3) == 0) return 64;
+    return 0;
+}
+
+// LLVM FCmpPredicate (oeq=1,ogt=2,oge=3,olt=4,ole=5,one=6) -> ARM cond code
+// after FCMP. Ordered predicates only (matches the wasm backend). -1 if
+// unsupported.
+static int fcmp_pred_to_cond(int64_t pred) {
+    switch (pred) {
+    case 1: return 0;   // oeq -> EQ
+    case 2: return 12;  // ogt -> GT
+    case 3: return 10;  // oge -> GE
+    case 4: return 4;   // olt -> MI
+    case 5: return 9;   // ole -> LS
+    case 6: return 1;   // one -> NE
+    default: return -1;
+    }
 }
 
 static unsigned a64_type_size(MLIR_Context *ctx, MLIR_TypeHandle ty);
@@ -730,8 +811,19 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         if (va == MLIR_INVALID_HANDLE || MLIR_GetOpNumResults(op) != 1)
             LFAIL("llvm->aarch64: malformed llvm.mlir.constant\n");
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
-        emit_load_imm(ctx, blk, 9, (uint64_t)MLIR_GetAttributeInteger(va),
-                      type_is_i64(ctx, res));
+        int fw = fp_width(ctx, res);
+        if (fw) {
+            // Float constant: materialise the IEEE bit pattern into a GP slot.
+            double d = MLIR_GetAttributeFloat(va);
+            uint64_t bits = 0;
+            if (fw == 32) { float f = (float)d; uint32_t b32;
+                            memcpy(&b32, &f, 4); bits = b32; }
+            else          { memcpy(&bits, &d, 8); }
+            emit_load_imm(ctx, blk, 9, bits, /*sf=*/true);
+        } else {
+            emit_load_imm(ctx, blk, 9, (uint64_t)MLIR_GetAttributeInteger(va),
+                          type_is_i64(ctx, res));
+        }
         store_value(ctx, blk, sm, res, 9);
 
     } else if (simple_binop_optype(on, &bt)) {
@@ -970,6 +1062,106 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         emit_adrp_data(ctx, blk, 9, tgt, off);
         emit_add_data_lo(ctx, blk, 9, 9, tgt, off);
         store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 9);
+
+    } else if (name_eq(on, "llvm.fadd") || name_eq(on, "llvm.fsub") ||
+               name_eq(on, "llvm.fmul") || name_eq(on, "llvm.fdiv")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        int fw = fp_width(ctx, res);
+        const char *kind = name_eq(on, "llvm.fadd") ? "fadd"
+                         : name_eq(on, "llvm.fsub") ? "fsub"
+                         : name_eq(on, "llvm.fmul") ? "fmul" : "fdiv";
+        if (fw == 0) LFAIL("llvm->aarch64: %.*s non-float result\n",
+                           (int)on.size, on.str);
+        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9) ||
+            !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10))
+            LFAIL("llvm->aarch64: %.*s operand not materialised\n",
+                  (int)on.size, on.str);
+        emit_fmov_gp_v(ctx, blk, /*to_v=*/true, true, 0, 9);
+        emit_fmov_gp_v(ctx, blk, /*to_v=*/true, true, 1, 10);
+        emit_fp_binop(ctx, blk, kind, fw, 0, 0, 1);
+        emit_fmov_gp_v(ctx, blk, /*to_v=*/false, true, 9, 0);
+        store_value(ctx, blk, sm, res, 9);
+
+    } else if (name_eq(on, "llvm.fneg")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        int fw = fp_width(ctx, res);
+        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
+            LFAIL("llvm->aarch64: fneg operand not materialised\n");
+        emit_fmov_gp_v(ctx, blk, true, true, 0, 9);
+        emit_fp_unop(ctx, blk, "fneg", fw, 0, 0);
+        emit_fmov_gp_v(ctx, blk, false, true, 9, 0);
+        store_value(ctx, blk, sm, res, 9);
+
+    } else if (name_eq(on, "llvm.fcmp")) {
+        MLIR_AttributeHandle pa = MLIR_GetOpAttributeByName(op, "predicate");
+        if (pa == MLIR_INVALID_HANDLE)
+            LFAIL("llvm->aarch64: fcmp missing predicate\n");
+        int cond = fcmp_pred_to_cond(MLIR_GetAttributeInteger(pa));
+        if (cond < 0)
+            LFAIL("llvm->aarch64: unsupported fcmp predicate\n");
+        int fw = fp_width(ctx, MLIR_GetOpOperand(op, 0));
+        if (fw == 0) LFAIL("llvm->aarch64: fcmp non-float operand\n");
+        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9) ||
+            !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10))
+            LFAIL("llvm->aarch64: fcmp operand not materialised\n");
+        emit_fmov_gp_v(ctx, blk, true, true, 0, 9);
+        emit_fmov_gp_v(ctx, blk, true, true, 1, 10);
+        emit_fcmp(ctx, blk, fw, 0, 1);
+        emit_cset(ctx, blk, 9, (uint8_t)cond, false);
+        store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 9);
+
+    } else if (name_eq(on, "llvm.fptosi") || name_eq(on, "llvm.fptoui")) {
+        // FP -> int. Result lands in a GP reg; narrow results must be masked
+        // back to the slot's zero-extended invariant.
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        bool sign = name_eq(on, "llvm.fptosi");
+        int src_w = fp_width(ctx, MLIR_GetOpOperand(op, 0));
+        if (src_w == 0)
+            LFAIL("llvm->aarch64: fptosi/fptoui non-float source\n");
+        int rw = int_type_bits(ctx, res);
+        int dst_w = rw > 32 ? 64 : 32;
+        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
+            LFAIL("llvm->aarch64: fptosi/fptoui operand not materialised\n");
+        emit_fmov_gp_v(ctx, blk, true, true, 0, 9);
+        emit_fp_cvt(ctx, blk, "f2i", src_w, dst_w, sign, /*rd GP*/9, /*rn V*/0);
+        if (rw > 0 && rw < 32) {
+            emit_load_imm(ctx, blk, 10, (1ull << rw) - 1, true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_AND_REG, 9, 9, 10, true);
+        }
+        store_value(ctx, blk, sm, res, 9);
+
+    } else if (name_eq(on, "llvm.sitofp") || name_eq(on, "llvm.uitofp")) {
+        // int -> FP. Slots hold zero-extended ints: uitofp can read the full
+        // 64-bit slot directly; sitofp must first sign-extend the source width.
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        bool sign = name_eq(on, "llvm.sitofp");
+        int sw = int_type_bits(ctx, MLIR_GetOpOperand(op, 0));
+        int dst_w = fp_width(ctx, res);
+        if (dst_w == 0)
+            LFAIL("llvm->aarch64: sitofp/uitofp non-float result\n");
+        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
+            LFAIL("llvm->aarch64: sitofp/uitofp operand not materialised\n");
+        if (sign && sw > 0 && sw < 64) {
+            emit_load_imm(ctx, blk, 10, (uint64_t)(64 - sw), true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_LSL_REG, 9, 9, 10, true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_ASR_REG, 9, 9, 10, true);
+        }
+        emit_fp_cvt(ctx, blk, "i2f", /*src_w=*/64, dst_w, sign, /*rd V*/0, /*rn GP*/9);
+        emit_fmov_gp_v(ctx, blk, false, true, 9, 0);
+        store_value(ctx, blk, sm, res, 9);
+
+    } else if (name_eq(on, "llvm.fpext") || name_eq(on, "llvm.fptrunc")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        int src_w = fp_width(ctx, MLIR_GetOpOperand(op, 0));
+        int dst_w = fp_width(ctx, res);
+        if (src_w == 0 || dst_w == 0)
+            LFAIL("llvm->aarch64: fpext/fptrunc non-float type\n");
+        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
+            LFAIL("llvm->aarch64: fpext/fptrunc operand not materialised\n");
+        emit_fmov_gp_v(ctx, blk, true, true, 0, 9);
+        emit_fp_cvt(ctx, blk, "f2f", src_w, dst_w, false, 0, 0);
+        emit_fmov_gp_v(ctx, blk, false, true, 9, 0);
+        store_value(ctx, blk, sm, res, 9);
 
     } else if (name_eq(on, "scf.if")) {
         lower_scf_if(L, op);
