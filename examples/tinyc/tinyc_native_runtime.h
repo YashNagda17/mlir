@@ -118,6 +118,13 @@ static const TinycRuntimeFn TINYC_RUNTIME_FNS[] = {
       "char *tinyc_va_arg_ptr(char **ap){\n"
       "  char *p; char **q; p=*ap; *ap=p+8; q=(char**)p; return *q;\n"
       "}\n" },
+    { "tinyc_va_arg_struct",
+      "void tinyc_va_arg_struct(char **ap, char *out, long size){\n"
+      "  char *p; long words; long i; long *o; long *s;\n"
+      "  p=*ap; words=(size+7)/8; o=(long*)out; s=(long*)p;\n"
+      "  for(i=0;i<words;i=i+1){ o[i]=s[i]; }\n"
+      "  *ap=p+words*8;\n"
+      "}\n" },
     // Integer formatting helpers used by printf.
     { "tinyc_rt_fmt_u64",
       "int tinyc_rt_fmt_u64(unsigned long v, char *buf, int base, int upper){\n"
