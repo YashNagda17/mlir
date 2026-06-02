@@ -229,7 +229,15 @@ static void emit_add_imm(MLIR_Context *ctx, MLIR_BlockHandle blk,
     a[3] = attr_b(ctx, "sf", sf);
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_ADD_IMM, a, 4));
 }
-// Memory load/store of `sz` bytes (1/4/8) from [base+0]; rt is the data reg.
+static void emit_sub_imm(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                         uint8_t rd, uint8_t rn, uint16_t imm12, bool sf) {
+    MLIR_AttributeHandle a[4];
+    a[0] = attr_i32(ctx, "rd", rd);
+    a[1] = attr_i32(ctx, "rn", rn);
+    a[2] = attr_i32(ctx, "imm12", imm12);
+    a[3] = attr_b(ctx, "sf", sf);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_SUB_IMM, a, 4));
+}
 static bool emit_mem_load(MLIR_Context *ctx, MLIR_BlockHandle blk,
                           uint8_t rt, uint8_t base, unsigned sz) {
     MLIR_OpType t = sz == 1 ? OP_TYPE_AARCH64_LDRB_IMM
@@ -888,15 +896,43 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             MLIR_GetTypeFunctionIsVarArg(MLIR_GetAttributeTypeValue(vct)))
             LFAIL("llvm->aarch64: variadic calls not yet supported\n");
         size_t no = MLIR_GetOpNumOperands(op);
-        if (no > 8)
-            LFAIL("llvm->aarch64: call with %zu args (>8 not supported)\n", no);
-        for (size_t k = 0; k < no; k++)
-            if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, k), (uint8_t)k))
-                LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
-                      (int)L->sym.size, L->sym.str);
+        if (no > 64)
+            LFAIL("llvm->aarch64: call with %zu args (>64 not supported)\n", no);
         string nm = MLIR_GetAttributeAsString(ctx, callee);
         if (nm.size > 0 && nm.str[0] == '@') { nm.str++; nm.size--; }
-        emit_bl(ctx, blk, nm);
+        if (no <= 8) {
+            for (size_t k = 0; k < no; k++)
+                if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, k), (uint8_t)k))
+                    LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
+                          (int)L->sym.size, L->sym.str);
+            emit_bl(ctx, blk, nm);
+        } else {
+            // AAPCS64: args 0..7 in x0..x7, the rest on the stack at the call
+            // sp. Reserve a 16-aligned arg area below sp; address slots via a
+            // stable copy of the original sp in x12 (the sub shifts sp-relative
+            // slot offsets).
+            size_t n_stack = no - 8;
+            uint32_t area = (uint32_t)((n_stack * 8u + 15u) & ~15u);
+            emit_sub_imm(ctx, blk, 31, 31, (uint16_t)area, true);
+            emit_add_imm(ctx, blk, 12, 31, (uint16_t)area, true); // x12 = orig sp
+            for (size_t k = 0; k < 8; k++) {
+                int32_t slot;
+                if (!sm_get(sm, MLIR_GetOpOperand(op, k), &slot))
+                    LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
+                          (int)L->sym.size, L->sym.str);
+                emit_ldr_x(ctx, blk, (uint8_t)k, 12, (uint32_t)slot * 8u);
+            }
+            for (size_t k = 8; k < no; k++) {
+                int32_t slot;
+                if (!sm_get(sm, MLIR_GetOpOperand(op, k), &slot))
+                    LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
+                          (int)L->sym.size, L->sym.str);
+                emit_ldr_x(ctx, blk, 9, 12, (uint32_t)slot * 8u);
+                emit_str_x(ctx, blk, 9, 31, (uint32_t)(k - 8) * 8u);
+            }
+            emit_bl(ctx, blk, nm);
+            emit_add_imm(ctx, blk, 31, 31, (uint16_t)area, true); // restore sp
+        }
         if (MLIR_GetOpNumResults(op) == 1)
             store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 0);
 
@@ -1389,9 +1425,9 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     }
     MLIR_BlockHandle src_blk = MLIR_GetRegionBlock(src_region, 0);
     size_t nargs = MLIR_GetBlockNumArgs(src_blk);
-    if (nargs > 8) {
+    if (nargs > 64) {
         A64_FAIL("llvm->aarch64: function '%.*s' has %zu parameters "
-                 "(>8 integer args not yet supported)\n",
+                 "(>64 not supported)\n",
                  (int)sym.size, sym.str, nargs);
     }
 
@@ -1420,8 +1456,14 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     uint32_t frame_size = (slot_bytes + alloca_bytes + 15u) & ~15u;
 
     emit_prologue(ctx, out_blk, frame_size);
-    for (size_t i = 0; i < nargs; i++)
+    for (size_t i = 0; i < nargs && i < 8; i++)
         store_value(ctx, out_blk, &sm, MLIR_GetBlockArg(src_blk, i), (uint8_t)i);
+    // Args 8.. arrive on the caller's stack. After the prologue x29 (fp) points
+    // at the saved {fp,lr} pair, so the first stack arg is at [x29, #16].
+    for (size_t i = 8; i < nargs; i++) {
+        emit_ldr_x(ctx, out_blk, 9, 29, (uint32_t)(16u + (i - 8) * 8u));
+        store_value(ctx, out_blk, &sm, MLIR_GetBlockArg(src_blk, i), 9);
+    }
 
     LowerCtx L = { ctx, &sm, out_reg, out_blk, sym, frame_size,
                    &am, slot_bytes, gm, true };
