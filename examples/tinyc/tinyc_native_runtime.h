@@ -33,7 +33,8 @@ typedef struct {
 } TinycRuntimeFn;
 
 static const char TINYC_RT_PRELUDE[] =
-    "long _write(long fd, char *buf, long n);\n";
+    "long _write(long fd, char *buf, long n);\n"
+    "char *_mmap(long addr, long len, long prot, long flags, long fd, long off);\n";
 
 static const TinycRuntimeFn TINYC_RUNTIME_FNS[] = {
     { "printNewline",
@@ -61,6 +62,42 @@ static const TinycRuntimeFn TINYC_RUNTIME_FNS[] = {
       "  if(s){ while(s[n]) n=n+1; _write(1,s,n); }\n"
       "  c=10; _write(1,&c,1);\n"
       "}\n" },
+    // libc string/memory helpers. Signatures match the suite's extern decls.
+    { "strlen",
+      "long strlen(char *s){ long n; n=0; while(s[n]){ n=n+1; } return n; }\n" },
+    { "strcmp",
+      "int strcmp(char *a, char *b){\n"
+      "  long i; i=0;\n"
+      "  while(a[i] && a[i]==b[i]){ i=i+1; }\n"
+      "  return (int)(unsigned char)a[i] - (int)(unsigned char)b[i];\n"
+      "}\n" },
+    { "memcmp",
+      "int memcmp(void *a, void *b, long n){\n"
+      "  char *pa; char *pb; long i;\n"
+      "  pa=(char*)a; pb=(char*)b; i=0;\n"
+      "  while(i<n){ if(pa[i] != pb[i]){ return (int)(unsigned char)pa[i] - (int)(unsigned char)pb[i]; } i=i+1; }\n"
+      "  return 0;\n"
+      "}\n" },
+    { "memchr",
+      "void *memchr(void *s, int c, unsigned long n){\n"
+      "  char *p; unsigned long i; p=(char*)s; i=0;\n"
+      "  while(i<n){ if((unsigned char)p[i] == (unsigned char)c){ return p+i; } i=i+1; }\n"
+      "  return (void*)0;\n"
+      "}\n" },
+    // Heap allocator. The backend does not yet support module-level globals,
+    // so malloc cannot keep a bump pointer; each call mmaps its own anonymous
+    // region (rounded up to a 16 KiB page) and free is a no-op. Wasteful but
+    // correct for the test suite.
+    { "malloc",
+      "void *malloc(long n){\n"
+      "  long sz; char *p;\n"
+      "  if(n<=0){ n=1; }\n"
+      "  sz=(n+16383)/16384*16384;\n"
+      "  p=_mmap(0, sz, 3, 4098, -1, 0);\n"
+      "  return p;\n"
+      "}\n" },
+    { "free",
+      "void free(void *p){ }\n" },
     // Variadic support. tinyC lowers `va_arg(ap, T)` to a call to one of these
     // helpers (the backend lowers va_start/va_end). On Darwin arm64 the va_list
     // buffer's first 8 bytes hold a `cur` pointer into the on-stack variadic
