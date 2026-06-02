@@ -980,9 +980,15 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         if (!sm_get(L->am, res, &off))
             LFAIL("llvm->aarch64: alloca without a frame offset\n");
         uint32_t addr = L->slot_bytes + (uint32_t)off;
-        if (addr > 4095)
-            LFAIL("llvm->aarch64: alloca offset %u too large for add imm12\n", addr);
-        emit_add_imm(ctx, blk, 9, 31, (uint16_t)addr, true);
+        if (addr <= 4095) {
+            emit_add_imm(ctx, blk, 9, 31, (uint16_t)addr, true);
+        } else {
+            // Offset exceeds the 12-bit ADD immediate: materialise it in a
+            // scratch register and add it to a copy of sp.
+            emit_add_imm(ctx, blk, 9, 31, 0, true);             // x9 = sp
+            emit_load_imm(ctx, blk, 10, (uint64_t)addr, true);  // x10 = addr
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_ADD_REG, 9, 9, 10, true);
+        }
         store_value(ctx, blk, sm, res, 9);
 
     } else if (name_eq(on, "llvm.getelementptr")) {

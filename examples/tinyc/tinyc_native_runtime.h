@@ -102,6 +102,55 @@ static const TinycRuntimeFn TINYC_RUNTIME_FNS[] = {
       "  k=tinyc_rt_fmt_u64(u, buf+neg, 10, 0);\n"
       "  return k+neg;\n"
       "}\n" },
+    // Floating-point formatting (mirrors runtime_wasm.c fmt_f64): up to 6
+    // significant digits, trailing zeros trimmed, fixed notation for
+    // exponents in [-4,6) and scientific otherwise.
+    { "tinyc_rt_fmt_f64",
+      "int tinyc_rt_fmt_f64(double v, char *buf){\n"
+      "  int out; int exp10; double m; char digits[8]; char ebuf[8];\n"
+      "  int di; int k; int ndig; int i; int en;\n"
+      "  out=0;\n"
+      "  if(v != v){ buf[0]='n'; buf[1]='a'; buf[2]='n'; return 3; }\n"
+      "  if(v < 0.0){ buf[out]='-'; out=out+1; v=-v; }\n"
+      "  if(v > 1e308){ buf[out]='i'; buf[out+1]='n'; buf[out+2]='f'; return out+3; }\n"
+      "  if(v == 0.0){ buf[out]='0'; return out+1; }\n"
+      "  exp10=0; m=v;\n"
+      "  while(m >= 10.0){ m=m/10.0; exp10=exp10+1; }\n"
+      "  while(m < 1.0){ m=m*10.0; exp10=exp10-1; }\n"
+      "  for(di=0; di<8; di=di+1){ digits[di]=0; }\n"
+      "  for(k=0;k<6;k=k+1){\n"
+      "    int d; d=(int)m; if(d<0){ d=0; } if(d>9){ d=9; }\n"
+      "    digits[k]=(char)(48+d); m=(m-(double)d)*10.0;\n"
+      "  }\n"
+      "  ndig=6; while(ndig>1 && digits[ndig-1]=='0'){ ndig=ndig-1; }\n"
+      "  if(exp10 >= -4 && exp10 < 6){\n"
+      "    if(exp10>=0){\n"
+      "      int int_digits; int_digits=exp10+1;\n"
+      "      for(i=0;i<int_digits;i=i+1){ if(i<ndig){ buf[out]=digits[i]; } else { buf[out]='0'; } out=out+1; }\n"
+      "      if(int_digits<ndig){ buf[out]='.'; out=out+1;\n"
+      "        for(i=int_digits;i<ndig;i=i+1){ buf[out]=digits[i]; out=out+1; } }\n"
+      "    } else {\n"
+      "      buf[out]='0'; out=out+1; buf[out]='.'; out=out+1;\n"
+      "      for(i=0;i<(-exp10-1);i=i+1){ buf[out]='0'; out=out+1; }\n"
+      "      for(i=0;i<ndig;i=i+1){ buf[out]=digits[i]; out=out+1; }\n"
+      "    }\n"
+      "  } else {\n"
+      "    buf[out]=digits[0]; out=out+1;\n"
+      "    if(ndig>1){ buf[out]='.'; out=out+1;\n"
+      "      for(i=1;i<ndig;i=i+1){ buf[out]=digits[i]; out=out+1; } }\n"
+      "    buf[out]='e'; out=out+1;\n"
+      "    if(exp10<0){ buf[out]='-'; out=out+1; exp10=-exp10; } else { buf[out]='+'; out=out+1; }\n"
+      "    en=0; if(exp10==0){ ebuf[en]='0'; en=en+1; }\n"
+      "    while(exp10){ ebuf[en]=(char)(48+(exp10%10)); en=en+1; exp10=exp10/10; }\n"
+      "    if(en<2){ buf[out]='0'; out=out+1; }\n"
+      "    for(i=en-1;i>=0;i=i-1){ buf[out]=ebuf[i]; out=out+1; }\n"
+      "  }\n"
+      "  return out;\n"
+      "}\n" },
+    { "printF64",
+      "void printF64(double v){ char b[64]; int n; n=tinyc_rt_fmt_f64(v,b); _write(1,b,(long)n); }\n" },
+    { "printF32",
+      "void printF32(float v){ char b[64]; int n; n=tinyc_rt_fmt_f64((double)v,b); _write(1,b,(long)n); }\n" },
     // Minimal printf: supports %d %i %u %x %X %p %c %s %% (and length modifiers
     // l/ll). Float specifiers (%f %g) are not yet implemented. Semantics mirror
     // runtime_wasm.c's vprintf_impl for the integer/string subset.
