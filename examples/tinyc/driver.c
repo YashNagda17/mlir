@@ -24,6 +24,7 @@
 #include "mlir_llvm_to_aarch64.h"
 #include "mlir_aarch64_to_macho.h"
 #include "tinyc.h"
+#include "tinyc_native_runtime.h"
 
 #if !defined(_WIN32) && !defined(__wasm__) && !defined(__TINYC__)
 #include <sys/stat.h>
@@ -499,6 +500,13 @@ int app_main(void) {
         arena_destroy(boot_arena);
         return 1;
     }
+
+    // The native llvm backend has no libc; provide its runtime (printI64,
+    // printStr, ...) as tinyC-subset C parsed into this same module, so it
+    // lowers through the llvm -> aarch64 path alongside user code. Only
+    // functions the user hasn't defined are injected.
+    if (macho_backend_llvm)
+        tinyc_inject_native_runtime(arena, prog, target_wasm32);
     MLIR_OpHandle module = tinyc_emit_module(&ctx, prog);
     if (tinyc_last_emit_errors() > 0) {
         arena_destroy(arena);

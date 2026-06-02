@@ -936,7 +936,10 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         if (MLIR_GetOpNumResults(op) == 1)
             store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 0);
 
-    } else if (name_eq(on, "llvm.mlir.undef")) {
+    } else if (name_eq(on, "llvm.mlir.undef") ||
+               name_eq(on, "llvm.mlir.zero")) {
+        // mlir.zero materialises a typed zero (null pointer / zeroed
+        // aggregate scalar); mlir.undef is don't-care — 0 is fine for both.
         if (MLIR_GetOpNumResults(op) == 1) {
             emit_load_imm(ctx, blk, 9, 0, false);
             store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 9);
