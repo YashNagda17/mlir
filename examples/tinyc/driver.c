@@ -474,7 +474,15 @@ int app_main(void) {
     // 32-bit so the imported function signatures we generate match
     // wasm32-wasi's ABI. tinyC otherwise hardcodes them at 64-bit
     // (the size on every 64-bit native host we support).
-    bool target_wasm32 = emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho || emit_wmir || emit_aarch64;
+    //
+    // The `--macho-backend=llvm` path is a NATIVE arm64/Darwin (LP64)
+    // target: it uses real 64-bit pointers and a 64-bit `long`, so it
+    // must NOT use wasm32 sizing even though it goes through `--emit=macho`.
+    // The wasm/wmir Mach-O paths keep wasm32 sizing (their pointers are
+    // 32-bit linear-memory offsets).
+    bool target_wasm32 = (emit_wasm || emit_wasmssa || emit_wasmstack ||
+                          emit_wat || emit_macho || emit_wmir || emit_aarch64) &&
+                         !macho_backend_llvm;
     Program *prog = arena_new(arena, Program);
     *prog = (Program){0};
     int total_errs = 0;
