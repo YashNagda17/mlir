@@ -598,6 +598,7 @@ typedef struct {
     SlotMap          *am;          // alloca result value -> byte offset in frame
     uint32_t          slot_bytes;  // size of the slot region (allocas sit above)
     GlobalMap        *gm;          // global symbol name -> byte offset in __data
+    size_t            n_fixed;     // number of fixed (named) params of this func
     bool              ok;
 } LowerCtx;
 
@@ -892,49 +893,77 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         if (callee == MLIR_INVALID_HANDLE)
             LFAIL("llvm->aarch64: indirect calls not yet supported\n");
         MLIR_AttributeHandle vct = MLIR_GetOpAttributeByName(op, "var_callee_type");
-        if (vct != MLIR_INVALID_HANDLE &&
-            MLIR_GetTypeFunctionIsVarArg(MLIR_GetAttributeTypeValue(vct)))
-            LFAIL("llvm->aarch64: variadic calls not yet supported\n");
+        bool is_variadic = false;
+        size_t n_fixed = 0;
+        if (vct != MLIR_INVALID_HANDLE) {
+            MLIR_TypeHandle ft = MLIR_GetAttributeTypeValue(vct);
+            if (MLIR_GetTypeFunctionIsVarArg(ft)) {
+                is_variadic = true;
+                n_fixed = MLIR_GetTypeFunctionNumInputs(ft);
+            }
+        }
         size_t no = MLIR_GetOpNumOperands(op);
         if (no > 64)
             LFAIL("llvm->aarch64: call with %zu args (>64 not supported)\n", no);
         string nm = MLIR_GetAttributeAsString(ctx, callee);
         if (nm.size > 0 && nm.str[0] == '@') { nm.str++; nm.size--; }
-        if (no <= 8) {
+        // n_reg = args passed in x0..x7. Darwin arm64 passes ALL variadic args
+        // on the stack, so only the fixed params (capped at 8) go in registers.
+        size_t n_reg = no;
+        if (is_variadic)   n_reg = n_fixed < 8 ? n_fixed : 8;
+        else if (no > 8)   n_reg = 8;
+        if (n_reg > no)    n_reg = no;
+        if (no == n_reg) {
             for (size_t k = 0; k < no; k++)
                 if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, k), (uint8_t)k))
                     LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
                           (int)L->sym.size, L->sym.str);
             emit_bl(ctx, blk, nm);
         } else {
-            // AAPCS64: args 0..7 in x0..x7, the rest on the stack at the call
-            // sp. Reserve a 16-aligned arg area below sp; address slots via a
-            // stable copy of the original sp in x12 (the sub shifts sp-relative
-            // slot offsets).
-            size_t n_stack = no - 8;
+            // AAPCS64: first n_reg args in x0..x{n_reg-1}, the rest on the stack
+            // at the call sp. Reserve a 16-aligned arg area below sp; address
+            // slots via a stable copy of the original sp in x12 (the sub shifts
+            // sp-relative slot offsets).
+            size_t n_stack = no - n_reg;
             uint32_t area = (uint32_t)((n_stack * 8u + 15u) & ~15u);
             emit_sub_imm(ctx, blk, 31, 31, (uint16_t)area, true);
             emit_add_imm(ctx, blk, 12, 31, (uint16_t)area, true); // x12 = orig sp
-            for (size_t k = 0; k < 8; k++) {
+            for (size_t k = 0; k < n_reg; k++) {
                 int32_t slot;
                 if (!sm_get(sm, MLIR_GetOpOperand(op, k), &slot))
                     LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
                           (int)L->sym.size, L->sym.str);
                 emit_ldr_x(ctx, blk, (uint8_t)k, 12, (uint32_t)slot * 8u);
             }
-            for (size_t k = 8; k < no; k++) {
+            for (size_t k = n_reg; k < no; k++) {
                 int32_t slot;
                 if (!sm_get(sm, MLIR_GetOpOperand(op, k), &slot))
                     LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
                           (int)L->sym.size, L->sym.str);
                 emit_ldr_x(ctx, blk, 9, 12, (uint32_t)slot * 8u);
-                emit_str_x(ctx, blk, 9, 31, (uint32_t)(k - 8) * 8u);
+                emit_str_x(ctx, blk, 9, 31, (uint32_t)(k - n_reg) * 8u);
             }
             emit_bl(ctx, blk, nm);
             emit_add_imm(ctx, blk, 31, 31, (uint16_t)area, true); // restore sp
         }
         if (MLIR_GetOpNumResults(op) == 1)
             store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 0);
+
+    } else if (name_eq(on, "llvm.intr.vastart")) {
+        // Darwin arm64: all variadic args are passed on the stack and va_list is
+        // just a pointer to the first one. Incoming stack args of this function
+        // sit at [x29, #16 + max(0, n_fixed-8)*8] (after the saved {fp,lr} pair
+        // and any fixed stack args). Store that address into the va_list buffer.
+        uint32_t base_off = 16u +
+            (L->n_fixed > 8 ? (uint32_t)(L->n_fixed - 8) * 8u : 0u);
+        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 10))
+            LFAIL("llvm->aarch64: undefined va_list in '%.*s'\n",
+                  (int)L->sym.size, L->sym.str);
+        emit_add_imm(ctx, blk, 9, 29, (uint16_t)base_off, true);
+        emit_str_x(ctx, blk, 9, 10, 0);
+
+    } else if (name_eq(on, "llvm.intr.vaend")) {
+        // No teardown needed for the stack-based va_list.
 
     } else if (name_eq(on, "llvm.mlir.undef") ||
                name_eq(on, "llvm.mlir.zero")) {
@@ -1469,7 +1498,7 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     }
 
     LowerCtx L = { ctx, &sm, out_reg, out_blk, sym, frame_size,
-                   &am, slot_bytes, gm, true };
+                   &am, slot_bytes, gm, nargs, true };
     MLIR_OpHandle term = lower_block_ops(&L, src_blk);
     if (!L.ok) return MLIR_INVALID_HANDLE;
 
