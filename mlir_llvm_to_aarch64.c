@@ -1156,13 +1156,17 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         emit_fmov_gp_v(ctx, blk, /*to_v=*/false, true, 9, 0);
         store_value(ctx, blk, sm, res, 9);
 
-    } else if (name_eq(on, "llvm.fneg")) {
+    } else if (name_eq(on, "llvm.fneg") || name_eq(on, "llvm.intr.sqrt")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
         int fw = fp_width(ctx, res);
+        const char *kind = name_eq(on, "llvm.fneg") ? "fneg" : "fsqrt";
+        if (fw == 0) LFAIL("llvm->aarch64: %.*s non-float result\n",
+                           (int)on.size, on.str);
         if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
-            LFAIL("llvm->aarch64: fneg operand not materialised\n");
+            LFAIL("llvm->aarch64: %.*s operand not materialised\n",
+                  (int)on.size, on.str);
         emit_fmov_gp_v(ctx, blk, true, true, 0, 9);
-        emit_fp_unop(ctx, blk, "fneg", fw, 0, 0);
+        emit_fp_unop(ctx, blk, kind, fw, 0, 0);
         emit_fmov_gp_v(ctx, blk, false, true, 9, 0);
         store_value(ctx, blk, sm, res, 9);
 
