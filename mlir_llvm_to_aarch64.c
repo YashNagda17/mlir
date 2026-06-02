@@ -140,6 +140,36 @@ static void emit_str_x(MLIR_Context *ctx, MLIR_BlockHandle blk,
                        uint8_t rt, uint8_t rn, uint32_t off) {
     emit_ldst_x(ctx, blk, OP_TYPE_AARCH64_STR_X, rt, rn, off);
 }
+static void emit_add_imm(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                         uint8_t rd, uint8_t rn, uint16_t imm12, bool sf) {
+    MLIR_AttributeHandle a[4];
+    a[0] = attr_i32(ctx, "rd", rd);
+    a[1] = attr_i32(ctx, "rn", rn);
+    a[2] = attr_i32(ctx, "imm12", imm12);
+    a[3] = attr_b(ctx, "sf", sf);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_ADD_IMM, a, 4));
+}
+// Memory load/store of `sz` bytes (1/4/8) from [base+0]; rt is the data reg.
+static bool emit_mem_load(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                          uint8_t rt, uint8_t base, unsigned sz) {
+    MLIR_OpType t = sz == 1 ? OP_TYPE_AARCH64_LDRB_IMM
+                  : sz == 4 ? OP_TYPE_AARCH64_LDR_W
+                  : sz == 8 ? OP_TYPE_AARCH64_LDR_X
+                            : OP_TYPE_AARCH64_LDR_X;
+    if (sz != 1 && sz != 4 && sz != 8) return false;
+    emit_ldst_x(ctx, blk, t, rt, base, 0);
+    return true;
+}
+static bool emit_mem_store(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                           uint8_t rt, uint8_t base, unsigned sz) {
+    MLIR_OpType t = sz == 1 ? OP_TYPE_AARCH64_STRB_IMM
+                  : sz == 4 ? OP_TYPE_AARCH64_STR_W
+                  : sz == 8 ? OP_TYPE_AARCH64_STR_X
+                            : OP_TYPE_AARCH64_STR_X;
+    if (sz != 1 && sz != 4 && sz != 8) return false;
+    emit_ldst_x(ctx, blk, t, rt, base, 0);
+    return true;
+}
 static void emit_cmp_reg(MLIR_Context *ctx, MLIR_BlockHandle blk,
                          uint8_t rn, uint8_t rm, bool sf) {
     MLIR_AttributeHandle a[3];
@@ -244,11 +274,84 @@ static int int_type_bits(MLIR_Context *ctx, MLIR_ValueHandle v) {
     return w;
 }
 
+static unsigned a64_type_size(MLIR_Context *ctx, MLIR_TypeHandle ty);
+
+static unsigned a64_align_up(unsigned x, unsigned a) {
+    return (x + a - 1) & ~(a - 1);
+}
+static unsigned a64_struct_size(MLIR_Context *ctx, MLIR_TypeHandle ty);
+static unsigned a64_type_align(MLIR_Context *ctx, MLIR_TypeHandle ty) {
+    if (MLIR_IsTypeLLVMArray(ty))
+        return a64_type_align(ctx, MLIR_GetTypeLLVMArrayElement(ty));
+    if (MLIR_IsTypeLLVMStruct(ty)) {
+        size_t nf = MLIR_GetTypeLLVMStructNumFields(ty);
+        unsigned ma = 1;
+        for (size_t i = 0; i < nf; i++) {
+            unsigned fa = a64_type_align(ctx, MLIR_GetTypeLLVMStructField(ty, i));
+            if (fa > ma) ma = fa;
+        }
+        return ma;
+    }
+    unsigned sz = a64_type_size(ctx, ty);
+    return sz ? sz : 1;
+}
+static unsigned a64_struct_size(MLIR_Context *ctx, MLIR_TypeHandle ty) {
+    size_t nf = MLIR_GetTypeLLVMStructNumFields(ty);
+    unsigned off = 0, max_align = 1;
+    for (size_t i = 0; i < nf; i++) {
+        MLIR_TypeHandle ft = MLIR_GetTypeLLVMStructField(ty, i);
+        unsigned fsz = a64_type_size(ctx, ft);
+        unsigned fal = a64_type_align(ctx, ft);
+        if (fsz == 0 || fal == 0) return 0;
+        off = a64_align_up(off, fal);
+        off += fsz;
+        if (fal > max_align) max_align = fal;
+    }
+    return a64_align_up(off, max_align);
+}
+// Byte offset of the i-th field within an LLVM struct (native 64-bit layout).
+static unsigned a64_struct_field_offset(MLIR_Context *ctx, MLIR_TypeHandle sty,
+                                        size_t fld) {
+    unsigned off = 0;
+    for (size_t i = 0; i <= fld; i++) {
+        MLIR_TypeHandle ft = MLIR_GetTypeLLVMStructField(sty, i);
+        off = a64_align_up(off, a64_type_align(ctx, ft));
+        if (i == fld) return off;
+        off += a64_type_size(ctx, ft);
+    }
+    return off;
+}
+// Size in bytes of an LLVM-dialect type on aarch64 (pointers are 8 bytes).
+static unsigned a64_type_size(MLIR_Context *ctx, MLIR_TypeHandle ty) {
+    string s = MLIR_GetTypeString(ctx, ty);
+    if (s.size >= 9 && memcmp(s.str, "!llvm.ptr", 9) == 0) return 8;
+    if (s.size == 3 && memcmp(s.str, "ptr", 3) == 0) return 8;
+    if (s.size == 3 && memcmp(s.str, "f32", 3) == 0) return 4;
+    if (s.size == 3 && memcmp(s.str, "f64", 3) == 0) return 8;
+    if (s.size > 1 && s.str[0] == 'i') {
+        int w = 0;
+        for (size_t i = 1; i < s.size; i++) {
+            if (s.str[i] >= '0' && s.str[i] <= '9') w = w * 10 + (s.str[i] - '0');
+            else { w = -1; break; }
+        }
+        if (w == 1 || w == 8) return 1;
+        if (w == 16) return 2;
+        if (w == 32) return 4;
+        if (w == 64) return 8;
+    }
+    if (MLIR_IsTypeLLVMArray(ty)) {
+        unsigned esz = a64_type_size(ctx, MLIR_GetTypeLLVMArrayElement(ty));
+        if (esz == 0) return 0;
+        return esz * (unsigned)MLIR_GetTypeLLVMArrayNumElements(ty);
+    }
+    if (MLIR_IsTypeLLVMStruct(ty)) return a64_struct_size(ctx, ty);
+    return 0;
+}
+
 static bool func_has_body(MLIR_OpHandle fn) {
     return MLIR_GetOpNumRegions(fn) > 0 &&
            MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(fn, 0)) > 0;
 }
-
 // Map an LLVM-dialect icmp predicate (eq=0, ne=1, slt=2, sle=3, sgt=4,
 // sge=5, ult=6, ule=7, ugt=8, uge=9) to an AArch64 condition code. -1 if
 // out of range.
@@ -369,6 +472,8 @@ typedef struct {
     MLIR_BlockHandle  cur;
     string            sym;
     uint32_t          frame_size;
+    SlotMap          *am;          // alloca result value -> byte offset in frame
+    uint32_t          slot_bytes;  // size of the slot region (allocas sit above)
     bool              ok;
 } LowerCtx;
 
@@ -428,6 +533,24 @@ static bool parse_cases(string cs, int64_t *out, size_t n) {
         out[got++] = sign * v;
     }
     return got == n;
+}
+
+// Parse "array<i32: v0, v1, ...>" into `out` (capacity `cap`); returns count.
+static size_t parse_i32_array(string cs, int32_t *out, size_t cap) {
+    size_t p = 0, got = 0;
+    while (p < cs.size && cs.str[p] != ':') p++;
+    if (p < cs.size) p++;
+    while (p < cs.size && got < cap) {
+        while (p < cs.size && (cs.str[p] == ' ' || cs.str[p] == ',')) p++;
+        if (p >= cs.size || cs.str[p] == '>') break;
+        int64_t sign = 1;
+        if (cs.str[p] == '-') { sign = -1; p++; }
+        int64_t v = 0;
+        while (p < cs.size && cs.str[p] >= '0' && cs.str[p] <= '9')
+            v = v * 10 + (cs.str[p++] - '0');
+        out[got++] = (int32_t)(sign * v);
+    }
+    return got;
 }
 
 static void lower_scf_if(LowerCtx *L, MLIR_OpHandle op) {
@@ -656,6 +779,108 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 9);
         }
 
+    } else if (name_eq(on, "llvm.alloca")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        int32_t off;
+        if (!sm_get(L->am, res, &off))
+            LFAIL("llvm->aarch64: alloca without a frame offset\n");
+        uint32_t addr = L->slot_bytes + (uint32_t)off;
+        if (addr > 4095)
+            LFAIL("llvm->aarch64: alloca offset %u too large for add imm12\n", addr);
+        emit_add_imm(ctx, blk, 9, 31, (uint16_t)addr, true);
+        store_value(ctx, blk, sm, res, 9);
+
+    } else if (name_eq(on, "llvm.getelementptr")) {
+        MLIR_ValueHandle res  = MLIR_GetOpResult(op, 0);
+        MLIR_ValueHandle base = MLIR_GetOpOperand(op, 0);
+        MLIR_AttributeHandle eta = MLIR_GetOpAttributeByName(op, "elem_type");
+        MLIR_AttributeHandle ria = MLIR_GetOpAttributeByName(op, "rawConstantIndices");
+        if (eta == MLIR_INVALID_HANDLE || ria == MLIR_INVALID_HANDLE)
+            LFAIL("llvm->aarch64: getelementptr missing elem_type/indices\n");
+        MLIR_TypeHandle elem_ty = MLIR_GetAttributeTypeValue(eta);
+        int32_t cidx[64];
+        size_t n_idx = parse_i32_array(MLIR_GetAttributeAsString(ctx, ria),
+                                       cidx, 64);
+        if (n_idx == 0)
+            LFAIL("llvm->aarch64: getelementptr with no indices\n");
+        if (!load_value(ctx, blk, sm, base, 9))   // running address in x9
+            LFAIL("llvm->aarch64: undefined gep base in '%.*s'\n",
+                  (int)L->sym.size, L->sym.str);
+        size_t op_idx = 1;
+        MLIR_TypeHandle cur_ty = elem_ty;
+        for (size_t i = 0; i < n_idx; i++) {
+            bool is_dyn = (cidx[i] == (int32_t)0x80000000);
+            unsigned stride;
+            int64_t  cst = 0;
+            if (i == 0) {
+                stride = a64_type_size(ctx, elem_ty);
+            } else if (MLIR_IsTypeLLVMStruct(cur_ty)) {
+                if (is_dyn)
+                    LFAIL("llvm->aarch64: dynamic struct index in gep\n");
+                unsigned foff = a64_struct_field_offset(ctx, cur_ty, (size_t)cidx[i]);
+                cur_ty = MLIR_GetTypeLLVMStructField(cur_ty, (size_t)cidx[i]);
+                if (foff) { emit_load_imm(ctx, blk, 10, (uint64_t)foff, true);
+                            emit_3reg(ctx, blk, OP_TYPE_AARCH64_ADD_REG, 9, 9, 10, true); }
+                continue;
+            } else if (MLIR_IsTypeLLVMArray(cur_ty)) {
+                MLIR_TypeHandle et = MLIR_GetTypeLLVMArrayElement(cur_ty);
+                stride = a64_type_size(ctx, et);
+                cur_ty = et;
+            } else {
+                LFAIL("llvm->aarch64: gep into non-aggregate type\n");
+            }
+            if (stride == 0) continue;
+            if (is_dyn) {
+                if (op_idx >= MLIR_GetOpNumOperands(op))
+                    LFAIL("llvm->aarch64: gep dynamic index operand missing\n");
+                if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, op_idx++), 10))
+                    LFAIL("llvm->aarch64: undefined gep index in '%.*s'\n",
+                          (int)L->sym.size, L->sym.str);
+                emit_load_imm(ctx, blk, 11, (uint64_t)stride, true);
+                emit_3reg(ctx, blk, OP_TYPE_AARCH64_MUL, 10, 10, 11, true);
+                emit_3reg(ctx, blk, OP_TYPE_AARCH64_ADD_REG, 9, 9, 10, true);
+            } else if ((cst = cidx[i]) != 0) {
+                emit_load_imm(ctx, blk, 10, (uint64_t)(cst * (int64_t)stride), true);
+                emit_3reg(ctx, blk, OP_TYPE_AARCH64_ADD_REG, 9, 9, 10, true);
+            }
+        }
+        store_value(ctx, blk, sm, res, 9);
+
+    } else if (name_eq(on, "llvm.store")) {
+        MLIR_ValueHandle val = MLIR_GetOpOperand(op, 0);
+        MLIR_ValueHandle ptr = MLIR_GetOpOperand(op, 1);
+        unsigned sz = a64_type_size(ctx, MLIR_GetValueType(val));
+        if (sz != 1 && sz != 4 && sz != 8)
+            LFAIL("llvm->aarch64: unsupported store size %u\n", sz);
+        if (!load_value(ctx, blk, sm, val, 9) ||
+            !load_value(ctx, blk, sm, ptr, 10))
+            LFAIL("llvm->aarch64: undefined store operand in '%.*s'\n",
+                  (int)L->sym.size, L->sym.str);
+        emit_mem_store(ctx, blk, 9, 10, sz);
+
+    } else if (name_eq(on, "llvm.load")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        unsigned sz = a64_type_size(ctx, MLIR_GetValueType(res));
+        if (sz != 1 && sz != 4 && sz != 8)
+            LFAIL("llvm->aarch64: unsupported load size %u\n", sz);
+        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 10))
+            LFAIL("llvm->aarch64: undefined load operand in '%.*s'\n",
+                  (int)L->sym.size, L->sym.str);
+        emit_mem_load(ctx, blk, 9, 10, sz);
+        store_value(ctx, blk, sm, res, 9);
+
+    } else if (name_eq(on, "llvm.ptrtoint") || name_eq(on, "llvm.inttoptr")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
+            LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
+                  (int)L->sym.size, L->sym.str);
+        int w = int_type_bits(ctx, res);   // 0 for ptr (64-bit, no mask)
+        if (w > 0 && w < 64) {
+            emit_load_imm(ctx, blk, 10, (1ull << w) - 1, true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_AND_REG, 9, 9, 10, true);
+        }
+        store_value(ctx, blk, sm, res, 9);
+
     } else if (name_eq(on, "arith.index_cast") ||
                name_eq(on, "arith.index_castui")) {
         // index <-> integer: a plain copy in our 64-bit slot model.
@@ -730,6 +955,47 @@ static void assign_slots_block(SlotMap *sm, MLIR_BlockHandle block,
     }
 }
 
+// Recursive prepass: assign each llvm.alloca result a byte offset within the
+// alloca region (placed above the slot region). Returns total alloca bytes.
+static bool collect_allocas(MLIR_Context *ctx, SlotMap *am,
+                            MLIR_BlockHandle block, uint32_t *bytes) {
+    size_t no = MLIR_GetBlockNumOps(block);
+    for (size_t i = 0; i < no; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(block, i);
+        if (name_eq(MLIR_GetOpName(op), "llvm.alloca") &&
+            MLIR_GetOpNumResults(op) == 1) {
+            MLIR_AttributeHandle eta = MLIR_GetOpAttributeByName(op, "elem_type");
+            if (eta == MLIR_INVALID_HANDLE) return false;
+            MLIR_TypeHandle et = MLIR_GetAttributeTypeValue(eta);
+            unsigned esz = a64_type_size(ctx, et);
+            if (esz == 0) return false;
+            int64_t cnt = 1;
+            if (MLIR_GetOpNumOperands(op) >= 1) {
+                MLIR_OpHandle cd = MLIR_GetValueDefiningOp(MLIR_GetOpOperand(op, 0));
+                if (cd == MLIR_INVALID_HANDLE ||
+                    !name_eq(MLIR_GetOpName(cd), "llvm.mlir.constant"))
+                    return false;
+                cnt = MLIR_GetAttributeInteger(
+                          MLIR_GetOpAttributeByName(cd, "value"));
+            }
+            unsigned al = a64_type_align(ctx, et);
+            if (al < 8) al = 8;
+            *bytes = a64_align_up(*bytes, al);
+            sm_put(am, MLIR_GetOpResult(op, 0), (int32_t)*bytes);
+            *bytes += (uint32_t)(esz * cnt);
+        }
+        size_t ng = MLIR_GetOpNumRegions(op);
+        for (size_t g = 0; g < ng; g++) {
+            MLIR_RegionHandle rg = MLIR_GetOpRegion(op, g);
+            size_t nbk = MLIR_GetRegionNumBlocks(rg);
+            for (size_t b = 0; b < nbk; b++)
+                if (!collect_allocas(ctx, am, MLIR_GetRegionBlock(rg, b), bytes))
+                    return false;
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Select one defined `llvm.func` into an `aarch64.func`. Supports straight-
 // line integer code plus structured control flow (scf.if / scf.while /
@@ -766,13 +1032,23 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
                  "(frame too large for the trivial allocator)\n",
                  (int)sym.size, sym.str, nslots);
     }
-    uint32_t frame_size = ((uint32_t)nslots * 8u + 15u) & ~15u;
+    uint32_t slot_bytes = (uint32_t)nslots * 8u;
+
+    SlotMap am = {0};
+    am.arena = MLIR_GetArenaAllocator(ctx);
+    uint32_t alloca_bytes = 0;
+    if (!collect_allocas(ctx, &am, src_blk, &alloca_bytes)) {
+        A64_FAIL("llvm->aarch64: function '%.*s' has an unsupported alloca\n",
+                 (int)sym.size, sym.str);
+    }
+    uint32_t frame_size = (slot_bytes + alloca_bytes + 15u) & ~15u;
 
     emit_prologue(ctx, out_blk, frame_size);
     for (size_t i = 0; i < nargs; i++)
         store_value(ctx, out_blk, &sm, MLIR_GetBlockArg(src_blk, i), (uint8_t)i);
 
-    LowerCtx L = { ctx, &sm, out_reg, out_blk, sym, frame_size, true };
+    LowerCtx L = { ctx, &sm, out_reg, out_blk, sym, frame_size,
+                   &am, slot_bytes, true };
     MLIR_OpHandle term = lower_block_ops(&L, src_blk);
     if (!L.ok) return MLIR_INVALID_HANDLE;
 
