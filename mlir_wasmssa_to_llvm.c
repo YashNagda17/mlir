@@ -62,13 +62,17 @@ static string at_s(MLIR_OpHandle op, const char *name) {
     return a ? MLIR_GetAttributeString(a) : (string){0};
 }
 
-// Map a wasm valtype to its `llvm`-dialect carrier integer type. Milestone 1
-// is integer-only; f32/f64 are deferred (the caller rejects them).
+// Map a wasm valtype to its `llvm`-dialect type. Integers map to iN; f32/f64
+// map to real float types (the unified backend supports float load/store,
+// arith, compare and conversions end-to-end).
 static MLIR_TypeHandle vt_to_llvm(MLIR_Context *ctx, uint8_t vt) {
     if (vt == WT_I64) return MLIR_CreateTypeInteger(ctx, 64, true);
+    if (vt == WT_F32) return MLIR_CreateTypeFloat(ctx, 32, false);
+    if (vt == WT_F64) return MLIR_CreateTypeFloat(ctx, 64, false);
     return MLIR_CreateTypeInteger(ctx, 32, true);
 }
 static bool vt_is_int(uint8_t vt) { return vt == WT_I32 || vt == WT_I64; }
+static bool vt_is_float(uint8_t vt) { return vt == WT_F32 || vt == WT_F64; }
 
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -449,6 +453,74 @@ static MLIR_ValueHandle build_icmp(FLower *L, int64_t pred,
     return r[0];
 }
 
+// Map a wasm float arithmetic opcode to its `llvm`-dialect op name (matched by
+// name by the unified backend). f32: 0x92-0x95, f64: 0xa0-0xa3.
+static const char *fbinop_name(int64_t opc) {
+    switch (opc) {
+        case 0x92: case 0xa0: return "llvm.fadd";
+        case 0x93: case 0xa1: return "llvm.fsub";
+        case 0x94: case 0xa2: return "llvm.fmul";
+        case 0x95: case 0xa3: return "llvm.fdiv";
+        default: return NULL;
+    }
+}
+
+// Map a wasm float comparison opcode to an `llvm`-dialect fcmp predicate.
+// Ordered predicates (oeq=1, ogt=2, oge=3, olt=4, ole=5, one=6) match the
+// backend's fcmp_pred_to_cond table; `ne` maps to `one` which the aarch64
+// backend lowers as an unordered-NE (NaN => true), matching wasm f.ne.
+// f32: 0x5b-0x60, f64: 0x61-0x66.
+static bool fcmp_to_pred(int64_t opc, int64_t *pred) {
+    switch (opc) {
+        case 0x5b: case 0x61: *pred = 1; return true; // eq
+        case 0x5c: case 0x62: *pred = 6; return true; // ne
+        case 0x5d: case 0x63: *pred = 4; return true; // lt
+        case 0x5e: case 0x64: *pred = 2; return true; // gt
+        case 0x5f: case 0x65: *pred = 5; return true; // le
+        case 0x60: case 0x66: *pred = 3; return true; // ge
+        default: return false;
+    }
+}
+
+// Build an llvm.fcmp with an i32 boolean result (wasm comparison convention).
+static MLIR_ValueHandle build_fcmp(FLower *L, int64_t pred,
+                                   MLIR_ValueHandle a, MLIR_ValueHandle b) {
+    MLIR_Context *ctx = L->ctx;
+    MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
+    MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(ctx, 64, true);
+    MLIR_AttributeHandle pa = MLIR_CreateAttributeInteger(
+        ctx, str_from_cstr_view((char *)"predicate"), pred, i64);
+    MLIR_TypeHandle rt[1] = { i32 };
+    MLIR_ValueHandle r[1] = { mk_res(ctx, i32) };
+    MLIR_ValueHandle ops[2] = { a, b };
+    MLIR_OpHandle out = build_op_named(ctx, "llvm.fcmp", &pa, 1, rt, 1, r, ops, 2);
+    emit(L, out);
+    return r[0];
+}
+
+// Emit a single-operand cast op matched by name (fpext/fptrunc/sitofp/...).
+static MLIR_ValueHandle emit_cast_named(FLower *L, const char *nm,
+                                        MLIR_ValueHandle v, MLIR_TypeHandle toty) {
+    MLIR_TypeHandle rt[1] = { toty };
+    MLIR_ValueHandle r[1] = { mk_res(L->ctx, toty) };
+    MLIR_ValueHandle ops[1] = { v };
+    MLIR_OpHandle out = build_op_named(L->ctx, nm, NULL, 0, rt, 1, r, ops, 1);
+    emit(L, out);
+    return r[0];
+}
+
+// Emit a two-operand op matched by name (llvm.fadd/...) producing `ty`.
+static MLIR_ValueHandle emit_binop_named(FLower *L, const char *nm,
+                                         MLIR_ValueHandle a, MLIR_ValueHandle b,
+                                         MLIR_TypeHandle ty) {
+    MLIR_TypeHandle rt[1] = { ty };
+    MLIR_ValueHandle r[1] = { mk_res(L->ctx, ty) };
+    MLIR_ValueHandle ops[2] = { a, b };
+    MLIR_OpHandle out = build_op_named(L->ctx, nm, NULL, 0, rt, 1, r, ops, 2);
+    emit(L, out);
+    return r[0];
+}
+
 static bool lower_op(FLower *L, MLIR_OpHandle op);
 
 // =============================================================================
@@ -553,8 +625,35 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
     switch (t) {
     case OP_TYPE_WASMSSA_CONST: {
         uint8_t vt = (uint8_t)at_i(op, "valtype");
+        if (vt_is_float(vt)) {
+            // The `value` attr holds the raw IEEE-754 bit pattern as an integer
+            // (f32 in the low 32 bits). Decode to a double and build a
+            // float-typed llvm.mlir.constant.
+            int64_t raw = at_i(op, "value");
+            double d;
+            if (vt == WT_F32) {
+                uint32_t b32 = (uint32_t)raw;
+                float f;
+                memcpy(&f, &b32, 4);
+                d = (double)f;
+            } else {
+                uint64_t b64 = (uint64_t)raw;
+                memcpy(&d, &b64, 8);
+            }
+            MLIR_TypeHandle fty = vt_to_llvm(ctx, vt);
+            MLIR_AttributeHandle va = MLIR_CreateAttributeFloat(
+                ctx, str_from_cstr_view((char *)"value"), d, fty);
+            MLIR_TypeHandle rt[1] = { fty };
+            MLIR_ValueHandle r[1] = { mk_res(ctx, fty) };
+            MLIR_OpHandle out = build_op(ctx, OP_TYPE_LLVM_MLIR_CONSTANT,
+                &va, 1, rt, 1, r, NULL, 0);
+            emit(L, out);
+            vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r[0]);
+            return true;
+        }
         if (!vt_is_int(vt)) {
-            fprintf(stderr, "wasmssa->llvm: float const not yet supported\n");
+            fprintf(stderr, "wasmssa->llvm: const valtype %u not supported\n",
+                    (unsigned)vt);
             return false;
         }
         int64_t v = at_i(op, "value");
@@ -611,19 +710,22 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
     case OP_TYPE_WASMSSA_ADD:
     case OP_TYPE_WASMSSA_SUB: {
         uint8_t vt = (uint8_t)at_i(op, "valtype");
-        if (!vt_is_int(vt)) {
-            fprintf(stderr, "wasmssa->llvm: float add/sub not yet supported\n");
-            return false;
-        }
         MLIR_ValueHandle a, b;
         if (!vmap_get(L->vmap, MLIR_GetOpOperand(op, 0), &a) ||
             !vmap_get(L->vmap, MLIR_GetOpOperand(op, 1), &b)) {
             fprintf(stderr, "wasmssa->llvm: unbound operand on add/sub\n");
             return false;
         }
+        MLIR_TypeHandle ity = vt_to_llvm(ctx, vt);
+        if (vt_is_float(vt)) {
+            const char *nm = (t == OP_TYPE_WASMSSA_ADD) ? "llvm.fadd"
+                                                        : "llvm.fsub";
+            MLIR_ValueHandle res = emit_binop_named(L, nm, a, b, ity);
+            vmap_set(L->vmap, MLIR_GetOpResult(op, 0), res);
+            return true;
+        }
         MLIR_OpType ot = (t == OP_TYPE_WASMSSA_ADD) ? OP_TYPE_LLVM_ADD
                                                     : OP_TYPE_LLVM_SUB;
-        MLIR_TypeHandle ity = vt_to_llvm(ctx, vt);
         MLIR_TypeHandle rt[1] = { ity };
         MLIR_ValueHandle r[1] = { mk_res(ctx, ity) };
         MLIR_ValueHandle ops[2] = { a, b };
@@ -645,6 +747,31 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
             }
             MLIR_ValueHandle r = build_icmp(L, pred, a, b);
             vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r);
+            return true;
+        }
+        if (fcmp_to_pred(opc, &pred)) {
+            MLIR_ValueHandle a, b;
+            if (!vmap_get(L->vmap, MLIR_GetOpOperand(op, 0), &a) ||
+                !vmap_get(L->vmap, MLIR_GetOpOperand(op, 1), &b)) {
+                fprintf(stderr, "wasmssa->llvm: unbound operand on fcmp\n");
+                return false;
+            }
+            MLIR_ValueHandle r = build_fcmp(L, pred, a, b);
+            vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r);
+            return true;
+        }
+        const char *fnm = fbinop_name(opc);
+        if (fnm) {
+            uint8_t vt = (uint8_t)at_i(op, "valtype");
+            MLIR_ValueHandle a, b;
+            if (!vmap_get(L->vmap, MLIR_GetOpOperand(op, 0), &a) ||
+                !vmap_get(L->vmap, MLIR_GetOpOperand(op, 1), &b)) {
+                fprintf(stderr, "wasmssa->llvm: unbound operand on fbinop\n");
+                return false;
+            }
+            MLIR_TypeHandle fty = vt_to_llvm(ctx, vt);
+            MLIR_ValueHandle res = emit_binop_named(L, fnm, a, b, fty);
+            vmap_set(L->vmap, MLIR_GetOpResult(op, 0), res);
             return true;
         }
         MLIR_OpType ot;
@@ -1019,8 +1146,32 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         int64_t off = at_i(op, "memory_offset");
         int64_t sz  = at_i(op, "mem_size_bytes");
         uint8_t vt  = (uint8_t)at_i(op, "valtype");
+        if (vt_is_float(vt)) {
+            if (!((vt == WT_F32 && sz == 4) || (vt == WT_F64 && sz == 8))) {
+                fprintf(stderr,
+                    "wasmssa->llvm: float load mem_size=%lld valtype=%u "
+                    "not supported\n", (long long)sz, (unsigned)vt);
+                return false;
+            }
+            MLIR_ValueHandle addr;
+            if (!vmap_get(L->vmap, MLIR_GetOpOperand(op, 0), &addr)) {
+                fprintf(stderr, "wasmssa->llvm: unbound operand on load\n");
+                return false;
+            }
+            MLIR_ValueHandle p = linmem_ptr(L, addr, off);
+            MLIR_TypeHandle fty = vt_to_llvm(ctx, vt);
+            MLIR_TypeHandle lrt[1] = { fty };
+            MLIR_ValueHandle lr[1] = { mk_res(ctx, fty) };
+            MLIR_ValueHandle lops[1] = { p };
+            MLIR_OpHandle lop = build_op(ctx, OP_TYPE_LLVM_LOAD,
+                NULL, 0, lrt, 1, lr, lops, 1);
+            emit(L, lop);
+            vmap_set(L->vmap, MLIR_GetOpResult(op, 0), lr[0]);
+            return true;
+        }
         if (!vt_is_int(vt)) {
-            fprintf(stderr, "wasmssa->llvm: float load not yet supported\n");
+            fprintf(stderr, "wasmssa->llvm: load valtype %u not supported\n",
+                    (unsigned)vt);
             return false;
         }
         bool ok = (vt == WT_I32 && (sz == 1 || sz == 2 || sz == 4)) ||
@@ -1067,8 +1218,29 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         int64_t off = at_i(op, "memory_offset");
         int64_t sz  = at_i(op, "mem_size_bytes");
         uint8_t vt  = (uint8_t)at_i(op, "valtype");
+        if (vt_is_float(vt)) {
+            if (!((vt == WT_F32 && sz == 4) || (vt == WT_F64 && sz == 8))) {
+                fprintf(stderr,
+                    "wasmssa->llvm: float store mem_size=%lld valtype=%u "
+                    "not supported\n", (long long)sz, (unsigned)vt);
+                return false;
+            }
+            MLIR_ValueHandle addr, val;
+            if (!vmap_get(L->vmap, MLIR_GetOpOperand(op, 0), &addr) ||
+                !vmap_get(L->vmap, MLIR_GetOpOperand(op, 1), &val)) {
+                fprintf(stderr, "wasmssa->llvm: unbound operand on store\n");
+                return false;
+            }
+            MLIR_ValueHandle p = linmem_ptr(L, addr, off);
+            MLIR_ValueHandle ops[2] = { val, p };
+            MLIR_OpHandle out = build_op(ctx, OP_TYPE_LLVM_STORE,
+                NULL, 0, NULL, 0, NULL, ops, 2);
+            emit(L, out);
+            return true;
+        }
         if (!vt_is_int(vt)) {
-            fprintf(stderr, "wasmssa->llvm: float store not yet supported\n");
+            fprintf(stderr, "wasmssa->llvm: store valtype %u not supported\n",
+                    (unsigned)vt);
             return false;
         }
         bool ok = (vt == WT_I32 && (sz == 1 || sz == 2 || sz == 4)) ||
@@ -1147,6 +1319,8 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_TypeHandle i16 = MLIR_CreateTypeInteger(ctx, 16, true);
         MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
         MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(ctx, 64, true);
+        MLIR_TypeHandle f32 = MLIR_CreateTypeFloat(ctx, 32, false);
+        MLIR_TypeHandle f64 = MLIR_CreateTypeFloat(ctx, 64, false);
         MLIR_ValueHandle res;
         switch (opc) {
         case 0xa7: // i32.wrap_i64
@@ -1170,6 +1344,30 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         case 0xc4: // i64.extend32_s
             res = emit_cast(L, OP_TYPE_LLVM_SEXT,
                 emit_cast(L, OP_TYPE_LLVM_TRUNC, a, i32), i64); break;
+        // ---- float <-> int conversions ----
+        // f -> i (signed): trunc_f{32,64}_s
+        case 0xa8: res = emit_cast_named(L, "llvm.fptosi", a, i32); break;
+        case 0xaa: res = emit_cast_named(L, "llvm.fptosi", a, i32); break;
+        case 0xae: res = emit_cast_named(L, "llvm.fptosi", a, i64); break;
+        case 0xb0: res = emit_cast_named(L, "llvm.fptosi", a, i64); break;
+        // f -> i (unsigned): trunc_f{32,64}_u
+        case 0xa9: res = emit_cast_named(L, "llvm.fptoui", a, i32); break;
+        case 0xab: res = emit_cast_named(L, "llvm.fptoui", a, i32); break;
+        case 0xaf: res = emit_cast_named(L, "llvm.fptoui", a, i64); break;
+        case 0xb1: res = emit_cast_named(L, "llvm.fptoui", a, i64); break;
+        // i -> f (signed): convert_i{32,64}_s
+        case 0xb2: res = emit_cast_named(L, "llvm.sitofp", a, f32); break;
+        case 0xb4: res = emit_cast_named(L, "llvm.sitofp", a, f32); break;
+        case 0xb7: res = emit_cast_named(L, "llvm.sitofp", a, f64); break;
+        case 0xb9: res = emit_cast_named(L, "llvm.sitofp", a, f64); break;
+        // i -> f (unsigned): convert_i{32,64}_u
+        case 0xb3: res = emit_cast_named(L, "llvm.uitofp", a, f32); break;
+        case 0xb5: res = emit_cast_named(L, "llvm.uitofp", a, f32); break;
+        case 0xb8: res = emit_cast_named(L, "llvm.uitofp", a, f64); break;
+        case 0xba: res = emit_cast_named(L, "llvm.uitofp", a, f64); break;
+        // f <-> f
+        case 0xb6: res = emit_cast_named(L, "llvm.fptrunc", a, f32); break; // demote
+        case 0xbb: res = emit_cast_named(L, "llvm.fpext",   a, f64); break; // promote
         default:
             fprintf(stderr,
                 "wasmssa->llvm: unop opcode 0x%llx not yet supported\n",
@@ -1299,17 +1497,6 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     uint8_t *local_vt = (uint8_t *)malloc((n_locals ? n_locals : 1));
     for (size_t i = 0; i < n_locals; i++)
         local_vt[i] = (i < n_lt) ? type_byte_at(lt, i) : type_byte_at(pt, i);
-    for (size_t i = 0; i < n_locals; i++) {
-        if (!vt_is_int(local_vt[i])) {
-            fprintf(stderr,
-                "wasmssa->llvm: func '%.*s' has a non-integer local "
-                "(floats not yet supported)\n",
-                (int)name.size, name.str);
-            free(local_vt);
-            return MLIR_INVALID_HANDLE;
-        }
-    }
-
     MLIR_RegionHandle dreg = MLIR_CreateRegion(ctx);
     MLIR_BlockHandle  entry = MLIR_CreateBlock(ctx);
     MLIR_AppendRegionBlock(ctx, dreg, entry);
