@@ -306,7 +306,7 @@ static uint32_t arm64_sub_imm(uint8_t rd, uint8_t rn, uint16_t imm12, bool sf) {
                 | ((uint32_t)(rn & 0x1f) << 5) | (uint32_t)(rd & 0x1f);
 }
 // add/sub Xd, Xn, Xm (shifted-register, LSL #0). With sf=false we get
-// the W form. NB: for our wmir.load lowering we use sf=true on values
+// the W form. NB: for our load lowering we use sf=true on values
 // produced by W-form loads, which zero-extend into the full X register
 // — so a plain X-form add is equivalent to "add Xd, Xn, Wm, UXTW".
 static uint32_t arm64_add_reg(uint8_t rd, uint8_t rn, uint8_t rm, bool sf) {
@@ -685,7 +685,7 @@ static string attr_s(MLIR_OpHandle op, const char *name) {
 // LDR x16, [x16, GOT_lo12]; BR x16`. dyld fills the corresponding
 // __DATA_CONST,__got slot at load time via chained fixups.
 //
-// LibSysSym enumerates every libSystem symbol the wmir backend may
+// LibSysSym enumerates every libSystem symbol the backend may
 // reference from its synth_* shims. The actual set used by any given
 // program is discovered by walking BL relocs after function emission
 // (see `n_libsys_stubs` further down). Enum order matters: it controls
@@ -1341,7 +1341,7 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     size_t n_top = MLIR_GetBlockNumOps(mb);
 
     // -----------------------------------------------------------------
-    // Read module-level layout attributes set by mlir_wmir_to_aarch64.
+    // Read module-level layout attributes set by mlir_llvm_to_aarch64.c.
     // -----------------------------------------------------------------
     uint32_t n_globals    = (uint32_t)attr_i(module, "n_globals");
     uint64_t global0_init = (uint64_t)attr_i(module, "global0_init");
@@ -1441,7 +1441,7 @@ static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
         // Round up to 16 for ARM64 alignment expectations.
         linmem_init_size = (linmem_init_size + 15u) & ~15u;
         // The native llvm->aarch64 path stores globals in the linmem
-        // template section without any wmir linmem/globals; ensure the
+        // template section without any linmem/globals; ensure the
         // __DATA segment (and its 32-byte data_priv prefix) is emitted.
         if (!has_data_seg) { has_data_seg = true; data_priv_size = 32u; }
     }
@@ -1546,7 +1546,7 @@ static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
     // sizeofcmds varies with __DATA presence. We use up to 2 sections in
     // __DATA: __data + __linmem_template. Linear memory itself is
     // allocated dynamically by `_start` via mmap (see synth_start in
-    // mlir_wmir_to_aarch64.c), so the binary no longer reserves a
+    // mlir_llvm_to_aarch64.c), so the binary no longer reserves a
     // multi-GiB __linmem_bss zerofill section — that placement is
     // incompatible with the dyld shared cache on macOS arm64.
     uint32_t n_data_sections  = 0;
@@ -1798,8 +1798,8 @@ static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
     buf_le64(&img, 0);
 
     // LC_MAIN
-    // Initial stack size: 256 MB. This is large because the wmir
-    // backend currently doesn't promote wasm locals to physical
+    // Initial stack size: 256 MB. This is large because the
+    // backend does not promote wasm locals to physical
     // registers — every local lives in an 8-byte stack cell, and
     // the regalloc spills aggressively (no live-range splitting).
     // Real-world tinyc functions like emit_expr end up with ~225 KB
@@ -2487,7 +2487,7 @@ bool mlir_llvm_to_macho(MLIR_Context *ctx, MLIR_OpHandle llvm_module,
         n_inits = 1;
     }
 
-    // The llvm path carries no wmir-style linmem/globals layout attrs; the
+    // The llvm path carries no separate linmem/globals layout attrs; the
     // data blob alone drives the __DATA segment.
     bool r = finalize_macho(efs, n_funcs, start_idx, inits, n_inits,
                             0, 0, 0, out_data, out_size);

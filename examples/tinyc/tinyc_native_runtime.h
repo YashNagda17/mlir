@@ -1,13 +1,11 @@
-// Native (arm64/Darwin, LP64) runtime for the `--macho-backend=llvm`
-// backend. Unlike the wmir backend — which hand-emits malloc/printf/str*/
-// print* as ~2500 lines of aarch64 "synth_*" MLIR — the llvm backend gets
-// its runtime as ordinary tinyC-subset C, parsed into the user's module and
-// lowered through the same llvm -> aarch64 path. The only primitives that
-// cannot be expressed in C are the raw syscalls; those bind to libSystem
-// dyld stubs by their underscore names (`_write`, `_exit`, `_mmap`, ...),
-// which the Mach-O encoder already imports.
+// Native (arm64/Darwin, LP64) runtime for the llvm Mach-O backend.
+// The backend gets its runtime as ordinary tinyC-subset C, parsed into the
+// user's module and lowered through the same llvm -> aarch64 path. The only
+// primitives that cannot be expressed in C are the raw syscalls; those bind
+// to libSystem dyld stubs by their underscore names (`_write`, `_exit`,
+// `_mmap`, ...), which the Mach-O encoder already imports.
 //
-// Semantics mirror runtime_wasm.c exactly so output matches the wmir suite:
+// Semantics mirror runtime_wasm.c exactly so output matches the wasm suite:
 //   printI64(v)    -> decimal digits, NO trailing newline
 //   printNewline() -> "\n"
 //   printI32(v)    -> decimal digits + "\n"

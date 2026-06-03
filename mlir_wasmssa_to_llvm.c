@@ -5,15 +5,12 @@
 // `--from-wasm` self-host path. This is the WASM-input counterpart to the
 // C-frontend emit.c (which produces the `llvm` dialect directly).
 //
-// Coverage grows test-by-test, mirroring how mlir_wasmssa_to_wmir.c was
-// built up. The current milestone handles single-block, straight-line
-// integer functions (the macho_exit / macho_arith shape): module walk,
-// import_func recognition, per-function locals-as-alloca lowering, and the
-// const / local_get / local_set / add / sub / binop(arith) / extend_i32_s /
-// call / return ops. Any unsupported op (control flow, floats, linear
-// memory, globals, ...) makes the lowering fail cleanly with a diagnostic so
-// the opt-in path degrades gracefully while the default `wmir` path is
-// untouched.
+// Coverage was grown test-by-test. It handles the full self-host surface:
+// module walk, import_func recognition, per-function locals-as-alloca
+// lowering, integer/float ops, control flow (block/loop/if/br/br_if
+// flattened to cf.br/cf.cond_br), linear memory + globals, and the WASI
+// runtime shims. Any unsupported op makes the lowering fail cleanly with a
+// diagnostic.
 
 #include "mlir_wasmssa_to_llvm.h"
 
@@ -141,7 +138,7 @@ static int omap_get(const OffsetMap *m, string name, int32_t *out) {
 }
 
 // =============================================================================
-// Function-pointer support (mirrors the wmir lifter). func_addr targets are
+// Function-pointer support. func_addr targets are
 // interned into a slot table; call_indirect dispatches via a synthesised
 // __dispatch_<sig> function that switches on the slot. FuncSigMap records each
 // function's (param_types, result_types) wasm-type strings.
@@ -219,7 +216,7 @@ static int64_t at_i_or(MLIR_OpHandle op, const char *name, int64_t dflt) {
 // =============================================================================
 // VMap: wasmssa result value -> lifted llvm value. Open-addressing hash keyed
 // on the MLIR_ValueHandle (sentinel MLIR_INVALID_HANDLE == empty). Mirrors the
-// wmir lifter's map; lookups only, so iteration order never affects output.
+// the func-addr map; lookups only, so iteration order never affects output.
 // =============================================================================
 typedef struct {
     MLIR_ValueHandle *src;
@@ -1329,7 +1326,7 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_ValueHandle p = linmem_ptr(L, addr, off);
         MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
         // Truncate the value to a backend-supported store width (1/4/8). A
-        // 2-byte store uses a 4-byte store (matches the wmir backend).
+        // 2-byte store uses a 4-byte store.
         if (sz == 1) {
             MLIR_TypeHandle i8 = MLIR_CreateTypeInteger(ctx, 8, true);
             val = emit_cast(L, OP_TYPE_LLVM_TRUNC, val, i8);
@@ -2008,8 +2005,7 @@ static void synth_fd_write(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
 //
 // Each is emitted as an `llvm.func` that calls libc (_read/_lseek/_open/_close)
 // with host pointers, translating wasm linear-memory offsets via `linmem_ptr`.
-// They mirror the wmir backend's raw-aarch64 synth_* shims
-// (mlir_wmir_to_aarch64.c) but at the `llvm`-dialect level. argc/argv are
+// They provide the WASI host shims at the `llvm`-dialect level. argc/argv are
 // recovered from the @__wasm_argc / @__wasm_argv globals that `_start` fills.
 // =============================================================================
 
@@ -2504,7 +2500,7 @@ static void synth_environ_get(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
 // `ap` is a wasm offset to a 4-byte cell holding the current va_list cursor
 // (itself a wasm offset to the next arg in linmem). Read the value at the
 // cursor (8-byte-aligning the cursor first for the 64-bit forms), then advance
-// the stored cursor past it. Mirrors mlir_wmir_to_aarch64.c synth_tinyc_va_arg_*.
+// the stored cursor past it.
 static void synth_va_arg_scalar(MLIR_Context *ctx, MLIR_BlockHandle out_body,
                                 const char *name, size_t namelen, bool is64) {
     MLIR_RegionHandle reg = MLIR_CreateRegion(ctx);

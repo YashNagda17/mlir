@@ -5,7 +5,7 @@
 // block's predecessors are known, so all blocks are treated as sealed and no
 // incomplete-phi bookkeeping is needed).
 //
-// Like the wmir-level pass, this is def-use-tracking-agnostic: it never relies
+// Like the wasm-lifter pass, this is def-use-tracking-agnostic: it never relies
 // on use lists or MLIR_ReplaceAllUsesOfValue. It builds its own value->value
 // remap table (llvm.load result -> reaching SSA value) and, after rewriting,
 // sweeps every op operand and terminator successor-operand to resolve through

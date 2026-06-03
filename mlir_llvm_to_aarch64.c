@@ -23,7 +23,7 @@
 // off. Emitting `aarch64.*` directly here is the GlobalISel "fast isel +
 // trivial regalloc" shape.
 //
-// Nothing here is on the path of the existing wasm/wmir backends; it is
+// Nothing here is on the path of the existing wasm-wrapper backend; it is
 // reached only via the opt-in `--macho-backend=llvm` driver flag.
 
 #include <stdio.h>
@@ -35,7 +35,7 @@
 #include "mlir_op_names.h"
 
 // ---------------------------------------------------------------------------
-// Small attribute / op builders (mirrors of the wmir backend's helpers).
+// Small attribute / op builders (mirrors of the former wmir backend's helpers).
 // ---------------------------------------------------------------------------
 static MLIR_AttributeHandle attr_i32(MLIR_Context *ctx, const char *name,
                                      int64_t v) {
@@ -113,7 +113,7 @@ static void emit_add_data_lo(MLIR_Context *ctx, MLIR_BlockHandle blk,
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_ADD_DATA_LO, a, 4));
 }
 
-// ---- Floating-point op builders (mirror the wmir->aarch64 backend) --------
+// ---- Floating-point op builders (mirror the former wmir->aarch64 backend) --------
 // FMOV between a GP and a V register. dir_to_v=true: GP->V; false: V->GP.
 // sf=true picks X<->D (moves all 64 bits); sf=false picks W<->S.
 static void emit_fmov_gp_v(MLIR_Context *ctx, MLIR_BlockHandle blk,
@@ -1809,7 +1809,7 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
 //   * stash the process argc/argv into `__wasm_argc` / `__wasm_argv` so the
 //     WASI args_get / args_sizes_get shims can recover them.
 // The 4 GiB reservation means `memory.grow` never needs real allocation
-// (pages fault in on first touch), mirroring the wmir backend's crt0.
+// (pages fault in on first touch), mirroring a conventional crt0.
 static MLIR_OpHandle synth_start(MLIR_Context *ctx, string main_name,
                                  PtrReloc *relocs, size_t n_relocs,
                                  GlobalMap *gm) {

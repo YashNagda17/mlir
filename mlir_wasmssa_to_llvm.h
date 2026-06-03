@@ -7,7 +7,7 @@
 // produces the in-house `llvm` dialect directly. Lifting WASM to the same
 // `llvm` dialect lets the single unified backend (`mlir_llvm_to_aarch64.c`)
 // serve BOTH the C-frontend native path and the `--from-wasm` self-host
-// path, which is what ultimately retires the separate `wmir` backend.
+// path. This is what replaced the separate `wmir` backend.
 //
 // Unlike the C frontend (which emits structured control flow in a single
 // block per function), the lifted WASM is a flattened multi-block CFG using
@@ -15,9 +15,7 @@
 // into a single host-mapped region; only at `load`/`store` boundaries is a
 // real host pointer formed as `linmem_base + zext(i32 addr)`.
 //
-// This is the first-light scaffold; the initial supported op subset is just
-// enough to grow test-by-test (mirroring how `mlir_wasmssa_to_wmir.c` was
-// built up). On unsupported wasmssa ops the lowering returns
+// On unsupported wasmssa ops the lowering returns
 // MLIR_INVALID_HANDLE and prints a diagnostic to stderr identifying the op.
 
 #pragma once
