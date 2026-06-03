@@ -1109,30 +1109,39 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
                 ef_add_br(out, BR_B, tgt, off, 0, false);
                 break;
             }
+            // Conditional branches (B.cond / CBZ / CBNZ) only reach ±1 MiB
+            // (a signed 19-bit word offset), which overflows in large
+            // self-host functions and silently wraps to a wrong target. Emit
+            // every conditional branch as a fixed inverted skip (imm19 = 2,
+            // i.e. PC+8) over an unconditional B, whose imm26 reaches ±128 MiB
+            // and is enough for any function we emit.
             case OP_TYPE_AARCH64_B_COND: {
                 MLIR_BlockHandle tgt = MLIR_GetOpSuccessor(op, 0);
                 uint8_t cond = (uint8_t)attr_i(op, "cond");
+                emit_word(&out->code, arm64_b_cond(2, (uint8_t)(cond ^ 1u)));
                 uint32_t off = (uint32_t)out->code.len;
-                emit_word(&out->code, arm64_b_cond(0, cond));
-                ef_add_br(out, BR_B_COND, tgt, off, cond, false);
+                emit_word(&out->code, arm64_b(0));
+                ef_add_br(out, BR_B, tgt, off, 0, false);
                 break;
             }
             case OP_TYPE_AARCH64_CBZ: {
                 MLIR_BlockHandle tgt = MLIR_GetOpSuccessor(op, 0);
                 uint8_t rt = (uint8_t)attr_i(op, "rt");
                 bool    sf = attr_b(op, "sf");
+                emit_word(&out->code, arm64_cbnz(rt, 2, sf));
                 uint32_t off = (uint32_t)out->code.len;
-                emit_word(&out->code, arm64_cbz(rt, 0, sf));
-                ef_add_br(out, BR_CBZ, tgt, off, rt, sf);
+                emit_word(&out->code, arm64_b(0));
+                ef_add_br(out, BR_B, tgt, off, 0, false);
                 break;
             }
             case OP_TYPE_AARCH64_CBNZ: {
                 MLIR_BlockHandle tgt = MLIR_GetOpSuccessor(op, 0);
                 uint8_t rt = (uint8_t)attr_i(op, "rt");
                 bool    sf = attr_b(op, "sf");
+                emit_word(&out->code, arm64_cbz(rt, 2, sf));
                 uint32_t off = (uint32_t)out->code.len;
-                emit_word(&out->code, arm64_cbnz(rt, 0, sf));
-                ef_add_br(out, BR_CBNZ, tgt, off, rt, sf);
+                emit_word(&out->code, arm64_b(0));
+                ef_add_br(out, BR_B, tgt, off, 0, false);
                 break;
             }
             case OP_TYPE_AARCH64_LABEL:
