@@ -1288,13 +1288,17 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     MLIR_BlockHandle sblk = MLIR_GetRegionBlock(sreg, 0);
 
     size_t n_params = pt.size / 2;
-    size_t n_decls  = lt.size / 2;
-    size_t n_locals = n_params + n_decls;
+    // The wasmssa `local_types` attr already enumerates the FULL local index
+    // space — params first, then declared locals — matching the wasm local
+    // numbering (see mlir_wasm_to_macho.c local_types construction). Do NOT
+    // prepend params again; index local_vt[i] directly from local_types.
+    size_t n_lt     = lt.size / 2;
+    size_t n_locals = n_lt > n_params ? n_lt : n_params;
 
     // Decode and validate all local valtypes up front (integer-only here).
     uint8_t *local_vt = (uint8_t *)malloc((n_locals ? n_locals : 1));
-    for (size_t i = 0; i < n_params; i++) local_vt[i] = type_byte_at(pt, i);
-    for (size_t i = 0; i < n_decls; i++)  local_vt[n_params + i] = type_byte_at(lt, i);
+    for (size_t i = 0; i < n_locals; i++)
+        local_vt[i] = (i < n_lt) ? type_byte_at(lt, i) : type_byte_at(pt, i);
     for (size_t i = 0; i < n_locals; i++) {
         if (!vt_is_int(local_vt[i])) {
             fprintf(stderr,
