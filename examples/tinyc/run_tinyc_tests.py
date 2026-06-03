@@ -351,7 +351,9 @@ def main():
             # touching the wmir backend. This is the only way to get
             # per-TU isolation that tinyc itself doesn't provide for the
             # joint multi-source --emit=macho invocation.
-            if MACHO_BACKEND == "wmir_via_wasm":
+            if MACHO_BACKEND in ("wmir_via_wasm", "llvm_via_wasm"):
+                via_backend = ("llvm" if MACHO_BACKEND == "llvm_via_wasm"
+                               else "wmir")
                 # Per-source emit -> link -> from-wasm -> macho.
                 # Mirror the wasm-target convention: by default the
                 # sources are compiled jointly (so cross-file calls
@@ -397,7 +399,7 @@ def main():
                     failures += 1
                     continue
                 r = run([str(TINYC), "--from-wasm", str(linked_wasm),
-                         "--emit=macho", "--macho-backend=wmir",
+                         "--emit=macho", f"--macho-backend={via_backend}",
                          "-o", str(exe)])
                 if r.returncode != 0:
                     print(f"FAIL {name}: tinyc --from-wasm returned {r.returncode}\nstderr:\n{r.stderr}")

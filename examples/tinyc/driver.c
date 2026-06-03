@@ -20,6 +20,7 @@
 #include "mlir_wasmstack_to_wasmssa.h"
 #include "mlir_wasm_link.h"
 #include "mlir_wasmssa_to_wmir.h"
+#include "mlir_wasmssa_to_llvm.h"
 #include "mlir_wmir_to_aarch64.h"
 #include "mlir_llvm_to_aarch64.h"
 #include "mlir_aarch64_to_macho.h"
@@ -409,17 +410,34 @@ int app_main(void) {
                 Arena *late_arena = arena_create(64 * 1024 * 1024 - 64 * 1024);
                 MLIR_SetArenaAllocator(&ctx, late_arena);
                 MLIR_ResetInternRegistry();
-                MLIR_OpHandle wmir = mlir_wasmssa_to_wmir(&ctx, ssa);
-                if (wmir == MLIR_INVALID_HANDLE) {
-                    arena_destroy(late_arena);
+                MLIR_OpHandle a64;
+                if (macho_backend_llvm) {
+                    // New unified path: lift wasmssa to the in-house `llvm`
+                    // dialect, then reuse the C-frontend's llvm->aarch64
+                    // backend. This is what ultimately retires `wmir`.
+                    MLIR_OpHandle llvm_mod = mlir_wasmssa_to_llvm(&ctx, ssa);
+                    if (llvm_mod == MLIR_INVALID_HANDLE) {
+                        arena_destroy(late_arena);
+                        arena_destroy(arena);
+                        arena_destroy(boot_arena);
+                        return 1;
+                    }
                     arena_destroy(arena);
-                    arena_destroy(boot_arena);
-                    return 1;
+                    arena = late_arena;
+                    a64 = mlir_llvm_to_aarch64(&ctx, llvm_mod);
+                } else {
+                    MLIR_OpHandle wmir = mlir_wasmssa_to_wmir(&ctx, ssa);
+                    if (wmir == MLIR_INVALID_HANDLE) {
+                        arena_destroy(late_arena);
+                        arena_destroy(arena);
+                        arena_destroy(boot_arena);
+                        return 1;
+                    }
+                    // wasmstack + wasmssa + the input wasm bytes are now dead.
+                    arena_destroy(arena);
+                    arena = late_arena;
+                    a64 = mlir_wmir_to_aarch64(&ctx, wmir);
                 }
-                // wasmstack + wasmssa + the input wasm bytes are now dead.
-                arena_destroy(arena);
-                arena = late_arena;
-                MLIR_OpHandle a64 = mlir_wmir_to_aarch64(&ctx, wmir);
                 if (a64 == MLIR_INVALID_HANDLE) {
                     arena_destroy(arena);
                     arena_destroy(boot_arena);
