@@ -1715,6 +1715,129 @@ static void synth_fd_write(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     MLIR_AppendBlockOp(ctx, out_body, fn);
     free(L.frames);
 }
+
+// tinyc_va_arg_i32/ptr(i32 ap) -> i32  and  tinyc_va_arg_i64/f64(i32 ap) -> i64
+// `ap` is a wasm offset to a 4-byte cell holding the current va_list cursor
+// (itself a wasm offset to the next arg in linmem). Read the value at the
+// cursor (8-byte-aligning the cursor first for the 64-bit forms), then advance
+// the stored cursor past it. Mirrors mlir_wmir_to_aarch64.c synth_tinyc_va_arg_*.
+static void synth_va_arg_scalar(MLIR_Context *ctx, MLIR_BlockHandle out_body,
+                                const char *name, size_t namelen, bool is64) {
+    MLIR_RegionHandle reg = MLIR_CreateRegion(ctx);
+    MLIR_BlockHandle  entry = MLIR_CreateBlock(ctx);
+    MLIR_AppendRegionBlock(ctx, reg, entry);
+
+    MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
+    MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(ctx, 64, true);
+    MLIR_TypeHandle vty = is64 ? i64 : i32;
+
+    MLIR_ValueHandle ap = MLIR_CreateValueBlockArg(ctx, (string){0}, 0, i32,
+        MLIR_CreateLocationUnknown(ctx, (string){0}));
+    MLIR_AppendBlockArg(ctx, entry, ap);
+
+    FLower L = {0};
+    L.ctx = ctx; L.dreg = reg; L.cur = entry;
+
+    MLIR_ValueHandle app = linmem_ptr(&L, ap, 0);
+    MLIR_ValueHandle cur = emit_load_ty(&L, app, i32);
+    if (is64) {
+        cur = emit_binop2(&L, OP_TYPE_LLVM_ADD, cur, emit_const(&L, i32, 7), i32);
+        cur = emit_binop2(&L, OP_TYPE_LLVM_AND, cur, emit_const(&L, i32, -8), i32);
+    }
+    MLIR_ValueHandle vp  = linmem_ptr(&L, cur, 0);
+    MLIR_ValueHandle res = emit_load_ty(&L, vp, vty);
+    MLIR_ValueHandle nxt = emit_binop2(&L, OP_TYPE_LLVM_ADD, cur,
+        emit_const(&L, i32, is64 ? 8 : 4), i32);
+    emit_store_v(&L, nxt, app);
+
+    MLIR_ValueHandle rops[1] = { res };
+    MLIR_OpHandle ret = build_op(ctx, OP_TYPE_LLVM_RETURN, NULL, 0, NULL, 0, NULL, rops, 1);
+    emit(&L, ret);
+
+    MLIR_AttributeHandle fa[1] = { attr_s(ctx, "sym_name", (char *)name, namelen) };
+    MLIR_RegionHandle regs[1] = { reg };
+    MLIR_OpHandle fn = MLIR_CreateOp(ctx, OP_TYPE_LLVM_FUNC,
+        op_type_to_string(OP_TYPE_LLVM_FUNC), fa, 1, NULL, 0, NULL, 0, NULL, 0, regs, 1,
+        MLIR_CreateLocationUnknown(ctx, (string){0}), MLIR_INVALID_HANDLE, (string){0}, -1);
+    MLIR_AppendBlockOp(ctx, out_body, fn);
+    free(L.frames);
+}
+
+// tinyc_va_arg_struct(i32 ap, i32 out, i64 size) -> void: copy `(size+7)/8`
+// 8-byte words from the (8-byte-aligned) va_list cursor into linmem[out],
+// advancing the stored cursor. Mirrors synth_tinyc_va_arg_struct.
+static void synth_va_arg_struct(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
+    MLIR_RegionHandle reg = MLIR_CreateRegion(ctx);
+    MLIR_BlockHandle  entry = MLIR_CreateBlock(ctx);
+    MLIR_AppendRegionBlock(ctx, reg, entry);
+
+    MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
+    MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(ctx, 64, true);
+
+    MLIR_ValueHandle ap = MLIR_CreateValueBlockArg(ctx, (string){0}, 0, i32,
+        MLIR_CreateLocationUnknown(ctx, (string){0}));
+    MLIR_ValueHandle outo = MLIR_CreateValueBlockArg(ctx, (string){0}, 1, i32,
+        MLIR_CreateLocationUnknown(ctx, (string){0}));
+    MLIR_ValueHandle size = MLIR_CreateValueBlockArg(ctx, (string){0}, 2, i64,
+        MLIR_CreateLocationUnknown(ctx, (string){0}));
+    MLIR_AppendBlockArg(ctx, entry, ap);
+    MLIR_AppendBlockArg(ctx, entry, outo);
+    MLIR_AppendBlockArg(ctx, entry, size);
+
+    FLower L = {0};
+    L.ctx = ctx; L.dreg = reg; L.cur = entry;
+
+    MLIR_ValueHandle app  = linmem_ptr(&L, ap, 0);
+    MLIR_ValueHandle words = emit_binop2(&L, OP_TYPE_LLVM_LSHR,
+        emit_binop2(&L, OP_TYPE_LLVM_ADD, size, emit_const(&L, i64, 7), i64),
+        emit_const(&L, i64, 3), i64);
+    MLIR_ValueHandle curpr = emit_alloca(&L, i32, 1);
+    MLIR_ValueHandle outpr = emit_alloca(&L, i32, 1);
+    MLIR_ValueHandle wpr   = emit_alloca(&L, i64, 1);
+    emit_store_v(&L, emit_load_ty(&L, app, i32), curpr);
+    emit_store_v(&L, outo, outpr);
+    emit_store_v(&L, words, wpr);
+
+    MLIR_BlockHandle loop = new_block(&L);
+    MLIR_BlockHandle body = new_block(&L);
+    MLIR_BlockHandle done = new_block(&L);
+    term_br(&L, loop);
+
+    // loop: if words==0 goto done
+    L.cur = loop; L.terminated = false;
+    MLIR_ValueHandle w = emit_load_ty(&L, wpr, i64);
+    MLIR_ValueHandle wz = build_icmp(&L, /*eq*/0, w, emit_const(&L, i64, 0));
+    term_cond_br(&L, wz, done, body);
+
+    // body: align cur to 8, copy one word, advance all cursors
+    L.cur = body; L.terminated = false;
+    MLIR_ValueHandle cur = emit_load_ty(&L, curpr, i32);
+    cur = emit_binop2(&L, OP_TYPE_LLVM_ADD, cur, emit_const(&L, i32, 7), i32);
+    cur = emit_binop2(&L, OP_TYPE_LLVM_AND, cur, emit_const(&L, i32, -8), i32);
+    MLIR_ValueHandle o = emit_load_ty(&L, outpr, i32);
+    MLIR_ValueHandle srcp = linmem_ptr(&L, cur, 0);
+    MLIR_ValueHandle dstp = linmem_ptr(&L, o, 0);
+    emit_store_v(&L, emit_load_ty(&L, srcp, i64), dstp);
+    emit_store_v(&L, emit_binop2(&L, OP_TYPE_LLVM_ADD, cur, emit_const(&L, i32, 8), i32), curpr);
+    emit_store_v(&L, emit_binop2(&L, OP_TYPE_LLVM_ADD, o, emit_const(&L, i32, 8), i32), outpr);
+    emit_store_v(&L, emit_binop2(&L, OP_TYPE_LLVM_SUB, w, emit_const(&L, i64, 1), i64), wpr);
+    term_br(&L, loop);
+
+    // done: write the final cursor back to linmem[ap], return void
+    L.cur = done; L.terminated = false;
+    emit_store_v(&L, emit_load_ty(&L, curpr, i32), app);
+    MLIR_OpHandle ret = build_op(ctx, OP_TYPE_LLVM_RETURN, NULL, 0, NULL, 0, NULL, NULL, 0);
+    emit(&L, ret);
+
+    MLIR_AttributeHandle fa[1] = { attr_s(ctx, "sym_name", (char *)"tinyc_va_arg_struct", 19) };
+    MLIR_RegionHandle regs[1] = { reg };
+    MLIR_OpHandle fn = MLIR_CreateOp(ctx, OP_TYPE_LLVM_FUNC,
+        op_type_to_string(OP_TYPE_LLVM_FUNC), fa, 1, NULL, 0, NULL, 0, NULL, 0, regs, 1,
+        MLIR_CreateLocationUnknown(ctx, (string){0}), MLIR_INVALID_HANDLE, (string){0}, -1);
+    MLIR_AppendBlockOp(ctx, out_body, fn);
+    free(L.frames);
+}
+
 static void scan_max_global(MLIR_OpHandle op, int64_t *max_idx) {
     MLIR_OpType t = MLIR_GetOpType(op);
     if (t == OP_TYPE_WASMSSA_GLOBAL_GET || t == OP_TYPE_WASMSSA_GLOBAL_SET) {
@@ -1989,6 +2112,8 @@ MLIR_OpHandle mlir_wasmssa_to_llvm(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
     // -- Imports: allow the known WASI/print imports; reject others. --
     bool need_printI64 = false, need_printNewline = false, need_printStr = false;
     bool need_fd_write = false;
+    bool need_va_i32 = false, need_va_i64 = false, need_va_ptr = false;
+    bool need_va_f64 = false, need_va_struct = false;
     for (size_t i = 0; i < nops; i++) {
         MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
         if (MLIR_GetOpType(op) != OP_TYPE_WASMSSA_IMPORT_FUNC) continue;
@@ -1998,6 +2123,11 @@ MLIR_OpHandle mlir_wasmssa_to_llvm(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
         if (nm.size == 12 && memcmp(nm.str, "printNewline", 12) == 0) { need_printNewline = true; continue; }
         if (nm.size == 8 && memcmp(nm.str, "printStr", 8) == 0) { need_printStr = true; continue; }
         if (nm.size == 8 && memcmp(nm.str, "fd_write", 8) == 0) { need_fd_write = true; continue; }
+        if (nm.size == 16 && memcmp(nm.str, "tinyc_va_arg_i32", 16) == 0) { need_va_i32 = true; continue; }
+        if (nm.size == 16 && memcmp(nm.str, "tinyc_va_arg_i64", 16) == 0) { need_va_i64 = true; continue; }
+        if (nm.size == 16 && memcmp(nm.str, "tinyc_va_arg_ptr", 16) == 0) { need_va_ptr = true; continue; }
+        if (nm.size == 16 && memcmp(nm.str, "tinyc_va_arg_f64", 16) == 0) { need_va_f64 = true; continue; }
+        if (nm.size == 19 && memcmp(nm.str, "tinyc_va_arg_struct", 19) == 0) { need_va_struct = true; continue; }
         fprintf(stderr,
             "wasmssa->llvm: import '%.*s' not yet supported\n",
             (int)nm.size, nm.str);
@@ -2059,6 +2189,11 @@ MLIR_OpHandle mlir_wasmssa_to_llvm(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
     if (need_printNewline) synth_print_newline(ctx, out_body);
     if (need_printStr) synth_print_str(ctx, out_body);
     if (need_fd_write) synth_fd_write(ctx, out_body);
+    if (need_va_i32) synth_va_arg_scalar(ctx, out_body, "tinyc_va_arg_i32", 16, false);
+    if (need_va_ptr) synth_va_arg_scalar(ctx, out_body, "tinyc_va_arg_ptr", 16, false);
+    if (need_va_i64) synth_va_arg_scalar(ctx, out_body, "tinyc_va_arg_i64", 16, true);
+    if (need_va_f64) synth_va_arg_scalar(ctx, out_body, "tinyc_va_arg_f64", 16, true);
+    if (need_va_struct) synth_va_arg_struct(ctx, out_body);
 
     free(globals.names); free(globals.offsets);
     free(fnptrs.names); free(fnptrs.slots);
