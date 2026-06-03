@@ -386,10 +386,15 @@ static bool name_eq(string s, const char *cstr) {
     return s.size == n && memcmp(s.str, cstr, n) == 0;
 }
 
-static bool type_is_i64(MLIR_Context *ctx, MLIR_ValueHandle v) {
-    MLIR_TypeHandle ty = MLIR_GetValueType(v);
-    string s = MLIR_GetTypeString(ctx, ty);
-    return s.size == 3 && memcmp(s.str, "i64", 3) == 0;
+static unsigned a64_type_size(MLIR_Context *ctx, MLIR_TypeHandle ty);
+
+// True when a value occupies a full 64-bit general-purpose register, i.e. it
+// is an i64 OR a pointer (!llvm.ptr / ptr) — both must use 64-bit (sf=1)
+// AArch64 ops. Deciding this from the literal "i64" string alone is WRONG: a
+// pointer-typed value would then be lowered with sf=0, and ops like CSEL/CMP/
+// ADD would zero the upper 32 bits, truncating the pointer to its low half.
+static bool type_is_gp64(MLIR_Context *ctx, MLIR_ValueHandle v) {
+    return a64_type_size(ctx, MLIR_GetValueType(v)) == 8;
 }
 
 // Bit width of an integer-typed value ("i1"/"i8"/"i16"/"i32"/"i64"). 0 if not
@@ -890,13 +895,13 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             emit_load_imm(ctx, blk, 9, bits, /*sf=*/true);
         } else {
             emit_load_imm(ctx, blk, 9, (uint64_t)MLIR_GetAttributeInteger(va),
-                          type_is_i64(ctx, res));
+                          type_is_gp64(ctx, res));
         }
         store_value(ctx, blk, sm, res, 9);
 
     } else if (simple_binop_optype(on, &bt)) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
-        bool sf = type_is_i64(ctx, res);
+        bool sf = type_is_gp64(ctx, res);
         if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9) ||
             !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10))
             LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
@@ -906,7 +911,7 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
 
     } else if (name_eq(on, "llvm.srem") || name_eq(on, "llvm.urem")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
-        bool sf = type_is_i64(ctx, res);
+        bool sf = type_is_gp64(ctx, res);
         if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9) ||
             !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10))
             LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
@@ -926,7 +931,7 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         if (cond < 0)
             LFAIL("llvm->aarch64: unsupported icmp predicate %lld\n",
                   (long long)MLIR_GetAttributeInteger(pa));
-        bool sf = type_is_i64(ctx, MLIR_GetOpOperand(op, 0));
+        bool sf = type_is_gp64(ctx, MLIR_GetOpOperand(op, 0));
         if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9) ||
             !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10))
             LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
@@ -937,7 +942,7 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
 
     } else if (name_eq(on, "llvm.select")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
-        bool sf = type_is_i64(ctx, res);
+        bool sf = type_is_gp64(ctx, res);
         if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9)  ||
             !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10) ||
             !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 2), 11))
@@ -1623,6 +1628,10 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
     for (size_t b = 0; b < n_blocks; b++) {
         L.cur = out_blks[b];
         MLIR_BlockHandle sb = src_blks[b];
+        if (b != 0 && MLIR_GetBlockNumArgs(sb) != 0)
+            A64_FAIL("llvm->aarch64: non-entry block %zu in '%.*s' has %zu "
+                     "block arg(s) (phi edge copies not implemented)\n",
+                     b, (int)sym.size, sym.str, MLIR_GetBlockNumArgs(sb));
         size_t no = MLIR_GetBlockNumOps(sb);
         if (no == 0) {
             fprintf(stderr, "llvm->aarch64: empty block in '%.*s'\n",
@@ -1653,10 +1662,18 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
             emit_epilogue(ctx, L.cur, frame_size);
             emit_ret(ctx, L.cur);
         } else if (name_eq(tn, "cf.br")) {
+            if (MLIR_GetOpNumOperands(term) != 0)
+                A64_FAIL("llvm->aarch64: cf.br with %zu block-arg operand(s) "
+                         "in '%.*s' (edge copies not implemented)\n",
+                         MLIR_GetOpNumOperands(term), (int)sym.size, sym.str);
             MLIR_BlockHandle d = map_block(src_blks, out_blks, n_blocks,
                                            MLIR_GetOpSuccessor(term, 0));
             emit_b(ctx, L.cur, d);
         } else if (name_eq(tn, "cf.cond_br")) {
+            if (MLIR_GetOpNumOperands(term) != 1)
+                A64_FAIL("llvm->aarch64: cf.cond_br with %zu operand(s) "
+                         "in '%.*s' (block-arg edge copies not implemented)\n",
+                         MLIR_GetOpNumOperands(term), (int)sym.size, sym.str);
             if (!load_value(ctx, L.cur, &sm, MLIR_GetOpOperand(term, 0), 9)) {
                 fprintf(stderr, "llvm->aarch64: undefined cond_br condition "
                         "in '%.*s'\n", (int)sym.size, sym.str);
