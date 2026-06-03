@@ -74,6 +74,22 @@ static MLIR_TypeHandle vt_to_llvm(MLIR_Context *ctx, uint8_t vt) {
 static bool vt_is_int(uint8_t vt) { return vt == WT_I32 || vt == WT_I64; }
 static bool vt_is_float(uint8_t vt) { return vt == WT_F32 || vt == WT_F64; }
 
+// Re-materialise a FRESH type in `ctx` matching the (possibly foreign-arena)
+// tracked type `t`. Under --from-wasm the wasmssa module's arena is freed
+// between passes, so a type handle that points into it dangles and later reads
+// back as '?'. Decoding via the type string (valid while the source arena is
+// alive) and recreating in `ctx` yields a stable handle. Defaults to i32.
+static MLIR_TypeHandle fresh_type_like(MLIR_Context *ctx, MLIR_TypeHandle t) {
+    string s = MLIR_GetTypeString(ctx, t);
+    if (s.size == 3 && memcmp(s.str, "i64", 3) == 0)
+        return MLIR_CreateTypeInteger(ctx, 64, true);
+    if (s.size == 3 && memcmp(s.str, "f32", 3) == 0)
+        return MLIR_CreateTypeFloat(ctx, 32, false);
+    if (s.size == 3 && memcmp(s.str, "f64", 3) == 0)
+        return MLIR_CreateTypeFloat(ctx, 64, false);
+    return MLIR_CreateTypeInteger(ctx, 32, true);
+}
+
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -289,6 +305,8 @@ typedef struct {
     OffsetMap        *globals;   // import_global name -> linmem offset
     FuncPtrMap       *fnptrs;    // func_addr target name -> slot index
     const FuncSigMap *sigs;      // callee name -> (param,result) wasm types
+    MLIR_ValueHandle  linmem_base; // cached i64 load of @__wasm_linmem_base
+    bool              have_base;   // whether linmem_base is populated
 } FLower;
 
 // Create a fresh op result value of the given type.
@@ -612,8 +630,18 @@ static MLIR_ValueHandle linmem_ptr(FLower *L, MLIR_ValueHandle addr_i32,
     MLIR_Context *ctx = L->ctx;
     MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(ctx, 64, true);
     MLIR_TypeHandle ptr = MLIR_CreateTypeLLVMPointer(ctx);
-    MLIR_ValueHandle base_slot = emit_addressof(L, LINMEM_BASE_GLOBAL);
-    MLIR_ValueHandle base_i64 = emit_load_ty(L, base_slot, i64);
+    // The base pointer is loaded once per function (in the entry block) and
+    // reused for every access; this avoids re-emitting addressof+load on each
+    // memory operation, which otherwise dominates the lifted IR size. The
+    // synth_* runtime helpers build their own FLower without a cached base, so
+    // fall back to a per-access load there (they have few accesses).
+    MLIR_ValueHandle base_i64;
+    if (L->have_base) {
+        base_i64 = L->linmem_base;
+    } else {
+        MLIR_ValueHandle base_slot = emit_addressof(L, LINMEM_BASE_GLOBAL);
+        base_i64 = emit_load_ty(L, base_slot, i64);
+    }
     MLIR_ValueHandle addr64 = emit_cast(L, OP_TYPE_LLVM_ZEXT, addr_i32, i64);
     MLIR_ValueHandle ea = emit_binop2(L, OP_TYPE_LLVM_ADD, base_i64, addr64, i64);
     if (off != 0) {
@@ -874,11 +902,8 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
             if (L->sigs && fsm_get(L->sigs, callee, &cpt, &crt) && crt.size >= 2)
                 ty = vt_to_llvm(ctx, type_byte_at(crt, 0));
             if (ty == MLIR_INVALID_HANDLE) {
-                ty = MLIR_GetValueType(MLIR_GetOpResult(op, 0));
-                string tys = MLIR_GetTypeString(ctx, ty);
-                if (tys.size == 0 || tys.str == NULL || tys.str[0] == '?' ||
-                    (tys.size == 7 && memcmp(tys.str, "unknown", 7) == 0))
-                    ty = MLIR_CreateTypeInteger(ctx, 32, true);
+                MLIR_TypeHandle tracked = MLIR_GetValueType(MLIR_GetOpResult(op, 0));
+                ty = fresh_type_like(ctx, tracked);
             }
             rt[0] = ty;
             r[0] = mk_res(ctx, ty);
@@ -1493,12 +1518,12 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_TypeHandle rt[1];
         MLIR_ValueHandle r[1];
         if (nr == 1) {
-            MLIR_TypeHandle ty = MLIR_GetValueType(MLIR_GetOpResult(op, 0));
-            string tys = MLIR_GetTypeString(ctx, ty);
-            if (tys.size == 0 || tys.str == NULL || tys.str[0] == '?' ||
-                (tys.size == 7 && memcmp(tys.str, "unknown", 7) == 0)) {
-                ty = sig_r.size >= 2 ? vt_to_llvm(ctx, type_byte_at(sig_r, 0))
-                                     : MLIR_CreateTypeInteger(ctx, 32, true);
+            MLIR_TypeHandle ty;
+            if (sig_r.size >= 2) {
+                ty = vt_to_llvm(ctx, type_byte_at(sig_r, 0));
+            } else {
+                MLIR_TypeHandle tracked = MLIR_GetValueType(MLIR_GetOpResult(op, 0));
+                ty = fresh_type_like(ctx, tracked);
             }
             rt[0] = ty;
             r[0] = mk_res(ctx, ty);
@@ -1626,6 +1651,16 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
         MLIR_OpHandle st = build_op(ctx, OP_TYPE_LLVM_STORE,
             NULL, 0, NULL, 0, NULL, ops, 2);
         MLIR_AppendBlockOp(ctx, entry, st);
+    }
+
+    // Load the linear-memory base pointer once in the entry block; linmem_ptr
+    // reuses this cached value for every access (the entry block dominates the
+    // whole body, so the value is valid everywhere). L.cur is still the entry
+    // block here (body lowering has not started).
+    {
+        MLIR_ValueHandle bslot = emit_addressof(&L, LINMEM_BASE_GLOBAL);
+        L.linmem_base = emit_load_ty(&L, bslot, i64ty);
+        L.have_base = true;
     }
 
     // Lower the body. Control-flow ops append further blocks to dreg and
