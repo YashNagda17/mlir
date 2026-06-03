@@ -90,6 +90,10 @@ static void buf_cstr(Buf *b, const char *s) {
     while (*s) buf_u8(b, (uint8_t)*s++);
     buf_u8(b, 0);
 }
+static void buf_strn(Buf *b, const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) buf_u8(b, (uint8_t)s[i]);
+    buf_u8(b, 0);
+}
 static void buf_patch_le32(Buf *b, size_t pos, uint32_t v) {
     b->data[pos + 0] = (uint8_t)(v & 0xff);
     b->data[pos + 1] = (uint8_t)((v >> 8) & 0xff);
@@ -704,9 +708,10 @@ typedef enum {
     LS_LSEEK,
     LS_ERRNO,
     LS_MMAP,
-    LS_MEMCPY
+    LS_MEMCPY,
+    LS_FCHMOD
 } LibSysSym;
-#define LS_COUNT 9
+#define LS_COUNT 10
 
 static const char *libsys_name(int sym) {
     if (sym == LS_EXIT)   return "_exit";
@@ -718,6 +723,7 @@ static const char *libsys_name(int sym) {
     if (sym == LS_ERRNO)  return "___error";
     if (sym == LS_MMAP)   return "_mmap";
     if (sym == LS_MEMCPY) return "_memcpy";
+    if (sym == LS_FCHMOD) return "_fchmod";
     return "";
 }
 
@@ -2124,7 +2130,39 @@ static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
     }
     while (strtab.len % 8) buf_u8(&strtab, 0);
 
+    // Optional: per-function local symbols (gated by env var) so `sample`/
+    // `nm`/`atos` can name functions in the stripped output. Names are the
+    // lifter's `func_<wasmidx>` (or import name); n_value points at the
+    // function's text VM address.
+    bool emit_local_syms = (getenv("A64_LOCAL_SYMS") != NULL);
+    Buf locals_strs = {0};
+    uint32_t *local_stroff = NULL;
+    if (emit_local_syms) {
+        local_stroff = (uint32_t *)malloc(n_funcs * sizeof(uint32_t));
+        for (size_t i = 0; i < n_funcs; i++) {
+            local_stroff[i] = (uint32_t)strtab.len + (uint32_t)locals_strs.len;
+            // leading '_' for tool friendliness
+            buf_u8(&locals_strs, (uint8_t)'_');
+            for (size_t k = 0; k < efs[i].name.size; k++)
+                buf_u8(&locals_strs, (uint8_t)efs[i].name.str[k]);
+            buf_u8(&locals_strs, 0);
+        }
+        buf_append(&strtab, locals_strs.data, locals_strs.len);
+        while (strtab.len % 8) buf_u8(&strtab, 0);
+    }
+
     Buf symtab = {0};
+    // Local function symbols come FIRST (dysymtab requires locals, then
+    // external-defined, then undefined, each contiguous).
+    if (emit_local_syms) {
+        for (size_t i = 0; i < n_funcs; i++) {
+            buf_le32(&symtab, local_stroff[i]);
+            buf_u8(&symtab, 0x0e);  // N_SECT (local, not external)
+            buf_u8(&symtab, 1);     // n_sect = __text
+            buf_le16(&symtab, 0);
+            buf_le64(&symtab, TEXT_VM_BASE + text_section_off + efs[i].text_off);
+        }
+    }
     // __mh_execute_header
     buf_le32(&symtab, str_mh);
     buf_u8(&symtab, 0x0f); buf_u8(&symtab, 1);
@@ -2153,18 +2191,20 @@ static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
         }
     }
 
-    uint32_t n_syms       = 2u + n_stubs;
+    uint32_t n_locals     = emit_local_syms ? (uint32_t)n_funcs : 0u;
+    uint32_t n_syms       = n_locals + 2u + n_stubs;
     uint32_t n_undefs     = n_stubs;
-    uint32_t iundefsym    = 2;
+    uint32_t iextdefsym   = n_locals;
+    uint32_t iundefsym    = n_locals + 2u;
 
     // Indirect-symbols table: 2*n_stubs entries. The first n_stubs are
     // for the __got section (reserved1=0 in the section header); the
     // next n_stubs are for __stubs (reserved1=n_stubs). Both blocks
     // hold the same values: indirect_sym[i] = symtab index of the
-    // undef sym that backs slot i. Our undefs start at symtab[2].
+    // undef sym that backs slot i. Undefs start at iundefsym.
     Buf indsyms = {0};
-    for (uint32_t i = 0; i < n_stubs; i++) buf_le32(&indsyms, 2u + i);  // GOT
-    for (uint32_t i = 0; i < n_stubs; i++) buf_le32(&indsyms, 2u + i);  // stubs
+    for (uint32_t i = 0; i < n_stubs; i++) buf_le32(&indsyms, iundefsym + i);  // GOT
+    for (uint32_t i = 0; i < n_stubs; i++) buf_le32(&indsyms, iundefsym + i);  // stubs
 
     size_t symtab_off  = img.len;
     buf_append(&img, symtab.data, symtab.len);
@@ -2204,8 +2244,8 @@ static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
     buf_patch_le32(&img, pos_lc_symtab           + 16, (uint32_t)strtab_off);
     buf_patch_le32(&img, pos_lc_symtab           + 20, (uint32_t)strtab.len);
     buf_patch_le32(&img, pos_lc_dysymtab         + 8,  0);
-    buf_patch_le32(&img, pos_lc_dysymtab         + 12, 0);
-    buf_patch_le32(&img, pos_lc_dysymtab         + 16, 0);
+    buf_patch_le32(&img, pos_lc_dysymtab         + 12, n_locals);
+    buf_patch_le32(&img, pos_lc_dysymtab         + 16, iextdefsym);
     buf_patch_le32(&img, pos_lc_dysymtab         + 20, 2);
     buf_patch_le32(&img, pos_lc_dysymtab         + 24, iundefsym);
     buf_patch_le32(&img, pos_lc_dysymtab         + 28, n_undefs);
