@@ -1492,6 +1492,147 @@ static bool collect_globals(MLIR_Context *ctx, MLIR_BlockHandle mb,
 }
 
 
+// ---------------------------------------------------------------------------
+// Multi-block CFG lowering. Used for functions whose body is an explicit
+// `cf.br` / `cf.cond_br` control-flow graph (e.g. the `--from-wasm` lifter
+// output) rather than single-block structured `scf`. The WASM-sourced CFG
+// has an empty operand stack at every block boundary (all cross-block state
+// flows through `llvm.alloca` locals), so branch ops carry NO block-arg
+// operands — there is no phi / edge-copy to resolve. Each source block maps
+// 1:1 to an output `aarch64` block; non-terminator ops reuse `lower_op`.
+// ---------------------------------------------------------------------------
+static MLIR_BlockHandle map_block(MLIR_BlockHandle *src, MLIR_BlockHandle *dst,
+                                  size_t n, MLIR_BlockHandle s) {
+    for (size_t i = 0; i < n; i++)
+        if (src[i] == s) return dst[i];
+    return MLIR_INVALID_HANDLE;
+}
+
+static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
+                                     string sym, GlobalMap *gm) {
+    MLIR_RegionHandle src_region = MLIR_GetOpRegion(fn, 0);
+    size_t n_blocks = MLIR_GetRegionNumBlocks(src_region);
+    MLIR_BlockHandle entry_src = MLIR_GetRegionBlock(src_region, 0);
+    size_t nargs = MLIR_GetBlockNumArgs(entry_src);
+    if (nargs > 64)
+        A64_FAIL("llvm->aarch64: function '%.*s' has %zu parameters "
+                 "(>64 not supported)\n", (int)sym.size, sym.str, nargs);
+
+    SlotMap sm = {0};
+    sm.arena = MLIR_GetArenaAllocator(ctx);
+    int32_t nslots = 0;
+    for (size_t b = 0; b < n_blocks; b++)
+        assign_slots_block(&sm, MLIR_GetRegionBlock(src_region, b), &nslots);
+    if (nslots > 4095)
+        A64_FAIL("llvm->aarch64: function '%.*s' needs %d slots "
+                 "(frame too large for the trivial allocator)\n",
+                 (int)sym.size, sym.str, nslots);
+    uint32_t slot_bytes = (uint32_t)nslots * 8u;
+
+    SlotMap am = {0};
+    am.arena = MLIR_GetArenaAllocator(ctx);
+    uint32_t alloca_bytes = 0;
+    for (size_t b = 0; b < n_blocks; b++)
+        if (!collect_allocas(ctx, &am, MLIR_GetRegionBlock(src_region, b),
+                             &alloca_bytes))
+            A64_FAIL("llvm->aarch64: function '%.*s' has an unsupported "
+                     "alloca\n", (int)sym.size, sym.str);
+    uint32_t frame_size = (slot_bytes + alloca_bytes + 15u) & ~15u;
+
+    MLIR_RegionHandle out_reg = MLIR_CreateRegion(ctx);
+    MLIR_BlockHandle *src_blks = (MLIR_BlockHandle *)malloc(
+        n_blocks * sizeof(MLIR_BlockHandle));
+    MLIR_BlockHandle *out_blks = (MLIR_BlockHandle *)malloc(
+        n_blocks * sizeof(MLIR_BlockHandle));
+    for (size_t b = 0; b < n_blocks; b++) {
+        src_blks[b] = MLIR_GetRegionBlock(src_region, b);
+        out_blks[b] = MLIR_CreateBlock(ctx);
+        MLIR_AppendRegionBlock(ctx, out_reg, out_blks[b]);
+    }
+
+    // Prologue + incoming-param spill in the entry block.
+    emit_prologue(ctx, out_blks[0], frame_size);
+    for (size_t i = 0; i < nargs && i < 8; i++)
+        store_value(ctx, out_blks[0], &sm, MLIR_GetBlockArg(entry_src, i),
+                    (uint8_t)i);
+    for (size_t i = 8; i < nargs; i++) {
+        emit_ldr_x(ctx, out_blks[0], 9, 29, (uint32_t)(16u + (i - 8) * 8u));
+        store_value(ctx, out_blks[0], &sm, MLIR_GetBlockArg(entry_src, i), 9);
+    }
+
+    LowerCtx L = { ctx, &sm, out_reg, out_blks[0], sym, frame_size,
+                   &am, slot_bytes, gm, nargs, true };
+
+    for (size_t b = 0; b < n_blocks; b++) {
+        L.cur = out_blks[b];
+        MLIR_BlockHandle sb = src_blks[b];
+        size_t no = MLIR_GetBlockNumOps(sb);
+        if (no == 0) {
+            fprintf(stderr, "llvm->aarch64: empty block in '%.*s'\n",
+                    (int)sym.size, sym.str);
+            free(src_blks); free(out_blks);
+            return MLIR_INVALID_HANDLE;
+        }
+        for (size_t i = 0; i + 1 < no; i++) {
+            lower_op(&L, MLIR_GetBlockOp(sb, i));
+            if (!L.ok) { free(src_blks); free(out_blks); return MLIR_INVALID_HANDLE; }
+        }
+        MLIR_OpHandle term = MLIR_GetBlockOp(sb, no - 1);
+        string tn = MLIR_GetOpName(term);
+        if (name_eq(tn, "llvm.return")) {
+            size_t nr = MLIR_GetOpNumOperands(term);
+            if (nr == 1) {
+                if (!load_value(ctx, L.cur, &sm, MLIR_GetOpOperand(term, 0), 0)) {
+                    fprintf(stderr, "llvm->aarch64: undefined return value "
+                            "in '%.*s'\n", (int)sym.size, sym.str);
+                    free(src_blks); free(out_blks);
+                    return MLIR_INVALID_HANDLE;
+                }
+            } else if (nr > 1) {
+                fprintf(stderr, "llvm->aarch64: multi-value return\n");
+                free(src_blks); free(out_blks);
+                return MLIR_INVALID_HANDLE;
+            }
+            emit_epilogue(ctx, L.cur, frame_size);
+            emit_ret(ctx, L.cur);
+        } else if (name_eq(tn, "cf.br")) {
+            MLIR_BlockHandle d = map_block(src_blks, out_blks, n_blocks,
+                                           MLIR_GetOpSuccessor(term, 0));
+            emit_b(ctx, L.cur, d);
+        } else if (name_eq(tn, "cf.cond_br")) {
+            if (!load_value(ctx, L.cur, &sm, MLIR_GetOpOperand(term, 0), 9)) {
+                fprintf(stderr, "llvm->aarch64: undefined cond_br condition "
+                        "in '%.*s'\n", (int)sym.size, sym.str);
+                free(src_blks); free(out_blks);
+                return MLIR_INVALID_HANDLE;
+            }
+            MLIR_BlockHandle tb = map_block(src_blks, out_blks, n_blocks,
+                                            MLIR_GetOpSuccessor(term, 0));
+            MLIR_BlockHandle fb = map_block(src_blks, out_blks, n_blocks,
+                                            MLIR_GetOpSuccessor(term, 1));
+            emit_cbnz(ctx, L.cur, 9, false, tb);
+            emit_b(ctx, L.cur, fb);
+        } else {
+            fprintf(stderr, "llvm->aarch64: block in '%.*s' ends in "
+                    "non-terminator '%.*s'\n",
+                    (int)sym.size, sym.str, (int)tn.size, tn.str);
+            free(src_blks); free(out_blks);
+            return MLIR_INVALID_HANDLE;
+        }
+    }
+    free(src_blks);
+    free(out_blks);
+
+    MLIR_AttributeHandle attrs[1];
+    attrs[0] = attr_s(ctx, "sym_name", sym.str, sym.size);
+    MLIR_RegionHandle regs[1] = { out_reg };
+    return MLIR_CreateOp(ctx, OP_TYPE_AARCH64_FUNC,
+        op_type_to_string(OP_TYPE_AARCH64_FUNC),
+        attrs, 1, NULL, 0, NULL, 0, NULL, 0, regs, 1,
+        MLIR_CreateLocationUnknown(ctx, (string){0}),
+        MLIR_INVALID_HANDLE, (string){0}, -1);
+}
+
 // line integer code plus structured control flow (scf.if / scf.while /
 // scf.index_switch). Uses the trivial spill-everything allocator: every SSA
 // value (incl. block args / scf results) lives in a frame slot, so phi /
@@ -1500,6 +1641,8 @@ static bool collect_globals(MLIR_Context *ctx, MLIR_BlockHandle mb,
 static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
                                  string sym, GlobalMap *gm) {
     MLIR_RegionHandle src_region = MLIR_GetOpRegion(fn, 0);
+    if (MLIR_GetRegionNumBlocks(src_region) > 1)
+        return select_func_cfg(ctx, fn, sym, gm);
     if (MLIR_GetRegionNumBlocks(src_region) != 1) {
         A64_FAIL("llvm->aarch64: function '%.*s' has a non-structured CFG "
                  "(expected a single entry block with scf control flow)\n",

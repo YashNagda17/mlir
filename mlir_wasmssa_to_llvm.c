@@ -143,14 +143,31 @@ static int vmap_get(VMap *m, MLIR_ValueHandle k, MLIR_ValueHandle *out) {
 
 // =============================================================================
 // Per-function lowering state.
+//
+// WASM structured control flow (block / loop / if + depth-relative br) is
+// flattened into an explicit cf.br / cf.cond_br CFG. Each enclosing scope
+// pushes a Frame recording two target blocks:
+//   - br_target: where `br {depth}` to this scope jumps (loop header for a
+//     loop; the scope's continuation for a block / if).
+//   - ft_target: where a normal fall-through (block_return) goes (the
+//     continuation for all three; differs from br_target only for loops).
 // =============================================================================
 typedef struct {
+    MLIR_BlockHandle br_target;
+    MLIR_BlockHandle ft_target;
+} Frame;
+
+typedef struct {
     MLIR_Context     *ctx;
-    MLIR_BlockHandle  blk;       // destination block (single entry block)
+    MLIR_RegionHandle dreg;      // destination region (new blocks appended here)
+    MLIR_BlockHandle  cur;       // block currently being appended to
+    bool              terminated;// cur already has a terminator
     VMap             *vmap;
     MLIR_ValueHandle *local_ptr; // alloca ptr per local index (params + decls)
     uint8_t          *local_vt;  // valtype per local index
     size_t            n_locals;  // params + declared locals
+    Frame            *frames;
+    size_t            n_frames, frames_cap;
 } FLower;
 
 // Create a fresh op result value of the given type.
@@ -168,6 +185,71 @@ static MLIR_OpHandle build_op(MLIR_Context *ctx, MLIR_OpType t,
         MLIR_CreateLocationUnknown(ctx, (string){0}),
         MLIR_INVALID_HANDLE, (string){0}, -1);
 }
+
+// Build an op with an explicit name string (for unregistered ops like
+// llvm.select that have no MLIR_OpType enum).
+static MLIR_OpHandle build_op_named(MLIR_Context *ctx, const char *nm,
+                                    MLIR_AttributeHandle *attrs, size_t na,
+                                    MLIR_TypeHandle *rtys, size_t nr,
+                                    MLIR_ValueHandle *res,
+                                    MLIR_ValueHandle *ops, size_t no) {
+    return MLIR_CreateOp(ctx, OP_TYPE_UNREGISTERED, str_from_cstr_view((char *)nm),
+        attrs, na, rtys, nr, res, nr, ops, no, NULL, 0,
+        MLIR_CreateLocationUnknown(ctx, (string){0}),
+        MLIR_INVALID_HANDLE, (string){0}, -1);
+}
+
+// Append `op` to the current block.
+static void emit(FLower *L, MLIR_OpHandle op) {
+    MLIR_AppendBlockOp(L->ctx, L->cur, op);
+}
+
+// Create a fresh CFG block appended to the destination region.
+static MLIR_BlockHandle new_block(FLower *L) {
+    MLIR_BlockHandle b = MLIR_CreateBlock(L->ctx);
+    MLIR_AppendRegionBlock(L->ctx, L->dreg, b);
+    return b;
+}
+
+// Emit an unconditional cf.br to `target` and mark cur terminated.
+static void term_br(FLower *L, MLIR_BlockHandle target) {
+    MLIR_BlockHandle succs[1] = { target };
+    MLIR_ValueHandle *sops[1] = { NULL };
+    MLIR_OpHandle op = MLIR_CreateOpWithSuccessors(L->ctx, OP_TYPE_CF_BR,
+        op_type_to_string(OP_TYPE_CF_BR),
+        NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+        succs, 1, sops, 0,
+        MLIR_CreateLocationUnknown(L->ctx, (string){0}),
+        MLIR_INVALID_HANDLE, (string){0}, -1);
+    emit(L, op);
+    L->terminated = true;
+}
+
+// Emit a cf.cond_br on `cond` to (t_blk, f_blk) and mark cur terminated.
+static void term_cond_br(FLower *L, MLIR_ValueHandle cond,
+                         MLIR_BlockHandle t_blk, MLIR_BlockHandle f_blk) {
+    MLIR_BlockHandle succs[2] = { t_blk, f_blk };
+    MLIR_ValueHandle cond_arr[1] = { cond };
+    MLIR_OpHandle op = MLIR_CreateOpWithSuccessors(L->ctx, OP_TYPE_CF_COND_BR,
+        op_type_to_string(OP_TYPE_CF_COND_BR),
+        NULL, 0, NULL, 0, NULL, 0, cond_arr, 1, NULL, 0,
+        succs, 2, NULL, 0,
+        MLIR_CreateLocationUnknown(L->ctx, (string){0}),
+        MLIR_INVALID_HANDLE, (string){0}, -1);
+    emit(L, op);
+    L->terminated = true;
+}
+
+static void push_frame(FLower *L, MLIR_BlockHandle br_t, MLIR_BlockHandle ft_t) {
+    if (L->n_frames == L->frames_cap) {
+        L->frames_cap = L->frames_cap ? L->frames_cap * 2 : 8;
+        L->frames = (Frame *)realloc(L->frames, L->frames_cap * sizeof(Frame));
+    }
+    L->frames[L->n_frames].br_target = br_t;
+    L->frames[L->n_frames].ft_target = ft_t;
+    L->n_frames++;
+}
+static void pop_frame(FLower *L) { L->n_frames--; }
 
 // Map a wasmssa.binop wasm opcode to an `llvm`-dialect integer op. Returns
 // false for opcodes outside the milestone-1 (arithmetic / bitwise) subset.
@@ -205,7 +287,66 @@ static bool binop_to_llvm(int64_t opc, MLIR_OpType *out) {
     }
 }
 
-// Lower one wasmssa body op into `llvm`-dialect op(s) appended to L->blk.
+// Map a wasmssa comparison opcode to an `llvm`-dialect icmp predicate integer
+// (eq=0, ne=1, slt=2, sle=3, sgt=4, sge=5, ult=6, ule=7, ugt=8, uge=9).
+// Returns false for non-comparison opcodes.
+static bool cmp_to_icmp_pred(int64_t opc, int64_t *pred) {
+    switch (opc) {
+        // i32 comparisons
+        case 0x46: *pred = 0; return true; // eq
+        case 0x47: *pred = 1; return true; // ne
+        case 0x48: *pred = 2; return true; // lt_s
+        case 0x49: *pred = 6; return true; // lt_u
+        case 0x4a: *pred = 4; return true; // gt_s
+        case 0x4b: *pred = 8; return true; // gt_u
+        case 0x4c: *pred = 3; return true; // le_s
+        case 0x4d: *pred = 7; return true; // le_u
+        case 0x4e: *pred = 5; return true; // ge_s
+        case 0x4f: *pred = 9; return true; // ge_u
+        // i64 comparisons
+        case 0x51: *pred = 0; return true; // eq
+        case 0x52: *pred = 1; return true; // ne
+        case 0x53: *pred = 2; return true; // lt_s
+        case 0x54: *pred = 6; return true; // lt_u
+        case 0x55: *pred = 4; return true; // gt_s
+        case 0x56: *pred = 8; return true; // gt_u
+        case 0x57: *pred = 3; return true; // le_s
+        case 0x58: *pred = 7; return true; // le_u
+        case 0x59: *pred = 5; return true; // ge_s
+        case 0x5a: *pred = 9; return true; // ge_u
+        default: return false;
+    }
+}
+
+// Build an llvm.icmp with an i32 boolean result (wasm comparison convention).
+static MLIR_ValueHandle build_icmp(FLower *L, int64_t pred,
+                                   MLIR_ValueHandle a, MLIR_ValueHandle b) {
+    MLIR_Context *ctx = L->ctx;
+    MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
+    MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(ctx, 64, true);
+    MLIR_AttributeHandle pa = MLIR_CreateAttributeInteger(
+        ctx, str_from_cstr_view((char *)"predicate"), pred, i64);
+    MLIR_TypeHandle rt[1] = { i32 };
+    MLIR_ValueHandle r[1] = { mk_res(ctx, i32) };
+    MLIR_ValueHandle ops[2] = { a, b };
+    MLIR_OpHandle out = build_op(ctx, OP_TYPE_LLVM_ICMP, &pa, 1, rt, 1, r, ops, 2);
+    emit(L, out);
+    return r[0];
+}
+
+static bool lower_op(FLower *L, MLIR_OpHandle op);
+
+// Lower every op of a structured region's single block in order. Ops after a
+// terminator (br / block_return / unreachable / return) are dead and skipped.
+static bool lower_region(FLower *L, MLIR_BlockHandle src_blk) {
+    size_t n = MLIR_GetBlockNumOps(src_blk);
+    for (size_t i = 0; i < n; i++) {
+        if (L->terminated) break;
+        if (!lower_op(L, MLIR_GetBlockOp(src_blk, i))) return false;
+    }
+    return true;
+}
+
 static bool lower_op(FLower *L, MLIR_OpHandle op) {
     MLIR_Context *ctx = L->ctx;
     MLIR_OpType t = MLIR_GetOpType(op);
@@ -225,7 +366,7 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_ValueHandle r[1] = { mk_res(ctx, ity) };
         MLIR_OpHandle out = build_op(ctx, OP_TYPE_LLVM_MLIR_CONSTANT,
             &va, 1, rt, 1, r, NULL, 0);
-        MLIR_AppendBlockOp(ctx, L->blk, out);
+        emit(L, out);
         vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r[0]);
         return true;
     }
@@ -244,7 +385,7 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_ValueHandle ops[1] = { L->local_ptr[idx] };
         MLIR_OpHandle out = build_op(ctx, OP_TYPE_LLVM_LOAD,
             NULL, 0, rt, 1, r, ops, 1);
-        MLIR_AppendBlockOp(ctx, L->blk, out);
+        emit(L, out);
         vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r[0]);
         return true;
     }
@@ -264,7 +405,7 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_ValueHandle ops[2] = { v, L->local_ptr[idx] };
         MLIR_OpHandle out = build_op(ctx, OP_TYPE_LLVM_STORE,
             NULL, 0, NULL, 0, NULL, ops, 2);
-        MLIR_AppendBlockOp(ctx, L->blk, out);
+        emit(L, out);
         return true;
     }
 
@@ -288,13 +429,25 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_ValueHandle r[1] = { mk_res(ctx, ity) };
         MLIR_ValueHandle ops[2] = { a, b };
         MLIR_OpHandle out = build_op(ctx, ot, NULL, 0, rt, 1, r, ops, 2);
-        MLIR_AppendBlockOp(ctx, L->blk, out);
+        emit(L, out);
         vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r[0]);
         return true;
     }
 
     case OP_TYPE_WASMSSA_BINOP: {
         int64_t opc = at_i(op, "wasm_opcode");
+        int64_t pred;
+        if (cmp_to_icmp_pred(opc, &pred)) {
+            MLIR_ValueHandle a, b;
+            if (!vmap_get(L->vmap, MLIR_GetOpOperand(op, 0), &a) ||
+                !vmap_get(L->vmap, MLIR_GetOpOperand(op, 1), &b)) {
+                fprintf(stderr, "wasmssa->llvm: unbound operand on cmp\n");
+                return false;
+            }
+            MLIR_ValueHandle r = build_icmp(L, pred, a, b);
+            vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r);
+            return true;
+        }
         MLIR_OpType ot;
         if (!binop_to_llvm(opc, &ot)) {
             fprintf(stderr,
@@ -314,7 +467,7 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_ValueHandle r[1] = { mk_res(ctx, ity) };
         MLIR_ValueHandle ops[2] = { a, b };
         MLIR_OpHandle out = build_op(ctx, ot, NULL, 0, rt, 1, r, ops, 2);
-        MLIR_AppendBlockOp(ctx, L->blk, out);
+        emit(L, out);
         vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r[0]);
         return true;
     }
@@ -331,7 +484,7 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_ValueHandle ops[1] = { a };
         MLIR_OpHandle out = build_op(ctx, OP_TYPE_LLVM_SEXT,
             NULL, 0, rt, 1, r, ops, 1);
-        MLIR_AppendBlockOp(ctx, L->blk, out);
+        emit(L, out);
         vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r[0]);
         return true;
     }
@@ -373,7 +526,7 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         }
         MLIR_OpHandle out = build_op(ctx, OP_TYPE_LLVM_CALL,
             attrs, 1, rt, nr, r, ops, no);
-        MLIR_AppendBlockOp(ctx, L->blk, out);
+        emit(L, out);
         if (nr == 1) vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r[0]);
         free(ops);
         return true;
@@ -394,7 +547,221 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         }
         MLIR_OpHandle out = build_op(ctx, OP_TYPE_LLVM_RETURN,
             NULL, 0, NULL, 0, NULL, ops, no);
-        MLIR_AppendBlockOp(ctx, L->blk, out);
+        emit(L, out);
+        L->terminated = true;
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_EQZ: {
+        MLIR_ValueHandle a;
+        if (!vmap_get(L->vmap, MLIR_GetOpOperand(op, 0), &a)) {
+            fprintf(stderr, "wasmssa->llvm: unbound operand on eqz\n");
+            return false;
+        }
+        // result = icmp eq (a, 0) : i32
+        MLIR_TypeHandle aty = MLIR_GetValueType(a);
+        MLIR_AttributeHandle za = MLIR_CreateAttributeInteger(
+            ctx, str_from_cstr_view((char *)"value"), 0, aty);
+        MLIR_TypeHandle zrt[1] = { aty };
+        MLIR_ValueHandle zr[1] = { mk_res(ctx, aty) };
+        MLIR_OpHandle zc = build_op(ctx, OP_TYPE_LLVM_MLIR_CONSTANT,
+            &za, 1, zrt, 1, zr, NULL, 0);
+        emit(L, zc);
+        MLIR_ValueHandle r = build_icmp(L, /*eq*/0, a, zr[0]);
+        vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_SELECT: {
+        // wasmssa.select(%a, %b, %cond) -> R   (cond is the LAST operand);
+        // llvm.select wants (cond, tval, fval).
+        MLIR_ValueHandle a, b, c;
+        if (!vmap_get(L->vmap, MLIR_GetOpOperand(op, 0), &a) ||
+            !vmap_get(L->vmap, MLIR_GetOpOperand(op, 1), &b) ||
+            !vmap_get(L->vmap, MLIR_GetOpOperand(op, 2), &c)) {
+            fprintf(stderr, "wasmssa->llvm: unbound operand on select\n");
+            return false;
+        }
+        uint8_t vt = (uint8_t)at_i(op, "valtype");
+        (void)vt;
+        MLIR_TypeHandle ity = MLIR_GetValueType(MLIR_GetOpResult(op, 0));
+        MLIR_TypeHandle rt[1] = { ity };
+        MLIR_ValueHandle r[1] = { mk_res(ctx, ity) };
+        MLIR_ValueHandle ops[3] = { c, a, b };
+        MLIR_OpHandle out = build_op_named(ctx, "llvm.select",
+            NULL, 0, rt, 1, r, ops, 3);
+        emit(L, out);
+        vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r[0]);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_UNREACHABLE: {
+        // No native trap op wired; a self-branch is a valid (dead) terminator.
+        term_br(L, L->cur);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_BR: {
+        if (MLIR_GetOpNumOperands(op) != 0) {
+            fprintf(stderr,
+                "wasmssa->llvm: value-carrying br not yet supported\n");
+            return false;
+        }
+        int64_t depth = at_i(op, "depth");
+        if (depth < 0 || (size_t)depth >= L->n_frames) {
+            fprintf(stderr, "wasmssa->llvm: br depth %lld out of range\n",
+                    (long long)depth);
+            return false;
+        }
+        term_br(L, L->frames[L->n_frames - 1 - (size_t)depth].br_target);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_BR_IF: {
+        int64_t depth = at_i(op, "depth");
+        if (depth < 0 || (size_t)depth >= L->n_frames) {
+            fprintf(stderr, "wasmssa->llvm: br_if depth %lld out of range\n",
+                    (long long)depth);
+            return false;
+        }
+        MLIR_ValueHandle cond;
+        if (!vmap_get(L->vmap, MLIR_GetOpOperand(op, 0), &cond)) {
+            fprintf(stderr, "wasmssa->llvm: unbound condition on br_if\n");
+            return false;
+        }
+        MLIR_BlockHandle target = L->frames[L->n_frames - 1 - (size_t)depth].br_target;
+        MLIR_BlockHandle fall = new_block(L);
+        term_cond_br(L, cond, target, fall);
+        L->cur = fall;
+        L->terminated = false;
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_BLOCK_RETURN: {
+        if (MLIR_GetOpNumOperands(op) != 0) {
+            fprintf(stderr,
+                "wasmssa->llvm: value-carrying block_return not yet supported\n");
+            return false;
+        }
+        if (L->n_frames == 0) {
+            fprintf(stderr, "wasmssa->llvm: block_return with no frame\n");
+            return false;
+        }
+        term_br(L, L->frames[L->n_frames - 1].ft_target);
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_BLOCK: {
+        if (MLIR_GetOpNumResults(op) != 0) {
+            fprintf(stderr,
+                "wasmssa->llvm: value-carrying block not yet supported\n");
+            return false;
+        }
+        if (MLIR_GetOpNumRegions(op) < 1) {
+            fprintf(stderr, "wasmssa->llvm: block has no region\n");
+            return false;
+        }
+        MLIR_BlockHandle merge = new_block(L);
+        push_frame(L, merge, merge);
+        L->terminated = false;
+        if (!lower_region(L, MLIR_GetRegionBlock(MLIR_GetOpRegion(op, 0), 0))) {
+            pop_frame(L);
+            return false;
+        }
+        if (!L->terminated) term_br(L, merge);
+        pop_frame(L);
+        L->cur = merge;
+        L->terminated = false;
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_IF: {
+        if (MLIR_GetOpNumResults(op) != 0) {
+            fprintf(stderr,
+                "wasmssa->llvm: value-carrying if not yet supported\n");
+            return false;
+        }
+        MLIR_ValueHandle cond;
+        if (!vmap_get(L->vmap, MLIR_GetOpOperand(op, 0), &cond)) {
+            fprintf(stderr, "wasmssa->llvm: unbound condition on if\n");
+            return false;
+        }
+        size_t n_regions = MLIR_GetOpNumRegions(op);
+        if (n_regions < 1) {
+            fprintf(stderr, "wasmssa->llvm: if has no then region\n");
+            return false;
+        }
+        bool has_else = (n_regions >= 2)
+            && (MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 1)) > 0);
+
+        MLIR_BlockHandle then_blk = new_block(L);
+        MLIR_BlockHandle else_blk = has_else ? new_block(L) : MLIR_INVALID_HANDLE;
+        MLIR_BlockHandle merge    = new_block(L);
+
+        term_cond_br(L, cond, then_blk, has_else ? else_blk : merge);
+
+        L->cur = then_blk;
+        L->terminated = false;
+        push_frame(L, merge, merge);
+        if (!lower_region(L, MLIR_GetRegionBlock(MLIR_GetOpRegion(op, 0), 0))) {
+            pop_frame(L);
+            return false;
+        }
+        if (!L->terminated) term_br(L, merge);
+        pop_frame(L);
+
+        if (has_else) {
+            L->cur = else_blk;
+            L->terminated = false;
+            push_frame(L, merge, merge);
+            if (!lower_region(L, MLIR_GetRegionBlock(MLIR_GetOpRegion(op, 1), 0))) {
+                pop_frame(L);
+                return false;
+            }
+            if (!L->terminated) term_br(L, merge);
+            pop_frame(L);
+        }
+
+        L->cur = merge;
+        L->terminated = false;
+        return true;
+    }
+
+    case OP_TYPE_WASMSSA_LOOP: {
+        if (MLIR_GetOpNumResults(op) != 0 || MLIR_GetOpNumOperands(op) != 0) {
+            fprintf(stderr,
+                "wasmssa->llvm: value-carrying loop not yet supported\n");
+            return false;
+        }
+        if (MLIR_GetOpNumRegions(op) < 1) {
+            fprintf(stderr, "wasmssa->llvm: loop has no region\n");
+            return false;
+        }
+        MLIR_RegionHandle loop_region = MLIR_GetOpRegion(op, 0);
+        if (MLIR_GetRegionNumBlocks(loop_region) < 1) {
+            fprintf(stderr, "wasmssa->llvm: loop region empty\n");
+            return false;
+        }
+        MLIR_BlockHandle src_loop_blk = MLIR_GetRegionBlock(loop_region, 0);
+        if (MLIR_GetBlockNumArgs(src_loop_blk) != 0) {
+            fprintf(stderr,
+                "wasmssa->llvm: loop with block args not yet supported\n");
+            return false;
+        }
+        MLIR_BlockHandle header = new_block(L);
+        term_br(L, header);
+        MLIR_BlockHandle post = new_block(L);
+        L->cur = header;
+        L->terminated = false;
+        push_frame(L, header, post);
+        if (!lower_region(L, src_loop_blk)) {
+            pop_frame(L);
+            return false;
+        }
+        if (!L->terminated) term_br(L, post);
+        pop_frame(L);
+        L->cur = post;
+        L->terminated = false;
         return true;
     }
 
@@ -426,8 +793,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     MLIR_RegionHandle sreg = MLIR_GetOpRegion(src, 0);
     if (MLIR_GetRegionNumBlocks(sreg) != 1) {
         fprintf(stderr,
-            "wasmssa->llvm: func '%.*s' has a multi-block CFG "
-            "(control flow not yet supported)\n",
+            "wasmssa->llvm: func '%.*s' unexpected multi-block source region\n",
             (int)name.size, name.str);
         return MLIR_INVALID_HANDLE;
     }
@@ -459,7 +825,9 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
     VMap vmap = {0};
     FLower L = {0};
     L.ctx = ctx;
-    L.blk = entry;
+    L.dreg = dreg;
+    L.cur = entry;
+    L.terminated = false;
     L.vmap = &vmap;
     L.n_locals = n_locals;
     L.local_vt = local_vt;
@@ -509,18 +877,16 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src) {
         MLIR_AppendBlockOp(ctx, entry, st);
     }
 
-    // Lower the body.
-    bool ok = true;
-    size_t n_ops = MLIR_GetBlockNumOps(sblk);
-    for (size_t i = 0; i < n_ops; i++) {
-        if (!lower_op(&L, MLIR_GetBlockOp(sblk, i))) { ok = false; break; }
-    }
+    // Lower the body. Control-flow ops append further blocks to dreg and
+    // advance L.cur; lower_region skips dead ops after a terminator.
+    bool ok = lower_region(&L, sblk);
 
     free(vmap.src);
     free(vmap.dst);
     free(local_vt);
     free(L.local_ptr);
     free(param_args);
+    free(L.frames);
     if (!ok) return MLIR_INVALID_HANDLE;
 
     MLIR_AttributeHandle attrs[1] = {
