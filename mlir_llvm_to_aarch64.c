@@ -663,8 +663,65 @@ typedef struct {
     uint32_t          slot_bytes;  // size of the slot region (allocas sit above)
     GlobalMap        *gm;          // global symbol name -> byte offset in __data
     size_t            n_fixed;     // number of fixed (named) params of this func
+    SlotMap          *rm;          // value -> home physical reg (x19..x28); NULL = none
     bool              ok;
 } LowerCtx;
+
+// mov xd, xn  (orr xd, xzr, xn). 64-bit; safe for our full-register slot model.
+static void emit_mov_reg(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                         uint8_t rd, uint8_t rn) {
+    if (rd == rn) return;
+    emit_3reg(ctx, blk, OP_TYPE_AARCH64_ORR_REG, rd, 31, rn, true);
+}
+
+// Allocation-aware operand read: returns the register holding `v`. If `v` has a
+// home register, it is returned with no code emitted; otherwise `v` is loaded
+// from its frame slot into `scratch`. With L->rm == NULL this is exactly the
+// old `load_value(v, scratch)` path (byte-identical).
+static uint8_t use_val(LowerCtx *L, MLIR_ValueHandle v, uint8_t scratch) {
+    int32_t reg;
+    if (L->rm && sm_get(L->rm, v, &reg)) return (uint8_t)reg;
+    if (!load_value(L->ctx, L->cur, L->sm, v, scratch)) {
+        fprintf(stderr, "llvm->aarch64: undefined operand in '%.*s'\n",
+                (int)L->sym.size, L->sym.str);
+        L->ok = false;
+    }
+    return scratch;
+}
+// Ensure value `v` is materialised in register `dst` (mov from its home reg, or
+// ldr from its frame slot). With L->rm == NULL this is exactly the old
+// `load_value(v, dst)` path (byte-identical).
+static void load_into(LowerCtx *L, MLIR_ValueHandle v, uint8_t dst) {
+    int32_t reg;
+    if (L->rm && sm_get(L->rm, v, &reg)) {
+        emit_mov_reg(L->ctx, L->cur, dst, (uint8_t)reg);
+        return;
+    }
+    if (!load_value(L->ctx, L->cur, L->sm, v, dst)) {
+        fprintf(stderr, "llvm->aarch64: undefined operand in '%.*s'\n",
+                (int)L->sym.size, L->sym.str);
+        L->ok = false;
+    }
+}
+// Allocation-aware result target: the register the caller should write `v`'s
+// result into (its home register if allocated, else `scratch`).
+static uint8_t def_val(LowerCtx *L, MLIR_ValueHandle v, uint8_t scratch) {
+    int32_t reg;
+    if (L->rm && sm_get(L->rm, v, &reg)) return (uint8_t)reg;
+    return scratch;
+}
+// Finalise `v`'s result, produced in register `produced`: allocated -> move
+// into the home register if needed; spilled -> store to the frame slot. With
+// L->rm == NULL this is exactly the old `store_value(v, produced)`.
+static void fin_val(LowerCtx *L, MLIR_ValueHandle v, uint8_t produced) {
+    int32_t reg;
+    if (L->rm && sm_get(L->rm, v, &reg)) {
+        if ((uint8_t)reg != produced)
+            emit_mov_reg(L->ctx, L->cur, (uint8_t)reg, produced);
+        return;
+    }
+    if (!store_value(L->ctx, L->cur, L->sm, v, produced)) L->ok = false;
+}
 
 #define LFAIL(...) do { fprintf(stderr, __VA_ARGS__); L->ok = false; return; } while (0)
 
@@ -900,6 +957,7 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         if (va == MLIR_INVALID_HANDLE || MLIR_GetOpNumResults(op) != 1)
             LFAIL("llvm->aarch64: malformed llvm.mlir.constant\n");
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        uint8_t rd = def_val(L, res, 9);
         int fw = fp_width(ctx, res);
         if (fw) {
             // Float constant: materialise the IEEE bit pattern into a GP slot.
@@ -908,35 +966,35 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             if (fw == 32) { float f = (float)d; uint32_t b32;
                             memcpy(&b32, &f, 4); bits = b32; }
             else          { memcpy(&bits, &d, 8); }
-            emit_load_imm(ctx, blk, 9, bits, /*sf=*/true);
+            emit_load_imm(ctx, blk, rd, bits, /*sf=*/true);
         } else {
-            emit_load_imm(ctx, blk, 9, (uint64_t)MLIR_GetAttributeInteger(va),
+            emit_load_imm(ctx, blk, rd, (uint64_t)MLIR_GetAttributeInteger(va),
                           type_is_gp64(ctx, res));
         }
-        store_value(ctx, blk, sm, res, 9);
+        fin_val(L, res, rd);
 
     } else if (simple_binop_optype(on, &bt)) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
         bool sf = type_is_gp64(ctx, res);
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9) ||
-            !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10))
-            LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
-        emit_3reg(ctx, blk, bt, 9, 9, 10, sf);
-        store_value(ctx, blk, sm, res, 9);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        uint8_t r1 = use_val(L, MLIR_GetOpOperand(op, 1), 10);
+        if (!L->ok) return;
+        uint8_t rd = def_val(L, res, 9);
+        emit_3reg(ctx, blk, bt, rd, r0, r1, sf);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.srem") || name_eq(on, "llvm.urem")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
         bool sf = type_is_gp64(ctx, res);
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9) ||
-            !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10))
-            LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        uint8_t r1 = use_val(L, MLIR_GetOpOperand(op, 1), 10);
+        if (!L->ok) return;
         MLIR_OpType dt = name_eq(on, "llvm.srem") ? OP_TYPE_AARCH64_SDIV
                                                   : OP_TYPE_AARCH64_UDIV;
-        emit_3reg(ctx, blk, dt, 11, 9, 10, sf);
-        emit_msub(ctx, blk, 9, 11, 10, 9, sf);
-        store_value(ctx, blk, sm, res, 9);
+        uint8_t rd = def_val(L, res, 9);
+        emit_3reg(ctx, blk, dt, 11, r0, r1, sf);
+        emit_msub(ctx, blk, rd, 11, r1, r0, sf);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.icmp")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
@@ -948,25 +1006,25 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             LFAIL("llvm->aarch64: unsupported icmp predicate %lld\n",
                   (long long)MLIR_GetAttributeInteger(pa));
         bool sf = type_is_gp64(ctx, MLIR_GetOpOperand(op, 0));
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9) ||
-            !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10))
-            LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
-        emit_cmp_reg(ctx, blk, 9, 10, sf);
-        emit_cset(ctx, blk, 9, (uint8_t)cond, false);
-        store_value(ctx, blk, sm, res, 9);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        uint8_t r1 = use_val(L, MLIR_GetOpOperand(op, 1), 10);
+        if (!L->ok) return;
+        uint8_t rd = def_val(L, res, 9);
+        emit_cmp_reg(ctx, blk, r0, r1, sf);
+        emit_cset(ctx, blk, rd, (uint8_t)cond, false);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.select")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
         bool sf = type_is_gp64(ctx, res);
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9)  ||
-            !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10) ||
-            !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 2), 11))
-            LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
-        emit_cmp_imm(ctx, blk, 9, 0, false);
-        emit_csel(ctx, blk, 9, 10, 11, /*NE*/1, sf);
-        store_value(ctx, blk, sm, res, 9);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        uint8_t r1 = use_val(L, MLIR_GetOpOperand(op, 1), 10);
+        uint8_t r2 = use_val(L, MLIR_GetOpOperand(op, 2), 11);
+        if (!L->ok) return;
+        uint8_t rd = def_val(L, res, 9);
+        emit_cmp_imm(ctx, blk, r0, 0, false);
+        emit_csel(ctx, blk, rd, r1, r2, /*NE*/1, sf);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.call")) {
         MLIR_AttributeHandle callee = MLIR_GetOpAttributeByName(op, "callee");
@@ -1041,7 +1099,7 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             emit_add_imm(ctx, blk, 31, 31, (uint16_t)area, true); // restore sp
         }
         if (MLIR_GetOpNumResults(op) == 1)
-            store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 0);
+            fin_val(L, MLIR_GetOpResult(op, 0), 0);
 
     } else if (name_eq(on, "llvm.intr.vastart")) {
         // Darwin arm64: all variadic args are passed on the stack and va_list is
@@ -1050,11 +1108,10 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         // and any fixed stack args). Store that address into the va_list buffer.
         uint32_t base_off = 16u +
             (L->n_fixed > 8 ? (uint32_t)(L->n_fixed - 8) * 8u : 0u);
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 10))
-            LFAIL("llvm->aarch64: undefined va_list in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
+        uint8_t rp = use_val(L, MLIR_GetOpOperand(op, 0), 10);
+        if (!L->ok) return;
         emit_add_imm(ctx, blk, 9, 29, (uint16_t)base_off, true);
-        emit_str_x(ctx, blk, 9, 10, 0);
+        emit_str_x(ctx, blk, 9, rp, 0);
 
     } else if (name_eq(on, "llvm.intr.vaend")) {
         // No teardown needed for the stack-based va_list.
@@ -1064,8 +1121,10 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         // mlir.zero materialises a typed zero (null pointer / zeroed
         // aggregate scalar); mlir.undef is don't-care — 0 is fine for both.
         if (MLIR_GetOpNumResults(op) == 1) {
-            emit_load_imm(ctx, blk, 9, 0, false);
-            store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 9);
+            MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+            uint8_t rd = def_val(L, res, 9);
+            emit_load_imm(ctx, blk, rd, 0, false);
+            fin_val(L, res, rd);
         }
 
     } else if (name_eq(on, "llvm.alloca")) {
@@ -1074,16 +1133,17 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         if (!sm_get(L->am, res, &off))
             LFAIL("llvm->aarch64: alloca without a frame offset\n");
         uint32_t addr = L->slot_bytes + (uint32_t)off;
+        uint8_t rd = def_val(L, res, 9);
         if (addr <= 4095) {
-            emit_add_imm(ctx, blk, 9, 31, (uint16_t)addr, true);
+            emit_add_imm(ctx, blk, rd, 31, (uint16_t)addr, true);
         } else {
             // Offset exceeds the 12-bit ADD immediate: materialise it in a
             // scratch register and add it to a copy of sp.
-            emit_add_imm(ctx, blk, 9, 31, 0, true);             // x9 = sp
+            emit_add_imm(ctx, blk, rd, 31, 0, true);            // rd = sp
             emit_load_imm(ctx, blk, 10, (uint64_t)addr, true);  // x10 = addr
-            emit_3reg(ctx, blk, OP_TYPE_AARCH64_ADD_REG, 9, 9, 10, true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_ADD_REG, rd, rd, 10, true);
         }
-        store_value(ctx, blk, sm, res, 9);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.getelementptr")) {
         MLIR_ValueHandle res  = MLIR_GetOpResult(op, 0);
@@ -1098,9 +1158,8 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
                                        cidx, 64);
         if (n_idx == 0)
             LFAIL("llvm->aarch64: getelementptr with no indices\n");
-        if (!load_value(ctx, blk, sm, base, 9))   // running address in x9
-            LFAIL("llvm->aarch64: undefined gep base in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
+        load_into(L, base, 9);   // running address in x9
+        if (!L->ok) return;
         size_t op_idx = 1;
         MLIR_TypeHandle cur_ty = elem_ty;
         for (size_t i = 0; i < n_idx; i++) {
@@ -1128,18 +1187,17 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             if (is_dyn) {
                 if (op_idx >= MLIR_GetOpNumOperands(op))
                     LFAIL("llvm->aarch64: gep dynamic index operand missing\n");
-                if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, op_idx++), 10))
-                    LFAIL("llvm->aarch64: undefined gep index in '%.*s'\n",
-                          (int)L->sym.size, L->sym.str);
+                uint8_t ri = use_val(L, MLIR_GetOpOperand(op, op_idx++), 10);
+                if (!L->ok) return;
                 emit_load_imm(ctx, blk, 11, (uint64_t)stride, true);
-                emit_3reg(ctx, blk, OP_TYPE_AARCH64_MUL, 10, 10, 11, true);
+                emit_3reg(ctx, blk, OP_TYPE_AARCH64_MUL, 10, ri, 11, true);
                 emit_3reg(ctx, blk, OP_TYPE_AARCH64_ADD_REG, 9, 9, 10, true);
             } else if ((cst = cidx[i]) != 0) {
                 emit_load_imm(ctx, blk, 10, (uint64_t)(cst * (int64_t)stride), true);
                 emit_3reg(ctx, blk, OP_TYPE_AARCH64_ADD_REG, 9, 9, 10, true);
             }
         }
-        store_value(ctx, blk, sm, res, 9);
+        fin_val(L, res, 9);
 
     } else if (name_eq(on, "llvm.store")) {
         MLIR_ValueHandle val = MLIR_GetOpOperand(op, 0);
@@ -1147,42 +1205,45 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         unsigned sz = a64_type_size(ctx, MLIR_GetValueType(val));
         if (sz != 1 && sz != 4 && sz != 8)
             LFAIL("llvm->aarch64: unsupported store size %u\n", sz);
-        if (!load_value(ctx, blk, sm, val, 9) ||
-            !load_value(ctx, blk, sm, ptr, 10))
-            LFAIL("llvm->aarch64: undefined store operand in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
-        emit_mem_store(ctx, blk, 9, 10, sz);
+        uint8_t rv = use_val(L, val, 9);
+        uint8_t rp = use_val(L, ptr, 10);
+        if (!L->ok) return;
+        emit_mem_store(ctx, blk, rv, rp, sz);
 
     } else if (name_eq(on, "llvm.load")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
         unsigned sz = a64_type_size(ctx, MLIR_GetValueType(res));
         if (sz != 1 && sz != 4 && sz != 8)
             LFAIL("llvm->aarch64: unsupported load size %u\n", sz);
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 10))
-            LFAIL("llvm->aarch64: undefined load operand in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
-        emit_mem_load(ctx, blk, 9, 10, sz);
-        store_value(ctx, blk, sm, res, 9);
+        uint8_t rp = use_val(L, MLIR_GetOpOperand(op, 0), 10);
+        if (!L->ok) return;
+        uint8_t rd = def_val(L, res, 9);
+        emit_mem_load(ctx, blk, rd, rp, sz);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.ptrtoint") || name_eq(on, "llvm.inttoptr")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
-            LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        if (!L->ok) return;
         int w = int_type_bits(ctx, res);   // 0 for ptr (64-bit, no mask)
+        uint8_t rd = def_val(L, res, 9);
         if (w > 0 && w < 64) {
             emit_load_imm(ctx, blk, 10, (1ull << w) - 1, true);
-            emit_3reg(ctx, blk, OP_TYPE_AARCH64_AND_REG, 9, 9, 10, true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_AND_REG, rd, r0, 10, true);
+        } else {
+            emit_mov_reg(ctx, blk, rd, r0);
         }
-        store_value(ctx, blk, sm, res, 9);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "arith.index_cast") ||
                name_eq(on, "arith.index_castui")) {
         // index <-> integer: a plain copy in our 64-bit slot model.
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
-            LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
-        store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 9);
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        if (!L->ok) return;
+        uint8_t rd = def_val(L, res, 9);
+        emit_mov_reg(ctx, blk, rd, r0);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.trunc") || name_eq(on, "llvm.zext")) {
         // Both keep the low N bits (our values are stored zero-extended); a
@@ -1190,29 +1251,33 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
         int w = name_eq(on, "llvm.trunc") ? int_type_bits(ctx, res)
                                           : int_type_bits(ctx, MLIR_GetOpOperand(op, 0));
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
-            LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        if (!L->ok) return;
+        uint8_t rd = def_val(L, res, 9);
         if (w > 0 && w < 64) {
             emit_load_imm(ctx, blk, 10, (w >= 64) ? ~0ull : ((1ull << w) - 1), true);
-            emit_3reg(ctx, blk, OP_TYPE_AARCH64_AND_REG, 9, 9, 10, true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_AND_REG, rd, r0, 10, true);
+        } else {
+            emit_mov_reg(ctx, blk, rd, r0);
         }
-        store_value(ctx, blk, sm, res, 9);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.sext")) {
         // Sign-extend from the source width via a left-then-arithmetic-right
         // shift pair in 64-bit registers.
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
         int w = int_type_bits(ctx, MLIR_GetOpOperand(op, 0));
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
-            LFAIL("llvm->aarch64: undefined operand in '%.*s'\n",
-                  (int)L->sym.size, L->sym.str);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        if (!L->ok) return;
+        uint8_t rd = def_val(L, res, 9);
         if (w > 0 && w < 64) {
             emit_load_imm(ctx, blk, 10, (uint64_t)(64 - w), true);
-            emit_3reg(ctx, blk, OP_TYPE_AARCH64_LSL_REG, 9, 9, 10, true);
-            emit_3reg(ctx, blk, OP_TYPE_AARCH64_ASR_REG, 9, 9, 10, true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_LSL_REG, rd, r0, 10, true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_ASR_REG, rd, rd, 10, true);
+        } else {
+            emit_mov_reg(ctx, blk, rd, r0);
         }
-        store_value(ctx, blk, sm, res, 9);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.mlir.addressof")) {
         // Materialise the address of a module-level global: ADRP+ADD against
@@ -1222,19 +1287,21 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             LFAIL("llvm->aarch64: addressof missing global_name\n");
         string gnm = MLIR_GetAttributeAsString(ctx, ga);
         if (gnm.size > 0 && gnm.str[0] == '@') { gnm.str++; gnm.size--; }
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        uint8_t rd = def_val(L, res, 9);
         uint32_t off = 0;
         if (L->gm && gmap_get(L->gm, gnm, &off)) {
             string tgt = str_from_cstr_view("linmem_template");
-            emit_adrp_data(ctx, blk, 9, tgt, off);
-            emit_add_data_lo(ctx, blk, 9, 9, tgt, off);
+            emit_adrp_data(ctx, blk, rd, tgt, off);
+            emit_add_data_lo(ctx, blk, rd, rd, tgt, off);
         } else {
             // Not a data global — materialise the address of a function
             // symbol (ADRP+ADD resolved against the function's text address
             // by the Mach-O encoder).
-            emit_adrp_data(ctx, blk, 9, gnm, 0);
-            emit_add_data_lo(ctx, blk, 9, 9, gnm, 0);
+            emit_adrp_data(ctx, blk, rd, gnm, 0);
+            emit_add_data_lo(ctx, blk, rd, rd, gnm, 0);
         }
-        store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 9);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.fadd") || name_eq(on, "llvm.fsub") ||
                name_eq(on, "llvm.fmul") || name_eq(on, "llvm.fdiv")) {
@@ -1245,15 +1312,15 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
                          : name_eq(on, "llvm.fmul") ? "fmul" : "fdiv";
         if (fw == 0) LFAIL("llvm->aarch64: %.*s non-float result\n",
                            (int)on.size, on.str);
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9) ||
-            !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10))
-            LFAIL("llvm->aarch64: %.*s operand not materialised\n",
-                  (int)on.size, on.str);
-        emit_fmov_gp_v(ctx, blk, /*to_v=*/true, true, 0, 9);
-        emit_fmov_gp_v(ctx, blk, /*to_v=*/true, true, 1, 10);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        uint8_t r1 = use_val(L, MLIR_GetOpOperand(op, 1), 10);
+        if (!L->ok) return;
+        emit_fmov_gp_v(ctx, blk, /*to_v=*/true, true, 0, r0);
+        emit_fmov_gp_v(ctx, blk, /*to_v=*/true, true, 1, r1);
         emit_fp_binop(ctx, blk, kind, fw, 0, 0, 1);
-        emit_fmov_gp_v(ctx, blk, /*to_v=*/false, true, 9, 0);
-        store_value(ctx, blk, sm, res, 9);
+        uint8_t rd = def_val(L, res, 9);
+        emit_fmov_gp_v(ctx, blk, /*to_v=*/false, true, rd, 0);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.fneg") || name_eq(on, "llvm.intr.sqrt")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
@@ -1261,13 +1328,13 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         const char *kind = name_eq(on, "llvm.fneg") ? "fneg" : "fsqrt";
         if (fw == 0) LFAIL("llvm->aarch64: %.*s non-float result\n",
                            (int)on.size, on.str);
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
-            LFAIL("llvm->aarch64: %.*s operand not materialised\n",
-                  (int)on.size, on.str);
-        emit_fmov_gp_v(ctx, blk, true, true, 0, 9);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        if (!L->ok) return;
+        emit_fmov_gp_v(ctx, blk, true, true, 0, r0);
         emit_fp_unop(ctx, blk, kind, fw, 0, 0);
-        emit_fmov_gp_v(ctx, blk, false, true, 9, 0);
-        store_value(ctx, blk, sm, res, 9);
+        uint8_t rd = def_val(L, res, 9);
+        emit_fmov_gp_v(ctx, blk, false, true, rd, 0);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.fcmp")) {
         MLIR_AttributeHandle pa = MLIR_GetOpAttributeByName(op, "predicate");
@@ -1278,14 +1345,16 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             LFAIL("llvm->aarch64: unsupported fcmp predicate\n");
         int fw = fp_width(ctx, MLIR_GetOpOperand(op, 0));
         if (fw == 0) LFAIL("llvm->aarch64: fcmp non-float operand\n");
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9) ||
-            !load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 1), 10))
-            LFAIL("llvm->aarch64: fcmp operand not materialised\n");
-        emit_fmov_gp_v(ctx, blk, true, true, 0, 9);
-        emit_fmov_gp_v(ctx, blk, true, true, 1, 10);
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        uint8_t r1 = use_val(L, MLIR_GetOpOperand(op, 1), 10);
+        if (!L->ok) return;
+        emit_fmov_gp_v(ctx, blk, true, true, 0, r0);
+        emit_fmov_gp_v(ctx, blk, true, true, 1, r1);
         emit_fcmp(ctx, blk, fw, 0, 1);
-        emit_cset(ctx, blk, 9, (uint8_t)cond, false);
-        store_value(ctx, blk, sm, MLIR_GetOpResult(op, 0), 9);
+        uint8_t rd = def_val(L, res, 9);
+        emit_cset(ctx, blk, rd, (uint8_t)cond, false);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.fptosi") || name_eq(on, "llvm.fptoui")) {
         // FP -> int. Result lands in a GP reg; narrow results must be masked
@@ -1297,15 +1366,16 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             LFAIL("llvm->aarch64: fptosi/fptoui non-float source\n");
         int rw = int_type_bits(ctx, res);
         int dst_w = rw > 32 ? 64 : 32;
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
-            LFAIL("llvm->aarch64: fptosi/fptoui operand not materialised\n");
-        emit_fmov_gp_v(ctx, blk, true, true, 0, 9);
-        emit_fp_cvt(ctx, blk, "f2i", src_w, dst_w, sign, /*rd GP*/9, /*rn V*/0);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        if (!L->ok) return;
+        emit_fmov_gp_v(ctx, blk, true, true, 0, r0);
+        uint8_t rd = def_val(L, res, 9);
+        emit_fp_cvt(ctx, blk, "f2i", src_w, dst_w, sign, /*rd GP*/rd, /*rn V*/0);
         if (rw > 0 && rw < 32) {
             emit_load_imm(ctx, blk, 10, (1ull << rw) - 1, true);
-            emit_3reg(ctx, blk, OP_TYPE_AARCH64_AND_REG, 9, 9, 10, true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_AND_REG, rd, rd, 10, true);
         }
-        store_value(ctx, blk, sm, res, 9);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.sitofp") || name_eq(on, "llvm.uitofp")) {
         // int -> FP. Slots hold zero-extended ints: uitofp can read the full
@@ -1316,16 +1386,18 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         int dst_w = fp_width(ctx, res);
         if (dst_w == 0)
             LFAIL("llvm->aarch64: sitofp/uitofp non-float result\n");
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
-            LFAIL("llvm->aarch64: sitofp/uitofp operand not materialised\n");
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        if (!L->ok) return;
         if (sign && sw > 0 && sw < 64) {
             emit_load_imm(ctx, blk, 10, (uint64_t)(64 - sw), true);
-            emit_3reg(ctx, blk, OP_TYPE_AARCH64_LSL_REG, 9, 9, 10, true);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_LSL_REG, 9, r0, 10, true);
             emit_3reg(ctx, blk, OP_TYPE_AARCH64_ASR_REG, 9, 9, 10, true);
+            r0 = 9;
         }
-        emit_fp_cvt(ctx, blk, "i2f", /*src_w=*/64, dst_w, sign, /*rd V*/0, /*rn GP*/9);
-        emit_fmov_gp_v(ctx, blk, false, true, 9, 0);
-        store_value(ctx, blk, sm, res, 9);
+        emit_fp_cvt(ctx, blk, "i2f", /*src_w=*/64, dst_w, sign, /*rd V*/0, /*rn GP*/r0);
+        uint8_t rd = def_val(L, res, 9);
+        emit_fmov_gp_v(ctx, blk, false, true, rd, 0);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "llvm.fpext") || name_eq(on, "llvm.fptrunc")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
@@ -1333,12 +1405,13 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         int dst_w = fp_width(ctx, res);
         if (src_w == 0 || dst_w == 0)
             LFAIL("llvm->aarch64: fpext/fptrunc non-float type\n");
-        if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 9))
-            LFAIL("llvm->aarch64: fpext/fptrunc operand not materialised\n");
-        emit_fmov_gp_v(ctx, blk, true, true, 0, 9);
+        uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
+        if (!L->ok) return;
+        emit_fmov_gp_v(ctx, blk, true, true, 0, r0);
         emit_fp_cvt(ctx, blk, "f2f", src_w, dst_w, false, 0, 0);
-        emit_fmov_gp_v(ctx, blk, false, true, 9, 0);
-        store_value(ctx, blk, sm, res, 9);
+        uint8_t rd = def_val(L, res, 9);
+        emit_fmov_gp_v(ctx, blk, false, true, rd, 0);
+        fin_val(L, res, rd);
 
     } else if (name_eq(on, "scf.if")) {
         lower_scf_if(L, op);
@@ -1583,6 +1656,148 @@ static MLIR_BlockHandle map_block(MLIR_BlockHandle *src, MLIR_BlockHandle *dst,
     return MLIR_INVALID_HANDLE;
 }
 
+// Callee-saved register pool for the linear-scan allocator: x19..x28.
+#define A64_NSAVED 10
+#define A64_SAVE_BASE 19
+
+// Save (or, with restore=true, reload) the callee-saved registers selected by
+// `mask` (bit k = x(19+k)) to/from the per-frame save area at byte offset
+// `base` and up. Emitted just after the prologue and just before each epilogue.
+static void emit_callee_saves(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                              uint32_t mask, uint32_t base, bool restore) {
+    uint32_t off = base;
+    for (int k = 0; k < A64_NSAVED; k++) {
+        if (!(mask & (1u << k))) continue;
+        uint8_t reg = (uint8_t)(A64_SAVE_BASE + k);
+        if (restore) emit_ldr_x_off(ctx, blk, reg, 31, off);
+        else         emit_str_x_off(ctx, blk, reg, 31, off);
+        off += 8;
+    }
+}
+
+// Linear-scan register allocator for the CFG (from-wasm) lowering path. Assigns
+// block-local SSA values (def and all uses in one block, never a block arg, and
+// never consumed by a terminator or an llvm.call — those paths read frame slots
+// directly) to callee-saved registers x19..x28. Everything else keeps its frame
+// slot. Fills `rm` (value -> home reg) and returns the set of used callee-saved
+// regs as a bitmask over x19..x28 (bit k = x(19+k)).
+//
+// Allocation is deterministic (purely structural block/op order, ascending
+// register preference), which is required for the bit-identical self-host gate.
+// Callee-saved homes survive `bl`, so a value live across a call needs no
+// spill-around-call handling. Functions containing ops with nested regions are
+// not allocated (returns 0) — the CFG path is flat in practice.
+static uint32_t alloc_regs_cfg(MLIR_Context *ctx, MLIR_RegionHandle reg,
+                               size_t n_blocks, SlotMap *rm) {
+    Arena *ar = MLIR_GetArenaAllocator(ctx);
+    size_t cap = 0;
+    for (size_t b = 0; b < n_blocks; b++) {
+        MLIR_BlockHandle bk = MLIR_GetRegionBlock(reg, b);
+        size_t no = MLIR_GetBlockNumOps(bk);
+        for (size_t i = 0; i < no; i++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(bk, i);
+            if (MLIR_GetOpNumRegions(op) > 0) return 0;   // bail: nested regions
+            cap += MLIR_GetOpNumResults(op);
+        }
+    }
+    if (cap == 0) return 0;
+
+    int32_t *def_block = (int32_t *)arena_alloc(ar, cap * sizeof(int32_t));
+    int32_t *def_pos   = (int32_t *)arena_alloc(ar, cap * sizeof(int32_t));
+    int32_t *last_use  = (int32_t *)arena_alloc(ar, cap * sizeof(int32_t));
+    uint8_t *disq      = (uint8_t *)arena_alloc(ar, cap * sizeof(uint8_t));
+    uint8_t *usedv     = (uint8_t *)arena_alloc(ar, cap * sizeof(uint8_t));
+    MLIR_ValueHandle *vals =
+        (MLIR_ValueHandle *)arena_alloc(ar, cap * sizeof(MLIR_ValueHandle));
+    SlotMap idx = {0}; idx.arena = ar;   // value -> array index
+    size_t nv = 0;
+
+    // Pass 1: record every op-result definition with its block and position.
+    for (size_t b = 0; b < n_blocks; b++) {
+        MLIR_BlockHandle bk = MLIR_GetRegionBlock(reg, b);
+        size_t no = MLIR_GetBlockNumOps(bk);
+        for (size_t i = 0; i < no; i++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(bk, i);
+            size_t nr = MLIR_GetOpNumResults(op);
+            for (size_t r = 0; r < nr; r++) {
+                vals[nv] = MLIR_GetOpResult(op, r);
+                def_block[nv] = (int32_t)b; def_pos[nv] = (int32_t)i;
+                last_use[nv] = -1; disq[nv] = 0; usedv[nv] = 0;
+                sm_put(&idx, vals[nv], (int32_t)nv);
+                nv++;
+            }
+        }
+    }
+
+    // Pass 2: scan operand uses. Disqualify on cross-block use, or use by a
+    // terminator (incl. successor/edge operands) or an llvm.call (those paths
+    // read frame slots, not home registers). Track the last in-block use.
+    for (size_t b = 0; b < n_blocks; b++) {
+        MLIR_BlockHandle bk = MLIR_GetRegionBlock(reg, b);
+        size_t no = MLIR_GetBlockNumOps(bk);
+        for (size_t i = 0; i < no; i++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(bk, i);
+            bool is_term = (i + 1 == no);
+            bool is_call = name_eq(MLIR_GetOpName(op), "llvm.call");
+            size_t nop = MLIR_GetOpNumOperands(op);
+            for (size_t k = 0; k < nop; k++) {
+                int32_t vi;
+                if (!sm_get(&idx, MLIR_GetOpOperand(op, k), &vi)) continue;
+                usedv[vi] = 1;
+                if ((int32_t)b != def_block[vi] || is_term || is_call)
+                    disq[vi] = 1;
+                else if ((int32_t)i > last_use[vi])
+                    last_use[vi] = (int32_t)i;
+            }
+            // Branch successor (block-arg) operands are a separate operand list
+            // resolved via slot-to-slot edge copies (copy_slot reads the frame
+            // slot), so any value passed across an edge must stay in memory.
+            size_t nsucc = MLIR_GetOpNumSuccessors(op);
+            for (size_t s = 0; s < nsucc; s++) {
+                size_t nso = MLIR_GetOpNumSuccessorOperands(op, s);
+                for (size_t k = 0; k < nso; k++) {
+                    int32_t vi;
+                    if (!sm_get(&idx, MLIR_GetOpSuccessorOperand(op, s, k), &vi))
+                        continue;
+                    usedv[vi] = 1; disq[vi] = 1;
+                }
+            }
+        }
+    }
+
+    // Per-block linear scan. Block-local values never overlap across blocks, so
+    // each block independently reuses the whole x19..x28 pool. Expiry uses a
+    // strict `end < start` test so an operand whose last use coincides with a
+    // result's definition keeps its register — preventing a multi-instruction
+    // lowering from clobbering an operand it still reads.
+    uint32_t used_mask = 0;
+    for (size_t b = 0; b < n_blocks; b++) {
+        uint16_t freemask = (uint16_t)((1u << A64_NSAVED) - 1);
+        int32_t act_end[A64_NSAVED]; uint8_t act_reg[A64_NSAVED]; size_t nact = 0;
+        for (size_t vi = 0; vi < nv; vi++) {
+            if (def_block[vi] != (int32_t)b) continue;
+            if (disq[vi] || !usedv[vi] || last_use[vi] < def_pos[vi]) continue;
+            int32_t s = def_pos[vi];
+            for (size_t a = 0; a < nact; ) {
+                if (act_end[a] < s) {
+                    freemask |= (uint16_t)(1u << (act_reg[a] - A64_SAVE_BASE));
+                    act_reg[a] = act_reg[nact - 1];
+                    act_end[a] = act_end[nact - 1];
+                    nact--;
+                } else a++;
+            }
+            if (freemask == 0) continue;     // no free reg: value stays in memory
+            int rk = 0; while (!(freemask & (1u << rk))) rk++;
+            freemask &= (uint16_t)~(1u << rk);
+            uint8_t regn = (uint8_t)(A64_SAVE_BASE + rk);
+            sm_put(rm, vals[vi], regn);
+            used_mask |= (1u << rk);
+            act_end[nact] = last_use[vi]; act_reg[nact] = regn; nact++;
+        }
+    }
+    return used_mask;
+}
+
 static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                                      string sym, GlobalMap *gm) {
     MLIR_RegionHandle src_region = MLIR_GetOpRegion(fn, 0);
@@ -1612,7 +1827,18 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                              &alloca_bytes))
             A64_FAIL("llvm->aarch64: function '%.*s' has an unsupported "
                      "alloca\n", (int)sym.size, sym.str);
-    uint32_t frame_size = (slot_bytes + alloca_bytes + 15u) & ~15u;
+    uint32_t base_bytes = slot_bytes + alloca_bytes;
+
+    // Linear-scan register allocation over callee-saved x19..x28 (CFG path).
+    SlotMap rm = {0};
+    rm.arena = MLIR_GetArenaAllocator(ctx);
+    uint32_t saved_mask = 0;
+    if (!getenv("TINYC_NO_REGALLOC"))
+        saved_mask = alloc_regs_cfg(ctx, src_region, n_blocks, &rm);
+    uint32_t num_saved = 0;
+    for (uint32_t mtmp = saved_mask; mtmp; mtmp &= mtmp - 1) num_saved++;
+    uint32_t save_base = (base_bytes + 7u) & ~7u;
+    uint32_t frame_size = (save_base + num_saved * 8u + 15u) & ~15u;
     if (frame_size > 0xff0000u)
         A64_FAIL("llvm->aarch64: function '%.*s' frame %u too large\n",
                  (int)sym.size, sym.str, frame_size);
@@ -1630,6 +1856,7 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
 
     // Prologue + incoming-param spill in the entry block.
     emit_prologue(ctx, out_blks[0], frame_size);
+    emit_callee_saves(ctx, out_blks[0], saved_mask, save_base, false);
     for (size_t i = 0; i < nargs && i < 8; i++)
         store_value(ctx, out_blks[0], &sm, MLIR_GetBlockArg(entry_src, i),
                     (uint8_t)i);
@@ -1639,7 +1866,7 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
     }
 
     LowerCtx L = { ctx, &sm, out_reg, out_blks[0], sym, frame_size,
-                   &am, slot_bytes, gm, nargs, true };
+                   &am, slot_bytes, gm, nargs, &rm, true };
 
     for (size_t b = 0; b < n_blocks; b++) {
         L.cur = out_blks[b];
@@ -1671,6 +1898,7 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                 free(src_blks); free(out_blks);
                 return MLIR_INVALID_HANDLE;
             }
+            emit_callee_saves(ctx, L.cur, saved_mask, save_base, true);
             emit_epilogue(ctx, L.cur, frame_size);
             emit_ret(ctx, L.cur);
         } else if (name_eq(tn, "cf.br")) {
@@ -1808,7 +2036,7 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     }
 
     LowerCtx L = { ctx, &sm, out_reg, out_blk, sym, frame_size,
-                   &am, slot_bytes, gm, nargs, true };
+                   &am, slot_bytes, gm, nargs, NULL, true };
     MLIR_OpHandle term = lower_block_ops(&L, src_blk);
     if (!L.ok) return MLIR_INVALID_HANDLE;
 
