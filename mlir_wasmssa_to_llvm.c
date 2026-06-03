@@ -2293,6 +2293,24 @@ static void synth_path_open(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
 
     L.cur = ook; L.terminated = false;
     emit_store_v(&L, fd, linmem_ptr(&L, popened, 0));
+    // Darwin arm64: open()'s mode is a *variadic* argument and must be passed
+    // on the stack, but our call ABI passes args in registers, so a freshly
+    // created file ends up with a garbage mode (e.g. ---------x) and later
+    // read-back of the file fails. fchmod() is non-variadic, so fix the mode
+    // explicitly to 0644 whenever O_CREAT (WASI oflags bit0) was requested.
+    MLIR_ValueHandle created = build_icmp(&L, /*ne*/1,
+        emit_binop2(&L, OP_TYPE_LLVM_AND, poflags, emit_const(&L, i32, 1), i32),
+        emit_const(&L, i32, 0));
+    MLIR_BlockHandle do_chmod = new_block(&L);
+    MLIR_BlockHandle ret_ok = new_block(&L);
+    term_cond_br(&L, created, do_chmod, ret_ok);
+
+    L.cur = do_chmod; L.terminated = false;
+    MLIR_ValueHandle cargs[2] = { fd, emit_const(&L, i32, 0x1a4) };
+    (void)emit_libc_call(&L, "_fchmod", cargs, 2, i32);
+    term_br(&L, ret_ok);
+
+    L.cur = ret_ok; L.terminated = false;
     emit_ret_v(&L, emit_const(&L, i32, 0));
 
     L.cur = err; L.terminated = false;
@@ -2874,11 +2892,19 @@ MLIR_OpHandle mlir_wasmssa_to_llvm(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
     int64_t max_global = -1;
     for (size_t i = 0; i < nops; i++)
         scan_max_global(MLIR_GetBlockOp(mb, i), &max_global);
+    // g0 (the shadow stack pointer) must start at wasm-ld's __stack_pointer
+    // (the top of the stack region; the heap grows up from there). Use the
+    // value propagated from the wasm GLOBAL section. Initialising it to the
+    // top of linear memory instead would make the stack grow down INTO the
+    // heap and clobber early heap allocations.
+    int64_t g0_init = linmem_total;
+    MLIR_AttributeHandle a_g0 = MLIR_GetOpAttributeByName(ssa_module, "global0_init");
+    if (a_g0) g0_init = MLIR_GetAttributeInteger(a_g0);
     MLIR_TypeHandle i32t = MLIR_CreateTypeInteger(ctx, 32, true);
     for (int64_t g = 0; g <= max_global; g++) {
         char gname[32];
         snprintf(gname, sizeof(gname), "__wasm_g%lld", (long long)g);
-        int64_t init = (g == 0) ? linmem_total : 0;
+        int64_t init = (g == 0) ? g0_init : 0;
         MLIR_OpHandle gg = MLIR_CreateLLVMGlobal(ctx,
             str_from_cstr_view(gname), i32t, false, 0, init, 0.0, NULL,
             MLIR_CreateLocationUnknown(ctx, (string){0}));

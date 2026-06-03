@@ -1502,13 +1502,28 @@ MLIR_OpHandle mlir_wasmstack_to_wasmssa(MLIR_Context *ctx,
     // Propagate `memory_min_pages` from the wasmstack module so the
     // wasmssa -> wmir -> aarch64 chain can size the linear memory image
     // correctly (see mlir_wasm_to_wasmstack.c for the rationale).
-    MLIR_AttributeHandle mod_attrs[1];
+    MLIR_AttributeHandle mod_attrs[2];
     size_t n_mod_attrs = 0;
     MLIR_AttributeHandle a_min_pages = MLIR_GetOpAttributeByName(
         stack_module, "memory_min_pages");
     if (a_min_pages) {
         mod_attrs[n_mod_attrs++] = attr_i32(ctx, "memory_min_pages",
             MLIR_GetAttributeInteger(a_min_pages));
+    }
+
+    // Propagate global 0's init value (the wasm shadow stack pointer =
+    // wasm-ld's __stack_pointer). The GLOBAL_DECL ops are dropped below
+    // (the backends synthesise their own global storage), but g0's init
+    // is the top of the stack region and MUST match what wasm-ld chose:
+    // the stack grows down from it and the heap (__heap_base) starts at
+    // it, so picking the wrong value collides the stack with the heap.
+    for (size_t i = 0; i < MLIR_GetBlockNumOps(mb); i++) {
+        MLIR_OpHandle top = MLIR_GetBlockOp(mb, i);
+        if (MLIR_GetOpType(top) != OP_TYPE_WASMSTACK_GLOBAL_DECL) continue;
+        if (at_i(top, "global_idx") != 0) continue;
+        mod_attrs[n_mod_attrs++] = attr_i64(ctx, "global0_init",
+            at_i(top, "init_value"));
+        break;
     }
 
     MLIR_OpHandle out_module = MLIR_CreateOp(ctx, OP_TYPE_MODULE,
