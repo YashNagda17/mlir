@@ -288,6 +288,7 @@ typedef struct {
     size_t            n_frames, frames_cap;
     OffsetMap        *globals;   // import_global name -> linmem offset
     FuncPtrMap       *fnptrs;    // func_addr target name -> slot index
+    const FuncSigMap *sigs;      // callee name -> (param,result) wasm types
 } FLower;
 
 // Create a fresh op result value of the given type.
@@ -866,7 +867,19 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_TypeHandle rt[1];
         MLIR_ValueHandle r[1];
         if (nr == 1) {
-            MLIR_TypeHandle ty = MLIR_GetValueType(MLIR_GetOpResult(op, 0));
+            // Under --from-wasm (no_def_use_tracking) the wasmssa.call result
+            // value carries no reliable type; prefer the callee signature.
+            MLIR_TypeHandle ty = MLIR_INVALID_HANDLE;
+            string cpt, crt;
+            if (L->sigs && fsm_get(L->sigs, callee, &cpt, &crt) && crt.size >= 2)
+                ty = vt_to_llvm(ctx, type_byte_at(crt, 0));
+            if (ty == MLIR_INVALID_HANDLE) {
+                ty = MLIR_GetValueType(MLIR_GetOpResult(op, 0));
+                string tys = MLIR_GetTypeString(ctx, ty);
+                if (tys.size == 0 || tys.str == NULL || tys.str[0] == '?' ||
+                    (tys.size == 7 && memcmp(tys.str, "unknown", 7) == 0))
+                    ty = MLIR_CreateTypeInteger(ctx, 32, true);
+            }
             rt[0] = ty;
             r[0] = mk_res(ctx, ty);
         }
@@ -930,7 +943,18 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         }
         uint8_t vt = (uint8_t)at_i(op, "valtype");
         (void)vt;
-        MLIR_TypeHandle ity = MLIR_GetValueType(MLIR_GetOpResult(op, 0));
+        // Result type follows the value operands; the result value itself is
+        // untyped under no_def_use_tracking, so take it from operand `a`.
+        MLIR_TypeHandle ity = MLIR_GetValueType(a);
+        string itys = MLIR_GetTypeString(ctx, ity);
+        if (itys.size == 0 || itys.str == NULL || itys.str[0] == '?' ||
+            (itys.size == 7 && memcmp(itys.str, "unknown", 7) == 0)) {
+            ity = MLIR_GetValueType(b);
+            itys = MLIR_GetTypeString(ctx, ity);
+            if (itys.size == 0 || itys.str == NULL || itys.str[0] == '?' ||
+                (itys.size == 7 && memcmp(itys.str, "unknown", 7) == 0))
+                ity = MLIR_CreateTypeInteger(ctx, 32, true);
+        }
         MLIR_TypeHandle rt[1] = { ity };
         MLIR_ValueHandle r[1] = { mk_res(ctx, ity) };
         MLIR_ValueHandle ops[3] = { c, a, b };
@@ -1396,6 +1420,11 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         // f <-> f
         case 0xb6: res = emit_cast_named(L, "llvm.fptrunc", a, f32); break; // demote
         case 0xbb: res = emit_cast_named(L, "llvm.fpext",   a, f64); break; // promote
+        // ---- float unary ops ----
+        case 0x8c: res = emit_cast_named(L, "llvm.fneg",      a, f32); break; // f32.neg
+        case 0x91: res = emit_cast_named(L, "llvm.intr.sqrt", a, f32); break; // f32.sqrt
+        case 0x9a: res = emit_cast_named(L, "llvm.fneg",      a, f64); break; // f64.neg
+        case 0x9f: res = emit_cast_named(L, "llvm.intr.sqrt", a, f64); break; // f64.sqrt
         default:
             fprintf(stderr,
                 "wasmssa->llvm: unop opcode 0x%llx not yet supported\n",
@@ -1465,6 +1494,12 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_ValueHandle r[1];
         if (nr == 1) {
             MLIR_TypeHandle ty = MLIR_GetValueType(MLIR_GetOpResult(op, 0));
+            string tys = MLIR_GetTypeString(ctx, ty);
+            if (tys.size == 0 || tys.str == NULL || tys.str[0] == '?' ||
+                (tys.size == 7 && memcmp(tys.str, "unknown", 7) == 0)) {
+                ty = sig_r.size >= 2 ? vt_to_llvm(ctx, type_byte_at(sig_r, 0))
+                                     : MLIR_CreateTypeInteger(ctx, 32, true);
+            }
             rt[0] = ty;
             r[0] = mk_res(ctx, ty);
         }
@@ -1489,7 +1524,8 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
 // Lift one wasmssa.func into an `llvm.func`. Returns MLIR_INVALID_HANDLE on
 // failure (the caller aborts the whole module).
 static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
-                                OffsetMap *globals, FuncPtrMap *fnptrs) {
+                                OffsetMap *globals, FuncPtrMap *fnptrs,
+                                const FuncSigMap *sigs) {
     string name     = at_s(src, "sym_name");
     bool   exported = at_b(src, "exported");
     string pt       = at_s(src, "param_types");
@@ -1540,6 +1576,7 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     L.local_vt = local_vt;
     L.globals = globals;
     L.fnptrs = fnptrs;
+    L.sigs = sigs;
     L.local_ptr = (MLIR_ValueHandle *)malloc(
         (n_locals ? n_locals : 1) * sizeof(MLIR_ValueHandle));
 
@@ -2100,7 +2137,36 @@ static void synth_fd_seek(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     free(L.frames);
 }
 
-// i32 path_open(dirfd, dirflags, path, path_len, oflags, rights:i64,
+// i32 fd_tell(fd, offset_ptr): write the current file position to *offset_ptr.
+// POSIX: lseek(fd, 0, SEEK_CUR=1).
+static void synth_fd_tell(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
+    MLIR_RegionHandle reg = MLIR_CreateRegion(ctx);
+    MLIR_BlockHandle entry = MLIR_CreateBlock(ctx);
+    MLIR_AppendRegionBlock(ctx, reg, entry);
+    MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
+    MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(ctx, 64, true);
+    MLIR_ValueHandle pfd = mk_arg(ctx, entry, 0, i32);
+    MLIR_ValueHandle pno = mk_arg(ctx, entry, 1, i32);
+    FLower L = {0}; L.ctx = ctx; L.dreg = reg; L.cur = entry;
+
+    MLIR_ValueHandle sargs[3] = { pfd, emit_const(&L, i64, 0),
+                                  emit_const(&L, i32, 1) };
+    MLIR_ValueHandle r = emit_libc_call(&L, "_lseek", sargs, 3, i64);
+    MLIR_BlockHandle ok = new_block(&L);
+    MLIR_BlockHandle err = new_block(&L);
+    MLIR_ValueHandle isneg = build_icmp(&L, /*slt*/2, r, emit_const(&L, i64, 0));
+    term_cond_br(&L, isneg, err, ok);
+
+    L.cur = ok; L.terminated = false;
+    emit_store_v(&L, r, linmem_ptr(&L, pno, 0));
+    emit_ret_v(&L, emit_const(&L, i32, 0));
+
+    L.cur = err; L.terminated = false;
+    emit_ret_v(&L, emit_const(&L, i32, 8));
+
+    finish_func(ctx, out_body, reg, "fd_tell");
+    free(L.frames);
+}
 //               rights_inh:i64, fdflags, opened_fd): copy the path to a stack
 // buffer, translate WASI flags to POSIX open() flags, _open, store the fd to
 // *opened_fd. Ignores dirfd (relies on the process cwd matching the preopen).
@@ -2793,6 +2859,7 @@ MLIR_OpHandle mlir_wasmssa_to_llvm(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
     bool need_printI64 = false, need_printNewline = false, need_printStr = false;
     bool need_fd_write = false;
     bool need_fd_read = false, need_fd_seek = false, need_fd_close = false;
+    bool need_fd_tell = false;
     bool need_path_open = false, need_args_get = false, need_args_sizes = false;
     bool need_environ_get = false, need_environ_sizes = false;
     bool need_va_i32 = false, need_va_i64 = false, need_va_ptr = false;
@@ -2808,6 +2875,7 @@ MLIR_OpHandle mlir_wasmssa_to_llvm(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
         if (nm.size == 8 && memcmp(nm.str, "fd_write", 8) == 0) { need_fd_write = true; continue; }
         if (nm.size == 7 && memcmp(nm.str, "fd_read", 7) == 0) { need_fd_read = true; continue; }
         if (nm.size == 7 && memcmp(nm.str, "fd_seek", 7) == 0) { need_fd_seek = true; continue; }
+        if (nm.size == 7 && memcmp(nm.str, "fd_tell", 7) == 0) { need_fd_tell = true; continue; }
         if (nm.size == 8 && memcmp(nm.str, "fd_close", 8) == 0) { need_fd_close = true; continue; }
         if (nm.size == 9 && memcmp(nm.str, "path_open", 9) == 0) { need_path_open = true; continue; }
         if (nm.size == 8 && memcmp(nm.str, "args_get", 8) == 0) { need_args_get = true; continue; }
@@ -2847,7 +2915,7 @@ MLIR_OpHandle mlir_wasmssa_to_llvm(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
     for (size_t i = 0; i < nops; i++) {
         MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
         if (MLIR_GetOpType(op) != OP_TYPE_WASMSSA_FUNC) continue;
-        MLIR_OpHandle fn = lower_func(ctx, op, &globals, &fnptrs);
+        MLIR_OpHandle fn = lower_func(ctx, op, &globals, &fnptrs, &sigs);
         if (fn == MLIR_INVALID_HANDLE) {
             free(image);
             free(globals.names); free(globals.offsets);
@@ -2882,6 +2950,7 @@ MLIR_OpHandle mlir_wasmssa_to_llvm(MLIR_Context *ctx, MLIR_OpHandle ssa_module) 
     if (need_fd_write) synth_fd_write(ctx, out_body);
     if (need_fd_read) synth_fd_read(ctx, out_body);
     if (need_fd_seek) synth_fd_seek(ctx, out_body);
+    if (need_fd_tell) synth_fd_tell(ctx, out_body);
     if (need_fd_close) synth_fd_close(ctx, out_body);
     if (need_path_open) synth_path_open(ctx, out_body);
     if (need_args_get) synth_args_get(ctx, out_body);

@@ -226,6 +226,43 @@ static void emit_str_x(MLIR_Context *ctx, MLIR_BlockHandle blk,
                        uint8_t rt, uint8_t rn, uint32_t off) {
     emit_ldst_x(ctx, blk, OP_TYPE_AARCH64_STR_X, rt, rn, off);
 }
+// Register-offset 64-bit load/store: ldr/str Xt, [Xn, Xm, LSL #0].
+static void emit_ldst_x_reg(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                            MLIR_OpType t, uint8_t rt, uint8_t rn, uint8_t rm) {
+    MLIR_AttributeHandle a[3];
+    a[0] = attr_i32(ctx, "rt", rt);
+    a[1] = attr_i32(ctx, "rn", rn);
+    a[2] = attr_i32(ctx, "rm", rm);
+    MLIR_AppendBlockOp(ctx, blk, build_op(ctx, t, a, 3));
+}
+// Materialise an unsigned byte offset into register `rd`.
+static void emit_mov_imm32(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                           uint8_t rd, uint32_t v) {
+    emit_movz(ctx, blk, rd, (uint16_t)(v & 0xffffu), 0, true);
+    if (v >> 16)
+        emit_movk(ctx, blk, rd, (uint16_t)((v >> 16) & 0xffffu), 1, true);
+}
+// 64-bit load from [base + byte_off] into rt, handling offsets beyond the
+// 12-bit scaled immediate range via a materialised register offset (x17).
+static void emit_ldr_x_off(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                           uint8_t rt, uint8_t base, uint32_t byte_off) {
+    if (byte_off <= 32760u && (byte_off & 7u) == 0u) {
+        emit_ldr_x(ctx, blk, rt, base, byte_off);
+    } else {
+        emit_mov_imm32(ctx, blk, 17, byte_off);
+        emit_ldst_x_reg(ctx, blk, OP_TYPE_AARCH64_LDR_X_REG, rt, base, 17);
+    }
+}
+// 64-bit store of rt into [base + byte_off], large-offset safe (scratch x17).
+static void emit_str_x_off(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                           uint8_t rt, uint8_t base, uint32_t byte_off) {
+    if (byte_off <= 32760u && (byte_off & 7u) == 0u) {
+        emit_str_x(ctx, blk, rt, base, byte_off);
+    } else {
+        emit_mov_imm32(ctx, blk, 17, byte_off);
+        emit_ldst_x_reg(ctx, blk, OP_TYPE_AARCH64_STR_X_REG, rt, base, 17);
+    }
+}
 static void emit_add_imm(MLIR_Context *ctx, MLIR_BlockHandle blk,
                          uint8_t rd, uint8_t rn, uint16_t imm12, bool sf) {
     MLIR_AttributeHandle a[4];
@@ -546,7 +583,7 @@ static bool load_value(MLIR_Context *ctx, MLIR_BlockHandle blk, SlotMap *sm,
                        MLIR_ValueHandle v, uint8_t rd) {
     int32_t slot;
     if (!sm_get(sm, v, &slot)) return false;
-    emit_ldr_x(ctx, blk, rd, 31, (uint32_t)slot * 8u);
+    emit_ldr_x_off(ctx, blk, rd, 31, (uint32_t)slot * 8u);
     return true;
 }
 // Store register `rd` into the frame slot for result value `v`.
@@ -554,7 +591,7 @@ static bool store_value(MLIR_Context *ctx, MLIR_BlockHandle blk, SlotMap *sm,
                         MLIR_ValueHandle v, uint8_t rd) {
     int32_t slot;
     if (!sm_get(sm, v, &slot)) return false;
-    emit_str_x(ctx, blk, rd, 31, (uint32_t)slot * 8u);
+    emit_str_x_off(ctx, blk, rd, 31, (uint32_t)slot * 8u);
     return true;
 }
 
@@ -968,15 +1005,15 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
                 if (!sm_get(sm, MLIR_GetOpOperand(op, arg_base + k), &slot))
                     LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
                           (int)L->sym.size, L->sym.str);
-                emit_ldr_x(ctx, blk, (uint8_t)k, 12, (uint32_t)slot * 8u);
+                emit_ldr_x_off(ctx, blk, (uint8_t)k, 12, (uint32_t)slot * 8u);
             }
             for (size_t k = n_reg; k < no; k++) {
                 int32_t slot;
                 if (!sm_get(sm, MLIR_GetOpOperand(op, arg_base + k), &slot))
                     LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
                           (int)L->sym.size, L->sym.str);
-                emit_ldr_x(ctx, blk, 9, 12, (uint32_t)slot * 8u);
-                emit_str_x(ctx, blk, 9, 31, (uint32_t)(k - n_reg) * 8u);
+                emit_ldr_x_off(ctx, blk, 9, 12, (uint32_t)slot * 8u);
+                emit_str_x_off(ctx, blk, 9, 31, (uint32_t)(k - n_reg) * 8u);
             }
             if (is_indirect) emit_blr(ctx, blk, 16);
             else             emit_bl(ctx, blk, nm);
@@ -1540,7 +1577,7 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
     int32_t nslots = 0;
     for (size_t b = 0; b < n_blocks; b++)
         assign_slots_block(&sm, MLIR_GetRegionBlock(src_region, b), &nslots);
-    if (nslots > 4095)
+    if (nslots > (1 << 20))
         A64_FAIL("llvm->aarch64: function '%.*s' needs %d slots "
                  "(frame too large for the trivial allocator)\n",
                  (int)sym.size, sym.str, nslots);
@@ -1555,6 +1592,9 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
             A64_FAIL("llvm->aarch64: function '%.*s' has an unsupported "
                      "alloca\n", (int)sym.size, sym.str);
     uint32_t frame_size = (slot_bytes + alloca_bytes + 15u) & ~15u;
+    if (frame_size > 0xff0000u)
+        A64_FAIL("llvm->aarch64: function '%.*s' frame %u too large\n",
+                 (int)sym.size, sym.str, frame_size);
 
     MLIR_RegionHandle out_reg = MLIR_CreateRegion(ctx);
     MLIR_BlockHandle *src_blks = (MLIR_BlockHandle *)malloc(
@@ -1573,7 +1613,7 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
         store_value(ctx, out_blks[0], &sm, MLIR_GetBlockArg(entry_src, i),
                     (uint8_t)i);
     for (size_t i = 8; i < nargs; i++) {
-        emit_ldr_x(ctx, out_blks[0], 9, 29, (uint32_t)(16u + (i - 8) * 8u));
+        emit_ldr_x_off(ctx, out_blks[0], 9, 29, (uint32_t)(16u + (i - 8) * 8u));
         store_value(ctx, out_blks[0], &sm, MLIR_GetBlockArg(entry_src, i), 9);
     }
 
@@ -1681,7 +1721,7 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     sm.arena = MLIR_GetArenaAllocator(ctx);
     int32_t nslots = 0;
     assign_slots_block(&sm, src_blk, &nslots);
-    if (nslots > 4095) {
+    if (nslots > (1 << 20)) {
         A64_FAIL("llvm->aarch64: function '%.*s' needs %d slots "
                  "(frame too large for the trivial allocator)\n",
                  (int)sym.size, sym.str, nslots);
@@ -1696,6 +1736,9 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
                  (int)sym.size, sym.str);
     }
     uint32_t frame_size = (slot_bytes + alloca_bytes + 15u) & ~15u;
+    if (frame_size > 0xff0000u)
+        A64_FAIL("llvm->aarch64: function '%.*s' frame %u too large\n",
+                 (int)sym.size, sym.str, frame_size);
 
     emit_prologue(ctx, out_blk, frame_size);
     for (size_t i = 0; i < nargs && i < 8; i++)
@@ -1703,7 +1746,7 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     // Args 8.. arrive on the caller's stack. After the prologue x29 (fp) points
     // at the saved {fp,lr} pair, so the first stack arg is at [x29, #16].
     for (size_t i = 8; i < nargs; i++) {
-        emit_ldr_x(ctx, out_blk, 9, 29, (uint32_t)(16u + (i - 8) * 8u));
+        emit_ldr_x_off(ctx, out_blk, 9, 29, (uint32_t)(16u + (i - 8) * 8u));
         store_value(ctx, out_blk, &sm, MLIR_GetBlockArg(src_blk, i), 9);
     }
 
