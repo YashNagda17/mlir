@@ -1576,6 +1576,173 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
     }
 }
 
+// =============================================================================
+// Boolean-normalization peephole (the WMIR `wmir_simplify_bools` analogue).
+//
+// C frontends materialise a comparison as an explicit 0/1 integer and then
+// re-test it for control flow, so the wasm (and hence the lifted llvm) carries
+// chains like
+//
+//     %b = llvm.icmp ...                       ; already 0 or 1 (i32)
+//     %s = llvm.select(%b, 1, 0)               ; %b ? 1 : 0   (identity on bool)
+//     %n = llvm.icmp ne (%s, 0)                ; %s != 0       (identity on bool)
+//     ... use %n ...
+//
+// and `!!c` idioms stack several select/icmp_ne pairs. wasmtime's Cranelift
+// folds these; our straight-line backend otherwise emits a csel/cset round-trip
+// per layer. Both `select(c,1,0)` and `icmp_ne(x,0)` equal their inner value
+// whenever that value is a 0/1 boolean. A value is a boolean if it is an
+// llvm.icmp / llvm.fcmp result OR is itself one of these folded redundancies
+// (so `!!` chains collapse transitively in a single forward pass). We forward
+// the result to the inner value at every use and erase the now-dead op.
+// =============================================================================
+typedef struct { MLIR_ValueHandle key, val; } BoolFwd;
+
+static size_t bf_hash(MLIR_ValueHandle k, size_t mask) {
+    return (size_t)(((uint64_t)k * 0x9E3779B97F4A7C15ull) >> 24) & mask;
+}
+static void bf_put(BoolFwd *m, size_t mask, MLIR_ValueHandle k, MLIR_ValueHandle v) {
+    size_t h = bf_hash(k, mask);
+    while (m[h].key != MLIR_INVALID_HANDLE && m[h].key != k) h = (h + 1) & mask;
+    m[h].key = k; m[h].val = v;
+}
+static bool bf_get(BoolFwd *m, size_t mask, MLIR_ValueHandle k, MLIR_ValueHandle *out) {
+    size_t h = bf_hash(k, mask);
+    while (m[h].key != MLIR_INVALID_HANDLE) {
+        if (m[h].key == k) { *out = m[h].val; return true; }
+        h = (h + 1) & mask;
+    }
+    return false;
+}
+static MLIR_ValueHandle bf_resolve(BoolFwd *m, size_t mask, MLIR_ValueHandle v) {
+    MLIR_ValueHandle n;
+    for (int g = 0; g < 64 && bf_get(m, mask, v, &n); g++) v = n;
+    return v;
+}
+static bool sb_op_name_is(MLIR_OpHandle op, const char *nm) {
+    string s = MLIR_GetOpName(op);
+    size_t l = strlen(nm);
+    return s.size == l && s.str != NULL && memcmp(s.str, nm, l) == 0;
+}
+static bool sb_is_cmp_def(MLIR_ValueHandle v) {
+    MLIR_OpHandle d = MLIR_GetValueDefiningOp(v);
+    if (!d) return false;
+    return sb_op_name_is(d, "llvm.icmp") || sb_op_name_is(d, "llvm.fcmp");
+}
+static bool sb_is_const(MLIR_ValueHandle v, int64_t want) {
+    MLIR_OpHandle d = MLIR_GetValueDefiningOp(v);
+    if (!d || MLIR_GetOpType(d) != OP_TYPE_LLVM_MLIR_CONSTANT) return false;
+    return at_i(d, "value") == want;
+}
+// Total operand slots (regular + per-successor block-arg operands), addressable
+// by the flat index MLIR_GetOpOperand / MLIR_SetOpOperand use.
+static size_t sb_flat_count(MLIR_OpHandle op) {
+    size_t n = MLIR_GetOpNumOperands(op);
+    size_t ns = MLIR_GetOpNumSuccessors(op);
+    for (size_t s = 0; s < ns; s++) n += MLIR_GetOpNumSuccessorOperands(op, s);
+    return n;
+}
+static MLIR_ValueHandle sb_flat_get(MLIR_OpHandle op, size_t i) {
+    size_t nreg = MLIR_GetOpNumOperands(op);
+    if (i < nreg) return MLIR_GetOpOperand(op, i);
+    size_t rem = i - nreg, ns = MLIR_GetOpNumSuccessors(op);
+    for (size_t s = 0; s < ns; s++) {
+        size_t c = MLIR_GetOpNumSuccessorOperands(op, s);
+        if (rem < c) return MLIR_GetOpSuccessorOperand(op, s, rem);
+        rem -= c;
+    }
+    return MLIR_INVALID_HANDLE;
+}
+
+// `op` is a fold candidate; return the inner value it is equivalent to (using
+// the in-progress map for the bool test so chains collapse), else INVALID.
+static MLIR_ValueHandle sb_fold_inner(BoolFwd *m, size_t mask, MLIR_OpHandle op) {
+    MLIR_ValueHandle dummy;
+    if (sb_op_name_is(op, "llvm.select") && MLIR_GetOpNumOperands(op) == 3) {
+        MLIR_ValueHandle c = MLIR_GetOpOperand(op, 0);
+        MLIR_ValueHandle t = MLIR_GetOpOperand(op, 1);
+        MLIR_ValueHandle f = MLIR_GetOpOperand(op, 2);
+        if (sb_is_const(t, 1) && sb_is_const(f, 0) &&
+            (sb_is_cmp_def(c) || bf_get(m, mask, c, &dummy)))
+            return bf_resolve(m, mask, c);
+    } else if (MLIR_GetOpType(op) == OP_TYPE_LLVM_ICMP &&
+               at_i(op, "predicate") == 1 /*ne*/ &&
+               MLIR_GetOpNumOperands(op) == 2) {
+        MLIR_ValueHandle a = MLIR_GetOpOperand(op, 0);
+        MLIR_ValueHandle b = MLIR_GetOpOperand(op, 1);
+        if (sb_is_const(b, 0) && (sb_is_cmp_def(a) || bf_get(m, mask, a, &dummy)))
+            return bf_resolve(m, mask, a);
+        if (sb_is_const(a, 0) && (sb_is_cmp_def(b) || bf_get(m, mask, b, &dummy)))
+            return bf_resolve(m, mask, b);
+    }
+    return MLIR_INVALID_HANDLE;
+}
+
+static void simplify_bools(MLIR_Context *ctx, MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    // Pass 1: upper-bound the candidate count (select/icmp-shaped ops) to size
+    // the forwarding map and erase list.
+    size_t ncand = 0;
+    for (size_t bi = 0; bi < nb; bi++) {
+        MLIR_BlockHandle blk = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(blk);
+        for (size_t oi = 0; oi < no; oi++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(blk, oi);
+            if (sb_op_name_is(op, "llvm.select") ||
+                (MLIR_GetOpType(op) == OP_TYPE_LLVM_ICMP && at_i(op, "predicate") == 1))
+                ncand++;
+        }
+    }
+    if (ncand == 0) return;
+
+    size_t cap = 16;
+    while (cap < ncand * 4) cap <<= 1;
+    size_t mask = cap - 1;
+    BoolFwd *map = (BoolFwd *)calloc(cap, sizeof(*map));
+    MLIR_OpHandle *erase = (MLIR_OpHandle *)malloc(ncand * sizeof(*erase));
+    if (!map || !erase) { free(map); free(erase); return; }
+    size_t nerase = 0;
+
+    // Pass 2: forward pass in program order (defs precede uses), recording
+    // result -> inner forwardings and the ops to drop.
+    for (size_t bi = 0; bi < nb; bi++) {
+        MLIR_BlockHandle blk = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(blk);
+        for (size_t oi = 0; oi < no; oi++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(blk, oi);
+            MLIR_ValueHandle inner = sb_fold_inner(map, mask, op);
+            if (inner != MLIR_INVALID_HANDLE) {
+                bf_put(map, mask, MLIR_GetOpResult(op, 0), inner);
+                erase[nerase++] = op;
+            }
+        }
+    }
+
+    // Pass 3: repoint every operand (regular + successor block-arg) that
+    // references a folded result onto the resolved inner value. Every operand
+    // pre-dates its op, so the inner value dominates each rewritten use.
+    for (size_t bi = 0; bi < nb; bi++) {
+        MLIR_BlockHandle blk = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(blk);
+        for (size_t oi = 0; oi < no; oi++) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(blk, oi);
+            size_t nf = sb_flat_count(op);
+            for (size_t i = 0; i < nf; i++) {
+                MLIR_ValueHandle cur = sb_flat_get(op, i);
+                MLIR_ValueHandle r = bf_resolve(map, mask, cur);
+                if (r != cur) MLIR_SetOpOperand(ctx, op, i, r);
+            }
+        }
+    }
+
+    // Pass 4: erase the now-dead folded ops. Their results have no remaining
+    // users; the feeding 0/1 constants emit no code (rematerialised at use, now
+    // unused) so they are left for the backend to drop.
+    for (size_t i = 0; i < nerase; i++) MLIR_EraseOp(ctx, erase[i]);
+
+    free(map); free(erase);
+}
+
 // Lift one wasmssa.func into an `llvm.func`. Returns MLIR_INVALID_HANDLE on
 // failure (the caller aborts the whole module).
 static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
@@ -1711,6 +1878,11 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     free(param_args);
     free(L.frames);
     if (!ok) return MLIR_INVALID_HANDLE;
+
+    // Boolean-normalization peephole: collapse select(1,0,bool) / icmp_ne(bool,0)
+    // chains the frontend emits around every comparison. Gated for A/B.
+    if (!getenv("TINYC_NO_SIMPLIFY_BOOLS"))
+        simplify_bools(ctx, dreg);
 
     MLIR_AttributeHandle attrs[1] = {
         attr_s(ctx, "sym_name", name.str, name.size)
