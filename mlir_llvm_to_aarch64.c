@@ -827,6 +827,19 @@ static void fin_val(LowerCtx *L, MLIR_ValueHandle v, uint8_t produced) {
 
 #define LFAIL(...) do { fprintf(stderr, __VA_ARGS__); L->ok = false; return; } while (0)
 
+// True if `v` is a rematerialized integer constant that fits an AArch64 12-bit
+// unsigned immediate (0..4095), so add/sub/cmp can fold it into their immediate
+// form instead of materialising it into a scratch register. Negative or large
+// constants fall back to the register form.
+static bool operand_const_u12(LowerCtx *L, MLIR_ValueHandle v, uint16_t *imm) {
+    int64_t cv; uint8_t c64;
+    if (!L->cm || !cm_get(L->cm, v, &cv, &c64)) return false;
+    uint64_t u = c64 ? (uint64_t)cv : (uint64_t)(uint32_t)cv;
+    if (u > 0xFFFu) return false;
+    *imm = (uint16_t)u;
+    return true;
+}
+
 static MLIR_BlockHandle new_block(LowerCtx *L) {
     MLIR_BlockHandle b = MLIR_CreateBlock(L->ctx);
     MLIR_AppendRegionBlock(L->ctx, L->out_region, b);
@@ -1081,6 +1094,51 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         emit_load_imm(ctx, blk, rd, bits, /*sf=*/true);
         fin_val(L, res, rd);
 
+    } else if (name_eq(on, "llvm.add")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        bool sf = type_is_gp64(ctx, res);
+        MLIR_ValueHandle a0 = MLIR_GetOpOperand(op, 0);
+        MLIR_ValueHandle a1 = MLIR_GetOpOperand(op, 1);
+        uint16_t imm;
+        if (operand_const_u12(L, a1, &imm) || operand_const_u12(L, a0, &imm)) {
+            // add is commutative: fold whichever operand is a small constant,
+            // keeping the other in a register.
+            MLIR_ValueHandle rv = operand_const_u12(L, a1, &imm) ? a0 : a1;
+            uint8_t r = use_val(L, rv, 9);
+            if (!L->ok) return;
+            uint8_t rd = def_val(L, res, 9);
+            emit_add_imm(ctx, blk, rd, r, imm, sf);
+            fin_val(L, res, rd);
+        } else {
+            uint8_t r0 = use_val(L, a0, 9);
+            uint8_t r1 = use_val(L, a1, 10);
+            if (!L->ok) return;
+            uint8_t rd = def_val(L, res, 9);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_ADD_REG, rd, r0, r1, sf);
+            fin_val(L, res, rd);
+        }
+
+    } else if (name_eq(on, "llvm.sub")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        bool sf = type_is_gp64(ctx, res);
+        MLIR_ValueHandle a0 = MLIR_GetOpOperand(op, 0);
+        MLIR_ValueHandle a1 = MLIR_GetOpOperand(op, 1);
+        uint16_t imm;
+        if (operand_const_u12(L, a1, &imm)) {   // sub is not commutative
+            uint8_t r0 = use_val(L, a0, 9);
+            if (!L->ok) return;
+            uint8_t rd = def_val(L, res, 9);
+            emit_sub_imm(ctx, blk, rd, r0, imm, sf);
+            fin_val(L, res, rd);
+        } else {
+            uint8_t r0 = use_val(L, a0, 9);
+            uint8_t r1 = use_val(L, a1, 10);
+            if (!L->ok) return;
+            uint8_t rd = def_val(L, res, 9);
+            emit_3reg(ctx, blk, OP_TYPE_AARCH64_SUB_REG, rd, r0, r1, sf);
+            fin_val(L, res, rd);
+        }
+
     } else if (simple_binop_optype(on, &bt)) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
         bool sf = type_is_gp64(ctx, res);
@@ -1115,10 +1173,16 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
                   (long long)MLIR_GetAttributeInteger(pa));
         bool sf = type_is_gp64(ctx, MLIR_GetOpOperand(op, 0));
         uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
-        uint8_t r1 = use_val(L, MLIR_GetOpOperand(op, 1), 10);
         if (!L->ok) return;
         uint8_t rd = def_val(L, res, 9);
-        emit_cmp_reg(ctx, blk, r0, r1, sf);
+        uint16_t imm;
+        if (operand_const_u12(L, MLIR_GetOpOperand(op, 1), &imm)) {
+            emit_cmp_imm(ctx, blk, r0, imm, sf);
+        } else {
+            uint8_t r1 = use_val(L, MLIR_GetOpOperand(op, 1), 10);
+            if (!L->ok) return;
+            emit_cmp_reg(ctx, blk, r0, r1, sf);
+        }
         emit_cset(ctx, blk, rd, (uint8_t)cond, false);
         fin_val(L, res, rd);
 
