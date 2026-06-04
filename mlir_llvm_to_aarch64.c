@@ -600,6 +600,91 @@ static bool store_value(MLIR_Context *ctx, MLIR_BlockHandle blk, SlotMap *sm,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Constant rematerialization (the wmir HOME_CONST analogue). An integer
+// `llvm.mlir.constant` never occupies a frame slot or register: instead a
+// `mov`-immediate is re-emitted at every use site. Identical constants cost no
+// spill/reload and add no register pressure. Float constants are excluded (they
+// keep a frame slot). A remat is byte-identical to the value the constant's own
+// lowering would have produced, so it is purely a code-placement change.
+// ---------------------------------------------------------------------------
+typedef struct { uintptr_t key; int64_t val; uint8_t is64; } ConstEnt;
+typedef struct { ConstEnt *t; size_t cap; size_t n; Arena *arena; } ConstMap;
+
+static void cm_grow(ConstMap *m) {
+    size_t ncap = m->cap ? m->cap * 2 : 64;
+    ConstEnt *nt = (ConstEnt *)arena_alloc(m->arena, ncap * sizeof(ConstEnt));
+    memset(nt, 0, ncap * sizeof(ConstEnt));
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->t[i].key == 0) continue;
+        size_t j = sm_hash(m->t[i].key) & (ncap - 1);
+        while (nt[j].key != 0) j = (j + 1) & (ncap - 1);
+        nt[j] = m->t[i];
+    }
+    m->t = nt;
+    m->cap = ncap;
+}
+static void cm_put(ConstMap *m, MLIR_ValueHandle k, int64_t val, uint8_t is64) {
+    if ((m->n + 1) * 4 >= m->cap * 3) cm_grow(m);
+    size_t mask = m->cap - 1;
+    size_t i = sm_hash((uintptr_t)k) & mask;
+    while (m->t[i].key != 0) {
+        if (m->t[i].key == (uintptr_t)k) return;
+        i = (i + 1) & mask;
+    }
+    m->t[i].key = (uintptr_t)k;
+    m->t[i].val = val;
+    m->t[i].is64 = is64;
+    m->n++;
+}
+static bool cm_get(ConstMap *m, MLIR_ValueHandle k, int64_t *val, uint8_t *is64) {
+    if (m->cap == 0) return false;
+    size_t mask = m->cap - 1;
+    size_t i = sm_hash((uintptr_t)k) & mask;
+    while (m->t[i].key != 0) {
+        if (m->t[i].key == (uintptr_t)k) {
+            *val = m->t[i].val; *is64 = m->t[i].is64; return true;
+        }
+        i = (i + 1) & mask;
+    }
+    return false;
+}
+
+// True if `op` is an integer llvm.mlir.constant eligible for remat. Mirrors the
+// integer branch of the llvm.mlir.constant lowering so the re-emitted immediate
+// is byte-identical to the value that branch would have produced.
+static bool const_int_val(MLIR_Context *ctx, MLIR_OpHandle op,
+                          int64_t *val, uint8_t *is64) {
+    if (!name_eq(MLIR_GetOpName(op), "llvm.mlir.constant")) return false;
+    if (MLIR_GetOpNumResults(op) != 1) return false;
+    MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+    if (fp_width(ctx, res) != 0) return false;
+    MLIR_AttributeHandle va = MLIR_GetOpAttributeByName(op, "value");
+    if (va == MLIR_INVALID_HANDLE) return false;
+    *val = MLIR_GetAttributeInteger(va);
+    *is64 = type_is_gp64(ctx, res) ? 1 : 0;
+    return true;
+}
+
+// Recursively record every remat-eligible integer constant in `cm`.
+static void build_const_map(MLIR_Context *ctx, ConstMap *cm,
+                            MLIR_BlockHandle block) {
+    size_t no = MLIR_GetBlockNumOps(block);
+    for (size_t i = 0; i < no; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(block, i);
+        int64_t v; uint8_t is64;
+        if (const_int_val(ctx, op, &v, &is64))
+            cm_put(cm, MLIR_GetOpResult(op, 0), v, is64);
+        size_t ng = MLIR_GetOpNumRegions(op);
+        for (size_t g = 0; g < ng; g++) {
+            MLIR_RegionHandle rg = MLIR_GetOpRegion(op, g);
+            size_t nbk = MLIR_GetRegionNumBlocks(rg);
+            for (size_t b = 0; b < nbk; b++)
+                build_const_map(ctx, cm, MLIR_GetRegionBlock(rg, b));
+        }
+    }
+}
+
 // Integer binops whose AArch64 form is a plain 3-register op.
 static bool simple_binop_optype(string on, MLIR_OpType *out) {
     if (name_eq(on, "llvm.add"))  { *out = OP_TYPE_AARCH64_ADD_REG; return true; }
@@ -664,6 +749,7 @@ typedef struct {
     GlobalMap        *gm;          // global symbol name -> byte offset in __data
     size_t            n_fixed;     // number of fixed (named) params of this func
     SlotMap          *rm;          // value -> home physical reg (x19..x28); NULL = none
+    ConstMap         *cm;          // value -> remat integer constant; NULL = none
     bool              ok;
 } LowerCtx;
 
@@ -678,9 +764,31 @@ static void emit_mov_reg(MLIR_Context *ctx, MLIR_BlockHandle blk,
 // home register, it is returned with no code emitted; otherwise `v` is loaded
 // from its frame slot into `scratch`. With L->rm == NULL this is exactly the
 // old `load_value(v, scratch)` path (byte-identical).
+// Bool-returning remat-aware load of `v` into `dst` (home-reg mov, constant
+// immediate, or frame-slot ldr). Returns false only when `v` has no home, no
+// remat constant, and no frame slot (a genuine internal error). Used at sites
+// that keep their own diagnostic.
+static bool mat_into(LowerCtx *L, MLIR_ValueHandle v, uint8_t dst) {
+    int32_t reg;
+    if (L->rm && sm_get(L->rm, v, &reg)) {
+        emit_mov_reg(L->ctx, L->cur, dst, (uint8_t)reg);
+        return true;
+    }
+    int64_t cv; uint8_t c64;
+    if (L->cm && cm_get(L->cm, v, &cv, &c64)) {
+        emit_load_imm(L->ctx, L->cur, dst, (uint64_t)cv, c64 != 0);
+        return true;
+    }
+    return load_value(L->ctx, L->cur, L->sm, v, dst);
+}
 static uint8_t use_val(LowerCtx *L, MLIR_ValueHandle v, uint8_t scratch) {
     int32_t reg;
     if (L->rm && sm_get(L->rm, v, &reg)) return (uint8_t)reg;
+    int64_t cv; uint8_t c64;
+    if (L->cm && cm_get(L->cm, v, &cv, &c64)) {
+        emit_load_imm(L->ctx, L->cur, scratch, (uint64_t)cv, c64 != 0);
+        return scratch;
+    }
     if (!load_value(L->ctx, L->cur, L->sm, v, scratch)) {
         fprintf(stderr, "llvm->aarch64: undefined operand in '%.*s'\n",
                 (int)L->sym.size, L->sym.str);
@@ -688,16 +796,10 @@ static uint8_t use_val(LowerCtx *L, MLIR_ValueHandle v, uint8_t scratch) {
     }
     return scratch;
 }
-// Ensure value `v` is materialised in register `dst` (mov from its home reg, or
-// ldr from its frame slot). With L->rm == NULL this is exactly the old
-// `load_value(v, dst)` path (byte-identical).
+// Ensure value `v` is materialised in register `dst` (mov from its home reg,
+// constant immediate, or ldr from its frame slot).
 static void load_into(LowerCtx *L, MLIR_ValueHandle v, uint8_t dst) {
-    int32_t reg;
-    if (L->rm && sm_get(L->rm, v, &reg)) {
-        emit_mov_reg(L->ctx, L->cur, dst, (uint8_t)reg);
-        return;
-    }
-    if (!load_value(L->ctx, L->cur, L->sm, v, dst)) {
+    if (!mat_into(L, v, dst)) {
         fprintf(stderr, "llvm->aarch64: undefined operand in '%.*s'\n",
                 (int)L->sym.size, L->sym.str);
         L->ok = false;
@@ -733,6 +835,14 @@ static MLIR_BlockHandle new_block(LowerCtx *L) {
 
 // Slot-to-slot copy (block-arg / phi resolution and yield forwarding).
 static void copy_slot(LowerCtx *L, MLIR_ValueHandle src, MLIR_ValueHandle dst) {
+    int64_t cv; uint8_t c64;
+    if (L->cm && cm_get(L->cm, src, &cv, &c64)) {
+        emit_load_imm(L->ctx, L->cur, 9, (uint64_t)cv, c64 != 0);
+        if (!store_value(L->ctx, L->cur, L->sm, dst, 9))
+            LFAIL("llvm->aarch64: undefined value in copy (%.*s)\n",
+                  (int)L->sym.size, L->sym.str);
+        return;
+    }
     if (!load_value(L->ctx, L->cur, L->sm, src, 9) ||
         !store_value(L->ctx, L->cur, L->sm, dst, 9))
         LFAIL("llvm->aarch64: undefined value in copy (%.*s)\n",
@@ -818,7 +928,7 @@ static size_t parse_i32_array(string cs, int32_t *out, size_t cap) {
 static void lower_scf_if(LowerCtx *L, MLIR_OpHandle op) {
     bool he = MLIR_GetOpNumRegions(op) >= 2 &&
               MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 1)) > 0;
-    if (!load_value(L->ctx, L->cur, L->sm, MLIR_GetOpOperand(op, 0), 9))
+    if (!mat_into(L, MLIR_GetOpOperand(op, 0), 9))
         LFAIL("llvm->aarch64: undefined scf.if condition\n");
 
     MLIR_BlockHandle then_blk = new_block(L);
@@ -863,7 +973,7 @@ static void lower_scf_while(LowerCtx *L, MLIR_OpHandle op) {
     MLIR_OpHandle cterm = lower_block_ops(L, before_src);   // scf.condition
     if (!L->ok) return;
     size_t nf = MLIR_GetOpNumOperands(cterm) - 1;           // forwarded values
-    if (!load_value(L->ctx, L->cur, L->sm, MLIR_GetOpOperand(cterm, 0), 9))
+    if (!mat_into(L, MLIR_GetOpOperand(cterm, 0), 9))
         LFAIL("llvm->aarch64: undefined scf.condition value\n");
 
     MLIR_BlockHandle exit_store = new_block(L);
@@ -909,7 +1019,7 @@ static void lower_scf_index_switch(LowerCtx *L, MLIR_OpHandle op) {
             !parse_cases(MLIR_GetAttributeAsString(L->ctx, ca), case_vals, n_cases))
             LFAIL("llvm->aarch64: cannot parse scf.index_switch cases\n");
     }
-    if (!load_value(L->ctx, L->cur, L->sm, MLIR_GetOpOperand(op, 0), 9))
+    if (!mat_into(L, MLIR_GetOpOperand(op, 0), 9))
         LFAIL("llvm->aarch64: undefined scf.index_switch selector\n");
 
     MLIR_BlockHandle end_blk = new_block(L);
@@ -957,20 +1067,18 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         if (va == MLIR_INVALID_HANDLE || MLIR_GetOpNumResults(op) != 1)
             LFAIL("llvm->aarch64: malformed llvm.mlir.constant\n");
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
-        uint8_t rd = def_val(L, res, 9);
         int fw = fp_width(ctx, res);
-        if (fw) {
-            // Float constant: materialise the IEEE bit pattern into a GP slot.
-            double d = MLIR_GetAttributeFloat(va);
-            uint64_t bits = 0;
-            if (fw == 32) { float f = (float)d; uint32_t b32;
-                            memcpy(&b32, &f, 4); bits = b32; }
-            else          { memcpy(&bits, &d, 8); }
-            emit_load_imm(ctx, blk, rd, bits, /*sf=*/true);
-        } else {
-            emit_load_imm(ctx, blk, rd, (uint64_t)MLIR_GetAttributeInteger(va),
-                          type_is_gp64(ctx, res));
-        }
+        // Integer constants are rematerialized at each use (no slot/reg/def);
+        // see ConstMap. Only float constants still need a def here.
+        if (!fw) return;
+        uint8_t rd = def_val(L, res, 9);
+        // Float constant: materialise the IEEE bit pattern into a GP slot.
+        double d = MLIR_GetAttributeFloat(va);
+        uint64_t bits = 0;
+        if (fw == 32) { float f = (float)d; uint32_t b32;
+                        memcpy(&b32, &f, 4); bits = b32; }
+        else          { memcpy(&bits, &d, 8); }
+        emit_load_imm(ctx, blk, rd, bits, /*sf=*/true);
         fin_val(L, res, rd);
 
     } else if (simple_binop_optype(on, &bt)) {
@@ -1045,7 +1153,7 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         // any stack adjustment, since the slot is sp-relative.
         size_t arg_base = is_indirect ? 1 : 0;
         if (is_indirect) {
-            if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, 0), 16))
+            if (!mat_into(L, MLIR_GetOpOperand(op, 0), 16))
                 LFAIL("llvm->aarch64: undefined indirect callee in '%.*s'\n",
                       (int)L->sym.size, L->sym.str);
         }
@@ -1065,7 +1173,7 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         if (n_reg > no)    n_reg = no;
         if (no == n_reg) {
             for (size_t k = 0; k < no; k++)
-                if (!load_value(ctx, blk, sm, MLIR_GetOpOperand(op, arg_base + k), (uint8_t)k))
+                if (!mat_into(L, MLIR_GetOpOperand(op, arg_base + k), (uint8_t)k))
                     LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
                           (int)L->sym.size, L->sym.str);
             if (is_indirect) emit_blr(ctx, blk, 16);
@@ -1074,24 +1182,36 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             // AAPCS64: first n_reg args in x0..x{n_reg-1}, the rest on the stack
             // at the call sp. Reserve a 16-aligned arg area below sp; address
             // slots via a stable copy of the original sp in x12 (the sub shifts
-            // sp-relative slot offsets).
+            // sp-relative slot offsets). Remat constants are sp-independent.
             size_t n_stack = no - n_reg;
             uint32_t area = (uint32_t)((n_stack * 8u + 15u) & ~15u);
             emit_sub_imm(ctx, blk, 31, 31, (uint16_t)area, true);
             emit_add_imm(ctx, blk, 12, 31, (uint16_t)area, true); // x12 = orig sp
             for (size_t k = 0; k < n_reg; k++) {
+                MLIR_ValueHandle a = MLIR_GetOpOperand(op, arg_base + k);
+                int64_t cv; uint8_t c64;
+                if (L->cm && cm_get(L->cm, a, &cv, &c64)) {
+                    emit_load_imm(ctx, blk, (uint8_t)k, (uint64_t)cv, c64 != 0);
+                    continue;
+                }
                 int32_t slot;
-                if (!sm_get(sm, MLIR_GetOpOperand(op, arg_base + k), &slot))
+                if (!sm_get(sm, a, &slot))
                     LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
                           (int)L->sym.size, L->sym.str);
                 emit_ldr_x_off(ctx, blk, (uint8_t)k, 12, (uint32_t)slot * 8u);
             }
             for (size_t k = n_reg; k < no; k++) {
-                int32_t slot;
-                if (!sm_get(sm, MLIR_GetOpOperand(op, arg_base + k), &slot))
-                    LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
-                          (int)L->sym.size, L->sym.str);
-                emit_ldr_x_off(ctx, blk, 9, 12, (uint32_t)slot * 8u);
+                MLIR_ValueHandle a = MLIR_GetOpOperand(op, arg_base + k);
+                int64_t cv; uint8_t c64;
+                if (L->cm && cm_get(L->cm, a, &cv, &c64)) {
+                    emit_load_imm(ctx, blk, 9, (uint64_t)cv, c64 != 0);
+                } else {
+                    int32_t slot;
+                    if (!sm_get(sm, a, &slot))
+                        LFAIL("llvm->aarch64: undefined call arg in '%.*s'\n",
+                              (int)L->sym.size, L->sym.str);
+                    emit_ldr_x_off(ctx, blk, 9, 12, (uint32_t)slot * 8u);
+                }
                 emit_str_x_off(ctx, blk, 9, 31, (uint32_t)(k - n_reg) * 8u);
             }
             if (is_indirect) emit_blr(ctx, blk, 16);
@@ -1428,14 +1548,17 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
 
 // Recursively assign an 8-byte frame slot to every block arg and op result
 // reachable in `block` (including nested scf regions).
-static void assign_slots_block(SlotMap *sm, MLIR_BlockHandle block,
-                               int32_t *nslots) {
+static void assign_slots_block(MLIR_Context *ctx, SlotMap *sm,
+                               MLIR_BlockHandle block, int32_t *nslots) {
     size_t na = MLIR_GetBlockNumArgs(block);
     for (size_t i = 0; i < na; i++)
         sm_put(sm, MLIR_GetBlockArg(block, i), (*nslots)++);
     size_t no = MLIR_GetBlockNumOps(block);
     for (size_t i = 0; i < no; i++) {
         MLIR_OpHandle op = MLIR_GetBlockOp(block, i);
+        int64_t cv; uint8_t c64;
+        // Integer constants are rematerialized at each use (no frame slot).
+        if (const_int_val(ctx, op, &cv, &c64)) continue;
         size_t nr = MLIR_GetOpNumResults(op);
         for (size_t r = 0; r < nr; r++)
             sm_put(sm, MLIR_GetOpResult(op, r), (*nslots)++);
@@ -1444,7 +1567,7 @@ static void assign_slots_block(SlotMap *sm, MLIR_BlockHandle block,
             MLIR_RegionHandle rg = MLIR_GetOpRegion(op, g);
             size_t nbk = MLIR_GetRegionNumBlocks(rg);
             for (size_t b = 0; b < nbk; b++)
-                assign_slots_block(sm, MLIR_GetRegionBlock(rg, b), nslots);
+                assign_slots_block(ctx, sm, MLIR_GetRegionBlock(rg, b), nslots);
         }
     }
 }
@@ -1718,6 +1841,8 @@ static uint32_t alloc_regs_cfg(MLIR_Context *ctx, MLIR_RegionHandle reg,
         size_t no = MLIR_GetBlockNumOps(bk);
         for (size_t i = 0; i < no; i++) {
             MLIR_OpHandle op = MLIR_GetBlockOp(bk, i);
+            int64_t cv; uint8_t c64;
+            if (const_int_val(ctx, op, &cv, &c64)) continue; // remat'd, no home
             size_t nr = MLIR_GetOpNumResults(op);
             for (size_t r = 0; r < nr; r++) {
                 vals[nv] = MLIR_GetOpResult(op, r);
@@ -1812,7 +1937,7 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
     sm.arena = MLIR_GetArenaAllocator(ctx);
     int32_t nslots = 0;
     for (size_t b = 0; b < n_blocks; b++)
-        assign_slots_block(&sm, MLIR_GetRegionBlock(src_region, b), &nslots);
+        assign_slots_block(ctx, &sm, MLIR_GetRegionBlock(src_region, b), &nslots);
     if (nslots > (1 << 20))
         A64_FAIL("llvm->aarch64: function '%.*s' needs %d slots "
                  "(frame too large for the trivial allocator)\n",
@@ -1865,8 +1990,13 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
         store_value(ctx, out_blks[0], &sm, MLIR_GetBlockArg(entry_src, i), 9);
     }
 
+    ConstMap cm = {0};
+    cm.arena = MLIR_GetArenaAllocator(ctx);
+    for (size_t b = 0; b < n_blocks; b++)
+        build_const_map(ctx, &cm, MLIR_GetRegionBlock(src_region, b));
+
     LowerCtx L = { ctx, &sm, out_reg, out_blks[0], sym, frame_size,
-                   &am, slot_bytes, gm, nargs, &rm, true };
+                   &am, slot_bytes, gm, nargs, &rm, &cm, true };
 
     for (size_t b = 0; b < n_blocks; b++) {
         L.cur = out_blks[b];
@@ -1887,7 +2017,7 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
         if (name_eq(tn, "llvm.return")) {
             size_t nr = MLIR_GetOpNumOperands(term);
             if (nr == 1) {
-                if (!load_value(ctx, L.cur, &sm, MLIR_GetOpOperand(term, 0), 0)) {
+                if (!mat_into(&L, MLIR_GetOpOperand(term, 0), 0)) {
                     fprintf(stderr, "llvm->aarch64: undefined return value "
                             "in '%.*s'\n", (int)sym.size, sym.str);
                     free(src_blks); free(out_blks);
@@ -1914,7 +2044,7 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                 free(src_blks); free(out_blks);
                 return MLIR_INVALID_HANDLE;
             }
-            if (!load_value(ctx, L.cur, &sm, MLIR_GetOpOperand(term, 0), 9)) {
+            if (!mat_into(&L, MLIR_GetOpOperand(term, 0), 9)) {
                 fprintf(stderr, "llvm->aarch64: undefined cond_br condition "
                         "in '%.*s'\n", (int)sym.size, sym.str);
                 free(src_blks); free(out_blks);
@@ -2005,7 +2135,7 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     SlotMap sm = {0};
     sm.arena = MLIR_GetArenaAllocator(ctx);
     int32_t nslots = 0;
-    assign_slots_block(&sm, src_blk, &nslots);
+    assign_slots_block(ctx, &sm, src_blk, &nslots);
     if (nslots > (1 << 20)) {
         A64_FAIL("llvm->aarch64: function '%.*s' needs %d slots "
                  "(frame too large for the trivial allocator)\n",
@@ -2035,8 +2165,12 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
         store_value(ctx, out_blk, &sm, MLIR_GetBlockArg(src_blk, i), 9);
     }
 
+    ConstMap cm = {0};
+    cm.arena = MLIR_GetArenaAllocator(ctx);
+    build_const_map(ctx, &cm, src_blk);
+
     LowerCtx L = { ctx, &sm, out_reg, out_blk, sym, frame_size,
-                   &am, slot_bytes, gm, nargs, NULL, true };
+                   &am, slot_bytes, gm, nargs, NULL, &cm, true };
     MLIR_OpHandle term = lower_block_ops(&L, src_blk);
     if (!L.ok) return MLIR_INVALID_HANDLE;
 
@@ -2046,7 +2180,7 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
                  (int)sym.size, sym.str);
     size_t no = MLIR_GetOpNumOperands(term);
     if (no == 1) {
-        if (!load_value(ctx, L.cur, &sm, MLIR_GetOpOperand(term, 0), 0))
+        if (!mat_into(&L, MLIR_GetOpOperand(term, 0), 0))
             A64_FAIL("llvm->aarch64: undefined return value in '%.*s'\n",
                      (int)sym.size, sym.str);
     } else if (no > 1) {
