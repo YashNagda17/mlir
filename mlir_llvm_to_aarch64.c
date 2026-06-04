@@ -868,13 +868,112 @@ static void copy_slot(LowerCtx *L, MLIR_ValueHandle src, MLIR_ValueHandle dst) {
 // block args) owns a stable frame slot, and a destination block-arg slot is
 // always disjoint from any source-value slot, so these sequential memory
 // copies need no parallel-copy / swap handling.
+//
+// With block-argument register homing (alloc_regs_cfg), some destination block
+// args live in a reserved callee-saved register and some sources may live in a
+// register too, so the edge becomes a genuine parallel copy over abstract
+// locations (homed reg / remat constant / frame slot). Register destinations
+// can form cycles (a homed arg whose source is another homed arg); these are
+// broken with scratch x9. Frame-slot destinations are never the source of
+// another copy (block-arg slots are disjoint from every source value's slot),
+// so only register destinations ever participate in a cycle.
+typedef enum { LK_REG, LK_SLOT, LK_CONST, LK_NONE } LocKind;
+typedef struct { LocKind k; uint8_t reg; int32_t slot; int64_t cval; uint8_t c64; } Loc;
+
+static Loc edge_src_loc(LowerCtx *L, MLIR_ValueHandle v) {
+    Loc loc; int32_t r; int64_t cv; uint8_t c64; int32_t slot;
+    if (L->rm && sm_get(L->rm, v, &r)) { loc.k = LK_REG; loc.reg = (uint8_t)r; return loc; }
+    if (L->cm && cm_get(L->cm, v, &cv, &c64)) {
+        loc.k = LK_CONST; loc.cval = cv; loc.c64 = c64; return loc;
+    }
+    if (sm_get(L->sm, v, &slot)) { loc.k = LK_SLOT; loc.slot = slot; return loc; }
+    loc.k = LK_NONE; return loc;
+}
+static Loc edge_dst_loc(LowerCtx *L, MLIR_ValueHandle v) {
+    Loc loc; int32_t r, slot;
+    if (L->rm && sm_get(L->rm, v, &r)) { loc.k = LK_REG; loc.reg = (uint8_t)r; return loc; }
+    if (sm_get(L->sm, v, &slot)) { loc.k = LK_SLOT; loc.slot = slot; return loc; }
+    loc.k = LK_NONE; return loc;
+}
+static bool loc_eq(Loc a, Loc b) {
+    if (a.k != b.k) return false;
+    if (a.k == LK_REG) return a.reg == b.reg;
+    if (a.k == LK_SLOT) return a.slot == b.slot;
+    return false;                                 // constants are leaf sources
+}
+// Materialise source `s` into destination `d` (no aliasing assumptions).
+static void emit_loc_move(LowerCtx *L, Loc s, Loc d) {
+    if (loc_eq(s, d)) return;
+    if (d.k == LK_REG) {
+        if (s.k == LK_REG) emit_mov_reg(L->ctx, L->cur, d.reg, s.reg);
+        else if (s.k == LK_CONST) emit_load_imm(L->ctx, L->cur, d.reg, (uint64_t)s.cval, s.c64 != 0);
+        else emit_ldr_x_off(L->ctx, L->cur, d.reg, 31, (uint32_t)s.slot * 8u);
+    } else {                                       // d.k == LK_SLOT
+        uint8_t r;
+        if (s.k == LK_REG) r = s.reg;
+        else if (s.k == LK_CONST) { emit_load_imm(L->ctx, L->cur, 9, (uint64_t)s.cval, s.c64 != 0); r = 9; }
+        else { emit_ldr_x_off(L->ctx, L->cur, 9, 31, (uint32_t)s.slot * 8u); r = 9; }
+        emit_str_x_off(L->ctx, L->cur, r, 31, (uint32_t)d.slot * 8u);
+    }
+}
 static void emit_edge_copies(LowerCtx *L, MLIR_OpHandle term, size_t s) {
     MLIR_BlockHandle dst = MLIR_GetOpSuccessor(term, s);
     size_t n = MLIR_GetOpNumSuccessorOperands(term, s);
+    if (n == 0) return;
+    // Fast path: no homing in this function -> all dsts are slots, no cycles,
+    // byte-identical to the original sequential copy_slot loop.
+    if (L->rm == NULL) {
+        for (size_t k = 0; k < n; k++) {
+            copy_slot(L, MLIR_GetOpSuccessorOperand(term, s, k),
+                      MLIR_GetBlockArg(dst, k));
+            if (!L->ok) return;
+        }
+        return;
+    }
+    Arena *ar = MLIR_GetArenaAllocator(L->ctx);
+    Loc *src = (Loc *)arena_alloc(ar, n * sizeof(Loc));
+    Loc *ds  = (Loc *)arena_alloc(ar, n * sizeof(Loc));
+    uint8_t *done = (uint8_t *)arena_alloc(ar, n * sizeof(uint8_t));
+    size_t remaining = 0;
     for (size_t k = 0; k < n; k++) {
-        copy_slot(L, MLIR_GetOpSuccessorOperand(term, s, k),
-                  MLIR_GetBlockArg(dst, k));
-        if (!L->ok) return;
+        src[k] = edge_src_loc(L, MLIR_GetOpSuccessorOperand(term, s, k));
+        ds[k]  = edge_dst_loc(L, MLIR_GetBlockArg(dst, k));
+        if (src[k].k == LK_NONE || ds[k].k == LK_NONE)
+            LFAIL("llvm->aarch64: undefined value in edge copy (%.*s)\n",
+                  (int)L->sym.size, L->sym.str);
+        done[k] = loc_eq(src[k], ds[k]) ? 1 : 0;   // identity copies are no-ops
+        if (!done[k]) remaining++;
+    }
+    while (remaining) {
+        int progress = 0;
+        for (size_t k = 0; k < n; k++) {
+            if (done[k]) continue;
+            int blocked = 0;                       // dst still read by a pending src?
+            for (size_t j = 0; j < n; j++)
+                if (!done[j] && j != k && loc_eq(src[j], ds[k])) { blocked = 1; break; }
+            if (blocked) continue;
+            emit_loc_move(L, src[k], ds[k]);
+            done[k] = 1; remaining--; progress = 1;
+        }
+        if (progress) continue;
+        // No progress => a cycle remains. Break one edge by saving its
+        // destination into x10 (NOT x9 — emit_loc_move uses x9 as slot/const
+        // scratch, so a slot move draining after the break would clobber a
+        // saved cycle value). Destinations may be registers (homed block args)
+        // OR frame slots (self-loop block-arg permutations), so load whichever
+        // into x10 and redirect every pending reader of that destination to
+        // x10. The broken cycle fully drains before any further break, so a
+        // single x10 suffices even with multiple independent cycles.
+        for (size_t k = 0; k < n; k++) {
+            if (done[k]) continue;
+            if (ds[k].k == LK_REG) emit_mov_reg(L->ctx, L->cur, 10, ds[k].reg);
+            else emit_ldr_x_off(L->ctx, L->cur, 10, 31, (uint32_t)ds[k].slot * 8u);
+            for (size_t j = 0; j < n; j++)
+                if (!done[j] && loc_eq(src[j], ds[k])) {
+                    src[j].k = LK_REG; src[j].reg = 10;
+                }
+            break;                                 // re-drain before next break
+        }
     }
 }
 
@@ -1253,7 +1352,11 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             emit_add_imm(ctx, blk, 12, 31, (uint16_t)area, true); // x12 = orig sp
             for (size_t k = 0; k < n_reg; k++) {
                 MLIR_ValueHandle a = MLIR_GetOpOperand(op, arg_base + k);
-                int64_t cv; uint8_t c64;
+                int64_t cv; uint8_t c64; int32_t hr;
+                if (L->rm && sm_get(L->rm, a, &hr)) {
+                    emit_mov_reg(ctx, blk, (uint8_t)k, (uint8_t)hr);
+                    continue;
+                }
                 if (L->cm && cm_get(L->cm, a, &cv, &c64)) {
                     emit_load_imm(ctx, blk, (uint8_t)k, (uint64_t)cv, c64 != 0);
                     continue;
@@ -1266,7 +1369,12 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             }
             for (size_t k = n_reg; k < no; k++) {
                 MLIR_ValueHandle a = MLIR_GetOpOperand(op, arg_base + k);
-                int64_t cv; uint8_t c64;
+                int64_t cv; uint8_t c64; int32_t hr;
+                if (L->rm && sm_get(L->rm, a, &hr)) {
+                    emit_str_x_off(ctx, blk, (uint8_t)hr, 31,
+                                   (uint32_t)(k - n_reg) * 8u);
+                    continue;
+                }
                 if (L->cm && cm_get(L->cm, a, &cv, &c64)) {
                     emit_load_imm(ctx, blk, 9, (uint64_t)cv, c64 != 0);
                 } else {
@@ -1856,6 +1964,10 @@ static MLIR_BlockHandle map_block(MLIR_BlockHandle *src, MLIR_BlockHandle *dst,
 // front end does not lower).
 #define A64_NPOOL  14
 #define A64_NCALLER 4
+// Number of block-arg home registers reserved from the top of the callee-saved
+// range (pool 13 -> x28, pool 12 -> x27). Kept at 2 so the only possible edge
+// parallel-copy cycle is a 2-cycle (one scratch-x9 break suffices).
+#define A64_NHOME  2
 static inline uint8_t a64_pool_reg(int pk) {
     return (uint8_t)(pk < A64_NCALLER ? 12 + pk
                                       : A64_SAVE_BASE + (pk - A64_NCALLER));
@@ -2004,8 +2116,78 @@ static uint32_t alloc_regs_cfg(MLIR_Context *ctx, MLIR_RegionHandle reg,
     // kept in pool-index space (0..A64_NPOOL-1), mapped to physical regs via
     // A64_POOL; allocation is deterministic for the bit-identical self-host.
     uint32_t used_mask = 0;
+
+    // ---- Block-argument register homing ----
+    // Keep loop-carried SSA values (mem2reg promotes them to block args) in
+    // registers across blocks. Collect non-entry block args, score them by use
+    // frequency, and give the top A64_NHOME a UNIQUE reserved callee-saved
+    // register (x28 downward). Because each homed arg gets a distinct register,
+    // no two homed args ever share a register and correctness needs no global
+    // liveness analysis (so none of the prior global-allocator O(blocks*values)
+    // bitset blowup). Reserved regs are excluded from the block-local pool
+    // below and saved/restored via used_mask; operand reads/writes already
+    // route through `rm` (use_val/def_val/fin_val), and edges into homed args
+    // are resolved by the allocation-aware parallel mover in emit_edge_copies.
+    // Selection is deterministic (score desc, then block/arg order) for the
+    // bit-identical self-host gate.
+    uint32_t reserved_mask = 0;
+    if (!getenv("TINYC_NO_HOMING")) {
+        size_t nba = 0;
+        for (size_t b = 1; b < n_blocks; b++)
+            nba += MLIR_GetBlockNumArgs(MLIR_GetRegionBlock(reg, b));
+        if (nba) {
+            MLIR_ValueHandle *bv =
+                (MLIR_ValueHandle *)arena_alloc(ar, nba * sizeof(MLIR_ValueHandle));
+            int32_t *bscore = (int32_t *)arena_alloc(ar, nba * sizeof(int32_t));
+            SlotMap bidx = {0}; bidx.arena = ar;
+            size_t m = 0;
+            for (size_t b = 1; b < n_blocks; b++) {
+                MLIR_BlockHandle bk = MLIR_GetRegionBlock(reg, b);
+                size_t na = MLIR_GetBlockNumArgs(bk);
+                for (size_t a = 0; a < na; a++) {
+                    bv[m] = MLIR_GetBlockArg(bk, a); bscore[m] = 0;
+                    sm_put(&bidx, bv[m], (int32_t)m); m++;
+                }
+            }
+            for (size_t b = 0; b < n_blocks; b++) {
+                MLIR_BlockHandle bk = MLIR_GetRegionBlock(reg, b);
+                size_t no = MLIR_GetBlockNumOps(bk);
+                for (size_t i = 0; i < no; i++) {
+                    MLIR_OpHandle op = MLIR_GetBlockOp(bk, i);
+                    size_t nop = MLIR_GetOpNumOperands(op);
+                    for (size_t k = 0; k < nop; k++) {
+                        int32_t bi;
+                        if (sm_get(&bidx, MLIR_GetOpOperand(op, k), &bi)) bscore[bi]++;
+                    }
+                    size_t nsucc = MLIR_GetOpNumSuccessors(op);
+                    for (size_t sx = 0; sx < nsucc; sx++) {
+                        size_t nso = MLIR_GetOpNumSuccessorOperands(op, sx);
+                        for (size_t k = 0; k < nso; k++) {
+                            int32_t bi;
+                            if (sm_get(&bidx, MLIR_GetOpSuccessorOperand(op, sx, k), &bi))
+                                bscore[bi]++;
+                        }
+                    }
+                }
+            }
+            for (int h = 0; h < A64_NHOME; h++) {
+                int best = -1;
+                for (size_t j = 0; j < nba; j++) {
+                    if (bscore[j] <= 0) continue;
+                    if (best < 0 || bscore[j] > bscore[best]) best = (int)j;
+                }
+                if (best < 0) break;
+                int pk = A64_NPOOL - 1 - h;          // 13 -> x28, 12 -> x27
+                sm_put(rm, bv[best], a64_pool_reg(pk));
+                reserved_mask |= (1u << pk);
+                used_mask |= (1u << (pk - A64_NCALLER));
+                bscore[best] = -1;                   // consumed
+            }
+        }
+    }
+
     for (size_t b = 0; b < n_blocks; b++) {
-        uint32_t freemask = (1u << A64_NPOOL) - 1u;
+        uint32_t freemask = ((1u << A64_NPOOL) - 1u) & ~reserved_mask;
         int32_t act_end[A64_NPOOL]; uint8_t act_pi[A64_NPOOL]; size_t nact = 0;
         for (size_t vi = 0; vi < nv; vi++) {
             if (def_block[vi] != (int32_t)b) continue;
@@ -2233,8 +2415,9 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
     SlotMap rm = {0};
     rm.arena = MLIR_GetArenaAllocator(ctx);
     uint32_t saved_mask = 0;
-    if (!getenv("TINYC_NO_REGALLOC"))
+    if (!getenv("TINYC_NO_REGALLOC")) {
         saved_mask = alloc_regs_cfg(ctx, src_region, n_blocks, &rm);
+    }
     uint32_t num_saved = 0;
     for (uint32_t mtmp = saved_mask; mtmp; mtmp &= mtmp - 1) num_saved++;
     uint32_t save_base = (base_bytes + 7u) & ~7u;
