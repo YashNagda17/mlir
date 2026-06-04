@@ -30,6 +30,8 @@ typedef uintptr_t MLIR_LocationHandle;
 
 typedef struct MLIR_Context {
     Arena *arena;
+    /* ASR dialect side tables (op refs, sequences). Set by ASR_ModuleStorageInit. */
+    void *asr_module_storage;
     // When true, MLIR_CreateOp* skips building the per-operand def-use
     // chains (UseNode allocations + the parallel operand_uses /
     // successor_operand_uses arrays). The def-use machinery is only needed
