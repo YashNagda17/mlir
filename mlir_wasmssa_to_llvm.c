@@ -297,6 +297,15 @@ typedef struct {
     MLIR_ValueHandle *local_ptr; // alloca ptr per local index (params + decls)
     uint8_t          *local_vt;  // valtype per local index
     size_t            n_locals;  // params + declared locals
+    // Within-block store-to-load forwarding ("local mem2reg-lite"). Wasm locals
+    // are never address-taken, so within a single (flat, straight-line) block
+    // the alloca for local `idx` holds exactly the value of the most recent
+    // local.set; a subsequent local.get can reuse that SSA value with no load.
+    // The whole map is invalidated lazily whenever the insertion block changes
+    // (the lifter emits into each block once, contiguously, never revisiting).
+    MLIR_ValueHandle *local_cur;     // last value stored to local idx this block
+    bool             *local_cur_set; // whether local_cur[idx] is valid
+    MLIR_BlockHandle  local_cur_blk; // block local_cur is valid for
     Frame            *frames;
     size_t            n_frames, frames_cap;
     OffsetMap        *globals;   // import_global name -> linmem offset
@@ -338,6 +347,16 @@ static MLIR_OpHandle build_op_named(MLIR_Context *ctx, const char *nm,
 // Append `op` to the current block.
 static void emit(FLower *L, MLIR_OpHandle op) {
     MLIR_AppendBlockOp(L->ctx, L->cur, op);
+}
+
+// Lazily invalidate the local store-to-load forwarding map when the insertion
+// block has changed since it was last populated. Must be called at the top of
+// every local.get / local.set handler before consulting/updating local_cur.
+static void local_fwd_sync(FLower *L) {
+    if (L->cur != L->local_cur_blk) {
+        for (size_t i = 0; i < L->n_locals; i++) L->local_cur_set[i] = false;
+        L->local_cur_blk = L->cur;
+    }
 }
 
 // Forward declarations (defined later) used by linmem_ptr / memory.grow.
@@ -722,6 +741,12 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
                     (long long)idx);
             return false;
         }
+        local_fwd_sync(L);
+        if (L->local_cur_set[idx]) {
+            // Reuse the value last stored to this local in the current block.
+            vmap_set(L->vmap, MLIR_GetOpResult(op, 0), L->local_cur[idx]);
+            return true;
+        }
         uint8_t vt = L->local_vt[idx];
         MLIR_TypeHandle ety = vt_to_llvm(ctx, vt);
         MLIR_TypeHandle rt[1] = { ety };
@@ -731,6 +756,10 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
             NULL, 0, rt, 1, r, ops, 1);
         emit(L, out);
         vmap_set(L->vmap, MLIR_GetOpResult(op, 0), r[0]);
+        // The alloca now demonstrably holds r[0]; cache it so further gets of
+        // this local in the same block also forward (still safe: no aliasing).
+        L->local_cur[idx] = r[0];
+        L->local_cur_set[idx] = true;
         return true;
     }
 
@@ -750,6 +779,10 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
         MLIR_OpHandle out = build_op(ctx, OP_TYPE_LLVM_STORE,
             NULL, 0, NULL, 0, NULL, ops, 2);
         emit(L, out);
+        // Record the stored value for within-block forwarding of later gets.
+        local_fwd_sync(L);
+        L->local_cur[idx] = v;
+        L->local_cur_set[idx] = true;
         return true;
     }
 
@@ -1601,6 +1634,11 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     L.sigs = sigs;
     L.local_ptr = (MLIR_ValueHandle *)malloc(
         (n_locals ? n_locals : 1) * sizeof(MLIR_ValueHandle));
+    L.local_cur = (MLIR_ValueHandle *)malloc(
+        (n_locals ? n_locals : 1) * sizeof(MLIR_ValueHandle));
+    L.local_cur_set = (bool *)calloc(
+        (n_locals ? n_locals : 1), sizeof(bool));
+    L.local_cur_blk = MLIR_INVALID_HANDLE;
 
     // Function parameters become block args. Map each SOURCE block arg (the
     // wasmssa param value) to its dest counterpart so that ops referencing a
@@ -1668,6 +1706,8 @@ static MLIR_OpHandle lower_func(MLIR_Context *ctx, MLIR_OpHandle src,
     free(vmap.dst);
     free(local_vt);
     free(L.local_ptr);
+    free(L.local_cur);
+    free(L.local_cur_set);
     free(param_args);
     free(L.frames);
     if (!ok) return MLIR_INVALID_HANDLE;

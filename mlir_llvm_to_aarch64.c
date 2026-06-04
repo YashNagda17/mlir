@@ -610,6 +610,22 @@ static bool sm_get(SlotMap *m, MLIR_ValueHandle k, int32_t *out) {
     return false;
 }
 
+// Increment the use count of value `k` (used to build a use-count map keyed by
+// SSA value handle, reusing the SlotMap storage with `slot` = count).
+static void uc_inc(SlotMap *m, MLIR_ValueHandle k) {
+    if (!k) return;
+    if ((m->n + 1) * 4 >= m->cap * 3) sm_grow(m);
+    size_t mask = m->cap - 1;
+    size_t i = sm_hash((uintptr_t)k) & mask;
+    while (m->t[i].key != 0) {
+        if (m->t[i].key == (uintptr_t)k) { m->t[i].slot++; return; }
+        i = (i + 1) & mask;
+    }
+    m->t[i].key = (uintptr_t)k;
+    m->t[i].slot = 1;
+    m->n++;
+}
+
 // Reload an operand value from its frame slot into register `rd`.
 static bool load_value(MLIR_Context *ctx, MLIR_BlockHandle blk, SlotMap *sm,
                        MLIR_ValueHandle v, uint8_t rd) {
@@ -777,6 +793,10 @@ typedef struct {
     size_t            n_fixed;     // number of fixed (named) params of this func
     SlotMap          *rm;          // value -> home physical reg (x19..x28); NULL = none
     ConstMap         *cm;          // value -> remat integer constant; NULL = none
+    SlotMap          *skip;        // op-result values whose ops are not lowered
+                                   // (folded into a fused branch); NULL = none
+    MLIR_OpHandle     fuse_root;   // icmp op lowered "cmp-only" (flags feed the
+                                   // terminator's b.cond); INVALID = none
     bool              ok;
 } LowerCtx;
 
@@ -1300,6 +1320,19 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         bool sf = type_is_gp64(ctx, MLIR_GetOpOperand(op, 0));
         uint8_t r0 = use_val(L, MLIR_GetOpOperand(op, 0), 9);
         if (!L->ok) return;
+        if (op == L->fuse_root) {
+            // Fused branch: emit only the comparison; the NZCV flags are
+            // consumed by the terminator's b.cond. No cset, no result store.
+            uint16_t imm;
+            if (operand_const_u12(L, MLIR_GetOpOperand(op, 1), &imm)) {
+                emit_cmp_imm(ctx, blk, r0, imm, sf);
+            } else {
+                uint8_t r1 = use_val(L, MLIR_GetOpOperand(op, 1), 10);
+                if (!L->ok) return;
+                emit_cmp_reg(ctx, blk, r0, r1, sf);
+            }
+            return;
+        }
         uint8_t rd = def_val(L, res, 9);
         uint16_t imm;
         if (operand_const_u12(L, MLIR_GetOpOperand(op, 1), &imm)) {
@@ -2414,6 +2447,116 @@ static void peephole_region(MLIR_Context *ctx, MLIR_RegionHandle reg) {
         peephole_block(ctx, MLIR_GetRegionBlock(reg, b));
 }
 
+// True if value `v` is an integer constant equal to `want`.
+static bool operand_is_const_val(LowerCtx *L, MLIR_ValueHandle v, int64_t want) {
+    int64_t cv; uint8_t c64;
+    return L->cm && cm_get(L->cm, v, &cv, &c64) && cv == want;
+}
+
+// Branch-condition fusion plan for a cf.cond_br terminator. tinyC lowers a
+// comparison condition as `icmp <pred>` -> `select(.,1,0)` -> `icmp ne(.,0)`
+// -> cond_br, ~10 instructions where `cmp; b.<cond>` suffices. We walk the
+// condition backward through the redundant boolean ops (each used exactly once
+// and defined in this block) to a genuine comparison "root" icmp, accumulating
+// a branch-sense inversion, then emit the root as a bare `cmp` and let the
+// terminator branch directly on the resulting NZCV flags.
+typedef struct {
+    bool          fuse;   // valid plan?
+    MLIR_OpHandle root;   // icmp lowered cmp-only
+    uint8_t       cond;   // ARM cond code for the b.cond (inversion applied)
+} FusePlan;
+
+static FusePlan analyze_cond_fusion(LowerCtx *L, MLIR_OpHandle term,
+                                    MLIR_BlockHandle sblk, SlotMap *uc,
+                                    SlotMap *skipset_out) {
+    FusePlan p = { false, MLIR_INVALID_HANDLE, 0 };
+    MLIR_ValueHandle cur = MLIR_GetOpOperand(term, 0);
+    int inv = 0;
+    MLIR_ValueHandle tmpskip[8];
+    int n_skip = 0;
+    MLIR_OpHandle root = MLIR_INVALID_HANDLE;
+    uint8_t root_cond = 0;
+    for (int step = 0; step < 8; step++) {
+        int32_t c;
+        if (!sm_get(uc, cur, &c) || c != 1) break;   // used only by the chain
+        MLIR_OpHandle D = MLIR_GetValueDefiningOp(cur);
+        if (D == MLIR_INVALID_HANDLE) break;          // block arg / cross-block
+        string dn = MLIR_GetOpName(D);
+        if (name_eq(dn, "llvm.icmp")) {
+            MLIR_AttributeHandle pa = MLIR_GetOpAttributeByName(D, "predicate");
+            if (pa == MLIR_INVALID_HANDLE) break;
+            int64_t pred = MLIR_GetAttributeInteger(pa);
+            bool z1 = operand_is_const_val(L, MLIR_GetOpOperand(D, 1), 0);
+            bool z0 = operand_is_const_val(L, MLIR_GetOpOperand(D, 0), 0);
+            if ((pred == 0 || pred == 1) && (z0 || z1)) {
+                // Redundant zero-test icmp eq/ne (x,0). Forward to x (eq == !x)
+                // only when x continues a fusible chain (select/icmp used once
+                // in this block); otherwise fuse this icmp itself as the root
+                // (`cmp x,#0; b.cond`), which also keeps the correct operand
+                // width instead of a 32-bit cbz/cbnz on x.
+                MLIR_ValueHandle x = z1 ? MLIR_GetOpOperand(D, 0)
+                                        : MLIR_GetOpOperand(D, 1);
+                MLIR_OpHandle XD = MLIR_GetValueDefiningOp(x);
+                int32_t xc;
+                bool x_fusible = XD != MLIR_INVALID_HANDLE &&
+                    sm_get(uc, x, &xc) && xc == 1 &&
+                    (name_eq(MLIR_GetOpName(XD), "llvm.select") ||
+                     name_eq(MLIR_GetOpName(XD), "llvm.icmp"));
+                if (x_fusible) {
+                    if (pred == 0) inv ^= 1;
+                    if (n_skip >= 8) break;
+                    tmpskip[n_skip++] = cur;
+                    cur = x;
+                    continue;
+                }
+            }
+            int cc = icmp_pred_to_cond(pred);
+            if (cc < 0) break;
+            root = D;
+            root_cond = (uint8_t)(inv ? (cc ^ 1) : cc);
+            break;
+        } else if (name_eq(dn, "llvm.select")) {
+            int64_t tv, fv; uint8_t t64, f64;
+            if (!(L->cm && cm_get(L->cm, MLIR_GetOpOperand(D, 1), &tv, &t64)
+                       && cm_get(L->cm, MLIR_GetOpOperand(D, 2), &fv, &f64)))
+                break;
+            if (tv == 1 && fv == 0) { /* sense unchanged */ }
+            else if (tv == 0 && fv == 1) { inv ^= 1; }
+            else break;
+            if (n_skip >= 8) break;
+            tmpskip[n_skip++] = cur;
+            cur = MLIR_GetOpOperand(D, 0);
+            continue;
+        }
+        break;
+    }
+    if (root == MLIR_INVALID_HANDLE) return p;
+    // Positional check: between `root` and the terminator every op must be a
+    // skipped chain op or an llvm.mlir.constant (both emit nothing), so the
+    // root cmp's NZCV flags reach the branch. Also confirms root is in sblk.
+    size_t no = MLIR_GetBlockNumOps(sblk);
+    bool reached = false;
+    for (size_t i = no - 1; i > 0; ) {
+        i--;
+        MLIR_OpHandle o = MLIR_GetBlockOp(sblk, i);
+        if (o == root) { reached = true; break; }
+        if (name_eq(MLIR_GetOpName(o), "llvm.mlir.constant")) continue;
+        bool is_skip = false;
+        if (MLIR_GetOpNumResults(o) == 1) {
+            MLIR_ValueHandle rv = MLIR_GetOpResult(o, 0);
+            for (int k = 0; k < n_skip; k++)
+                if (tmpskip[k] == rv) { is_skip = true; break; }
+        }
+        if (!is_skip) return p;   // a flag-clobbering op intervenes
+    }
+    if (!reached) return p;
+    for (int k = 0; k < n_skip; k++) sm_put(skipset_out, tmpskip[k], 1);
+    p.fuse = true;
+    p.root = root;
+    p.cond = root_cond;
+    return p;
+}
+
 static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                                      string sym, GlobalMap *gm) {
     MLIR_RegionHandle src_region = MLIR_GetOpRegion(fn, 0);
@@ -2487,8 +2630,33 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
     for (size_t b = 0; b < n_blocks; b++)
         build_const_map(ctx, &cm, MLIR_GetRegionBlock(src_region, b));
 
+    // Branch-condition fusion: build a function-wide use-count map (operands
+    // plus successor block-arg operands) and a skip set of folded chain ops.
+    bool do_fuse = !getenv("TINYC_NO_FUSE");
+    SlotMap uc = {0};   uc.arena = MLIR_GetArenaAllocator(ctx);
+    SlotMap skip = {0}; skip.arena = MLIR_GetArenaAllocator(ctx);
+    if (do_fuse) {
+        for (size_t b = 0; b < n_blocks; b++) {
+            MLIR_BlockHandle sb = src_blks[b];
+            size_t no = MLIR_GetBlockNumOps(sb);
+            for (size_t i = 0; i < no; i++) {
+                MLIR_OpHandle o = MLIR_GetBlockOp(sb, i);
+                size_t non = MLIR_GetOpNumOperands(o);
+                for (size_t k = 0; k < non; k++)
+                    uc_inc(&uc, MLIR_GetOpOperand(o, k));
+                size_t nsucc = MLIR_GetOpNumSuccessors(o);
+                for (size_t s = 0; s < nsucc; s++) {
+                    size_t nso = MLIR_GetOpNumSuccessorOperands(o, s);
+                    for (size_t k = 0; k < nso; k++)
+                        uc_inc(&uc, MLIR_GetOpSuccessorOperand(o, s, k));
+                }
+            }
+        }
+    }
+
     LowerCtx L = { ctx, &sm, out_reg, out_blks[0], sym, frame_size,
-                   &am, slot_bytes, gm, nargs, &rm, &cm, true };
+                   &am, slot_bytes, gm, nargs, &rm, &cm,
+                   do_fuse ? &skip : NULL, MLIR_INVALID_HANDLE, true };
 
     for (size_t b = 0; b < n_blocks; b++) {
         L.cur = out_blks[b];
@@ -2500,11 +2668,26 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
             free(src_blks); free(out_blks);
             return MLIR_INVALID_HANDLE;
         }
+        // Compute the branch-fusion plan for this block's terminator before
+        // lowering its ops (so folded chain ops are skipped and the root icmp
+        // is lowered cmp-only).
+        FusePlan plan = { false, MLIR_INVALID_HANDLE, 0 };
+        MLIR_OpHandle term0 = MLIR_GetBlockOp(sb, no - 1);
+        if (do_fuse && name_eq(MLIR_GetOpName(term0), "cf.cond_br") &&
+            MLIR_GetOpNumOperands(term0) >= 1) {
+            plan = analyze_cond_fusion(&L, term0, sb, &uc, &skip);
+        }
+        L.fuse_root = plan.fuse ? plan.root : MLIR_INVALID_HANDLE;
         for (size_t i = 0; i + 1 < no; i++) {
-            lower_op(&L, MLIR_GetBlockOp(sb, i));
+            MLIR_OpHandle o = MLIR_GetBlockOp(sb, i);
+            if (do_fuse && MLIR_GetOpNumResults(o) == 1) {
+                int32_t dummy;
+                if (sm_get(&skip, MLIR_GetOpResult(o, 0), &dummy)) continue;
+            }
+            lower_op(&L, o);
             if (!L.ok) { free(src_blks); free(out_blks); return MLIR_INVALID_HANDLE; }
         }
-        MLIR_OpHandle term = MLIR_GetBlockOp(sb, no - 1);
+        MLIR_OpHandle term = term0;
         string tn = MLIR_GetOpName(term);
         if (name_eq(tn, "llvm.return")) {
             size_t nr = MLIR_GetOpNumOperands(term);
@@ -2536,11 +2719,16 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                 free(src_blks); free(out_blks);
                 return MLIR_INVALID_HANDLE;
             }
-            if (!mat_into(&L, MLIR_GetOpOperand(term, 0), 9)) {
-                fprintf(stderr, "llvm->aarch64: undefined cond_br condition "
-                        "in '%.*s'\n", (int)sym.size, sym.str);
-                free(src_blks); free(out_blks);
-                return MLIR_INVALID_HANDLE;
+            // When the condition was fused, the root cmp has already been
+            // emitted (cmp-only) into this block and NZCV is live; branch on
+            // the flags. Otherwise materialise the condition and test for !=0.
+            if (!plan.fuse) {
+                if (!mat_into(&L, MLIR_GetOpOperand(term, 0), 9)) {
+                    fprintf(stderr, "llvm->aarch64: undefined cond_br condition "
+                            "in '%.*s'\n", (int)sym.size, sym.str);
+                    free(src_blks); free(out_blks);
+                    return MLIR_INVALID_HANDLE;
+                }
             }
             MLIR_BlockHandle real_t = map_block(src_blks, out_blks, n_blocks,
                                                 MLIR_GetOpSuccessor(term, 0));
@@ -2562,7 +2750,10 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                 br_f = MLIR_CreateBlock(ctx);
                 MLIR_AppendRegionBlock(ctx, out_reg, br_f);
             }
-            emit_cbnz(ctx, cur, 9, false, br_t);
+            if (plan.fuse)
+                emit_bcond(ctx, cur, plan.cond, br_t);
+            else
+                emit_cbnz(ctx, cur, 9, false, br_t);
             emit_b(ctx, cur, br_f);
             if (nso_t) {
                 L.cur = br_t;
@@ -2664,7 +2855,8 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     build_const_map(ctx, &cm, src_blk);
 
     LowerCtx L = { ctx, &sm, out_reg, out_blk, sym, frame_size,
-                   &am, slot_bytes, gm, nargs, NULL, &cm, true };
+                   &am, slot_bytes, gm, nargs, NULL, &cm,
+                   NULL, MLIR_INVALID_HANDLE, true };
     MLIR_OpHandle term = lower_block_ops(&L, src_blk);
     if (!L.ok) return MLIR_INVALID_HANDLE;
 
