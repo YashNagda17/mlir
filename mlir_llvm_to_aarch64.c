@@ -2035,6 +2035,169 @@ static uint32_t alloc_regs_cfg(MLIR_Context *ctx, MLIR_RegionHandle reg,
     return used_mask;
 }
 
+// ---------------------------------------------------------------------------
+// Within-block redundant-load elimination (a64 peephole).
+//
+// After isel+regalloc the emitted block stream contains many `str Xr,[sp,#off];
+// ... ; ldr Xr,[sp,#off]` pairs (terminator-condition spills, block-arg edge
+// copies) where the loaded slot is still resident in the very register the load
+// targets. We track, per sp-relative frame slot, which physical register
+// currently equals that slot's in-memory value, and erase a load that would
+// reload a slot into the register that already holds it.
+//
+// Safety: the cache only ever records sp-relative (base x31) immediate-offset
+// slots, which are compiler-private spill slots whose address is never taken,
+// so no pointer store can alias them. Any op we do not explicitly model
+// invalidates the whole cache, and any uncertain attribute read falls back to a
+// full invalidation -- the pass is conservative by construction, so the only
+// way it could miscompile is by FAILING to invalidate, which is audited per
+// op-type below. The pass is purely structural/deterministic, so it preserves
+// the bit-identical self-host fixed point.
+// ---------------------------------------------------------------------------
+#define A64_SLOTCACHE_CAP 32
+typedef struct { int32_t off; uint8_t reg; uint8_t width; } A64SlotReg;
+
+static int a64_attr_i(MLIR_OpHandle op, const char *name, int32_t *out) {
+    MLIR_AttributeHandle a = MLIR_GetOpAttributeByName(op, name);
+    if (a == MLIR_INVALID_HANDLE) return 0;
+    *out = (int32_t)MLIR_GetAttributeInteger(a);
+    return 1;
+}
+
+static int a64sc_find(A64SlotReg *c, size_t n, int32_t off) {
+    for (size_t i = 0; i < n; i++) if (c[i].off == off) return (int)i;
+    return -1;
+}
+static void a64sc_drop(A64SlotReg *c, size_t *n, int idx) {
+    c[idx] = c[*n - 1]; (*n)--;
+}
+// Record that slot `off` (of byte width `w`) now equals register `reg`.
+static void a64sc_set(A64SlotReg *c, size_t *n, int32_t off, uint8_t reg,
+                      uint8_t w) {
+    int i = a64sc_find(c, *n, off);
+    if (i >= 0) { c[i].reg = reg; c[i].width = w; return; }
+    if (*n >= A64_SLOTCACHE_CAP) a64sc_drop(c, n, 0); // FIFO-ish evict
+    c[*n].off = off; c[*n].reg = reg; c[*n].width = w; (*n)++;
+}
+// A register was redefined: any slot believed to live in it is now stale.
+static void a64sc_kill_reg(A64SlotReg *c, size_t *n, uint8_t reg) {
+    for (size_t i = 0; i < *n; ) {
+        if (c[i].reg == reg) a64sc_drop(c, n, (int)i); else i++;
+    }
+}
+// A call clobbers all caller-saved GP registers (x0..x18).
+static void a64sc_kill_caller(A64SlotReg *c, size_t *n) {
+    for (size_t i = 0; i < *n; ) {
+        if (c[i].reg <= 18) a64sc_drop(c, n, (int)i); else i++;
+    }
+}
+
+static uint8_t a64_ldst_width(MLIR_OpType t) {
+    switch (t) {
+        case OP_TYPE_AARCH64_LDR_X: case OP_TYPE_AARCH64_STR_X:   return 8;
+        case OP_TYPE_AARCH64_LDR_W: case OP_TYPE_AARCH64_STR_W:   return 4;
+        case OP_TYPE_AARCH64_LDRB_IMM: case OP_TYPE_AARCH64_STRB_IMM: return 1;
+        default: return 0;
+    }
+}
+
+static void peephole_block(MLIR_Context *ctx, MLIR_BlockHandle blk) {
+    A64SlotReg cache[A64_SLOTCACHE_CAP];
+    size_t nc = 0;
+    size_t nops = MLIR_GetBlockNumOps(blk);
+    MLIR_OpHandle *erase = (MLIR_OpHandle *)malloc(nops * sizeof(MLIR_OpHandle));
+    size_t nerase = 0;
+    for (size_t i = 0; i < nops; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(blk, i);
+        MLIR_OpType t = MLIR_GetOpType(op);
+        switch (t) {
+        case OP_TYPE_AARCH64_LDR_X:
+        case OP_TYPE_AARCH64_LDR_W:
+        case OP_TYPE_AARCH64_LDRB_IMM: {
+            int32_t rn, rt, off;
+            uint8_t w = a64_ldst_width(t);
+            if (a64_attr_i(op, "rn", &rn) && rn == 31 &&
+                a64_attr_i(op, "rt", &rt) && a64_attr_i(op, "off_bytes", &off)) {
+                int idx = a64sc_find(cache, nc, off);
+                if (idx >= 0 && cache[idx].width == w &&
+                    cache[idx].reg == (uint8_t)rt) {
+                    erase[nerase++] = op;        // reloads a still-resident slot
+                    break;                       // rt unchanged, cache intact
+                }
+                a64sc_kill_reg(cache, &nc, (uint8_t)rt);
+                a64sc_set(cache, &nc, off, (uint8_t)rt, w);
+            } else if (a64_attr_i(op, "rt", &rt)) {
+                a64sc_kill_reg(cache, &nc, (uint8_t)rt);
+            } else {
+                nc = 0;
+            }
+            break;
+        }
+        case OP_TYPE_AARCH64_STR_X:
+        case OP_TYPE_AARCH64_STR_W:
+        case OP_TYPE_AARCH64_STRB_IMM: {
+            int32_t rn, rt, off;
+            if (a64_attr_i(op, "rn", &rn) && rn == 31 &&
+                a64_attr_i(op, "rt", &rt) && a64_attr_i(op, "off_bytes", &off)) {
+                a64sc_set(cache, &nc, off, (uint8_t)rt, a64_ldst_width(t));
+            }
+            // non-sp store (pointer store) cannot alias spill slots; no def.
+            break;
+        }
+        case OP_TYPE_AARCH64_LDR_X_REG:
+        case OP_TYPE_AARCH64_LDR_W_REG:
+        case OP_TYPE_AARCH64_LDRB_REG: {
+            int32_t rt;                          // register-offset load: defs rt,
+            if (a64_attr_i(op, "rt", &rt))       // unknown slot => just kill rt
+                a64sc_kill_reg(cache, &nc, (uint8_t)rt);
+            else nc = 0;
+            break;
+        }
+        case OP_TYPE_AARCH64_ADD_IMM: case OP_TYPE_AARCH64_SUB_IMM:
+        case OP_TYPE_AARCH64_ADD_REG: case OP_TYPE_AARCH64_SUB_REG:
+        case OP_TYPE_AARCH64_AND_REG: case OP_TYPE_AARCH64_ORR_REG:
+        case OP_TYPE_AARCH64_EOR_REG: case OP_TYPE_AARCH64_ASR_REG:
+        case OP_TYPE_AARCH64_LSL_REG: case OP_TYPE_AARCH64_LSR_REG:
+        case OP_TYPE_AARCH64_MUL: case OP_TYPE_AARCH64_MSUB:
+        case OP_TYPE_AARCH64_SDIV: case OP_TYPE_AARCH64_UDIV:
+        case OP_TYPE_AARCH64_CSEL: case OP_TYPE_AARCH64_CSET:
+        case OP_TYPE_AARCH64_MOV_X: case OP_TYPE_AARCH64_MOVZ:
+        case OP_TYPE_AARCH64_MOVK: case OP_TYPE_AARCH64_ADRP_DATA:
+        case OP_TYPE_AARCH64_ADD_DATA_LO:
+        case OP_TYPE_AARCH64_SXTB: case OP_TYPE_AARCH64_SXTH:
+        case OP_TYPE_AARCH64_SXTW: case OP_TYPE_AARCH64_UXTW: {
+            int32_t rd;
+            if (a64_attr_i(op, "rd", &rd)) a64sc_kill_reg(cache, &nc, (uint8_t)rd);
+            else nc = 0;
+            break;
+        }
+        case OP_TYPE_AARCH64_BL:
+        case OP_TYPE_AARCH64_BLR:
+            a64sc_kill_caller(cache, &nc);
+            break;
+        // flags-only / control-flow ops: no GP def, no slot write.
+        case OP_TYPE_AARCH64_CMP_IMM: case OP_TYPE_AARCH64_CMP_REG:
+        case OP_TYPE_AARCH64_FCMP:
+        case OP_TYPE_AARCH64_B: case OP_TYPE_AARCH64_B_COND:
+        case OP_TYPE_AARCH64_CBNZ: case OP_TYPE_AARCH64_CBZ:
+        case OP_TYPE_AARCH64_RET: case OP_TYPE_AARCH64_LABEL:
+            break;
+        default:                                 // unmodeled => safe full reset
+            nc = 0;
+            break;
+        }
+    }
+    for (size_t i = 0; i < nerase; i++) MLIR_EraseOp(ctx, erase[i]);
+    free(erase);
+}
+
+static void peephole_region(MLIR_Context *ctx, MLIR_RegionHandle reg) {
+    if (getenv("TINYC_NO_PEEPHOLE")) return;
+    size_t nb = MLIR_GetRegionNumBlocks(reg);
+    for (size_t b = 0; b < nb; b++)
+        peephole_block(ctx, MLIR_GetRegionBlock(reg, b));
+}
+
 static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                                      string sym, GlobalMap *gm) {
     MLIR_RegionHandle src_region = MLIR_GetOpRegion(fn, 0);
@@ -2207,6 +2370,8 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
     free(src_blks);
     free(out_blks);
 
+    peephole_region(ctx, out_reg);
+
     MLIR_AttributeHandle attrs[1];
     attrs[0] = attr_s(ctx, "sym_name", sym.str, sym.size);
     MLIR_RegionHandle regs[1] = { out_reg };
@@ -2300,6 +2465,8 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
     }
     emit_epilogue(ctx, L.cur, frame_size);
     emit_ret(ctx, L.cur);
+
+    peephole_region(ctx, out_reg);
 
     MLIR_AttributeHandle attrs[1];
     attrs[0] = attr_s(ctx, "sym_name", sym.str, sym.size);
