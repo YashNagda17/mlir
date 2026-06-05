@@ -178,6 +178,7 @@ static bool lc_is_transparent(MLIR_OpHandle op) {
            lc_name_eq(nm, "llvm.bitcast");
 }
 static bool lc_is_load(MLIR_OpHandle op) { return MLIR_GetOpType(op) == OP_TYPE_LLVM_LOAD; }
+static bool lc_is_store(MLIR_OpHandle op) { return MLIR_GetOpType(op) == OP_TYPE_LLVM_STORE; }
 
 // Follow the replacement map to the canonical value (flat: replacement targets
 // are leaders that are never themselves replaced, but loop defensively).
@@ -227,6 +228,18 @@ static void lc_build_load_key(KB *k, MLIR_Context *ctx, PMap *repl, MLIR_OpHandl
     kb_u64(k, no);
     for (size_t i = 0; i < no; i++)
         lc_emit_value(k, ctx, repl, MLIR_GetOpOperand(op, i), 24);
+}
+
+// Build the key a single-operand `llvm.load` from this store's address (operand
+// 1), producing the stored value's type, WOULD have. A later load with the same
+// structural address and type then forwards to the stored value (operand 0).
+// Mirrors lc_build_load_key for a 1-operand load exactly so the keys collide.
+static void lc_build_store_key(KB *k, MLIR_Context *ctx, PMap *repl, MLIR_OpHandle op) {
+    kb_reset(k);
+    kb_bytes(k, "L", 1);
+    kb_u64(k, (uint64_t)MLIR_GetValueType(MLIR_GetOpOperand(op, 0)));
+    kb_u64(k, 1);
+    lc_emit_value(k, ctx, repl, MLIR_GetOpOperand(op, 1), 24);
 }
 
 // ===========================================================================
@@ -321,6 +334,7 @@ typedef struct {
     PMap   repl;                 // redundant load result -> leader load result
     MLIR_OpHandle *erase; size_t n_erase, cap_erase;   // redundant load ops
     uint64_t gen;
+    bool store_fwd;
 } Walk;
 
 static void walk_mark_erase(Walk *w, MLIR_OpHandle op) {
@@ -360,7 +374,30 @@ static void lc_process_block(Walk *w, size_t bi) {
             }
             continue;
         }
-        if (!lc_is_pure(op)) w->gen++;                  // store / call / unknown: clobber
+        if (lc_is_store(op)) {
+            w->gen++;                                   // store clobbers all available values
+            // Store-to-load forwarding: republish addr -> stored value at the
+            // new generation so a later must-alias load reuses the value
+            // instead of reloading. The gen bump above invalidates every prior
+            // entry, so only this store's (addr,value) is forwardable until the
+            // next clobber -- exactly must-alias semantics, no alias analysis.
+            if (w->store_fwd && MLIR_GetOpNumOperands(op) == 2) {
+                // The stored value may itself be a load we CSE'd away; forward
+                // to its canonical leader, never the soon-to-be-erased value.
+                MLIR_ValueHandle sv = lc_canon(&w->repl, MLIR_GetOpOperand(op, 0));
+                // Only forward scalar int/float values. The memfuse addressing
+                // spine carries slotless `!llvm.ptr` values; never republish one
+                // as a load result (it has no register slot). In the wasm-lifted
+                // IR stored values are always i32/i64/f32/f64, but enforce it.
+                MLIR_TypeHandle st = MLIR_GetValueType(sv);
+                if (MLIR_IsTypeInteger(st) || MLIR_IsTypeFloat(st)) {
+                    lc_build_store_key(&w->kb, c->ctx, &w->repl, op);
+                    lcse_insert(&w->map, w->kb.p, w->kb.n, sv, w->gen);
+                }
+            }
+            continue;
+        }
+        if (!lc_is_pure(op)) w->gen++;                  // call / unknown: clobber
     }
 }
 
@@ -536,6 +573,7 @@ static void lc_run_region(MLIR_Context *ctx, MLIR_RegionHandle region) {
 
     Walk w; memset(&w, 0, sizeof(w));
     w.c = &c; w.gen = 0;
+    w.store_fwd = (getenv("TINYC_NO_STORE_FWD") == NULL);
     lcse_map_init(&w.map, total_ops);
     kb_init(&w.kb);
     pmap_init(&w.repl, total_ops);
