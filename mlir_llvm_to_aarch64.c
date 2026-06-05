@@ -1006,6 +1006,26 @@ static bool operand_const_any(LowerCtx *L, MLIR_ValueHandle v,
     return cm_get(L->cm, v, cv, c64);
 }
 
+// True if `v` is a rematerialized integer constant equal to zero. In that case
+// the AArch64 zero register (wzr/xzr, encoding 31) can stand in for `v` as a
+// DATA-SOURCE operand with no materialising `mov #0`. Only valid where register
+// 31 denotes ZR -- i.e. a store transfer register (Rt) or an ALU/mov source --
+// NOT where it denotes SP (an address base or add/sub Rn). Float constants are
+// never in the ConstMap, so this only fires for integer zero.
+static bool operand_is_zero(LowerCtx *L, MLIR_ValueHandle v) {
+    int64_t cv; uint8_t c64;
+    if (!L->cm || !cm_get(L->cm, v, &cv, &c64)) return false;
+    return cv == 0;
+}
+
+// Operand read for a position where register 31 means ZR (store Rt / mov src):
+// a zero remat-constant returns wzr/xzr (31) with no code; everything else is
+// the ordinary `use_val`.
+static uint8_t use_val_zr(LowerCtx *L, MLIR_ValueHandle v, uint8_t scratch) {
+    if (operand_is_zero(L, v)) return 31;
+    return use_val(L, v, scratch);
+}
+
 static MLIR_BlockHandle new_block(LowerCtx *L) {
     MLIR_BlockHandle b = MLIR_CreateBlock(L->ctx);
     MLIR_AppendRegionBlock(L->ctx, L->out_region, b);
@@ -1039,8 +1059,10 @@ static bool i32_src_zero_extended(MLIR_ValueHandle v) {
 static void copy_slot(LowerCtx *L, MLIR_ValueHandle src, MLIR_ValueHandle dst) {
     int64_t cv; uint8_t c64;
     if (L->cm && cm_get(L->cm, src, &cv, &c64)) {
-        emit_load_imm(L->ctx, L->cur, 9, (uint64_t)cv, c64 != 0);
-        if (!store_value(L->ctx, L->cur, L->sm, dst, 9))
+        uint8_t r = 9;
+        if (cv == 0) r = 31;                         // str xzr: no `mov #0`
+        else emit_load_imm(L->ctx, L->cur, 9, (uint64_t)cv, c64 != 0);
+        if (!store_value(L->ctx, L->cur, L->sm, dst, r))
             LFAIL("llvm->aarch64: undefined value in copy (%.*s)\n",
                   (int)L->sym.size, L->sym.str);
         return;
@@ -1102,7 +1124,10 @@ static void emit_loc_move(LowerCtx *L, Loc s, Loc d, uint8_t sb) {
     } else {                                       // d.k == LK_SLOT
         uint8_t r;
         if (s.k == LK_REG) r = s.reg;
-        else if (s.k == LK_CONST) { emit_load_imm(L->ctx, L->cur, 9, (uint64_t)s.cval, s.c64 != 0); r = 9; }
+        else if (s.k == LK_CONST) {
+            if (s.cval == 0) r = 31;                  // str xzr: no `mov #0`
+            else { emit_load_imm(L->ctx, L->cur, 9, (uint64_t)s.cval, s.c64 != 0); r = 9; }
+        }
         else { emit_ldr_x_off(L->ctx, L->cur, 9, sb, (uint32_t)s.slot * 8u); r = 9; }
         emit_str_x_off(L->ctx, L->cur, r, sb, (uint32_t)d.slot * 8u);
     }
@@ -1672,7 +1697,8 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
                 uint8_t r;
                 if (s.k == LK_REG) r = s.reg;
                 else if (s.k == LK_CONST) {
-                    emit_load_imm(ctx, blk, 9, (uint64_t)s.cval, s.c64 != 0); r = 9;
+                    if (s.cval == 0) r = 31;          // str xzr: no `mov #0`
+                    else { emit_load_imm(ctx, blk, 9, (uint64_t)s.cval, s.c64 != 0); r = 9; }
                 } else {
                     emit_ldr_x_off(ctx, blk, 9, 11, (uint32_t)s.slot * 8u); r = 9;
                 }
@@ -1816,7 +1842,7 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             MLIR_ValueHandle mbase, midx; MLIR_OpHandle z, e, p;
             if (!memfuse_match(ctx, ptr, &mbase, &midx, &z, &e, &p))
                 LFAIL("llvm->aarch64: memfuse store spine mismatch\n");
-            uint8_t rv = use_val(L, val, 9);
+            uint8_t rv = use_val_zr(L, val, 9);
             uint8_t rn = use_val(L, mbase, 10);
             uint8_t rm = use_val(L, midx, 11);
             if (!L->ok) return;
@@ -1826,7 +1852,7 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             emit_ldst_x_reg(ctx, blk, t, rv, rn, rm);
             return;
         }
-        uint8_t rv = use_val(L, val, 9);
+        uint8_t rv = use_val_zr(L, val, 9);
         uint8_t rp = use_val(L, ptr, 10);
         if (!L->ok) return;
         emit_mem_store(ctx, blk, rv, rp, sz);
