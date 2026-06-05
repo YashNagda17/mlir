@@ -1301,21 +1301,136 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
     return true;
 }
 
+// Stable bottom-up mergesort of an index array by a uint64 key array.
+static void a64_sort_idx_u64(uint32_t *idx, size_t n, const uint64_t *key) {
+    if (n < 2) return;
+    uint32_t *tmp = (uint32_t *)malloc(n * sizeof(uint32_t));
+    for (size_t w = 1; w < n; w *= 2) {
+        for (size_t lo = 0; lo < n; lo += 2 * w) {
+            size_t mid = lo + w;     if (mid > n) mid = n;
+            size_t hi  = lo + 2 * w; if (hi  > n) hi  = n;
+            size_t a = lo, b = mid, o = lo;
+            while (a < mid && b < hi)
+                tmp[o++] = (key[idx[b]] < key[idx[a]]) ? idx[b++] : idx[a++];
+            while (a < mid) tmp[o++] = idx[a++];
+            while (b < hi)  tmp[o++] = idx[b++];
+        }
+        for (size_t i = 0; i < n; i++) idx[i] = tmp[i];
+    }
+    free(tmp);
+}
+
 // Resolve intra-function branch targets to PC-relative immediates. Done
 // AFTER all blocks have been emitted (and their offsets recorded) but
 // BEFORE the function is laid out within __text — branches are
 // function-local, so we don't need text_off here.
+//
+// Branch threading: a "pure trampoline" block — one whose entire body is a
+// single unconditional `b TARGET` (exactly 4 bytes, no edge-copy movs) — adds
+// a hop to every branch that lands on it. Such a block carries no block-arg
+// forwarding (forwarding would require movs, making it >4 bytes), so any
+// branch to it can be redirected straight to TARGET. Chains are followed (with
+// a cycle cap) so a branch reaches its ultimate destination in one hop. This
+// removes the per-iteration trampoline bounce that the structured-CFG lowering
+// emits in hot loops. Trampoline blocks are left in place (now cold). Gated by
+// TINYC_NO_THREAD for A/B.
 static bool patch_branches(EmittedFunc *e) {
+    size_t nbp = e->n_bp;
+    uint32_t *byhandle = NULL;   // bp indices sorted by block handle
+    int32_t  *fwd = NULL;        // bp index -> bp index it trampolines to (-1 none)
+    if (nbp > 0) {
+        byhandle = (uint32_t *)malloc(nbp * sizeof(uint32_t));
+        uint64_t *hkey = (uint64_t *)malloc(nbp * sizeof(uint64_t));
+        for (size_t k = 0; k < nbp; k++) {
+            byhandle[k] = (uint32_t)k; hkey[k] = (uint64_t)e->bp[k].blk;
+        }
+        a64_sort_idx_u64(byhandle, nbp, hkey);
+        free(hkey);
+
+        if (getenv("TINYC_NO_THREAD") == NULL) {
+            // Offset order, to compute block lengths and look a block up by its
+            // start offset.
+            uint32_t *byoff = (uint32_t *)malloc(nbp * sizeof(uint32_t));
+            uint64_t *okey = (uint64_t *)malloc(nbp * sizeof(uint64_t));
+            for (size_t k = 0; k < nbp; k++) {
+                byoff[k] = (uint32_t)k; okey[k] = e->bp[k].fn_off;
+            }
+            a64_sort_idx_u64(byoff, nbp, okey);
+            free(okey);
+            uint32_t *blen = (uint32_t *)malloc(nbp * sizeof(uint32_t));
+            for (size_t i = 0; i < nbp; i++) {
+                uint32_t o   = e->bp[byoff[i]].fn_off;
+                uint32_t end = (i + 1 < nbp) ? e->bp[byoff[i + 1]].fn_off
+                                             : (uint32_t)e->code.len;
+                blen[byoff[i]] = end - o;
+            }
+            fwd = (int32_t *)malloc(nbp * sizeof(int32_t));
+            for (size_t k = 0; k < nbp; k++) fwd[k] = -1;
+            for (size_t r = 0; r < e->n_br; r++) {
+                if (e->br[r].kind != BR_B) continue;
+                uint32_t roff = e->br[r].fn_off;
+                // The block whose single `b` sits at roff (binary search byoff).
+                // Several blocks can share roff when zero-length fallthrough-
+                // elided blocks precede the real one; among an equal-offset run
+                // only the actually-emitted block has nonzero length, so scan
+                // the run for the len==4 entry.
+                size_t lo = 0, hi = nbp; int blk_i = -1;
+                while (lo < hi) {
+                    size_t m = (lo + hi) / 2;
+                    uint32_t mo = e->bp[byoff[m]].fn_off;
+                    if (mo == roff) {
+                        size_t s = m;
+                        while (s > 0 && e->bp[byoff[s - 1]].fn_off == roff) s--;
+                        for (; s < nbp && e->bp[byoff[s]].fn_off == roff; s++)
+                            if (blen[byoff[s]] == 4) { blk_i = (int)byoff[s]; break; }
+                        break;
+                    }
+                    if (mo < roff) lo = m + 1; else hi = m;
+                }
+                if (blk_i < 0) continue;
+                // Forward target = bp index of this `b`'s target block.
+                MLIR_BlockHandle t = e->br[r].target;
+                size_t l2 = 0, h2 = nbp; int t_i = -1;
+                while (l2 < h2) {
+                    size_t m = (l2 + h2) / 2;
+                    MLIR_BlockHandle mh = e->bp[byhandle[m]].blk;
+                    if (mh == t) { t_i = (int)byhandle[m]; break; }
+                    if (mh < t) l2 = m + 1; else h2 = m;
+                }
+                if (t_i >= 0) fwd[blk_i] = t_i;
+            }
+            free(byoff); free(blen);
+        }
+    }
+
+    bool ok = true;
     for (size_t i = 0; i < e->n_br; i++) {
         BranchReloc *r = &e->br[i];
+        // Locate the target block (binary search), then thread through any
+        // trampoline chain to the ultimate destination.
+        int idx = -1;
+        size_t lo = 0, hi = nbp;
+        while (lo < hi) {
+            size_t m = (lo + hi) / 2;
+            MLIR_BlockHandle mh = e->bp[byhandle[m]].blk;
+            if (mh == r->target) { idx = (int)byhandle[m]; break; }
+            if (mh < r->target) lo = m + 1; else hi = m;
+        }
         uint32_t tgt_off = (uint32_t)-1;
-        for (size_t k = 0; k < e->n_bp; k++) {
-            if (e->bp[k].blk == r->target) { tgt_off = e->bp[k].fn_off; break; }
+        if (idx >= 0) {
+            if (fwd) {
+                size_t steps = 0;
+                while (fwd[idx] >= 0 && fwd[idx] != idx && steps < nbp) {
+                    idx = fwd[idx]; steps++;
+                }
+            }
+            tgt_off = e->bp[idx].fn_off;
         }
         if (tgt_off == (uint32_t)-1) {
             fprintf(stderr,
                 "aarch64->macho: branch target block has no recorded offset\n");
-            return false;
+            ok = false;
+            break;
         }
         int32_t rel = (int32_t)tgt_off - (int32_t)r->fn_off;
         int32_t imm = rel >> 2;
@@ -1331,7 +1446,8 @@ static bool patch_branches(EmittedFunc *e) {
         e->code.data[r->fn_off + 2] = (uint8_t)(insn >> 16);
         e->code.data[r->fn_off + 3] = (uint8_t)(insn >> 24);
     }
-    return true;
+    free(byhandle); free(fwd);
+    return ok;
 }
 
 // =============================================================================
