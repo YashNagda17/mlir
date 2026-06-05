@@ -1183,7 +1183,7 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
                 emit_word(&out->code, arm64_b_cond(2, (uint8_t)(cond ^ 1u)));
                 uint32_t off = (uint32_t)out->code.len;
                 emit_word(&out->code, arm64_b(0));
-                ef_add_br(out, BR_B, tgt, off, 0, false);
+                ef_add_br(out, BR_B_COND, tgt, off, cond, false);
                 break;
             }
             case OP_TYPE_AARCH64_CBZ: {
@@ -1193,7 +1193,7 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
                 emit_word(&out->code, arm64_cbnz(rt, 2, sf));
                 uint32_t off = (uint32_t)out->code.len;
                 emit_word(&out->code, arm64_b(0));
-                ef_add_br(out, BR_B, tgt, off, 0, false);
+                ef_add_br(out, BR_CBZ, tgt, off, rt, sf);
                 break;
             }
             case OP_TYPE_AARCH64_CBNZ: {
@@ -1203,7 +1203,7 @@ static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
                 emit_word(&out->code, arm64_cbz(rt, 2, sf));
                 uint32_t off = (uint32_t)out->code.len;
                 emit_word(&out->code, arm64_b(0));
-                ef_add_br(out, BR_B, tgt, off, 0, false);
+                ef_add_br(out, BR_CBNZ, tgt, off, rt, sf);
                 break;
             }
             case OP_TYPE_AARCH64_LABEL:
@@ -1320,6 +1320,14 @@ static void a64_sort_idx_u64(uint32_t *idx, size_t n, const uint64_t *key) {
     free(tmp);
 }
 
+// Patch a 32-bit little-endian instruction word into the code buffer.
+static void a64_write_word(EmittedFunc *e, uint32_t off, uint32_t insn) {
+    e->code.data[off + 0] = (uint8_t)(insn      );
+    e->code.data[off + 1] = (uint8_t)(insn >>  8);
+    e->code.data[off + 2] = (uint8_t)(insn >> 16);
+    e->code.data[off + 3] = (uint8_t)(insn >> 24);
+}
+
 // Resolve intra-function branch targets to PC-relative immediates. Done
 // AFTER all blocks have been emitted (and their offsets recorded) but
 // BEFORE the function is laid out within __text — branches are
@@ -1434,17 +1442,46 @@ static bool patch_branches(EmittedFunc *e) {
         }
         int32_t rel = (int32_t)tgt_off - (int32_t)r->fn_off;
         int32_t imm = rel >> 2;
-        uint32_t insn = 0;
-        switch (r->kind) {
-            case BR_B:      insn = arm64_b(imm); break;
-            case BR_B_COND: insn = arm64_b_cond(imm, r->cond_or_rt); break;
-            case BR_CBZ:    insn = arm64_cbz(r->cond_or_rt, imm, r->sf); break;
-            case BR_CBNZ:   insn = arm64_cbnz(r->cond_or_rt, imm, r->sf); break;
+        if (r->kind == BR_B) {
+            a64_write_word(e, r->fn_off, arm64_b(imm));
+        } else {
+            // Conditional branch lowered as `b.!cond +8; b target` (skip + b)
+            // for the imm26 reach of the unconditional `b`. When `target` fits
+            // the direct conditional imm19 reach (±1MiB from the conditional
+            // slot, which sits one word before the recorded `b`), emit the
+            // single direct form and NOP out the now-dead `b` slot. WMIR uses
+            // the direct form; this matches it whenever in range.
+            uint32_t cs = r->fn_off - 4;                  // conditional slot
+            int32_t  rel_c = (int32_t)tgt_off - (int32_t)cs;
+            int32_t  imm_c = rel_c >> 2;
+            bool     fits19 = (getenv("TINYC_NO_DIRECT_COND") == NULL) &&
+                              imm_c >= -(1 << 18) && imm_c <= (1 << 18) - 1;
+            if (fits19) {
+                uint32_t c = 0;
+                switch (r->kind) {
+                    case BR_B_COND: c = arm64_b_cond(imm_c, r->cond_or_rt); break;
+                    case BR_CBZ:    c = arm64_cbz(r->cond_or_rt, imm_c, r->sf); break;
+                    case BR_CBNZ:   c = arm64_cbnz(r->cond_or_rt, imm_c, r->sf); break;
+                    default: break;
+                }
+                a64_write_word(e, cs, c);
+                a64_write_word(e, r->fn_off, 0xD503201Fu); // NOP
+            } else {
+                // Fallback: keep the inverted-condition skip + unconditional b.
+                uint32_t skip = 0;
+                switch (r->kind) {
+                    case BR_B_COND:
+                        skip = arm64_b_cond(2, (uint8_t)(r->cond_or_rt ^ 1u)); break;
+                    case BR_CBZ:
+                        skip = arm64_cbnz(r->cond_or_rt, 2, r->sf); break;
+                    case BR_CBNZ:
+                        skip = arm64_cbz(r->cond_or_rt, 2, r->sf); break;
+                    default: break;
+                }
+                a64_write_word(e, cs, skip);
+                a64_write_word(e, r->fn_off, arm64_b(imm));
+            }
         }
-        e->code.data[r->fn_off + 0] = (uint8_t)(insn      );
-        e->code.data[r->fn_off + 1] = (uint8_t)(insn >>  8);
-        e->code.data[r->fn_off + 2] = (uint8_t)(insn >> 16);
-        e->code.data[r->fn_off + 3] = (uint8_t)(insn >> 24);
     }
     free(byhandle); free(fwd);
     return ok;
