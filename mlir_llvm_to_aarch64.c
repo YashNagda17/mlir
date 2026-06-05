@@ -213,14 +213,16 @@ static void emit_shift_imm(MLIR_Context *ctx, MLIR_BlockHandle blk, MLIR_OpType 
 }
 // add rd, rn, rm, LSL #lsl  (the encoder reads the optional "lsl" attribute,
 // defaulting to 0 for every other ADD_REG emission). Used to fold a power-of-2
-// gep stride into a single shifted-add instead of a mov+mul+add sequence.
+// gep stride or a single-use shift-by-constant addend into one shifted-add
+// instead of a mov+mul+add / lsl+add sequence. `sf` picks Xd (true) / Wd.
 static void emit_add_reg_lsl(MLIR_Context *ctx, MLIR_BlockHandle blk,
-                             uint8_t rd, uint8_t rn, uint8_t rm, uint8_t lsl) {
+                             uint8_t rd, uint8_t rn, uint8_t rm, uint8_t lsl,
+                             bool sf) {
     MLIR_AttributeHandle a[5];
     a[0] = attr_i32(ctx, "rd", rd);
     a[1] = attr_i32(ctx, "rn", rn);
     a[2] = attr_i32(ctx, "rm", rm);
-    a[3] = attr_b(ctx, "sf", true);
+    a[3] = attr_b(ctx, "sf", sf);
     a[4] = attr_i32(ctx, "lsl", lsl);
     MLIR_AppendBlockOp(ctx, blk, build_op(ctx, OP_TYPE_AARCH64_ADD_REG, a, 5));
 }
@@ -885,6 +887,11 @@ typedef struct {
                                    // inttoptr spine is folded into a register-
                                    // offset load/store [base, Widx, UXTW]; the
                                    // spine ops are in `skip`. NULL = none.
+    SlotMap          *shiftfuse;   // llvm.add result value whose single-use
+                                   // shl/mul-by-2^k operand is folded into a
+                                   // shifted-register `add Rd,Ra,Rx,lsl #amt`;
+                                   // the shl/mul op is in `skip`. NULL = none.
+                                   // Map value = (amt<<1)|shift_operand_index.
     bool              ok;
 } LowerCtx;
 
@@ -1211,6 +1218,9 @@ static void store_yield(LowerCtx *L, MLIR_OpHandle yield, MLIR_OpHandle owner) {
 }
 
 static void lower_op(LowerCtx *L, MLIR_OpHandle op);
+static bool shiftfuse_decode(MLIR_Context *ctx, MLIR_OpHandle addop, SlotMap *sfm,
+                             MLIR_ValueHandle *xv, MLIR_ValueHandle *av,
+                             unsigned *amt);
 
 // Lower every non-terminator op of `block` into the current CFG and return
 // the block's terminator op (the caller interprets it).
@@ -1420,6 +1430,17 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
     } else if (name_eq(on, "llvm.add")) {
         MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
         bool sf = type_is_gp64(ctx, res);
+        MLIR_ValueHandle xv, av; unsigned amt;
+        if (shiftfuse_decode(ctx, op, L->shiftfuse, &xv, &av, &amt)) {
+            // add Rd, Ra, Rx, lsl #amt  (the shl/mul op is skipped).
+            uint8_t ra = use_val(L, av, 9);
+            uint8_t rx = use_val(L, xv, 10);
+            if (!L->ok) return;
+            uint8_t rd = def_val(L, res, 9);
+            emit_add_reg_lsl(ctx, blk, rd, ra, rx, (uint8_t)amt, sf);
+            fin_val(L, res, rd);
+            return;
+        }
         MLIR_ValueHandle a0 = MLIR_GetOpOperand(op, 0);
         MLIR_ValueHandle a1 = MLIR_GetOpOperand(op, 1);
         uint16_t imm;
@@ -1817,7 +1838,7 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
                 // materialise the stride and multiply.
                 if (stride != 0 && (stride & (stride - 1)) == 0) {
                     unsigned sh = 0; while ((1u << sh) != stride) sh++;
-                    emit_add_reg_lsl(ctx, blk, 9, 9, ri, (uint8_t)sh);
+                    emit_add_reg_lsl(ctx, blk, 9, 9, ri, (uint8_t)sh, true);
                 } else {
                     emit_load_imm(ctx, blk, 11, (uint64_t)stride, true);
                     emit_3reg(ctx, blk, OP_TYPE_AARCH64_MUL, 10, ri, 11, true);
@@ -2541,9 +2562,86 @@ static bool a64_memfuse_uses(MLIR_Context *ctx, MLIR_OpHandle op, SlotMap *memfu
     return memfuse_match(ctx, P, base, idx, &z, &e, &p);
 }
 
+// Shift-fusion: does the `llvm.add` `addop` have an operand defined by a
+// single-use shift-by-constant (`llvm.shl(x, C)` or `llvm.mul(x, 2^C)`) that can
+// fold into one `add Rd, Ra, Rx, lsl #amt`? On success sets *sidx (the add
+// operand index holding the shift, 0 or 1) and *amt (the shift amount). The
+// shift source x must be non-constant, the amount in [1, 31]/[1, 63], and the
+// shift result single-use (uc==1) so its op can be skipped without losing a
+// reader.
+static bool shiftfuse_match(MLIR_Context *ctx, MLIR_OpHandle addop, SlotMap *uc,
+                            int *sidx, unsigned *amt) {
+    if (MLIR_GetOpNumResults(addop) != 1 || MLIR_GetOpNumOperands(addop) < 2)
+        return false;
+    unsigned maxsh = type_is_gp64(ctx, MLIR_GetOpResult(addop, 0)) ? 63u : 31u;
+    for (int k = 1; k >= 0; k--) {        // prefer operand 1 (matches add bias)
+        MLIR_OpHandle sop = MLIR_GetValueDefiningOp(MLIR_GetOpOperand(addop, k));
+        if (!sop || MLIR_GetOpNumOperands(sop) < 2) continue;
+        string opn = MLIR_GetOpName(sop);
+        MLIR_OpHandle d0 = MLIR_GetValueDefiningOp(MLIR_GetOpOperand(sop, 0));
+        MLIR_OpHandle d1 = MLIR_GetValueDefiningOp(MLIR_GetOpOperand(sop, 1));
+        int64_t c0, c1; uint8_t b0, b1;
+        bool c0k = d0 && const_int_val(ctx, d0, &c0, &b0);
+        bool c1k = d1 && const_int_val(ctx, d1, &c1, &b1);
+        unsigned a;
+        if (name_eq(opn, "llvm.shl")) {
+            if (!c1k || c0k) continue;            // shl(x, C), x non-constant
+            if (c1 < 1 || (uint64_t)c1 > maxsh) continue;
+            a = (unsigned)c1;
+        } else if (name_eq(opn, "llvm.mul")) {
+            int64_t cc;                           // mul(x, 2^a) or mul(2^a, x)
+            if (c1k && !c0k)      cc = c1;
+            else if (c0k && !c1k) cc = c0;
+            else continue;
+            if (cc < 2 || (cc & (cc - 1)) != 0) continue;   // power of 2, >= 2
+            a = 0; while (((int64_t)1 << a) != cc) a++;
+            if (a > maxsh) continue;
+        } else continue;
+        int32_t u;
+        if (!sm_get(uc, MLIR_GetOpResult(sop, 0), &u) || u != 1) continue;
+        *sidx = k; *amt = a;
+        return true;
+    }
+    return false;
+}
+
+// Decode a recorded shift-fused add (sfm value = (amt<<1)|sidx). Outputs the
+// shift source x, the other addend a, and the shift amount. x is the
+// NON-constant operand of the shift/mul op (the constant may be on either side
+// for `mul`). Used by both the emitter and the register allocators.
+static bool shiftfuse_decode(MLIR_Context *ctx, MLIR_OpHandle addop, SlotMap *sfm,
+                             MLIR_ValueHandle *xv, MLIR_ValueHandle *av,
+                             unsigned *amt) {
+    if (!sfm || MLIR_GetOpNumResults(addop) != 1) return false;
+    int32_t v;
+    if (!sm_get(sfm, MLIR_GetOpResult(addop, 0), &v)) return false;
+    int sidx = v & 1;
+    if (amt) *amt = (unsigned)(v >> 1);
+    if (av)  *av  = MLIR_GetOpOperand(addop, 1 - sidx);
+    MLIR_OpHandle sop = MLIR_GetValueDefiningOp(MLIR_GetOpOperand(addop, sidx));
+    if (!sop || MLIR_GetOpNumOperands(sop) < 2) return false;
+    MLIR_ValueHandle o0 = MLIR_GetOpOperand(sop, 0);
+    int64_t cv; uint8_t c64;
+    MLIR_OpHandle d0 = MLIR_GetValueDefiningOp(o0);
+    if (d0 && const_int_val(ctx, d0, &cv, &c64))
+        *xv = MLIR_GetOpOperand(sop, 1);   // const is operand 0 (mul(C,x))
+    else
+        *xv = o0;                          // shl(x,C) / mul(x,C): x is operand 0
+    return true;
+}
+
+// If `op` is a shift-fused add, output the shift-source operand x so the
+// allocator re-injects it as a live use at the add (the skipped shl/mul op no
+// longer carries x's liveness). Mirrors a64_memfuse_uses.
+static bool a64_shiftfuse_uses(MLIR_Context *ctx, MLIR_OpHandle op,
+                               SlotMap *shiftfuse, MLIR_ValueHandle *xv) {
+    return shiftfuse_decode(ctx, op, shiftfuse, xv, NULL, NULL);
+}
+
 static uint32_t alloc_regs_global(MLIR_Context *ctx, MLIR_RegionHandle reg,
                                   size_t n_blocks, SlotMap *rm,
                                   SlotMap *memfuse, SlotMap *memspine,
+                                  SlotMap *shiftfuse,
                                   SlotMap *sm, int32_t *out_nslots) {
     *out_nslots = 0;
     if (n_blocks == 0) return A64_GLOBAL_BAIL;
@@ -2724,6 +2822,11 @@ static uint32_t alloc_regs_global(MLIR_Context *ctx, MLIR_RegionHandle reg,
                     if (a64_hh_get(&vmap, uu[u], &vi) && !a64_bs_test(K, vi)) a64_bs_set(G, vi);
                 }
             }
+            MLIR_ValueHandle sfx;
+            if (a64_shiftfuse_uses(ctx, op, shiftfuse, &sfx)) {
+                uint32_t vi;
+                if (a64_hh_get(&vmap, sfx, &vi) && !a64_bs_test(K, vi)) a64_bs_set(G, vi);
+            }
             size_t nr = MLIR_GetOpNumResults(op);
             for (size_t r = 0; r < nr; r++) {
                 uint32_t vi;
@@ -2813,6 +2916,15 @@ static uint32_t alloc_regs_global(MLIR_Context *ctx, MLIR_RegionHandle reg,
                         if (up < first_pos[vi]) first_pos[vi] = up;
                         weight[vi] += w;
                     }
+                }
+            }
+            MLIR_ValueHandle sfx;
+            if (a64_shiftfuse_uses(ctx, op, shiftfuse, &sfx)) {
+                uint32_t vi;
+                if (a64_hh_get(&vmap, sfx, &vi)) {
+                    if (up > last_use[vi]) last_use[vi] = up;
+                    if (up < first_pos[vi]) first_pos[vi] = up;
+                    weight[vi] += w;
                 }
             }
             op_pos++;
@@ -2966,8 +3078,23 @@ static uint32_t alloc_regs_global(MLIR_Context *ctx, MLIR_RegionHandle reg,
             int nl = 10;
             if (dop) { string s = MLIR_GetOpName(dop); nm = s.str; nl = (int)s.size; }
             const char *dead = (last_use[vi] <= first_pos[vi]) ? "deaddef" : "live";
-            fprintf(stderr, "SPILL\t%s\t%s\t%.*s\n",
-                    weight[vi] > 1 ? "hot" : "cold", dead, nl, nm);
+            char ops[128]; int op_off = 0; ops[0] = '\0';
+            if (dop) {
+                size_t non = MLIR_GetOpNumOperands(dop);
+                for (size_t k = 0; k < non && op_off < 100; k++) {
+                    MLIR_ValueHandle ov = MLIR_GetOpOperand(dop, k);
+                    MLIR_OpHandle odef = MLIR_GetValueDefiningOp(ov);
+                    int64_t cvv; uint8_t c64v;
+                    const char *on; int onl;
+                    if (!odef) { on = "barg"; onl = 4; }
+                    else if (const_int_val(ctx, odef, &cvv, &c64v)) { on = "const"; onl = 5; }
+                    else { string os = MLIR_GetOpName(odef); on = os.str; onl = (int)os.size; }
+                    op_off += snprintf(ops + op_off, sizeof(ops) - op_off,
+                                       "%s%.*s", k ? "," : "", onl, on);
+                }
+            }
+            fprintf(stderr, "SPILL\t%s\t%s\t%.*s\t%s\n",
+                    weight[vi] > 1 ? "hot" : "cold", dead, nl, nm, ops);
         }
     }
     *out_nslots = next_slot;
@@ -3010,7 +3137,8 @@ static uint32_t alloc_regs_global(MLIR_Context *ctx, MLIR_RegionHandle reg,
 // not allocated (returns 0) — the CFG path is flat in practice.
 static uint32_t alloc_regs_cfg(MLIR_Context *ctx, MLIR_RegionHandle reg,
                                size_t n_blocks, SlotMap *rm,
-                               SlotMap *memfuse, SlotMap *memspine) {
+                               SlotMap *memfuse, SlotMap *memspine,
+                               SlotMap *shiftfuse) {
     Arena *ar = MLIR_GetArenaAllocator(ctx);
     size_t cap = 0;
     size_t maxops = 0;
@@ -3130,6 +3258,22 @@ static uint32_t alloc_regs_cfg(MLIR_Context *ctx, MLIR_RegionHandle reg,
                             else if ((int32_t)i > last_use[vi])
                                 last_use[vi] = (int32_t)i;
                         }
+                    }
+                }
+            }
+            // Shift-fused add: the shifted-register add reads the shift source x
+            // directly (the skipped shl/mul result is not a real operand). Mark
+            // x live here, mirroring the memfuse re-injection above.
+            if (shiftfuse) {
+                MLIR_ValueHandle sfx;
+                if (a64_shiftfuse_uses(ctx, op, shiftfuse, &sfx)) {
+                    int32_t vi;
+                    if (sm_get(&idx, sfx, &vi)) {
+                        usedv[vi] = 1;
+                        if ((int32_t)b != def_block[vi] || is_call)
+                            disq[vi] = 1;
+                        else if ((int32_t)i > last_use[vi])
+                            last_use[vi] = (int32_t)i;
                     }
                 }
             }
@@ -3672,6 +3816,37 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
         }
     }
 
+    // shift-fusion pre-pass: fold a single-use `shl(x,C)` / `mul(x,2^C)` addend
+    // of an `llvm.add` into one `add Rd, Ra, Rx, lsl #amt`. Record the add
+    // result in `shiftfuse` ((amt<<1)|operand_index) and add the shl/mul result
+    // to `skip` (no code) + `memspine` (no home, operand reads suppressed; x is
+    // re-injected as a live use at the add via a64_shiftfuse_uses).
+    SlotMap shiftfuse = {0}; shiftfuse.arena = MLIR_GetArenaAllocator(ctx);
+    bool do_shiftfuse = do_fuse && !getenv("TINYC_NO_SHIFTFUSE");
+    if (do_shiftfuse) {
+        for (size_t b = 0; b < n_blocks; b++) {
+            MLIR_BlockHandle sb = MLIR_GetRegionBlock(src_region, b);
+            size_t no = MLIR_GetBlockNumOps(sb);
+            for (size_t i = 0; i < no; i++) {
+                MLIR_OpHandle o = MLIR_GetBlockOp(sb, i);
+                if (!name_eq(MLIR_GetOpName(o), "llvm.add")) continue;
+                if (MLIR_GetOpNumResults(o) != 1) continue;
+                MLIR_ValueHandle ares = MLIR_GetOpResult(o, 0);
+                int32_t st;
+                if (sm_get(&skip, ares, &st)) continue;  // already a fused spine add
+                int sidx; unsigned amt;
+                if (!shiftfuse_match(ctx, o, &uc, &sidx, &amt)) continue;
+                MLIR_OpHandle sop =
+                    MLIR_GetValueDefiningOp(MLIR_GetOpOperand(o, sidx));
+                MLIR_ValueHandle sres = MLIR_GetOpResult(sop, 0);
+                if (sm_get(&memspine, sres, &st)) continue;  // shift already folded
+                sm_put(&shiftfuse, ares, (int32_t)((amt << 1) | (unsigned)sidx));
+                sm_put(&skip, sres, 1);
+                sm_put(&memspine, sres, 1);
+            }
+        }
+    }
+
     // Linear-scan register allocation over callee-saved x19..x27 (CFG path).
     SlotMap rm = {0};
     rm.arena = MLIR_GetArenaAllocator(ctx);
@@ -3720,12 +3895,15 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
         if (!getenv("TINYC_BLOCK_REGALLOC"))
             saved_mask = alloc_regs_global(ctx, src_region, n_blocks, &rm,
                                            do_memfuse ? &memfuse : NULL,
-                                           &memspine, &sm, &nslots);
+                                           &memspine,
+                                           do_shiftfuse ? &shiftfuse : NULL,
+                                           &sm, &nslots);
         global_ok = (saved_mask != A64_GLOBAL_BAIL);
         if (!global_ok)
             saved_mask = alloc_regs_cfg(ctx, src_region, n_blocks, &rm,
                                         do_memfuse ? &memfuse : NULL,
-                                        &memspine);
+                                        &memspine,
+                                        do_shiftfuse ? &shiftfuse : NULL);
     }
 
     // Assign frame slots. On the global path alloc_regs_global already filled
@@ -3783,7 +3961,8 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
     LowerCtx L = { ctx, &sm, out_reg, out_blks[0], sym, frame_size,
                    &am, slot_bytes, gm, nargs, &rm, &cm,
                    do_fuse ? &skip : NULL, MLIR_INVALID_HANDLE,
-                   do_memfuse ? &memfuse : NULL, true };
+                   do_memfuse ? &memfuse : NULL,
+                   do_shiftfuse ? &shiftfuse : NULL, true };
 
     // Prologue + incoming-param placement in the entry block. Now that the
     // allocator pool includes the argument registers x0..x8, a param may be
@@ -4026,7 +4205,7 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn,
 
     LowerCtx L = { ctx, &sm, out_reg, out_blk, sym, frame_size,
                    &am, slot_bytes, gm, nargs, NULL, &cm,
-                   NULL, MLIR_INVALID_HANDLE, NULL, true };
+                   NULL, MLIR_INVALID_HANDLE, NULL, NULL, true };
     MLIR_OpHandle term = lower_block_ops(&L, src_blk);
     if (!L.ok) return MLIR_INVALID_HANDLE;
 
