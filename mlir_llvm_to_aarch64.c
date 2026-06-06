@@ -450,31 +450,20 @@ static int int_type_bits(MLIR_Context *ctx, MLIR_ValueHandle v) {
     return w;
 }
 
-// Structurally match the linmem host-pointer spine produced by the wasm->llvm
-// lifter's linmem_ptr (no static offset):
-//   z   = llvm.zext  idx32 : i32 to i64        (idx32 = a linear-memory index)
-//   ea  = llvm.add   base, z                    (base = cached linmem base, i64)
-//   p   = llvm.inttoptr ea : i64 to ptr         (== the value `P`)
-// On success fills *base (i64), *idx (i32) and the three spine ops, and the
-// whole spine collapses to a single register-offset load/store
-// `Rt, [base, Widx, UXTW #0]` (the encoder already treats the index register as
-// a 32-bit value zero-extended to 64 bits). The `add` is commutative; the zext
-// may be either operand. (See memfuse handling in alloc_regs_cfg/lower_op.)
-static bool memfuse_match(MLIR_Context *ctx, MLIR_ValueHandle P,
-                          MLIR_ValueHandle *base, MLIR_ValueHandle *idx,
-                          MLIR_OpHandle *zop, MLIR_OpHandle *eop,
-                          MLIR_OpHandle *pop) {
-    MLIR_OpHandle pdef = MLIR_GetValueDefiningOp(P);
-    if (pdef == MLIR_INVALID_HANDLE) return false;
-    if (!name_eq(MLIR_GetOpName(pdef), "llvm.inttoptr")) return false;
-    if (MLIR_GetOpNumOperands(pdef) != 1) return false;
-    MLIR_ValueHandle E = MLIR_GetOpOperand(pdef, 0);
-    MLIR_OpHandle edef = MLIR_GetValueDefiningOp(E);
-    if (edef == MLIR_INVALID_HANDLE) return false;
-    if (!name_eq(MLIR_GetOpName(edef), "llvm.add")) return false;
-    if (MLIR_GetOpNumOperands(edef) != 2) return false;
-    MLIR_ValueHandle a[2] = { MLIR_GetOpOperand(edef, 0),
-                              MLIR_GetOpOperand(edef, 1) };
+// Forward decl: extract an integer llvm.mlir.constant's value (defined below).
+static bool const_int_val(MLIR_Context *ctx, MLIR_OpHandle op,
+                          int64_t *val, uint8_t *is64);
+
+// Helper: is `addop` an `llvm.add(base, zext(idx_i32))` (zext on either side)?
+// On success fills *base (i64), *idx (i32) and *zop (the zext op).
+static bool match_base_zext(MLIR_Context *ctx, MLIR_OpHandle addop,
+                            MLIR_ValueHandle *base, MLIR_ValueHandle *idx,
+                            MLIR_OpHandle *zop) {
+    if (addop == MLIR_INVALID_HANDLE) return false;
+    if (!name_eq(MLIR_GetOpName(addop), "llvm.add")) return false;
+    if (MLIR_GetOpNumOperands(addop) != 2) return false;
+    MLIR_ValueHandle a[2] = { MLIR_GetOpOperand(addop, 0),
+                              MLIR_GetOpOperand(addop, 1) };
     for (int k = 0; k < 2; k++) {
         MLIR_OpHandle zdef = MLIR_GetValueDefiningOp(a[k]);
         if (zdef == MLIR_INVALID_HANDLE) continue;
@@ -485,8 +474,60 @@ static bool memfuse_match(MLIR_Context *ctx, MLIR_ValueHandle P,
         *base = a[1 - k];
         *idx  = src;
         *zop  = zdef;
-        *eop  = edef;
-        *pop  = pdef;
+        return true;
+    }
+    return false;
+}
+
+// Match the linmem-pointer spine feeding `P`. Two shapes are recognised
+// (the second is the struct-field / static-offset case, where the lifter emits
+// an extra `add ea, const`; see linmem_ptr in mlir_wasmssa_to_llvm.c):
+//   off==0:  p = inttoptr( add(base, zext(idx)) )
+//   off!=0:  p = inttoptr( add( add(base, zext(idx)), const ) )
+// On success fills *base/*idx/*zop (the inner add's zext), *eop (the inner
+// `base+zext` add), *pop (the inttoptr), *coff (the constant byte offset, 0 if
+// none), and *oadd (the outer `+const` add to skip, INVALID if none). The whole
+// spine collapses to `add Wtmp,Widx,#off ; Rt,[base,Wtmp,UXTW]` (off!=0) or a
+// single `Rt,[base,Widx,UXTW]` (off==0). Folding the offset into the 32-bit
+// index is sound: a valid wasm access has idx+off < memsize <= 2^32, so the
+// 32-bit add never wraps, and UXTW(idx+off) == zext(idx)+off. coff/oadd may be
+// NULL when the caller only needs base/idx.
+static bool memfuse_match(MLIR_Context *ctx, MLIR_ValueHandle P,
+                          MLIR_ValueHandle *base, MLIR_ValueHandle *idx,
+                          MLIR_OpHandle *zop, MLIR_OpHandle *eop,
+                          MLIR_OpHandle *pop, int64_t *coff,
+                          MLIR_OpHandle *oadd) {
+    if (coff) *coff = 0;
+    if (oadd) *oadd = MLIR_INVALID_HANDLE;
+    MLIR_OpHandle pdef = MLIR_GetValueDefiningOp(P);
+    if (pdef == MLIR_INVALID_HANDLE) return false;
+    if (!name_eq(MLIR_GetOpName(pdef), "llvm.inttoptr")) return false;
+    if (MLIR_GetOpNumOperands(pdef) != 1) return false;
+    MLIR_ValueHandle E = MLIR_GetOpOperand(pdef, 0);
+    MLIR_OpHandle edef = MLIR_GetValueDefiningOp(E);
+    if (edef == MLIR_INVALID_HANDLE) return false;
+    if (!name_eq(MLIR_GetOpName(edef), "llvm.add")) return false;
+    if (MLIR_GetOpNumOperands(edef) != 2) return false;
+    // Shape 1: inttoptr(add(base, zext(idx))).
+    if (match_base_zext(ctx, edef, base, idx, zop)) {
+        *eop = edef;
+        *pop = pdef;
+        return true;
+    }
+    // Shape 2: inttoptr(add(add(base, zext(idx)), const)).
+    MLIR_ValueHandle o[2] = { MLIR_GetOpOperand(edef, 0),
+                              MLIR_GetOpOperand(edef, 1) };
+    for (int k = 0; k < 2; k++) {
+        MLIR_OpHandle cdef = MLIR_GetValueDefiningOp(o[k]);
+        int64_t cv; uint8_t c64;
+        if (cdef == MLIR_INVALID_HANDLE) continue;
+        if (!const_int_val(ctx, cdef, &cv, &c64)) continue;
+        MLIR_OpHandle xdef = MLIR_GetValueDefiningOp(o[1 - k]);
+        if (!match_base_zext(ctx, xdef, base, idx, zop)) continue;
+        *eop = xdef;        // inner base+zext add (skipped spine)
+        *pop = pdef;
+        if (coff) *coff = cv;
+        if (oadd) *oadd = edef;   // outer +const add (skipped spine)
         return true;
     }
     return false;
@@ -1910,15 +1951,21 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             LFAIL("llvm->aarch64: unsupported store size %u\n", sz);
         int32_t mtag;
         if (L->memfuse && sm_get(L->memfuse, ptr, &mtag)) {
-            // ptr = inttoptr(base + zext(idx_i32)): one register-offset store
-            // str Rt, [base, Widx, UXTW]. The zext/add/inttoptr spine is skipped.
+            // ptr = inttoptr(base + zext(idx_i32) [+ mtag]): one register-offset
+            // store str Rt, [base, Widx, UXTW]. With a static offset (mtag>0) the
+            // offset folds into the 32-bit index: add Wtmp,Widx,#mtag first. The
+            // zext/add(/+const)/inttoptr spine is skipped.
             MLIR_ValueHandle mbase, midx; MLIR_OpHandle z, e, p;
-            if (!memfuse_match(ctx, ptr, &mbase, &midx, &z, &e, &p))
+            if (!memfuse_match(ctx, ptr, &mbase, &midx, &z, &e, &p, NULL, NULL))
                 LFAIL("llvm->aarch64: memfuse store spine mismatch\n");
             uint8_t rv = use_val_zr(L, val, 9);
             uint8_t rn = use_val(L, mbase, 10);
             uint8_t rm = use_val(L, midx, 11);
             if (!L->ok) return;
+            if (mtag != 0) {                         // fold static offset into idx
+                emit_add_imm(ctx, blk, 11, rm, (uint16_t)mtag, false);
+                rm = 11;
+            }
             MLIR_OpType t = sz == 1 ? OP_TYPE_AARCH64_STRB_REG
                           : sz == 4 ? OP_TYPE_AARCH64_STR_W_REG
                                     : OP_TYPE_AARCH64_STR_X_REG;
@@ -1950,11 +1997,15 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         int32_t mtag;
         if (L->memfuse && sm_get(L->memfuse, ptr, &mtag)) {
             MLIR_ValueHandle mbase, midx; MLIR_OpHandle z, e, p;
-            if (!memfuse_match(ctx, ptr, &mbase, &midx, &z, &e, &p))
+            if (!memfuse_match(ctx, ptr, &mbase, &midx, &z, &e, &p, NULL, NULL))
                 LFAIL("llvm->aarch64: memfuse load spine mismatch\n");
             uint8_t rn = use_val(L, mbase, 10);
             uint8_t rm = use_val(L, midx, 11);
             if (!L->ok) return;
+            if (mtag != 0) {                         // fold static offset into idx
+                emit_add_imm(ctx, blk, 11, rm, (uint16_t)mtag, false);
+                rm = 11;
+            }
             uint8_t rd = def_val(L, res, 9);
             MLIR_OpType t = sz == 1 ? OP_TYPE_AARCH64_LDRB_REG
                           : sz == 4 ? OP_TYPE_AARCH64_LDR_W_REG
@@ -2636,7 +2687,7 @@ static bool a64_memfuse_uses(MLIR_Context *ctx, MLIR_OpHandle op, SlotMap *memfu
     int32_t mt;
     if (!sm_get(memfuse, P, &mt)) return false;
     MLIR_OpHandle z, e, p;
-    return memfuse_match(ctx, P, base, idx, &z, &e, &p);
+    return memfuse_match(ctx, P, base, idx, &z, &e, &p, NULL, NULL);
 }
 
 // Shift-fusion: does the `llvm.add` `addop` have an operand defined by a
@@ -3382,7 +3433,7 @@ static uint32_t alloc_regs_cfg(MLIR_Context *ctx, MLIR_RegionHandle reg,
                 int32_t mt;
                 if (P != MLIR_INVALID_HANDLE && sm_get(memfuse, P, &mt)) {
                     MLIR_ValueHandle mb, mi; MLIR_OpHandle z, e, p;
-                    if (memfuse_match(ctx, P, &mb, &mi, &z, &e, &p)) {
+                    if (memfuse_match(ctx, P, &mb, &mi, &z, &e, &p, NULL, NULL)) {
                         MLIR_ValueHandle uu[2] = { mb, mi };
                         for (int u = 0; u < 2; u++) {
                             int32_t vi;
@@ -3933,20 +3984,33 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                 if (P == MLIR_INVALID_HANDLE) continue;
                 if (vsz != 1 && vsz != 4 && vsz != 8) continue; // no LDRH_REG
                 MLIR_ValueHandle mb, mi; MLIR_OpHandle z, e, p;
-                if (!memfuse_match(ctx, P, &mb, &mi, &z, &e, &p)) continue;
+                int64_t coff; MLIR_OpHandle oadd;
+                if (!memfuse_match(ctx, P, &mb, &mi, &z, &e, &p, &coff, &oadd))
+                    continue;
+                // The static offset folds into the 32-bit index via one extra
+                // `add Wtmp,Widx,#coff`, so it must fit the add-immediate range.
+                if (coff < 0 || coff > 4095) continue;
                 // Only fold when the spine is single-use (no other reader of the
-                // inttoptr / add / zext results); else the spine ops still emit.
+                // inttoptr / +const add / base+zext add / zext results); else the
+                // spine ops still emit (e.g. base+zext shared across two fields).
                 int32_t c;
                 if (!sm_get(&uc, P, &c) || c != 1) continue;
+                if (oadd != MLIR_INVALID_HANDLE &&
+                    (!sm_get(&uc, MLIR_GetOpResult(oadd, 0), &c) || c != 1))
+                    continue;
                 if (!sm_get(&uc, MLIR_GetOpResult(e, 0), &c) || c != 1) continue;
                 if (!sm_get(&uc, MLIR_GetOpResult(z, 0), &c) || c != 1) continue;
-                sm_put(&memfuse, P, 1);
+                sm_put(&memfuse, P, (int32_t)coff);
                 sm_put(&memspine, P, 1);
                 sm_put(&memspine, MLIR_GetOpResult(e, 0), 1);
                 sm_put(&memspine, MLIR_GetOpResult(z, 0), 1);
                 sm_put(&skip, P, 1);
                 sm_put(&skip, MLIR_GetOpResult(e, 0), 1);
                 sm_put(&skip, MLIR_GetOpResult(z, 0), 1);
+                if (oadd != MLIR_INVALID_HANDLE) {
+                    sm_put(&memspine, MLIR_GetOpResult(oadd, 0), 1);
+                    sm_put(&skip, MLIR_GetOpResult(oadd, 0), 1);
+                }
             }
         }
     }
