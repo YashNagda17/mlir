@@ -430,6 +430,14 @@ static void emit_cbnz(MLIR_Context *ctx, MLIR_BlockHandle blk,
     MLIR_AppendBlockOp(ctx, blk,
         build_branch_op(ctx, OP_TYPE_AARCH64_CBNZ, a, 2, target));
 }
+static void emit_cbz(MLIR_Context *ctx, MLIR_BlockHandle blk,
+                     uint8_t rt, bool sf, MLIR_BlockHandle target) {
+    MLIR_AttributeHandle a[2];
+    a[0] = attr_i32(ctx, "rt", rt);
+    a[1] = attr_b(ctx, "sf", sf);
+    MLIR_AppendBlockOp(ctx, blk,
+        build_branch_op(ctx, OP_TYPE_AARCH64_CBZ, a, 2, target));
+}
 
 // ---------------------------------------------------------------------------
 // Helpers over the input `llvm` dialect module.
@@ -3849,12 +3857,21 @@ typedef struct {
     bool          fuse;   // valid plan?
     MLIR_OpHandle root;   // icmp lowered cmp-only
     uint8_t       cond;   // ARM cond code for the b.cond (inversion applied)
+    // Zero-test fast path: the root is a `icmp eq/ne(x,0)` whose `x` is not
+    // further fusible. Instead of `cmp x,#0; b.cond` emit a single `cbz`/`cbnz`
+    // on `x` (no flags needed). `root` still names the icmp (skipped, emits
+    // nothing); the terminator materialises `zt_val` and branches.
+    bool             zt;
+    MLIR_ValueHandle zt_val;  // the value `x` tested against zero
+    bool             zt_sf;   // 64-bit form (x is i64/ptr) ?
+    bool             zt_nz;   // true -> cbnz (branch if non-zero); false -> cbz
 } FusePlan;
 
 static FusePlan analyze_cond_fusion(LowerCtx *L, MLIR_OpHandle term,
                                     MLIR_BlockHandle sblk, SlotMap *uc,
                                     SlotMap *skipset_out) {
-    FusePlan p = { false, MLIR_INVALID_HANDLE, 0 };
+    FusePlan p = { false, MLIR_INVALID_HANDLE, 0,
+                   false, MLIR_INVALID_HANDLE, false, false };
     MLIR_ValueHandle cur = MLIR_GetOpOperand(term, 0);
     int inv = 0;
     MLIR_ValueHandle tmpskip[8];
@@ -3876,9 +3893,9 @@ static FusePlan analyze_cond_fusion(LowerCtx *L, MLIR_OpHandle term,
             if ((pred == 0 || pred == 1) && (z0 || z1)) {
                 // Redundant zero-test icmp eq/ne (x,0). Forward to x (eq == !x)
                 // only when x continues a fusible chain (select/icmp used once
-                // in this block); otherwise fuse this icmp itself as the root
-                // (`cmp x,#0; b.cond`), which also keeps the correct operand
-                // width instead of a 32-bit cbz/cbnz on x.
+                // in this block). Otherwise emit a single `cbz`/`cbnz` on x
+                // (one instruction, no cmp), with the operand width taken from
+                // x's type.
                 MLIR_ValueHandle x = z1 ? MLIR_GetOpOperand(D, 0)
                                         : MLIR_GetOpOperand(D, 1);
                 MLIR_OpHandle XD = MLIR_GetValueDefiningOp(x);
@@ -3894,6 +3911,17 @@ static FusePlan analyze_cond_fusion(LowerCtx *L, MLIR_OpHandle term,
                     cur = x;
                     continue;
                 }
+                int cc0 = icmp_pred_to_cond(pred);  // eq->EQ(0), ne->NE(1)
+                if (cc0 < 0) break;
+                root = D;
+                root_cond = (uint8_t)(inv ? (cc0 ^ 1) : cc0);
+                if (!getenv("TINYC_NO_ZEROTEST_CBZ")) {
+                    p.zt     = true;
+                    p.zt_val = x;
+                    p.zt_sf  = type_is_gp64(L->ctx, x);
+                    p.zt_nz  = (root_cond == 1);  // NE -> cbnz ; EQ -> cbz
+                }
+                break;
             }
             int cc = icmp_pred_to_cond(pred);
             if (cc < 0) break;
@@ -3936,6 +3964,9 @@ static FusePlan analyze_cond_fusion(LowerCtx *L, MLIR_OpHandle term,
     }
     if (!reached) return p;
     for (int k = 0; k < n_skip; k++) sm_put(skipset_out, tmpskip[k], 1);
+    // Zero-test: the root icmp itself emits nothing (the terminator does the
+    // cbz/cbnz on x), so skip it entirely rather than lowering it cmp-only.
+    if (p.zt) sm_put(skipset_out, MLIR_GetOpResult(root, 0), 1);
     p.fuse = true;
     p.root = root;
     p.cond = root_cond;
@@ -4368,10 +4399,18 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                 br_f = MLIR_CreateBlock(ctx);
                 MLIR_AppendRegionBlock(ctx, out_reg, br_f);
             }
-            if (plan.fuse)
-                emit_bcond(ctx, cur, plan.cond, br_t);
-            else
+            if (plan.fuse) {
+                if (plan.zt) {
+                    uint8_t r = use_val(&L, plan.zt_val, 9);
+                    if (!L.ok) { free(src_blks); free(out_blks); return MLIR_INVALID_HANDLE; }
+                    if (plan.zt_nz) emit_cbnz(ctx, cur, r, plan.zt_sf, br_t);
+                    else            emit_cbz(ctx, cur, r, plan.zt_sf, br_t);
+                } else {
+                    emit_bcond(ctx, cur, plan.cond, br_t);
+                }
+            } else {
                 emit_cbnz(ctx, cur, 9, false, br_t);
+            }
             emit_b(ctx, cur, br_f);
             if (nso_t) {
                 L.cur = br_t;
