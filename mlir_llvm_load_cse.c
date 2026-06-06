@@ -180,6 +180,19 @@ static bool lc_is_transparent(MLIR_OpHandle op) {
 static bool lc_is_load(MLIR_OpHandle op) { return MLIR_GetOpType(op) == OP_TYPE_LLVM_LOAD; }
 static bool lc_is_store(MLIR_OpHandle op) { return MLIR_GetOpType(op) == OP_TYPE_LLVM_STORE; }
 
+// True iff `op` bumps the memory generation (clobbers all available values)
+// when encountered during the walk. MUST match lc_process_block exactly: a
+// store clobbers; a malformed load (!=1 result) clobbers; a call / unknown
+// (non-pure) op clobbers; the block terminator and pure / normal-load ops do
+// not. Shared by lc_process_block and the join-clobber precompute so the two
+// can never disagree (a weaker precompute would forward stale values).
+static bool lc_op_bumps_gen(MLIR_OpHandle op, MLIR_OpHandle term) {
+    if (op == term) return false;
+    if (lc_is_load(op)) return MLIR_GetOpNumResults(op) != 1;
+    if (lc_is_store(op)) return true;
+    return !lc_is_pure(op);
+}
+
 // Follow the replacement map to the canonical value (flat: replacement targets
 // are leaders that are never themselves replaced, but loop defensively).
 static MLIR_ValueHandle lc_canon(PMap *repl, MLIR_ValueHandle v) {
@@ -253,6 +266,8 @@ typedef struct {
     size_t *succ_off, *succ, *pred_off, *pred;
     size_t *rpo; size_t nrpo;
     size_t *po_num, *idom, *dom_off, *dom_child;
+    char *blk_write;   // [nb]: block contains a memory clobber (lc_op_bumps_gen)
+    char *join_clob;   // [nb]: a >1-pred block whose idom..block region clobbers
 } Cfg;
 
 static size_t cfg_bidx(Cfg *c, MLIR_BlockHandle b) {
@@ -324,6 +339,62 @@ static void cfg_doms(Cfg *c) {
     free(cnt); free(fill);
 }
 
+// Precompute, for every join (>1-predecessor) block b, whether the CFG region
+// strictly between idom(b) and b contains a memory clobber. Without MemorySSA
+// the walk must, at a join, drop any ancestor value that a store on a sibling
+// path could have clobbered before the merge. The unconditional "clobber at
+// every join" that this replaces is needlessly pessimistic: it also kills
+// store-to-load forwarding across `a||b||c||d` short-circuit chains, whose
+// merge blocks are joins but whose sibling paths contain no stores at all.
+//
+// The between-region is computed by reverse-BFS from b's predecessors, stopping
+// before expanding d=idom(b). Because d dominates b, every path entry->b passes
+// through d, so the BFS stays within blocks dominated by d and always
+// terminates at d. CRUCIAL for loops: a join reached via a back-edge (a loop
+// header) is itself re-reached by the reverse walk through the latch, so the
+// loop body AND the header are scanned -- loop-carried stores correctly force a
+// clobber. Any uncertainty (unknown idom, an unreachable block on the way) is
+// resolved conservatively to "clobbers".
+static void cfg_join_clob(Cfg *c) {
+    c->blk_write = (char *)calloc(c->nb ? c->nb : 1, 1);
+    c->join_clob = (char *)calloc(c->nb ? c->nb : 1, 1);
+    for (size_t b = 0; b < c->nb; b++) {
+        MLIR_OpHandle term = c->terms[b];
+        size_t no = MLIR_GetBlockNumOps(c->blocks[b]);
+        for (size_t i = 0; i < no; i++)
+            if (lc_op_bumps_gen(MLIR_GetBlockOp(c->blocks[b], i), term)) {
+                c->blk_write[b] = 1; break;
+            }
+    }
+    char *vis = (char *)malloc(c->nb ? c->nb : 1);
+    size_t *q = (size_t *)malloc((c->nb ? c->nb : 1) * sizeof(size_t));
+    for (size_t b = 0; b < c->nb; b++) {
+        if (c->pred_off[b + 1] - c->pred_off[b] <= 1) continue;   // not a join
+        size_t d = c->idom[b];
+        if (d == SIZE_MAX) { c->join_clob[b] = 1; continue; }
+        memset(vis, 0, c->nb);
+        size_t head = 0, tail = 0; bool clob = false;
+        for (size_t e = c->pred_off[b]; e < c->pred_off[b + 1] && !clob; e++) {
+            size_t p = c->pred[e];
+            if (p == d) continue;                       // d's stores already in gen
+            if (c->po_num[p] == SIZE_MAX) { clob = true; break; }  // unreachable
+            if (!vis[p]) { vis[p] = 1; q[tail++] = p; }
+        }
+        while (tail > head && !clob) {
+            size_t x = q[head++];
+            if (c->blk_write[x]) { clob = true; break; }
+            for (size_t e = c->pred_off[x]; e < c->pred_off[x + 1]; e++) {
+                size_t p = c->pred[e];
+                if (p == d) continue;                   // stop at idom
+                if (c->po_num[p] == SIZE_MAX) { clob = true; break; }
+                if (!vis[p]) { vis[p] = 1; q[tail++] = p; }
+            }
+        }
+        c->join_clob[b] = clob ? 1 : 0;
+    }
+    free(vis); free(q);
+}
+
 // ===========================================================================
 // Dominator-tree walk: collect load replacements (no IR mutation yet).
 // ===========================================================================
@@ -335,6 +406,7 @@ typedef struct {
     MLIR_OpHandle *erase; size_t n_erase, cap_erase;   // redundant load ops
     uint64_t gen;
     bool store_fwd;
+    bool join_refine;            // conditional join clobber (TINYC_NO_JOIN_REFINE off)
 } Walk;
 
 static void walk_mark_erase(Walk *w, MLIR_OpHandle op) {
@@ -347,15 +419,15 @@ static void walk_mark_erase(Walk *w, MLIR_OpHandle op) {
 
 static void lc_process_block(Walk *w, size_t bi) {
     Cfg *c = w->c;
-    // Restrict load reuse to single-entry regions (extended basic blocks).
-    // Without MemorySSA the dominator-scoped generation counter cannot see a
-    // memory clobber that lies on a non-dominating CFG path re-merging at a
-    // join (the classic diamond: a load in the idom is *not* available after a
-    // store on the sibling path). Treat the entry of every multi-predecessor
-    // block as a full clobber so an ancestor load is never forwarded across a
-    // join. Single-predecessor chains (e.g. the `||` short-circuit false-edge
-    // chains we target) are unaffected.
-    if (c->pred_off[bi + 1] - c->pred_off[bi] > 1) w->gen++;
+    // Restrict load reuse across joins. Without MemorySSA a store on a sibling
+    // CFG path that re-merges at a multi-predecessor block can clobber an
+    // ancestor value, so a join must drop available values UNLESS the region
+    // between idom(b) and b is provably store-free (cfg_join_clob). The
+    // store-free case is exactly the `||` short-circuit merge we want to keep
+    // forwarding through. Single-predecessor chains are never clobbered here.
+    if (c->pred_off[bi + 1] - c->pred_off[bi] > 1 &&
+        (!w->join_refine || c->join_clob[bi]))
+        w->gen++;
     MLIR_BlockHandle blk = c->blocks[bi];
     size_t nops = MLIR_GetBlockNumOps(blk);
     for (size_t i = 0; i < nops; i++) {
@@ -570,10 +642,12 @@ static void lc_run_region(MLIR_Context *ctx, MLIR_RegionHandle region) {
     c.idom = (size_t *)malloc(nb * sizeof(size_t));
     cfg_rpo(&c);
     cfg_doms(&c);
+    cfg_join_clob(&c);
 
     Walk w; memset(&w, 0, sizeof(w));
     w.c = &c; w.gen = 0;
     w.store_fwd = (getenv("TINYC_NO_STORE_FWD") == NULL);
+    w.join_refine = (getenv("TINYC_NO_JOIN_REFINE") == NULL);
     lcse_map_init(&w.map, total_ops);
     kb_init(&w.kb);
     pmap_init(&w.repl, total_ops);
@@ -603,6 +677,7 @@ static void lc_run_region(MLIR_Context *ctx, MLIR_RegionHandle region) {
     free(c.pred_off); free(c.pred);
     free(c.rpo); free(c.po_num); free(c.idom);
     free(c.dom_off); free(c.dom_child);
+    free(c.blk_write); free(c.join_clob);
 }
 
 void mlir_llvm_load_cse(MLIR_Context *ctx, MLIR_OpHandle module) {
