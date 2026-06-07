@@ -14,6 +14,7 @@
 #include "mlir_llvm_mem2reg.h"
 #include "mlir_llvm_load_cse.h"
 #include "mlir_llvm_arith_gvn.h"
+#include "mlir_llvm_dce.h"
 #include "mlir_llvm_to_wasmssa.h"
 #include "mlir_wasmssa_to_wasmstack.h"
 #include "mlir_wasm_to_wat.h"
@@ -409,6 +410,14 @@ int app_main(void) {
                 // The memfuse address spine is excluded so [x28,Widx,UXTW]
                 // fusion is preserved. Skippable via TINYC_NO_ARITH_GVN.
                 mlir_llvm_arith_gvn(&ctx, llvm_mod);
+                // Whole-function dead-code elimination: the tinyC front end
+                // emits the value of every expression even in statement context
+                // (e.g. the (char)v result of `d[i] = v;`), which survives as a
+                // zero-use pure value after mem2reg/CSE/GVN. The backend has no
+                // DCE and would slot+spill each one (a wasted store per loop
+                // iteration in hot mem/str helpers). Remove them at the source.
+                // Skippable via TINYC_NO_DCE.
+                mlir_llvm_dce(&ctx, llvm_mod);
                 arena_destroy(arena);
                 arena = late_arena;
                 if (!mlir_llvm_to_macho(&ctx, llvm_mod,
