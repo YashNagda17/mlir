@@ -30,8 +30,6 @@ typedef uintptr_t MLIR_LocationHandle;
 
 typedef struct MLIR_Context {
     Arena *arena;
-    /* ASR dialect side tables (op refs, sequences). Set by ASR_ModuleStorageInit. */
-    void *asr_module_storage;
     // When true, MLIR_CreateOp* skips building the per-operand def-use
     // chains (UseNode allocations + the parallel operand_uses /
     // successor_operand_uses arrays). The def-use machinery is only needed
@@ -712,6 +710,10 @@ MLIR_ValueHandle MLIR_GetOpSuccessorOperand(MLIR_OpHandle op, size_t succ_idx, s
 // -----------------------------------------------------------------------------
 
 MLIR_RegionHandle MLIR_CreateRegion(MLIR_Context *ctx);
+// Ensure op has at least (idx + 1) regions; emplace empty ones as needed.
+MLIR_RegionHandle MLIR_EnsureOpRegion(MLIR_Context *ctx, MLIR_OpHandle op, size_t idx);
+// Ensure region has at least one block; create and append if empty.
+MLIR_BlockHandle MLIR_EnsureRegionEntryBlock(MLIR_Context *ctx, MLIR_RegionHandle region);
 void MLIR_AppendRegionBlock(MLIR_Context *ctx, MLIR_RegionHandle region, MLIR_BlockHandle block);
 size_t MLIR_GetRegionNumBlocks(MLIR_RegionHandle region);
 MLIR_BlockHandle MLIR_GetRegionBlock(MLIR_RegionHandle region, size_t idx);
