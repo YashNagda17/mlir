@@ -20,6 +20,10 @@ TINYC = Path(os.environ.get("TINYC", str(ROOT / ("tinyc.exe" if IS_WIN else "tin
 RUNTIME = HERE / "runtime.c"
 RUNTIME_WASM = HERE / "runtime_wasm.c"
 RUNTIME_WASM_START = HERE / "start_wasm.s"
+# corec platform_<os>.c whose file-I/O + exit primitives the via-wasm Mach-O
+# backend's WASI adapters call (spliced in via --host-platform).
+HOST_PLATFORM = ROOT / "corec" / "platform" / "platform_macos.c"
+COREC_DIR = ROOT / "corec"
 TESTS_TOML = HERE / "tests.toml"
 
 CC = os.environ.get("CC", "cl" if IS_WIN else "clang")
@@ -410,6 +414,8 @@ def main():
                     continue
                 r = run([str(TINYC), "--from-wasm", str(linked_wasm),
                          "--emit=macho", f"--macho-backend={via_backend}",
+                         "--host-platform", str(HOST_PLATFORM),
+                         "-I", str(COREC_DIR), "-I", str(ROOT),
                          "-o", str(exe)])
                 if r.returncode != 0:
                     print(f"FAIL {name}: tinyc --from-wasm returned {r.returncode}\nstderr:\n{r.stderr}")

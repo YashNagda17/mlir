@@ -129,14 +129,14 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
     if (tinyc_parse_into(pmod_arena, prog, toks, false) > 0) {
         fprintf(stderr, "tinyc: parse failed for host platform '%s'\n", path);
         MLIR_SetArenaAllocator(ctx, saved_arena);
-    ctx->no_def_use_tracking = saved_no_def_use;
+        ctx->no_def_use_tracking = saved_no_def_use;
         return false;
     }
     MLIR_OpHandle pmod = tinyc_emit_module(ctx, prog);
     if (tinyc_last_emit_errors() > 0 || pmod == MLIR_INVALID_HANDLE) {
         fprintf(stderr, "tinyc: emit failed for host platform '%s'\n", path);
         MLIR_SetArenaAllocator(ctx, saved_arena);
-    ctx->no_def_use_tracking = saved_no_def_use;
+        ctx->no_def_use_tracking = saved_no_def_use;
         return false;
     }
     if (!getenv("TINYC_NO_MEM2REG"))
@@ -144,13 +144,8 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
     if (!lower_fn(ctx, pmod)) {
         fprintf(stderr, "tinyc: lowering failed for host platform '%s'\n", path);
         MLIR_SetArenaAllocator(ctx, saved_arena);
-    ctx->no_def_use_tracking = saved_no_def_use;
+        ctx->no_def_use_tracking = saved_no_def_use;
         return false;
-    }
-    if (getenv("TINYC_DEBUG_HOSTPLAT")) {
-        string s = MLIR_PrintOperationGeneric(ctx, pmod);
-        fprintf(stderr, "=== host platform module (in helper) ===\n%.*s\n",
-                (int)s.size, s.str);
     }
     MLIR_BlockHandle pbody = MLIR_GetRegionBlock(MLIR_GetOpRegion(pmod, 0), 0);
     size_t pn = MLIR_GetBlockNumOps(pbody);
@@ -165,7 +160,7 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
         picks[np++] = op;
     }
     MLIR_SetArenaAllocator(ctx, saved_arena);
-    ctx->no_def_use_tracking = saved_no_def_use;
+        ctx->no_def_use_tracking = saved_no_def_use;
     if (np == 0) {
         fprintf(stderr, "tinyc: no __host_platform_* definitions in '%s'\n", path);
         return false;
@@ -501,12 +496,22 @@ int app_main(void) {
             if (emit_wasmssa) {
                 out_fw = MLIR_PrintOperationGeneric(&ctx, ssa);
             } else if (emit_macho) {
+                // The via-wasm Mach-O backend's WASI adapters call corec's
+                // platform_<os>.c (as __host_platform_*), so the path to it is
+                // required.
+                if (!host_platform_path) {
+                    fprintf(stderr,
+                        "tinyc --from-wasm --emit=macho: --host-platform=PATH "
+                        "is required (e.g. corec/platform/platform_macos.c)\n");
+                    arena_destroy(arena);
+                    arena_destroy(boot_arena);
+                    return 1;
+                }
                 // Compile the host platform file FIRST, while the interning
                 // epoch is clean: its funcs are spliced into the lifted module
                 // after the opt passes (see tinyc_compile_host_platform).
                 MLIR_OpHandle hp_picks[8]; size_t hp_n = 0;
-                if (host_platform_path &&
-                    !tinyc_compile_host_platform(&ctx, host_platform_path,
+                if (!tinyc_compile_host_platform(&ctx, host_platform_path,
                                                  include_dirs, n_include_dirs,
                                                  lower_for_wasm_fn,
                                                  hp_picks, &hp_n)) {

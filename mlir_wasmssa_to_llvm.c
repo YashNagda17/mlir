@@ -362,55 +362,31 @@ static void local_fwd_sync(FLower *L) {
 // Forward declarations (defined later) used by linmem_ptr / memory.grow.
 static MLIR_ValueHandle emit_load_ty(FLower *L, MLIR_ValueHandle p, MLIR_TypeHandle ty);
 static void emit_store_v(FLower *L, MLIR_ValueHandle v, MLIR_ValueHandle p);
+static MLIR_ValueHandle emit_libc_call(FLower *L, const char *name,
+                                       MLIR_ValueHandle *args, size_t na,
+                                       MLIR_TypeHandle rty);
 
 // =============================================================================
-// WASI host target — the platform the via-wasm native lowering binds to.
+// WASI host bridge — how the via-wasm native lowering reaches the OS.
 //
 // The WASI imports (fd_write, proc_exit, path_open, ...) are synthesised below
-// as small `llvm`-dialect shims. Those shims are NOT redundant with corec's
-// platform_<os>.c: they exist to bridge the wasm32 ABI of the lifted module
-// (pointers are 32-bit linear-memory offsets; iovec/struct fields are 32-bit)
-// to the native ABI of the host (64-bit pointers/fields). What they cannot do
-// in portable C — the actual OS entry — is delegated to the host.
+// as small `llvm`-dialect shims. The shims are deliberately THIN: they only
+// bridge the wasm32 ABI of the lifted module (pointers are 32-bit linear-memory
+// offsets; iovec/struct fields are 32-bit) to the native LP64 ABI — translate
+// offsets to host pointers, repack the iovec, store results back to linmem —
+// and then DELEGATE the actual OS work to corec's platform_<os>.c.
 //
-// This indirection is the single place the host OS is selected. Today only
-// macOS is wired up: each abstract operation maps to the libSystem symbol the
-// shim `bl`s, which the aarch64->Mach-O encoder resolves to a dyld stub
-// (mirroring what platform_macos.c does). The hooks for the other targets:
+// Those platform functions (platform_fd_write / _read / _close / _seek / _tell
+// / _path_open / _exit) are compiled LP64 and spliced into this module by the
+// driver as __host_platform_* (see tinyc_compile_host_platform / the
+// --host-platform flag). So there is ONE implementation of the platform per OS
+// — the corec source — shared by the native and the via-wasm paths; the shims
+// no longer re-implement it.
 //
-//   * WASI_HOST_LINUX  — would emit the raw syscall via the __builtin_syscall6
-//       intrinsic (see synth_syscall6 in mlir_llvm_to_aarch64.c), i.e. the
-//       structural equivalent of platform_linux.c, not a named libc call.
-//   * WASI_HOST_WINDOWS — would `bl` the kernel32 entry points
-//       (WriteFile / ExitProcess / ...) the PE container imports.
-//
-// Keeping the selection here (rather than scattered string literals) is what
-// lets the one ISA backend + the per-format containers retarget the via-wasm
-// path across operating systems.
+// Retargeting to Linux/Windows is then just: splice that OS's platform_<os>.c
+// (its raw-syscall / kernel32 bodies) instead of platform_macos.c. The shim
+// bodies here are OS-independent.
 // =============================================================================
-enum { WASI_HOST_MACOS = 0, WASI_HOST_LINUX, WASI_HOST_WINDOWS };
-enum { WH_EXIT = 0, WH_WRITE, WH_READ, WH_OPEN, WH_CLOSE, WH_LSEEK, WH_FCHMOD };
-
-// Selected host OS for the WASI shims. 0 (macOS) is the only target currently
-// wired up; a future Linux/Windows backend sets this before lowering. A plain
-// scalar (no aggregate initializer) so this file stays tinyC-compilable.
-static int g_wasi_host_os = WASI_HOST_MACOS;
-
-// Concrete symbol a WASI shim calls for an abstract host operation, under the
-// selected target. macOS maps each to its libSystem name.
-static const char *wasi_host_sym(int op) {
-    if (g_wasi_host_os == WASI_HOST_MACOS) {
-        if (op == WH_EXIT)   return "_exit";
-        if (op == WH_WRITE)  return "_write";
-        if (op == WH_READ)   return "_read";
-        if (op == WH_OPEN)   return "_open";
-        if (op == WH_CLOSE)  return "_close";
-        if (op == WH_LSEEK)  return "_lseek";
-        if (op == WH_FCHMOD) return "_fchmod";
-    }
-    // Linux/Windows targets are not wired up yet (see the comment above).
-    return "_exit";
-}
 
 
 // Create a fresh CFG block appended to the destination region.
@@ -950,10 +926,11 @@ static bool lower_op(FLower *L, MLIR_OpHandle op) {
             fprintf(stderr, "wasmssa->llvm: call without target\n");
             return false;
         }
-        // WASI imports map to the selected host's OS entry points (macOS:
-        // libSystem dyld stubs). See the WASI host target section above.
+        // WASI imports map to the host platform implementation (the
+        // __host_platform_* funcs compiled from corec's platform_<os>.c and
+        // spliced in by the driver via --host-platform).
         if (callee.size == 9 && memcmp(callee.str, "proc_exit", 9) == 0)
-            callee = str_from_cstr_view((char *)wasi_host_sym(WH_EXIT));
+            callee = str_from_cstr_view((char *)"__host_platform_exit");
         size_t no = MLIR_GetOpNumOperands(op);
         MLIR_ValueHandle *ops = (MLIR_ValueHandle *)malloc(
             (no ? no : 1) * sizeof(MLIR_ValueHandle));
@@ -1988,12 +1965,13 @@ static void emit_store_v(FLower *L, MLIR_ValueHandle v, MLIR_ValueHandle p) {
     emit(L, out);
 }
 
-// Emit `_write(fd, ptr, len)` (result discarded).
+// Emit `_write(fd, ptr, len)` (result discarded). Used by the printI64 /
+// printStr runtime shims (tinyC's own print imports, not the platform layer),
+// which write to stdout via the libSystem `_write` stub directly.
 static void emit_write_call(FLower *L, MLIR_ValueHandle fd, MLIR_ValueHandle p,
                             MLIR_ValueHandle len) {
-    const char *wn = wasi_host_sym(WH_WRITE);
     MLIR_AttributeHandle a[1] = {
-        attr_s(L->ctx, "callee", (char *)wn, strlen(wn))
+        attr_s(L->ctx, "callee", (char *)"_write", 6)
     };
     MLIR_ValueHandle ops[3] = { fd, p, len };
     MLIR_OpHandle out = build_op(L->ctx, OP_TYPE_LLVM_CALL, a, 1, NULL, 0, NULL, ops, 3);
@@ -2188,6 +2166,7 @@ static void synth_fd_write(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
 
     MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
     MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(ctx, 64, true);
+    MLIR_TypeHandle i8  = MLIR_CreateTypeInteger(ctx, 8, true);
 
     MLIR_ValueHandle pfd = MLIR_CreateValueBlockArg(ctx, (string){0}, 0, i32,
         MLIR_CreateLocationUnknown(ctx, (string){0}));
@@ -2208,6 +2187,8 @@ static void synth_fd_write(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     MLIR_ValueHandle iovpr = emit_alloca(&L, i32, 1); // current iovec offset
     MLIR_ValueHandle rempr = emit_alloca(&L, i32, 1); // remaining count
     MLIR_ValueHandle totpr = emit_alloca(&L, i64, 1); // bytes-written accumulator
+    MLIR_ValueHandle cvbuf = emit_alloca(&L, i8, 16); // one native ciovec {ptr,i64}
+    MLIR_ValueHandle nwchunk = emit_alloca(&L, i64, 1); // per-chunk *nwritten
     emit_store_v(&L, piov, iovpr);
     emit_store_v(&L, plen, rempr);
     emit_store_v(&L, emit_const(&L, i64, 0), totpr);
@@ -2232,16 +2213,16 @@ static void synth_fd_write(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     MLIR_ValueHandle clen = emit_load_ty(&L, lenp, i32);
     MLIR_ValueHandle host = linmem_ptr(&L, bufofs, 0);
     MLIR_ValueHandle clen64 = emit_cast(&L, OP_TYPE_LLVM_ZEXT, clen, i64);
-    // r = _write(fd, host, clen64)
-    const char *wn = wasi_host_sym(WH_WRITE);
-    MLIR_AttributeHandle wa[1] = { attr_s(ctx, "callee", (char *)wn, strlen(wn)) };
-    MLIR_ValueHandle wops[3] = { pfd, host, clen64 };
-    MLIR_TypeHandle wrt[1] = { i64 };
-    MLIR_ValueHandle wr[1] = { mk_res(ctx, i64) };
-    MLIR_OpHandle wc = build_op(ctx, OP_TYPE_LLVM_CALL, wa, 1, wrt, 1, wr, wops, 3);
-    emit(&L, wc);
+    // Build a 1-element native ciovec {buf=host, buf_len=clen64} and call the
+    // real platform_fd_write. *nwritten (size_t) receives the bytes written.
+    emit_store_v(&L, host, cvbuf);
+    emit_store_v(&L, clen64, emit_byte_ptr(&L, cvbuf, emit_const(&L, i64, 8)));
+    emit_store_v(&L, emit_const(&L, i64, 0), nwchunk);
+    MLIR_ValueHandle hargs[4] = { pfd, cvbuf, emit_const(&L, i64, 1), nwchunk };
+    emit_libc_call(&L, "__host_platform_fd_write", hargs, 4, i32);
+    MLIR_ValueHandle nbytes = emit_load_ty(&L, nwchunk, i64);
     MLIR_ValueHandle tot = emit_load_ty(&L, totpr, i64);
-    emit_store_v(&L, emit_binop2(&L, OP_TYPE_LLVM_ADD, tot, wr[0], i64), totpr);
+    emit_store_v(&L, emit_binop2(&L, OP_TYPE_LLVM_ADD, tot, nbytes, i64), totpr);
     emit_store_v(&L, emit_binop2(&L, OP_TYPE_LLVM_ADD, iov, emit_const(&L, i32, 8), i32), iovpr);
     emit_store_v(&L, emit_binop2(&L, OP_TYPE_LLVM_SUB, rem, emit_const(&L, i32, 1), i32), rempr);
     term_br(&L, loop);
@@ -2322,7 +2303,7 @@ static MLIR_ValueHandle emit_i2p(FLower *L, MLIR_ValueHandle i64v) {
     return r[0];
 }
 
-// i32 fd_close(i32 fd): _close(fd); return 0.
+// i32 fd_close(i32 fd): platform_fd_close(fd); return 0.
 static void synth_fd_close(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     MLIR_RegionHandle reg = MLIR_CreateRegion(ctx);
     MLIR_BlockHandle entry = MLIR_CreateBlock(ctx);
@@ -2331,7 +2312,7 @@ static void synth_fd_close(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     MLIR_ValueHandle fd = mk_arg(ctx, entry, 0, i32);
     FLower L = {0}; L.ctx = ctx; L.dreg = reg; L.cur = entry;
     MLIR_ValueHandle a[1] = { fd };
-    emit_libc_call(&L, wasi_host_sym(WH_CLOSE), a, 1, i32);
+    emit_libc_call(&L, "__host_platform_fd_close", a, 1, i32);
     emit_ret_v(&L, emit_const(&L, i32, 0));
     finish_func(ctx, out_body, reg, "fd_close");
 }
@@ -2344,6 +2325,7 @@ static void synth_fd_read(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     MLIR_AppendRegionBlock(ctx, reg, entry);
     MLIR_TypeHandle i32 = MLIR_CreateTypeInteger(ctx, 32, true);
     MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(ctx, 64, true);
+    MLIR_TypeHandle i8  = MLIR_CreateTypeInteger(ctx, 8, true);
     MLIR_ValueHandle pfd  = mk_arg(ctx, entry, 0, i32);
     MLIR_ValueHandle piov = mk_arg(ctx, entry, 1, i32);
     MLIR_ValueHandle plen = mk_arg(ctx, entry, 2, i32);
@@ -2353,6 +2335,8 @@ static void synth_fd_read(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     MLIR_ValueHandle iovpr = emit_alloca(&L, i32, 1);
     MLIR_ValueHandle rempr = emit_alloca(&L, i32, 1);
     MLIR_ValueHandle totpr = emit_alloca(&L, i64, 1);
+    MLIR_ValueHandle cvbuf = emit_alloca(&L, i8, 16);  // native ciovec {ptr,i64}
+    MLIR_ValueHandle nrchunk = emit_alloca(&L, i64, 1); // per-chunk *nread
     emit_store_v(&L, piov, iovpr);
     emit_store_v(&L, plen, rempr);
     emit_store_v(&L, emit_const(&L, i64, 0), totpr);
@@ -2375,12 +2359,18 @@ static void synth_fd_read(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     MLIR_ValueHandle clen = emit_load_ty(&L, linmem_ptr(&L, iov, 4), i32);
     MLIR_ValueHandle host = linmem_ptr(&L, bufofs, 0);
     MLIR_ValueHandle clen64 = emit_cast(&L, OP_TYPE_LLVM_ZEXT, clen, i64);
-    MLIR_ValueHandle rargs[3] = { pfd, host, clen64 };
-    MLIR_ValueHandle n = emit_libc_call(&L, wasi_host_sym(WH_READ), rargs, 3, i64);
-    MLIR_ValueHandle isneg = build_icmp(&L, /*slt*/2, n, emit_const(&L, i64, 0));
-    term_cond_br(&L, isneg, err, cont);
+    // Build a 1-element native iovec {host, clen64} and call platform_fd_read.
+    // Returns 0 (with bytes in *nread) or errno.
+    emit_store_v(&L, host, cvbuf);
+    emit_store_v(&L, clen64, emit_byte_ptr(&L, cvbuf, emit_const(&L, i64, 8)));
+    emit_store_v(&L, emit_const(&L, i64, 0), nrchunk);
+    MLIR_ValueHandle rargs[4] = { pfd, cvbuf, emit_const(&L, i64, 1), nrchunk };
+    MLIR_ValueHandle rc = emit_libc_call(&L, "__host_platform_fd_read", rargs, 4, i32);
+    MLIR_ValueHandle iserr = build_icmp(&L, /*ne*/1, rc, emit_const(&L, i32, 0));
+    term_cond_br(&L, iserr, err, cont);
 
     L.cur = cont; L.terminated = false;
+    MLIR_ValueHandle n = emit_load_ty(&L, nrchunk, i64);
     MLIR_ValueHandle tot = emit_load_ty(&L, totpr, i64);
     emit_store_v(&L, emit_binop2(&L, OP_TYPE_LLVM_ADD, tot, n, i64), totpr);
     emit_store_v(&L, emit_binop2(&L, OP_TYPE_LLVM_ADD, iov, emit_const(&L, i32, 8), i32), iovpr);
@@ -2415,15 +2405,17 @@ static void synth_fd_seek(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     MLIR_ValueHandle pno = mk_arg(ctx, entry, 3, i32);
     FLower L = {0}; L.ctx = ctx; L.dreg = reg; L.cur = entry;
 
-    MLIR_ValueHandle sargs[3] = { pfd, poff, pwh };
-    MLIR_ValueHandle r = emit_libc_call(&L, wasi_host_sym(WH_LSEEK), sargs, 3, i64);
+    MLIR_TypeHandle i64p = MLIR_CreateTypeInteger(ctx, 64, true);
+    MLIR_ValueHandle nofs = emit_alloca(&L, i64p, 1);  // native uint64 newoffset
+    MLIR_ValueHandle sargs[4] = { pfd, poff, pwh, nofs };
+    MLIR_ValueHandle rc = emit_libc_call(&L, "__host_platform_fd_seek", sargs, 4, i32);
     MLIR_BlockHandle ok = new_block(&L);
     MLIR_BlockHandle err = new_block(&L);
-    MLIR_ValueHandle isneg = build_icmp(&L, /*slt*/2, r, emit_const(&L, i64, 0));
-    term_cond_br(&L, isneg, err, ok);
+    MLIR_ValueHandle iserr = build_icmp(&L, /*ne*/1, rc, emit_const(&L, i32, 0));
+    term_cond_br(&L, iserr, err, ok);
 
     L.cur = ok; L.terminated = false;
-    emit_store_v(&L, r, linmem_ptr(&L, pno, 0));
+    emit_store_v(&L, emit_load_ty(&L, nofs, i64), linmem_ptr(&L, pno, 0));
     emit_ret_v(&L, emit_const(&L, i32, 0));
 
     L.cur = err; L.terminated = false;
@@ -2445,16 +2437,16 @@ static void synth_fd_tell(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     MLIR_ValueHandle pno = mk_arg(ctx, entry, 1, i32);
     FLower L = {0}; L.ctx = ctx; L.dreg = reg; L.cur = entry;
 
-    MLIR_ValueHandle sargs[3] = { pfd, emit_const(&L, i64, 0),
-                                  emit_const(&L, i32, 1) };
-    MLIR_ValueHandle r = emit_libc_call(&L, wasi_host_sym(WH_LSEEK), sargs, 3, i64);
+    MLIR_ValueHandle ofs = emit_alloca(&L, i64, 1);   // native uint64 offset
+    MLIR_ValueHandle targs[2] = { pfd, ofs };
+    MLIR_ValueHandle rc = emit_libc_call(&L, "__host_platform_fd_tell", targs, 2, i32);
     MLIR_BlockHandle ok = new_block(&L);
     MLIR_BlockHandle err = new_block(&L);
-    MLIR_ValueHandle isneg = build_icmp(&L, /*slt*/2, r, emit_const(&L, i64, 0));
-    term_cond_br(&L, isneg, err, ok);
+    MLIR_ValueHandle iserr = build_icmp(&L, /*ne*/1, rc, emit_const(&L, i32, 0));
+    term_cond_br(&L, iserr, err, ok);
 
     L.cur = ok; L.terminated = false;
-    emit_store_v(&L, r, linmem_ptr(&L, pno, 0));
+    emit_store_v(&L, emit_load_ty(&L, ofs, i64), linmem_ptr(&L, pno, 0));
     emit_ret_v(&L, emit_const(&L, i32, 0));
 
     L.cur = err; L.terminated = false;
@@ -2518,36 +2510,11 @@ static void synth_path_open(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
         emit_cast(&L, OP_TYPE_LLVM_ZEXT, plen, i64));
     emit_store_v(&L, emit_cast(&L, OP_TYPE_LLVM_TRUNC, emit_const(&L, i64, 0), i8), nuldst);
 
-    // POSIX open() flags (branchless). WASI: oflags CREAT=1,EXCL=4,TRUNC=8;
-    // rights FD_READ=0x02, FD_WRITE=0x40; fdflags APPEND=1.
-    MLIR_ValueHandle rights32 = emit_cast(&L, OP_TYPE_LLVM_TRUNC, prights, i32);
-    MLIR_ValueHandle hw = build_icmp(&L, /*ne*/1,
-        emit_binop2(&L, OP_TYPE_LLVM_AND, rights32, emit_const(&L, i32, 0x40), i32),
-        emit_const(&L, i32, 0));
-    MLIR_ValueHandle hr = build_icmp(&L, /*ne*/1,
-        emit_binop2(&L, OP_TYPE_LLVM_AND, rights32, emit_const(&L, i32, 0x02), i32),
-        emit_const(&L, i32, 0));
-    // access = hw * (1 + hr): 0=RDONLY, 1=WRONLY, 2=RDWR.
-    MLIR_ValueHandle access = emit_binop2(&L, OP_TYPE_LLVM_MUL, hw,
-        emit_binop2(&L, OP_TYPE_LLVM_ADD, emit_const(&L, i32, 1), hr, i32), i32);
-    MLIR_ValueHandle osf = access;
-    struct { int mask; int oflag_src; int posix; } fl[4] = {
-        { 1, 1, 0x200 },   // O_CREAT  (oflags bit0)
-        { 8, 1, 0x400 },   // O_TRUNC  (oflags bit3)
-        { 4, 1, 0x800 },   // O_EXCL   (oflags bit2)
-        { 1, 0, 0x08  },   // O_APPEND (fdflags bit0)
-    };
-    for (int k = 0; k < 4; k++) {
-        MLIR_ValueHandle src = fl[k].oflag_src ? poflags : pfdflags;
-        MLIR_ValueHandle set = build_icmp(&L, /*ne*/1,
-            emit_binop2(&L, OP_TYPE_LLVM_AND, src, emit_const(&L, i32, fl[k].mask), i32),
-            emit_const(&L, i32, 0));
-        MLIR_ValueHandle contrib = emit_binop2(&L, OP_TYPE_LLVM_MUL, set,
-            emit_const(&L, i32, fl[k].posix), i32);
-        osf = emit_binop2(&L, OP_TYPE_LLVM_ADD, osf, contrib, i32);
-    }
-    MLIR_ValueHandle oargs[3] = { buf, osf, emit_const(&L, i32, 0644) };
-    MLIR_ValueHandle fd = emit_libc_call(&L, wasi_host_sym(WH_OPEN), oargs, 3, i32);
+    // platform_path_open does the WASI rights/oflags -> POSIX translation
+    // internally, so pass the WASI values straight through.
+    MLIR_ValueHandle plen64 = emit_cast(&L, OP_TYPE_LLVM_ZEXT, plen, i64);
+    MLIR_ValueHandle oargs[4] = { buf, plen64, prights, poflags };
+    MLIR_ValueHandle fd = emit_libc_call(&L, "__host_platform_path_open", oargs, 4, i32);
     MLIR_BlockHandle ook = new_block(&L);
     MLIR_ValueHandle ofail = build_icmp(&L, /*slt*/2, fd, emit_const(&L, i32, 0));
     term_cond_br(&L, ofail, err, ook);
@@ -2555,10 +2522,10 @@ static void synth_path_open(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
     L.cur = ook; L.terminated = false;
     emit_store_v(&L, fd, linmem_ptr(&L, popened, 0));
     // Darwin arm64: open()'s mode is a *variadic* argument and must be passed
-    // on the stack, but our call ABI passes args in registers, so a freshly
-    // created file ends up with a garbage mode (e.g. ---------x) and later
-    // read-back of the file fails. fchmod() is non-variadic, so fix the mode
-    // explicitly to 0644 whenever O_CREAT (WASI oflags bit0) was requested.
+    // on the stack, but tinyC's call ABI passes args in registers, so a freshly
+    // created file ends up with a garbage mode (e.g. ---------x) — true inside
+    // platform_path_open's own open() too. fchmod() is non-variadic, so fix the
+    // mode explicitly to 0644 whenever O_CREAT (WASI oflags bit0) was requested.
     MLIR_ValueHandle created = build_icmp(&L, /*ne*/1,
         emit_binop2(&L, OP_TYPE_LLVM_AND, poflags, emit_const(&L, i32, 1), i32),
         emit_const(&L, i32, 0));
@@ -2568,7 +2535,7 @@ static void synth_path_open(MLIR_Context *ctx, MLIR_BlockHandle out_body) {
 
     L.cur = do_chmod; L.terminated = false;
     MLIR_ValueHandle cargs[2] = { fd, emit_const(&L, i32, 0644) };
-    (void)emit_libc_call(&L, wasi_host_sym(WH_FCHMOD), cargs, 2, i32);
+    (void)emit_libc_call(&L, "_fchmod", cargs, 2, i32);
     term_br(&L, ret_ok);
 
     L.cur = ret_ok; L.terminated = false;
