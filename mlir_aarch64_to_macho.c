@@ -32,14 +32,14 @@
 
 #include "mlir_api.h"
 #include "mlir_op_names.h"
+#include "mlir_machine.h"
 
 // =============================================================================
 // Growable byte buffer + endian helpers + SHA-256. These mirror the
 // helpers in mlir_wasm_to_macho.c (which keeps them file-local), so we
 // duplicate them here rather than tying the two backends together.
+// `Buf` itself is shared via mlir_machine.h (MachineFunc.code is a Buf).
 // =============================================================================
-typedef struct { uint8_t *data; size_t len, cap; } Buf;
-
 static void buf_grow(Buf *b, size_t add) {
     if (b->len + add <= b->cap) return;
     size_t nc = b->cap ? b->cap : 1024;
@@ -584,75 +584,28 @@ static uint32_t arm64_adrp(uint8_t rd, int64_t rel_pages) {
 static void emit_word(Buf *b, uint32_t w) { buf_le32(b, w); }
 
 // =============================================================================
-// Per-function emission. A pass over an aarch64.func produces a byte
-// buffer + a list of `bl` call sites that need PC-relative patching
-// once all function offsets are known.
+// Per-function emission. A pass over an aarch64.func produces a MachineFunc:
+// a byte buffer + a list of `bl` call sites and data references that need
+// PC-relative patching once all function offsets are known. The MachineFunc /
+// MachineCallReloc / MachineDataReloc / MachineBranchReloc / MachineBlockPos /
+// MachineDataInit / MachineModule types are the format-neutral seam defined in
+// mlir_machine.h and consumed by the Mach-O container below.
 // =============================================================================
-typedef struct {
-    string   callee;        // referenced symbol name
-    uint32_t fn_off;        // byte offset within the function's code
-} BlReloc;
 
-// ADRP / ADD imm12 relocs. `kind` is one of "data_priv" / "globals" /
-// "linmem"; the patcher computes the page-relative ADRP imm21 and the
-// low-12 ADD imm12 once segment VM addresses are known.
-typedef struct {
-    string   kind;          // "data_priv" / "globals" / "linmem"
-    bool     is_add_lo;     // false = ADRP, true = ADD imm12
-    uint8_t  rd;
-    uint8_t  rn;
-    uint32_t fn_off;
-    uint32_t addend;        // byte offset added to the resolved section base
-} DataReloc;
-
-// Branch reloc. Identifies a placeholder branch instruction emitted
-// for an aarch64.b / b_cond / cbz / cbnz op so we can resolve it to a
-// PC-relative imm once all blocks have known function offsets.
-enum BranchKind { BR_B, BR_B_COND, BR_CBZ, BR_CBNZ };
-typedef struct {
-    int              kind;            // enum BranchKind
-    MLIR_BlockHandle target;
-    uint32_t         fn_off;          // offset of the branch insn within fn
-    uint8_t          cond_or_rt;      // cond for B_COND, rt for CBZ/CBNZ
-    bool             sf;              // for CBZ/CBNZ
-} BranchReloc;
-
-// Position of a block within the function's code buffer. Filled in as
-// blocks are emitted, consumed by the branch patcher.
-typedef struct {
-    MLIR_BlockHandle blk;
-    uint32_t         fn_off;
-} BlockPos;
-
-typedef struct {
-    string       name;
-    bool         exported;
-    Buf          code;
-    BlReloc     *relocs;
-    size_t       n_relocs, c_relocs;
-    DataReloc   *dr;
-    size_t       n_dr, c_dr;
-    BranchReloc *br;
-    size_t       n_br, c_br;
-    BlockPos    *bp;
-    size_t       n_bp, c_bp;
-    uint32_t     text_off;   // assigned after layout
-} EmittedFunc;
-
-static void ef_add_reloc(EmittedFunc *e, string callee, uint32_t off) {
+static void ef_add_reloc(MachineFunc *e, string callee, uint32_t off) {
     if (e->n_relocs == e->c_relocs) {
         e->c_relocs = e->c_relocs ? e->c_relocs * 2 : 4;
-        e->relocs = (BlReloc *)realloc(e->relocs, e->c_relocs * sizeof(BlReloc));
+        e->relocs = (MachineCallReloc *)realloc(e->relocs, e->c_relocs * sizeof(MachineCallReloc));
     }
     e->relocs[e->n_relocs].callee = callee;
     e->relocs[e->n_relocs].fn_off = off;
     e->n_relocs++;
 }
-static void ef_add_dr(EmittedFunc *e, string kind, bool is_add_lo,
+static void ef_add_dr(MachineFunc *e, string kind, bool is_add_lo,
                       uint8_t rd, uint8_t rn, uint32_t off, uint32_t addend) {
     if (e->n_dr == e->c_dr) {
         e->c_dr = e->c_dr ? e->c_dr * 2 : 4;
-        e->dr = (DataReloc *)realloc(e->dr, e->c_dr * sizeof(DataReloc));
+        e->dr = (MachineDataReloc *)realloc(e->dr, e->c_dr * sizeof(MachineDataReloc));
     }
     e->dr[e->n_dr].kind      = kind;
     e->dr[e->n_dr].is_add_lo = is_add_lo;
@@ -662,11 +615,11 @@ static void ef_add_dr(EmittedFunc *e, string kind, bool is_add_lo,
     e->dr[e->n_dr].addend    = addend;
     e->n_dr++;
 }
-static void ef_add_br(EmittedFunc *e, int kind, MLIR_BlockHandle target,
+static void ef_add_br(MachineFunc *e, int kind, MLIR_BlockHandle target,
                       uint32_t off, uint8_t cond_or_rt, bool sf) {
     if (e->n_br == e->c_br) {
         e->c_br = e->c_br ? e->c_br * 2 : 4;
-        e->br = (BranchReloc *)realloc(e->br, e->c_br * sizeof(BranchReloc));
+        e->br = (MachineBranchReloc *)realloc(e->br, e->c_br * sizeof(MachineBranchReloc));
     }
     e->br[e->n_br].kind       = kind;
     e->br[e->n_br].target     = target;
@@ -675,10 +628,10 @@ static void ef_add_br(EmittedFunc *e, int kind, MLIR_BlockHandle target,
     e->br[e->n_br].sf         = sf;
     e->n_br++;
 }
-static void ef_add_bp(EmittedFunc *e, MLIR_BlockHandle blk, uint32_t off) {
+static void ef_add_bp(MachineFunc *e, MLIR_BlockHandle blk, uint32_t off) {
     if (e->n_bp == e->c_bp) {
         e->c_bp = e->c_bp ? e->c_bp * 2 : 4;
-        e->bp = (BlockPos *)realloc(e->bp, e->c_bp * sizeof(BlockPos));
+        e->bp = (MachineBlockPos *)realloc(e->bp, e->c_bp * sizeof(MachineBlockPos));
     }
     e->bp[e->n_bp].blk    = blk;
     e->bp[e->n_bp].fn_off = off;
@@ -771,7 +724,7 @@ typedef struct {
     uint32_t n_stubs;                 // total libSystem symbols used
 } LibSysRegistry;
 
-static bool emit_aarch64_func(MLIR_OpHandle fn, EmittedFunc *out) {
+static bool emit_aarch64_func(MLIR_OpHandle fn, MachineFunc *out) {
     out->name     = attr_s(fn, "sym_name");
     out->exported = attr_b(fn, "exported");
 
@@ -1339,7 +1292,7 @@ static void a64_sort_idx_u64(uint32_t *idx, size_t n, const uint64_t *key) {
 }
 
 // Patch a 32-bit little-endian instruction word into the code buffer.
-static void a64_write_word(EmittedFunc *e, uint32_t off, uint32_t insn) {
+static void a64_write_word(MachineFunc *e, uint32_t off, uint32_t insn) {
     e->code.data[off + 0] = (uint8_t)(insn      );
     e->code.data[off + 1] = (uint8_t)(insn >>  8);
     e->code.data[off + 2] = (uint8_t)(insn >> 16);
@@ -1372,7 +1325,7 @@ enum { FORM_B = 0, FORM_DIRECT = 1, FORM_FALLBACK = 2 };
 // removes the per-iteration trampoline bounce that the structured-CFG lowering
 // emits in hot loops. Trampoline blocks are left in place (now cold). Gated by
 // TINYC_NO_THREAD for A/B.
-static bool patch_branches(EmittedFunc *e) {
+static bool patch_branches(MachineFunc *e) {
     size_t nbp = e->n_bp;
     uint32_t *byhandle = NULL;   // bp indices sorted by block handle
     int32_t  *fwd = NULL;        // bp index -> bp index it trampolines to (-1 none)
@@ -1463,7 +1416,7 @@ static bool patch_branches(EmittedFunc *e) {
     uint32_t *tgt_old = (uint32_t *)malloc((nbr ? nbr : 1) * sizeof(uint32_t));
     bool      no_direct = (getenv("TINYC_NO_DIRECT_COND") != NULL);
     for (size_t i = 0; i < nbr; i++) {
-        BranchReloc *r = &e->br[i];
+        MachineBranchReloc *r = &e->br[i];
         int idx = -1;
         size_t lo = 0, hi = nbp;
         while (lo < hi) {
@@ -1538,7 +1491,7 @@ static bool patch_branches(EmittedFunc *e) {
         // kept as an explicit NOP exactly as before.
         #define NEWOFF(o) ((uint32_t)((o) - (compacted ? 4u * (uint32_t)a64_lower_count(del, ndel, (o)) : 0u)))
         for (size_t i = 0; i < nbr && ok; i++) {
-            BranchReloc *r = &e->br[i];
+            MachineBranchReloc *r = &e->br[i];
             uint32_t tnew = NEWOFF(tgt_old[i]);
             if (form[i] == FORM_B) {
                 uint32_t fo = NEWOFF(r->fn_off);
@@ -1620,18 +1573,13 @@ static bool patch_branches(EmittedFunc *e) {
 // Top-level translator.
 // =============================================================================
 
-// A contribution to the linmem __DATA image: `bytes` placed at `offset`.
-typedef struct { uint32_t offset; string bytes; } LinInit;
-
-// Assemble the final Mach-O image from per-function `EmittedFunc` records and
-// the linmem data-init contributions. Owns nothing on entry; frees `efs` and
-// `inits` (and the per-function heap buffers) before returning. This is the
-// shared back half of both the whole-module path (mlir_aarch64_to_macho) and
-// the streaming per-function path (mlir_llvm_to_macho).
-static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
-                           LinInit *inits, size_t n_inits,
-                           uint32_t n_globals, uint64_t global0_init,
-                           uint64_t linmem_size,
+// Assemble the final Mach-O image from a format-neutral MachineModule. Consumes
+// the module: frees each function's heap buffers, the `funcs` array, and the
+// `inits` array before returning (the MachineModule struct itself is caller-
+// owned). This is the container back half shared by both the whole-module path
+// (mlir_aarch64_to_macho) and the streaming per-function path
+// (mlir_llvm_to_macho).
+static bool finalize_macho(MachineModule *mm,
                            uint8_t **out_data, size_t *out_size);
 
 bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
@@ -1654,21 +1602,21 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
     // Collect functions, find `_start`. `_start` must be placed first
     // in __text so LC_MAIN.entryoff equals text_section_off.
     // -----------------------------------------------------------------
-    EmittedFunc *efs = (EmittedFunc *)calloc(n_top, sizeof(EmittedFunc));
+    MachineFunc *efs = (MachineFunc *)calloc(n_top, sizeof(MachineFunc));
     size_t n_funcs = 0;
     size_t start_idx = (size_t)-1;
     // -----------------------------------------------------------------
     // Walk top-level for data_init ops first: collect the contributions
     // to the linmem __DATA section.
     // -----------------------------------------------------------------
-    LinInit  *inits = NULL;
+    MachineDataInit  *inits = NULL;
     size_t    n_inits = 0;
     for (size_t i = 0; i < n_top; i++) {
         MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
         if (MLIR_GetOpType(op) != OP_TYPE_AARCH64_DATA_INIT) continue;
         int64_t off = attr_i(op, "offset");
         string  bs  = attr_s(op, "init_data");
-        inits = (LinInit *)realloc(inits, (n_inits + 1) * sizeof(LinInit));
+        inits = (MachineDataInit *)realloc(inits, (n_inits + 1) * sizeof(MachineDataInit));
         inits[n_inits].offset = (uint32_t)off;
         inits[n_inits].bytes  = bs;
         n_inits++;
@@ -1714,16 +1662,32 @@ bool mlir_aarch64_to_macho(MLIR_Context *ctx, MLIR_OpHandle module,
         free(efs); free(inits); return false;
     }
 
-    return finalize_macho(efs, n_funcs, start_idx, inits, n_inits,
-                          n_globals, global0_init, linmem_size,
-                          out_data, out_size);
+    MachineModule mm = {0};
+    mm.funcs = efs;
+    mm.n_funcs = n_funcs;
+    mm.entry_idx = start_idx;
+    mm.inits = inits;
+    mm.n_inits = n_inits;
+    mm.n_globals = n_globals;
+    mm.global0_init = global0_init;
+    mm.linmem_size = linmem_size;
+    return finalize_macho(&mm, out_data, out_size);
 }
 
-static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
-                           LinInit *inits, size_t n_inits,
-                           uint32_t n_globals, uint64_t global0_init,
-                           uint64_t linmem_size,
+static bool finalize_macho(MachineModule *mm,
                            uint8_t **out_data, size_t *out_size) {
+    // Destructure the format-neutral module into the local names the Mach-O
+    // writer below was originally written against. The body is unchanged from
+    // when these were direct function parameters.
+    MachineFunc     *efs          = mm->funcs;
+    size_t           n_funcs      = mm->n_funcs;
+    size_t           start_idx    = mm->entry_idx;
+    MachineDataInit *inits        = mm->inits;
+    size_t           n_inits      = mm->n_inits;
+    uint32_t         n_globals    = mm->n_globals;
+    uint64_t         global0_init = mm->global0_init;
+    uint64_t         linmem_size  = mm->linmem_size;
+
     *out_data = NULL; *out_size = 0;
 
     // Derived layout values (recomputed here so this entry is self-contained
@@ -1778,7 +1742,7 @@ static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
     LibSysRegistry libsys = {0};
     for (size_t i = 0; i < n_funcs; i++) {
         for (size_t k = 0; k < efs[i].n_relocs; k++) {
-            BlReloc *r = &efs[i].relocs[k];
+            MachineCallReloc *r = &efs[i].relocs[k];
             int ls = libsys_lookup(r->callee);
             if (ls < 0) continue;
             if (!libsys.used[ls]) {
@@ -1797,7 +1761,7 @@ static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
     // -----------------------------------------------------------------
     for (size_t i = 0; i < n_funcs; i++) {
         for (size_t k = 0; k < efs[i].n_relocs; k++) {
-            BlReloc *r = &efs[i].relocs[k];
+            MachineCallReloc *r = &efs[i].relocs[k];
             uint32_t dst_pc;
             bool resolved = false;
             for (size_t j = 0; j < n_funcs; j++) {
@@ -2235,7 +2199,7 @@ static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
     // -----------------------------------------------------------------
     for (size_t i = 0; i < n_funcs; i++) {
         for (size_t k = 0; k < efs[i].n_dr; k++) {
-            DataReloc *dr = &efs[i].dr[k];
+            MachineDataReloc *dr = &efs[i].dr[k];
             uint64_t dst_vm;
             if (dr->kind.size == 9 && memcmp(dr->kind.str, "data_priv", 9) == 0) {
                 dst_vm = data_priv_vmaddr;
@@ -2674,13 +2638,13 @@ static bool finalize_macho(EmittedFunc *efs, size_t n_funcs, size_t start_idx,
 // every function's aarch64 IR live at once, which — with the trivial
 // spill-everything allocator — balloons peak RSS past the 4GB self-host
 // budget. Here we instead lower ONE function at a time into a throwaway temp
-// arena, encode it to a heap `EmittedFunc`, deep-copy the few strings the
+// arena, encode it to a heap `MachineFunc`, deep-copy the few strings the
 // finalizer needs out of the temp arena, then reset the temp arena before the
 // next function. Type interning is pinned to the persistent arena for the
 // duration so cached type handles never dangle across a reset.
 // ===========================================================================
 
-// Track heap copies of EmittedFunc strings so they can be freed after the
+// Track heap copies of MachineFunc strings so they can be freed after the
 // finalizer (which only reads, never frees, the string contents).
 typedef struct { char **p; size_t n, c; } OwnedStrs;
 
@@ -2697,7 +2661,7 @@ static char *owned_dup(OwnedStrs *o, string s) {
 }
 
 // Deep-copy name + reloc callees + data-reloc kinds out of the temp arena.
-static void ef_heapdup_strings(EmittedFunc *e, OwnedStrs *o) {
+static void ef_heapdup_strings(MachineFunc *e, OwnedStrs *o) {
     if (e->name.size) e->name = (string){ owned_dup(o, e->name), e->name.size };
     for (size_t i = 0; i < e->n_relocs; i++) {
         string c = e->relocs[i].callee;
@@ -2709,7 +2673,7 @@ static void ef_heapdup_strings(EmittedFunc *e, OwnedStrs *o) {
     }
 }
 
-static void ef_free_one(EmittedFunc *e) {
+static void ef_free_one(MachineFunc *e) {
     free(e->code.data); free(e->relocs); free(e->dr);
     free(e->br); free(e->bp);
 }
@@ -2727,7 +2691,7 @@ bool mlir_llvm_to_macho(MLIR_Context *ctx, MLIR_OpHandle llvm_module,
     }
 
     size_t nf = mlir_llvm_sel_num_funcs(sel);
-    EmittedFunc *efs = (EmittedFunc *)calloc(nf + 1, sizeof(EmittedFunc));
+    MachineFunc *efs = (MachineFunc *)calloc(nf + 1, sizeof(MachineFunc));
     size_t n_funcs = 0;
     size_t start_idx = (size_t)-1;
     OwnedStrs owned = {0};
@@ -2745,12 +2709,12 @@ bool mlir_llvm_to_macho(MLIR_Context *ctx, MLIR_OpHandle llvm_module,
         MLIR_OpHandle fn = (i == 0)
             ? mlir_llvm_sel_synth_start(ctx, sel)
             : mlir_llvm_sel_func(ctx, sel, i - 1);
-        EmittedFunc *e = &efs[n_funcs];
+        MachineFunc *e = &efs[n_funcs];
         if (fn == MLIR_INVALID_HANDLE) {
             ok = false;
         } else if (!emit_aarch64_func(fn, e) || !patch_branches(e)) {
             ef_free_one(e);
-            *e = (EmittedFunc){0};
+            *e = (MachineFunc){0};
             ok = false;
         }
         MLIR_SetArenaAllocator(ctx, persist);
@@ -2782,9 +2746,9 @@ bool mlir_llvm_to_macho(MLIR_Context *ctx, MLIR_OpHandle llvm_module,
     }
 
     // One data-init record carrying the global blob (offset 0).
-    LinInit *inits = NULL; size_t n_inits = 0;
+    MachineDataInit *inits = NULL; size_t n_inits = 0;
     if (gblob_len > 0) {
-        inits = (LinInit *)malloc(sizeof(LinInit));
+        inits = (MachineDataInit *)malloc(sizeof(MachineDataInit));
         inits[0].offset = 0;
         inits[0].bytes  = (string){ (char *)gblob, gblob_len };
         n_inits = 1;
@@ -2792,8 +2756,13 @@ bool mlir_llvm_to_macho(MLIR_Context *ctx, MLIR_OpHandle llvm_module,
 
     // The llvm path carries no separate linmem/globals layout attrs; the
     // data blob alone drives the __DATA segment.
-    bool r = finalize_macho(efs, n_funcs, start_idx, inits, n_inits,
-                            0, 0, 0, out_data, out_size);
+    MachineModule mm = {0};
+    mm.funcs = efs;
+    mm.n_funcs = n_funcs;
+    mm.entry_idx = start_idx;
+    mm.inits = inits;
+    mm.n_inits = n_inits;
+    bool r = finalize_macho(&mm, out_data, out_size);
 
     // finalize_macho consumed/freed efs and inits; the blob bytes and the
     // duped strings are no longer referenced.
