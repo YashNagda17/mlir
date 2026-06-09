@@ -85,13 +85,15 @@ clang \
 
 test_wasm = { cmd = "wasmtime --dir . parser.wasm --construct", depends-on = ["build_wasm"], description = "Run parser.wasm under wasmtime (construct mode)" }
 
-build_tinyc_wasm = { cmd = "bash examples/tinyc/build_tinyc_wasm.sh", depends-on = ["tokenizer"], description = "Build the entire tinyC compiler + linker as a single wasm32-wasi module (tinyc.wasm) — drives the browser demo" }
+build_tinyc_wasm = { cmd = "shell examples/tinyc/build_tinyc_wasm.sh", depends-on = ["tokenizer"], description = "Build the entire tinyC compiler + linker as a single wasm32-wasi module (tinyc.wasm) — drives the browser demo" }
 
-selfhost_tinyc_wasm_stage2 = { cmd = "bash examples/tinyc/selfhost_tinyc_wasm.sh tinyc.wasm tinyc_stage2.wasm selfhost_stage2", depends-on = ["build_tinyc_wasm"], description = "Self-host stage 2: use tinyc.wasm (clang-built) under wasmtime to recompile every tinyc source into tinyc_stage2.wasm" }
+selfhost_tinyc_wasm_stage2 = { cmd = "python examples/tinyc/selfhost_tinyc_wasm.py tinyc.wasm tinyc_stage2.wasm selfhost_stage2", depends-on = ["build_tinyc_wasm"], description = "Self-host stage 2: use tinyc.wasm (clang-built) under wasmtime to recompile every tinyc source into tinyc_stage2.wasm" }
 
-selfhost_tinyc_wasm_stage3 = { cmd = "bash examples/tinyc/selfhost_tinyc_wasm.sh tinyc_stage2.wasm tinyc_stage3.wasm selfhost_stage3", depends-on = ["selfhost_tinyc_wasm_stage2"], description = "Self-host stage 3: use tinyc_stage2.wasm under wasmtime to recompile every tinyc source into tinyc_stage3.wasm" }
+selfhost_tinyc_wasm_stage3 = { cmd = "python examples/tinyc/selfhost_tinyc_wasm.py tinyc_stage2.wasm tinyc_stage3.wasm selfhost_stage3", depends-on = ["selfhost_tinyc_wasm_stage2"], description = "Self-host stage 3: use tinyc_stage2.wasm under wasmtime to recompile every tinyc source into tinyc_stage3.wasm" }
 
-verify_tinyc_wasm_selfhost = { cmd = "cmp tinyc_stage2.wasm tinyc_stage3.wasm && echo 'tinyc.wasm self-host is bit-identical (stage2 == stage3)'", depends-on = ["selfhost_tinyc_wasm_stage3"], description = "Compare stage 2 and stage 3 tinyc.wasm byte-for-byte to verify the self-hosting cycle reaches a fixed point" }
+verify_tinyc_wasm_selfhost = { cmd = """
+python -c "import sys; a=open('tinyc_stage2.wasm','rb').read(); b=open('tinyc_stage3.wasm','rb').read(); sys.exit('tinyc.wasm self-host MISMATCH: stage2 != stage3') if a!=b else print('tinyc.wasm self-host is bit-identical (stage2 == stage3)')"
+""", depends-on = ["selfhost_tinyc_wasm_stage3"], description = "Compare stage 2 and stage 3 tinyc.wasm byte-for-byte to verify the self-hosting cycle reaches a fixed point" }
 
 serve_tinyc_demo = { cmd = """
 mkdir -p examples/tinyc/browser/_dist && \
