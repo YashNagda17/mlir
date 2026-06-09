@@ -13,7 +13,7 @@ on Linux, macOS, and Windows. The ``shell`` interpreter pixi uses on
 Windows (deno_task_shell) does not support arrays, ``set --``, or
 word-splitting of variables, which a compile-each-then-link-all loop needs.
 
-The source set mirrors ``build_tinyc_wasm.sh`` exactly so the stage-2 and
+The source set mirrors ``build_tinyc_wasm.py`` exactly so the stage-2 and
 stage-3 outputs can be compared byte-for-byte to verify self-hosting
 reproducibility. Keep these two lists in sync.
 """
@@ -22,7 +22,7 @@ import os
 import subprocess
 import sys
 
-# Source set mirrors `build_tinyc_wasm.sh`. Keep these in sync.
+# Source set mirrors `build_tinyc_wasm.py`. Keep these in sync.
 COREC_C_FILES = [
     "corec/base/io.c",
     "corec/base/buddy.c",

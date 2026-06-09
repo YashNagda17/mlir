@@ -85,7 +85,7 @@ clang \
 
 test_wasm = { cmd = "wasmtime --dir . parser.wasm --construct", depends-on = ["build_wasm"], description = "Run parser.wasm under wasmtime (construct mode)" }
 
-build_tinyc_wasm = { cmd = "shell examples/tinyc/build_tinyc_wasm.sh", depends-on = ["tokenizer"], description = "Build the entire tinyC compiler + linker as a single wasm32-wasi module (tinyc.wasm) — drives the browser demo" }
+build_tinyc_wasm = { cmd = "python examples/tinyc/build_tinyc_wasm.py", depends-on = ["tokenizer"], description = "Build the entire tinyC compiler + linker as a single wasm32-wasi module (tinyc.wasm) — drives the browser demo" }
 
 selfhost_tinyc_wasm_stage2 = { cmd = "python examples/tinyc/selfhost_tinyc_wasm.py tinyc.wasm tinyc_stage2.wasm selfhost_stage2", depends-on = ["build_tinyc_wasm"], description = "Self-host stage 2: use tinyc.wasm (clang-built) under wasmtime to recompile every tinyc source into tinyc_stage2.wasm" }
 

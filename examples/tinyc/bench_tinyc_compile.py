@@ -63,7 +63,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 BENCH_DIR = ROOT / "bench_tinyc_out"
 
-# Source set mirrors examples/tinyc/build_tinyc_wasm.sh and
+# Source set mirrors examples/tinyc/build_tinyc_wasm.py and
 # examples/tinyc/selfhost_tinyc_wasm.py — every .c file that makes up
 # the tinyc.wasm self-host build, in the same order. Keep in sync.
 COREC_C_FILES = [
