@@ -543,6 +543,314 @@ static MLIR_BlockHandle map_block(MLIR_BlockHandle *src, MLIR_BlockHandle *dst,
     return MLIR_INVALID_HANDLE;
 }
 
+typedef struct {
+    MLIR_Context     *ctx;
+    SlotMap          *sm;
+    ConstMap         *cm;
+    SlotMap          *am;
+    MLIR_RegionHandle out_reg;
+    MLIR_BlockHandle  cur;
+    string            sym;
+    uint32_t          slot_bytes;
+    uint32_t          frame_size;
+    bool              ok;
+} LowerCtx;
+
+static bool mat_into(LowerCtx *L, MLIR_ValueHandle v, uint8_t dst);
+
+static void copy_slot(LowerCtx *L, MLIR_ValueHandle src, MLIR_ValueHandle dst) {
+    int64_t cv; uint8_t c64;
+    if (L->cm && cm_get(L->cm, src, &cv, &c64)) {
+        emit_mov_ri(L->ctx, L->cur, R_R10, cv);
+        if (!store_slot(L->ctx, L->cur, L->sm, dst, R_R10)) {
+            fprintf(stderr, "llvm->x86_64: undefined value in copy (%.*s)\n",
+                    (int)L->sym.size, L->sym.str);
+            L->ok = false;
+        }
+        return;
+    }
+    if (!mat_into(L, src, R_R10) ||
+        !store_slot(L->ctx, L->cur, L->sm, dst, R_R10)) {
+        fprintf(stderr, "llvm->x86_64: undefined value in copy (%.*s)\n",
+                (int)L->sym.size, L->sym.str);
+        L->ok = false;
+    }
+}
+
+static void emit_edge_copies(LowerCtx *L, MLIR_OpHandle term, size_t s) {
+    MLIR_BlockHandle dst = MLIR_GetOpSuccessor(term, s);
+    size_t n = MLIR_GetOpNumSuccessorOperands(term, s);
+    for (size_t k = 0; k < n; k++) {
+        copy_slot(L, MLIR_GetOpSuccessorOperand(term, s, k),
+                  MLIR_GetBlockArg(dst, k));
+        if (!L->ok) return;
+    }
+}
+
+static bool mat_into(LowerCtx *L, MLIR_ValueHandle v, uint8_t dst) {
+    int64_t cv; uint8_t c64;
+    if (cm_get(L->cm, v, &cv, &c64)) {
+        emit_mov_ri(L->ctx, L->cur, dst, cv);
+        return true;
+    }
+    int32_t slot;
+    if (sm_get(L->sm, v, &slot)) {
+        unsigned w = x64_type_size(L->ctx, MLIR_GetValueType(v));
+        if (w == 0) w = 8;
+        if (w > 8) w = 8;
+        emit_mov_rm(L->ctx, L->cur, dst, R_RBP, slot_disp(slot), (uint8_t)w);
+        if (w == 1) {
+            emit_mov_ri(L->ctx, L->cur, R_R11, 0xff);
+            emit_and_rr(L->ctx, L->cur, dst, dst, R_R11);
+        }
+        return true;
+    }
+    return false;
+}
+
+static void use_val(LowerCtx *L, MLIR_ValueHandle v, uint8_t scratch) {
+    if (!mat_into(L, v, scratch)) {
+        fprintf(stderr, "llvm->x86_64: undefined operand in '%.*s'\n",
+                (int)L->sym.size, L->sym.str);
+        L->ok = false;
+    }
+}
+
+static void fin_val(LowerCtx *L, MLIR_ValueHandle v, uint8_t produced) {
+    if (!store_slot(L->ctx, L->cur, L->sm, v, produced)) L->ok = false;
+}
+
+#define LFAIL(...) do { fprintf(stderr, __VA_ARGS__); L->ok = false; return; } while (0)
+
+static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
+    MLIR_Context *ctx = L->ctx;
+    MLIR_BlockHandle blk = L->cur;
+    string on = MLIR_GetOpName(op);
+
+    if (name_eq(on, "llvm.mlir.constant")) return; // remat only
+
+    if (name_eq(on, "llvm.add")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        uint8_t r0 = R_R10, r1 = R_R11;
+        use_val(L, MLIR_GetOpOperand(op, 0), r0);
+        use_val(L, MLIR_GetOpOperand(op, 1), r1);
+        if (!L->ok) return;
+        emit_add_rr(ctx, blk, r0, r0, r1);
+        fin_val(L, res, r0);
+    } else if (name_eq(on, "llvm.sub")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        uint8_t r0 = R_R10, r1 = R_R11;
+        use_val(L, MLIR_GetOpOperand(op, 0), r0);
+        use_val(L, MLIR_GetOpOperand(op, 1), r1);
+        if (!L->ok) return;
+        emit_sub_rr(ctx, blk, r0, r0, r1);
+        fin_val(L, res, r0);
+    } else if (name_eq(on, "llvm.mul")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        uint8_t r0 = R_R10, r1 = R_R11;
+        use_val(L, MLIR_GetOpOperand(op, 0), r0);
+        use_val(L, MLIR_GetOpOperand(op, 1), r1);
+        if (!L->ok) return;
+        emit_imul_rr(ctx, blk, r0, r0, r1);
+        fin_val(L, res, r0);
+    } else if (name_eq(on, "llvm.udiv") || name_eq(on, "llvm.sdiv")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        bool sgn = name_eq(on, "llvm.sdiv");
+        use_val(L, MLIR_GetOpOperand(op, 0), R_R10);
+        use_val(L, MLIR_GetOpOperand(op, 1), R_R11);
+        if (!L->ok) return;
+        emit_mov_rr(ctx, blk, R_RAX, R_R10);
+        if (sgn)
+            emit_cqo(ctx, blk);
+        else
+            emit_xor_rr(ctx, blk, R_RDX, R_RDX, R_RDX);
+        emit_idiv_r(ctx, blk, R_RAX, R_RAX, R_R11, !sgn);
+        fin_val(L, res, R_RAX);
+    } else if (name_eq(on, "llvm.urem") || name_eq(on, "llvm.srem")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        bool sgn = name_eq(on, "llvm.srem");
+        use_val(L, MLIR_GetOpOperand(op, 0), R_R10);
+        use_val(L, MLIR_GetOpOperand(op, 1), R_R11);
+        if (!L->ok) return;
+        emit_mov_rr(ctx, blk, R_RAX, R_R10);
+        if (sgn)
+            emit_cqo(ctx, blk);
+        else
+            emit_xor_rr(ctx, blk, R_RDX, R_RDX, R_RDX);
+        emit_idiv_r(ctx, blk, R_RAX, R_RAX, R_R11, !sgn);
+        fin_val(L, res, R_RDX);
+    } else if (name_eq(on, "llvm.getelementptr")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        MLIR_AttributeHandle eta = MLIR_GetOpAttributeByName(op, "elem_type");
+        MLIR_AttributeHandle ria = MLIR_GetOpAttributeByName(op, "rawConstantIndices");
+        if (eta == MLIR_INVALID_HANDLE || ria == MLIR_INVALID_HANDLE)
+            LFAIL("llvm->x86_64: getelementptr missing elem_type/indices\n");
+        MLIR_TypeHandle elem_ty = MLIR_GetAttributeTypeValue(eta);
+        int32_t cidx[64];
+        size_t n_idx = parse_i32_array(
+            MLIR_GetAttributeAsString(ctx, ria), cidx, 64);
+        if (n_idx == 0)
+            LFAIL("llvm->x86_64: getelementptr with no indices\n");
+        use_val(L, MLIR_GetOpOperand(op, 0), R_R10);
+        if (!L->ok) return;
+        size_t op_idx = 1;
+        MLIR_TypeHandle cur_ty = elem_ty;
+        for (size_t i = 0; i < n_idx; i++) {
+            bool is_dyn = (cidx[i] == (int32_t)0x80000000);
+            unsigned stride;
+            if (i == 0)
+                stride = x64_type_size(ctx, elem_ty);
+            else if (MLIR_IsTypeLLVMStruct(cur_ty)) {
+                if (is_dyn)
+                    LFAIL("llvm->x86_64: dynamic struct gep index\n");
+                LFAIL("llvm->x86_64: struct gep not supported\n");
+            } else if (MLIR_IsTypeLLVMArray(cur_ty)) {
+                cur_ty = MLIR_GetTypeLLVMArrayElement(cur_ty);
+                stride = x64_type_size(ctx, cur_ty);
+            } else {
+                LFAIL("llvm->x86_64: gep into non-aggregate type\n");
+            }
+            if (stride == 0) continue;
+            if (is_dyn) {
+                if (op_idx >= MLIR_GetOpNumOperands(op))
+                    LFAIL("llvm->x86_64: gep dynamic index missing\n");
+                use_val(L, MLIR_GetOpOperand(op, op_idx++), R_R11);
+                if (!L->ok) return;
+                if (stride != 1) {
+                    emit_mov_ri(ctx, blk, R_R12, (int64_t)stride);
+                    emit_imul_rr(ctx, blk, R_R11, R_R11, R_R12);
+                }
+                emit_add_rr(ctx, blk, R_R10, R_R10, R_R11);
+            } else if (cidx[i] != 0) {
+                int64_t off = cidx[i] * (int64_t)stride;
+                emit_mov_ri(ctx, blk, R_R11, off);
+                emit_add_rr(ctx, blk, R_R10, R_R10, R_R11);
+            }
+        }
+        fin_val(L, res, R_R10);
+    } else if (name_eq(on, "llvm.alloca")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        int32_t off;
+        if (!sm_get(L->am, res, &off))
+            LFAIL("llvm->x86_64: alloca without frame offset in '%.*s'\n",
+                  (int)L->sym.size, L->sym.str);
+        int32_t addr = (int32_t)L->slot_bytes + off;
+        emit_mov_rr(ctx, blk, R_R10, R_RBP);
+        if (addr != 0) {
+            emit_mov_ri(ctx, blk, R_R11, addr);
+            emit_sub_rr(ctx, blk, R_R10, R_R10, R_R11);
+        }
+        fin_val(L, res, R_R10);
+    } else if (name_eq(on, "llvm.load")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        unsigned sz = x64_type_size(ctx, MLIR_GetValueType(res));
+        if (sz != 1 && sz != 4 && sz != 8)
+            LFAIL("llvm->x86_64: unsupported load size %u in '%.*s'\n",
+                  sz, (int)L->sym.size, L->sym.str);
+        use_val(L, MLIR_GetOpOperand(op, 0), R_R10);
+        if (!L->ok) return;
+        emit_mov_rm(ctx, blk, R_R10, R_R10, 0, (uint8_t)sz);
+        if (sz == 1) {
+            emit_mov_ri(ctx, blk, R_R11, 0xff);
+            emit_and_rr(ctx, blk, R_R10, R_R10, R_R11);
+        }
+        fin_val(L, res, R_R10);
+    } else if (name_eq(on, "llvm.store")) {
+        MLIR_ValueHandle val = MLIR_GetOpOperand(op, 0);
+        MLIR_ValueHandle ptr = MLIR_GetOpOperand(op, 1);
+        unsigned sz = x64_type_size(ctx, MLIR_GetValueType(val));
+        if (sz != 1 && sz != 4 && sz != 8)
+            LFAIL("llvm->x86_64: unsupported store size %u in '%.*s'\n",
+                  sz, (int)L->sym.size, L->sym.str);
+        use_val(L, val, R_R10);
+        use_val(L, ptr, R_R11);
+        if (!L->ok) return;
+        emit_mov_mr(ctx, blk, R_R11, 0, R_R10, (uint8_t)sz);
+    } else if (name_eq(on, "llvm.icmp")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        MLIR_AttributeHandle pa = MLIR_GetOpAttributeByName(op, "predicate");
+        if (pa == MLIR_INVALID_HANDLE)
+            LFAIL("llvm->x86_64: icmp without predicate\n");
+        int cond = icmp_pred_to_x86_cond(MLIR_GetAttributeInteger(pa));
+        if (cond < 0)
+            LFAIL("llvm->x86_64: unsupported icmp predicate\n");
+        uint8_t w = (uint8_t)(type_is_gp64(ctx, MLIR_GetOpOperand(op, 0)) ? 8 : 4);
+        uint8_t r0 = R_R10;
+        use_val(L, MLIR_GetOpOperand(op, 0), r0);
+        if (!L->ok) return;
+        int64_t cv; uint8_t c64;
+        if (cm_get(L->cm, MLIR_GetOpOperand(op, 1), &cv, &c64))
+            emit_cmp_ri(ctx, blk, r0, cv, w);
+        else {
+            use_val(L, MLIR_GetOpOperand(op, 1), R_R11);
+            if (!L->ok) return;
+            emit_cmp_rr(ctx, blk, r0, R_R11, w);
+        }
+        emit_mov_ri(ctx, blk, R_R12, 0);
+        emit_setcc(ctx, blk, R_R12, (uint8_t)cond);
+        fin_val(L, res, R_R12);
+    } else if (name_eq(on, "llvm.select")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        use_val(L, MLIR_GetOpOperand(op, 0), R_R10);
+        use_val(L, MLIR_GetOpOperand(op, 1), R_R11);
+        use_val(L, MLIR_GetOpOperand(op, 2), R_R12);
+        if (!L->ok) return;
+        emit_cmp_ri(ctx, blk, R_R10, 0, 4);
+        emit_cmovcc(ctx, blk, R_R12, R_R12, R_R11, 5); // NE: r12 = r11 if cond
+        fin_val(L, res, R_R12);
+    } else if (name_eq(on, "llvm.call")) {
+        MLIR_AttributeHandle callee = MLIR_GetOpAttributeByName(op, "callee");
+        if (callee == MLIR_INVALID_HANDLE)
+            LFAIL("llvm->x86_64: indirect call unsupported\n");
+        string nm = MLIR_GetAttributeAsString(ctx, callee);
+        if (nm.size > 0 && nm.str[0] == '@') { nm.str++; nm.size--; }
+        size_t no = MLIR_GetOpNumOperands(op);
+        if (no > 6)
+            LFAIL("llvm->x86_64: >6 call args unsupported in '%.*s'\n",
+                  (int)L->sym.size, L->sym.str);
+        for (size_t k = 0; k < no; k++)
+            use_val(L, MLIR_GetOpOperand(op, k), k_arg_regs[k]);
+        if (!L->ok) return;
+        emit_call(ctx, blk, nm);
+    } else if (name_eq(on, "llvm.sext")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        int sw = int_type_bits(ctx, MLIR_GetOpOperand(op, 0));
+        int32_t slot;
+        if (sm_get(L->sm, MLIR_GetOpOperand(op, 0), &slot))
+            emit_mov_rm(ctx, blk, R_R10, R_RBP, slot_disp(slot), 4);
+        else if (!mat_into(L, MLIR_GetOpOperand(op, 0), R_R10))
+            LFAIL("llvm->x86_64: undefined sext operand\n");
+        if (!L->ok) return;
+        if (sw == 32) {
+            emit_shl_ri(ctx, blk, R_R10, R_R10, 32);
+            emit_sar_ri(ctx, blk, R_R10, R_R10, 32);
+        } else if (sw > 0 && sw < 64) {
+            uint8_t sh = (uint8_t)(64 - sw);
+            emit_shl_ri(ctx, blk, R_R10, R_R10, sh);
+            emit_sar_ri(ctx, blk, R_R10, R_R10, sh);
+        }
+        fin_val(L, res, R_R10);
+    } else if (name_eq(on, "llvm.zext") || name_eq(on, "llvm.trunc")) {
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        int w = name_eq(on, "llvm.trunc")
+              ? int_type_bits(ctx, res)
+              : int_type_bits(ctx, MLIR_GetOpOperand(op, 0));
+        use_val(L, MLIR_GetOpOperand(op, 0), R_R10);
+        if (!L->ok) return;
+        if (w > 0 && w < 64) {
+            int64_t mask = (w >= 63) ? -1 : ((1LL << w) - 1);
+            emit_mov_ri(ctx, blk, R_R11, mask);
+            emit_and_rr(ctx, blk, R_R10, R_R10, R_R11);
+        }
+        fin_val(L, res, R_R10);
+    } else if (name_eq(on, "llvm.return")) {
+        /* handled by caller */
+    } else {
+        LFAIL("llvm->x86_64: unsupported op '%.*s' in '%.*s'\n",
+              (int)on.size, on.str, (int)L->sym.size, L->sym.str);
+    }
+}
+
 
 MLIR_OpHandle mlir_llvm_to_x86_64(MLIR_Context *ctx,
                                   MLIR_OpHandle llvm_module) {
