@@ -1051,6 +1051,106 @@ static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn, string sym
     return select_func_cfg(ctx, fn, sym);
 }
 
+static MLIR_OpHandle synth_start(MLIR_Context *ctx, string main_name) {
+    MLIR_BlockHandle blk = MLIR_CreateBlock(ctx);
+    MLIR_RegionHandle reg = MLIR_CreateRegion(ctx);
+    MLIR_AppendRegionBlock(ctx, reg, blk);
+
+    emit_call(ctx, blk, main_name);
+    emit_mov_rr(ctx, blk, R_RDI, R_RAX);
+    emit_mov_ri(ctx, blk, R_RAX, 60); // SYS_exit
+    emit_syscall(ctx, blk);
+
+    return finish_x86_func(ctx, reg, str_lit("_start"), true);
+}
+
+static MLIR_OpHandle synth_write(MLIR_Context *ctx) {
+    MLIR_BlockHandle blk = MLIR_CreateBlock(ctx);
+    MLIR_RegionHandle reg = MLIR_CreateRegion(ctx);
+    MLIR_AppendRegionBlock(ctx, reg, blk);
+
+    // SysV AMD64: fd=rdi, buf=rsi, count=rdx already in place.
+    emit_mov_ri(ctx, blk, R_RAX, 1); // SYS_write
+    emit_syscall(ctx, blk);
+    emit_ret(ctx, blk);
+
+    return finish_x86_func(ctx, reg, str_lit("_write"), false);
+}
+
+static bool sym_eq(string a, string b) {
+    return a.size == b.size && memcmp(a.str, b.str, a.size) == 0;
+}
+
+static bool sym_list_has(string *syms, size_t n, string sym) {
+    for (size_t i = 0; i < n; i++)
+        if (sym_eq(syms[i], sym)) return true;
+    return false;
+}
+
+static void sym_list_add(string **syms, size_t *n, size_t *cap, string sym) {
+    if (sym_list_has(*syms, *n, sym)) return;
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 8;
+        *syms = (string *)realloc(*syms, *cap * sizeof(string));
+    }
+    (*syms)[(*n)++] = sym;
+}
+
+static void collect_calls_region(MLIR_Context *ctx, MLIR_RegionHandle region,
+                                string **syms, size_t *n, size_t *cap) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t b = 0; b < nb; b++) {
+        MLIR_BlockHandle blk = MLIR_GetRegionBlock(region, b);
+        size_t no = MLIR_GetBlockNumOps(blk);
+        for (size_t i = 0; i < no; i++) {
+            MLIR_OpHandle o = MLIR_GetBlockOp(blk, i);
+            if (!name_eq(MLIR_GetOpName(o), "llvm.call")) continue;
+            MLIR_AttributeHandle ca = MLIR_GetOpAttributeByName(o, "callee");
+            if (ca == MLIR_INVALID_HANDLE) continue;
+            string nm = MLIR_GetAttributeAsString(ctx, ca);
+            if (nm.size > 0 && nm.str[0] == '@') { nm.str++; nm.size--; }
+            sym_list_add(syms, n, cap, nm);
+        }
+        for (size_t i = 0; i < no; i++) {
+            MLIR_OpHandle o = MLIR_GetBlockOp(blk, i);
+            size_t ng = MLIR_GetOpNumRegions(o);
+            for (size_t g = 0; g < ng; g++)
+                collect_calls_region(ctx, MLIR_GetOpRegion(o, g), syms, n, cap);
+        }
+    }
+}
+
+static MLIR_OpHandle find_llvm_func(MLIR_BlockHandle mb, size_t nops, string sym) {
+    for (size_t i = 0; i < nops; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
+        if (!name_eq(MLIR_GetOpName(op), "llvm.func")) continue;
+        MLIR_AttributeHandle sa = MLIR_GetOpAttributeByName(op, "sym_name");
+        if (sa == MLIR_INVALID_HANDLE) continue;
+        if (sym_eq(MLIR_GetAttributeString(sa), sym)) return op;
+    }
+    return MLIR_INVALID_HANDLE;
+}
+
+static bool func_is_reachable(MLIR_Context *ctx, MLIR_BlockHandle mb, size_t nops,
+                              string sym) {
+    if (sym.size == 4 && memcmp(sym.str, "main", 4) == 0) return true;
+    string *queue = NULL;
+    size_t nq = 0, cq = 0, head = 0;
+    sym_list_add(&queue, &nq, &cq, str_lit("main"));
+    while (head < nq) {
+        string cur = queue[head++];
+        if (sym_eq(cur, sym)) {
+            free(queue);
+            return true;
+        }
+        MLIR_OpHandle fn = find_llvm_func(mb, nops, cur);
+        if (fn == MLIR_INVALID_HANDLE || !func_has_body(fn)) continue;
+        collect_calls_region(ctx, MLIR_GetOpRegion(fn, 0), &queue, &nq, &cq);
+    }
+    free(queue);
+    return false;
+}
+
 
 MLIR_OpHandle mlir_llvm_to_x86_64(MLIR_Context *ctx,
                                   MLIR_OpHandle llvm_module) {
