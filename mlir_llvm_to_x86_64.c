@@ -851,6 +851,206 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
     }
 }
 
+static MLIR_OpHandle finish_x86_func(MLIR_Context *ctx, MLIR_RegionHandle out_reg,
+                                     string sym, bool exported) {
+    MLIR_AttributeHandle attrs[2];
+    size_t na = 1;
+    attrs[0] = attr_s(ctx, "sym_name", sym.str, sym.size);
+    if (exported) {
+        attrs[1] = attr_b(ctx, "exported", true);
+        na = 2;
+    }
+    MLIR_RegionHandle regs[1] = { out_reg };
+    return MLIR_CreateOp(ctx, OP_TYPE_X86_64_FUNC,
+        op_type_to_string(OP_TYPE_X86_64_FUNC),
+        attrs, na, NULL, 0, NULL, 0, NULL, 0, regs, 1,
+        MLIR_CreateLocationUnknown(ctx, (string){0}),
+        MLIR_INVALID_HANDLE, (string){0}, -1);
+}
+
+static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn, string sym) {
+    MLIR_RegionHandle src_region = MLIR_GetOpRegion(fn, 0);
+    size_t n_blocks = MLIR_GetRegionNumBlocks(src_region);
+    MLIR_BlockHandle entry_src = MLIR_GetRegionBlock(src_region, 0);
+    size_t nargs = MLIR_GetBlockNumArgs(entry_src);
+    if (nargs > 6) {
+        X64_FAIL("llvm->x86_64: function '%.*s' has %zu parameters (>6 not supported)\n",
+                 (int)sym.size, sym.str, nargs);
+    }
+
+    SlotMap sm = {0};
+    sm.arena = MLIR_GetArenaAllocator(ctx);
+    int32_t nslots = 0;
+    assign_slots_region(ctx, &sm, src_region, &nslots);
+    uint32_t slot_bytes = (uint32_t)nslots * 8u;
+
+    SlotMap am = {0};
+    am.arena = MLIR_GetArenaAllocator(ctx);
+    uint32_t alloca_bytes = 0;
+    if (!collect_allocas_region(ctx, &am, src_region, &alloca_bytes)) {
+        X64_FAIL("llvm->x86_64: unsupported alloca in '%.*s'\n",
+                 (int)sym.size, sym.str);
+    }
+    uint32_t frame_size = (slot_bytes + alloca_bytes + 15u) & ~15u;
+
+    MLIR_RegionHandle out_reg = MLIR_CreateRegion(ctx);
+    MLIR_BlockHandle *src_blks = (MLIR_BlockHandle *)malloc(
+        n_blocks * sizeof(MLIR_BlockHandle));
+    MLIR_BlockHandle *out_blks = (MLIR_BlockHandle *)malloc(
+        n_blocks * sizeof(MLIR_BlockHandle));
+    if (!src_blks || !out_blks) {
+        free(src_blks);
+        free(out_blks);
+        X64_FAIL("llvm->x86_64: allocation failed\n");
+    }
+    for (size_t b = 0; b < n_blocks; b++) {
+        src_blks[b] = MLIR_GetRegionBlock(src_region, b);
+        out_blks[b] = MLIR_CreateBlock(ctx);
+        MLIR_AppendRegionBlock(ctx, out_reg, out_blks[b]);
+    }
+
+    ConstMap cm = {0};
+    cm.arena = MLIR_GetArenaAllocator(ctx);
+    build_const_map_region(ctx, &cm, src_region);
+
+    LowerCtx L = { ctx, &sm, &cm, &am, out_reg, out_blks[0], sym,
+                   slot_bytes, frame_size, true };
+
+    emit_prologue(ctx, out_blks[0], frame_size);
+    for (size_t i = 0; i < nargs; i++)
+        store_slot(ctx, out_blks[0], &sm, MLIR_GetBlockArg(entry_src, i),
+                   k_arg_regs[i]);
+
+    for (size_t b = 0; b < n_blocks; b++) {
+        L.cur = out_blks[b];
+        MLIR_BlockHandle sb = src_blks[b];
+        size_t no = MLIR_GetBlockNumOps(sb);
+        if (no == 0) {
+            fprintf(stderr, "llvm->x86_64: empty block in '%.*s'\n",
+                    (int)sym.size, sym.str);
+            free(src_blks);
+            free(out_blks);
+            return MLIR_INVALID_HANDLE;
+        }
+        for (size_t i = 0; i + 1 < no; i++) {
+            lower_op(&L, MLIR_GetBlockOp(sb, i));
+            if (!L.ok) {
+                free(src_blks);
+                free(out_blks);
+                return MLIR_INVALID_HANDLE;
+            }
+        }
+        MLIR_OpHandle term = MLIR_GetBlockOp(sb, no - 1);
+        string tn = MLIR_GetOpName(term);
+        if (name_eq(tn, "llvm.return")) {
+            size_t nr = MLIR_GetOpNumOperands(term);
+            if (nr == 1) {
+                if (!mat_into(&L, MLIR_GetOpOperand(term, 0), R_RAX)) {
+                    fprintf(stderr, "llvm->x86_64: undefined return value in '%.*s'\n",
+                            (int)sym.size, sym.str);
+                    free(src_blks);
+                    free(out_blks);
+                    return MLIR_INVALID_HANDLE;
+                }
+            } else if (nr > 1) {
+                fprintf(stderr, "llvm->x86_64: multi-value return in '%.*s'\n",
+                        (int)sym.size, sym.str);
+                free(src_blks);
+                free(out_blks);
+                return MLIR_INVALID_HANDLE;
+            }
+            emit_epilogue(ctx, L.cur, frame_size);
+            emit_ret(ctx, L.cur);
+        } else if (name_eq(tn, "llvm.br") || name_eq(tn, "cf.br")) {
+            MLIR_BlockHandle real_d = map_block(src_blks, out_blks, n_blocks,
+                                                MLIR_GetOpSuccessor(term, 0));
+            size_t nso = MLIR_GetOpNumSuccessorOperands(term, 0);
+            if (nso) {
+                MLIR_BlockHandle land = MLIR_CreateBlock(ctx);
+                MLIR_AppendRegionBlock(ctx, out_reg, land);
+                emit_jmp(ctx, L.cur, land);
+                L.cur = land;
+                emit_edge_copies(&L, term, 0);
+                if (!L.ok) {
+                    free(src_blks);
+                    free(out_blks);
+                    return MLIR_INVALID_HANDLE;
+                }
+                emit_jmp(ctx, land, real_d);
+            } else {
+                emit_jmp(ctx, L.cur, real_d);
+            }
+        } else if (name_eq(tn, "llvm.cond_br") || name_eq(tn, "cf.cond_br")) {
+            if (MLIR_GetOpNumOperands(term) < 1) {
+                fprintf(stderr, "llvm->x86_64: cond_br without condition in '%.*s'\n",
+                        (int)sym.size, sym.str);
+                free(src_blks);
+                free(out_blks);
+                return MLIR_INVALID_HANDLE;
+            }
+            use_val(&L, MLIR_GetOpOperand(term, 0), R_R10);
+            if (!L.ok) {
+                free(src_blks);
+                free(out_blks);
+                return MLIR_INVALID_HANDLE;
+            }
+            emit_cmp_ri(ctx, L.cur, R_R10, 0, 4);
+            MLIR_BlockHandle real_t = map_block(src_blks, out_blks, n_blocks,
+                                                MLIR_GetOpSuccessor(term, 0));
+            MLIR_BlockHandle real_f = map_block(src_blks, out_blks, n_blocks,
+                                                MLIR_GetOpSuccessor(term, 1));
+            size_t nso_t = MLIR_GetOpNumSuccessorOperands(term, 0);
+            size_t nso_f = MLIR_GetOpNumSuccessorOperands(term, 1);
+            MLIR_BlockHandle br_t = real_t, br_f = real_f;
+            MLIR_BlockHandle cur = L.cur;
+            if (nso_t) {
+                br_t = MLIR_CreateBlock(ctx);
+                MLIR_AppendRegionBlock(ctx, out_reg, br_t);
+            }
+            if (nso_f) {
+                br_f = MLIR_CreateBlock(ctx);
+                MLIR_AppendRegionBlock(ctx, out_reg, br_f);
+            }
+            emit_jcc(ctx, cur, 5, br_t); // NE
+            emit_jmp(ctx, cur, br_f);
+            if (nso_t) {
+                L.cur = br_t;
+                emit_edge_copies(&L, term, 0);
+                if (!L.ok) {
+                    free(src_blks);
+                    free(out_blks);
+                    return MLIR_INVALID_HANDLE;
+                }
+                emit_jmp(ctx, br_t, real_t);
+            }
+            if (nso_f) {
+                L.cur = br_f;
+                emit_edge_copies(&L, term, 1);
+                if (!L.ok) {
+                    free(src_blks);
+                    free(out_blks);
+                    return MLIR_INVALID_HANDLE;
+                }
+                emit_jmp(ctx, br_f, real_f);
+            }
+        } else {
+            fprintf(stderr, "llvm->x86_64: block in '%.*s' ends in '%.*s'\n",
+                    (int)sym.size, sym.str, (int)tn.size, tn.str);
+            free(src_blks);
+            free(out_blks);
+            return MLIR_INVALID_HANDLE;
+        }
+    }
+
+    free(src_blks);
+    free(out_blks);
+    return finish_x86_func(ctx, out_reg, sym, false);
+}
+
+static MLIR_OpHandle select_func(MLIR_Context *ctx, MLIR_OpHandle fn, string sym) {
+    return select_func_cfg(ctx, fn, sym);
+}
+
 
 MLIR_OpHandle mlir_llvm_to_x86_64(MLIR_Context *ctx,
                                   MLIR_OpHandle llvm_module) {
