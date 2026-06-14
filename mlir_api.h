@@ -476,6 +476,44 @@ typedef enum {
     //   attrs: sym_name (string, debug), offset (i32), init_data (string).
     OP_TYPE_AARCH64_DATA_INIT,
 
+    // -------------------------------------------------------------------------
+    // x86_64 dialect - planned Linux/System V AMD64 physical-register
+    // dialect. The `x86_64 -> ELF` backend mirrors the AArch64 split:
+    // selection and ABI lowering happen in `llvm -> x86_64`, while the
+    // ELF backend only encodes bytes and lays out the executable.
+    // -------------------------------------------------------------------------
+    OP_TYPE_X86_64_FUNC,
+    OP_TYPE_X86_64_LABEL,
+    OP_TYPE_X86_64_PROLOGUE,
+    OP_TYPE_X86_64_EPILOGUE,
+    OP_TYPE_X86_64_MOV_RI,
+    OP_TYPE_X86_64_MOV_RR,
+    OP_TYPE_X86_64_MOV_RM,
+    OP_TYPE_X86_64_MOV_MR,
+    OP_TYPE_X86_64_LEA_RIP,
+    OP_TYPE_X86_64_ADD_RR,
+    OP_TYPE_X86_64_ADD_RI,
+    OP_TYPE_X86_64_SUB_RR,
+    OP_TYPE_X86_64_IMUL_RR,
+    OP_TYPE_X86_64_CQO,
+    OP_TYPE_X86_64_IDIV_R,
+    OP_TYPE_X86_64_AND_RR,
+    OP_TYPE_X86_64_OR_RR,
+    OP_TYPE_X86_64_XOR_RR,
+    OP_TYPE_X86_64_SHL_RI,
+    OP_TYPE_X86_64_SHR_RI,
+    OP_TYPE_X86_64_SAR_RI,
+    OP_TYPE_X86_64_CMP_RR,
+    OP_TYPE_X86_64_CMP_RI,
+    OP_TYPE_X86_64_SETCC,
+    OP_TYPE_X86_64_CMOVCC,
+    OP_TYPE_X86_64_JMP,
+    OP_TYPE_X86_64_JCC,
+    OP_TYPE_X86_64_CALL,
+    OP_TYPE_X86_64_RET,
+    OP_TYPE_X86_64_SYSCALL,
+    OP_TYPE_X86_64_DATA_INIT,
+
     OP_TYPE_COUNT
 } MLIR_OpType;
 

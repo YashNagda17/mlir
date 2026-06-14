@@ -271,6 +271,38 @@ static string op_type_to_string_half2(MLIR_OpType type) {
         case OP_TYPE_AARCH64_FCMP:         return str_lit("aarch64.fcmp");
         case OP_TYPE_AARCH64_FP_CVT:       return str_lit("aarch64.fp_cvt");
         case OP_TYPE_AARCH64_DATA_INIT:    return str_lit("aarch64.data_init");
+        // x86_64 dialect
+        case OP_TYPE_X86_64_FUNC:          return str_lit("x86_64.func");
+        case OP_TYPE_X86_64_LABEL:         return str_lit("x86_64.label");
+        case OP_TYPE_X86_64_PROLOGUE:      return str_lit("x86_64.prologue");
+        case OP_TYPE_X86_64_EPILOGUE:      return str_lit("x86_64.epilogue");
+        case OP_TYPE_X86_64_MOV_RI:        return str_lit("x86_64.mov_ri");
+        case OP_TYPE_X86_64_MOV_RR:        return str_lit("x86_64.mov_rr");
+        case OP_TYPE_X86_64_MOV_RM:        return str_lit("x86_64.mov_rm");
+        case OP_TYPE_X86_64_MOV_MR:        return str_lit("x86_64.mov_mr");
+        case OP_TYPE_X86_64_LEA_RIP:       return str_lit("x86_64.lea_rip");
+        case OP_TYPE_X86_64_ADD_RR:        return str_lit("x86_64.add_rr");
+        case OP_TYPE_X86_64_ADD_RI:        return str_lit("x86_64.add_ri");
+        case OP_TYPE_X86_64_SUB_RR:        return str_lit("x86_64.sub_rr");
+        case OP_TYPE_X86_64_IMUL_RR:       return str_lit("x86_64.imul_rr");
+        case OP_TYPE_X86_64_CQO:           return str_lit("x86_64.cqo");
+        case OP_TYPE_X86_64_IDIV_R:        return str_lit("x86_64.idiv_r");
+        case OP_TYPE_X86_64_AND_RR:        return str_lit("x86_64.and_rr");
+        case OP_TYPE_X86_64_OR_RR:         return str_lit("x86_64.or_rr");
+        case OP_TYPE_X86_64_XOR_RR:        return str_lit("x86_64.xor_rr");
+        case OP_TYPE_X86_64_SHL_RI:        return str_lit("x86_64.shl_ri");
+        case OP_TYPE_X86_64_SHR_RI:        return str_lit("x86_64.shr_ri");
+        case OP_TYPE_X86_64_SAR_RI:        return str_lit("x86_64.sar_ri");
+        case OP_TYPE_X86_64_CMP_RR:        return str_lit("x86_64.cmp_rr");
+        case OP_TYPE_X86_64_CMP_RI:        return str_lit("x86_64.cmp_ri");
+        case OP_TYPE_X86_64_SETCC:         return str_lit("x86_64.setcc");
+        case OP_TYPE_X86_64_CMOVCC:        return str_lit("x86_64.cmovcc");
+        case OP_TYPE_X86_64_JMP:           return str_lit("x86_64.jmp");
+        case OP_TYPE_X86_64_JCC:           return str_lit("x86_64.jcc");
+        case OP_TYPE_X86_64_CALL:          return str_lit("x86_64.call");
+        case OP_TYPE_X86_64_RET:           return str_lit("x86_64.ret");
+        case OP_TYPE_X86_64_SYSCALL:       return str_lit("x86_64.syscall");
+        case OP_TYPE_X86_64_DATA_INIT:     return str_lit("x86_64.data_init");
         default: return OP_NAME_NOT_IN_THIS_HALF;
     }
 }
