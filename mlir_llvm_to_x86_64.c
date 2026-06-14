@@ -1151,53 +1151,122 @@ static bool func_is_reachable(MLIR_Context *ctx, MLIR_BlockHandle mb, size_t nop
     return false;
 }
 
+MLIR_OpHandle mlir_llvm_to_x86_64(MLIR_Context *ctx, MLIR_OpHandle llvm_module) {
+    MLIR_RegionHandle mr = MLIR_GetOpRegion(llvm_module, 0);
+    MLIR_BlockHandle mb = MLIR_GetRegionBlock(mr, 0);
+    size_t nops = MLIR_GetBlockNumOps(mb);
 
-MLIR_OpHandle mlir_llvm_to_x86_64(MLIR_Context *ctx,
-                                  MLIR_OpHandle llvm_module) {
-    (void)ctx;
-    (void)llvm_module;
-    fprintf(stderr, "llvm->x86_64: backend skeleton is not implemented yet\n");
-    return MLIR_INVALID_HANDLE;
+    MLIR_BlockHandle out_body = MLIR_CreateBlock(ctx);
+    MLIR_RegionHandle out_region = MLIR_CreateRegion(ctx);
+    MLIR_AppendRegionBlock(ctx, out_region, out_body);
+
+    MLIR_AppendBlockOp(ctx, out_body, synth_start(ctx, str_lit("main")));
+    MLIR_AppendBlockOp(ctx, out_body, synth_write(ctx));
+
+    bool saw_main = false;
+    for (size_t i = 0; i < nops; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
+        if (!name_eq(MLIR_GetOpName(op), "llvm.func")) continue;
+        if (!func_has_body(op)) continue;
+        MLIR_AttributeHandle sa = MLIR_GetOpAttributeByName(op, "sym_name");
+        if (sa == MLIR_INVALID_HANDLE) {
+            X64_FAIL("llvm->x86_64: llvm.func without sym_name\n");
+        }
+        string sym = MLIR_GetAttributeString(sa);
+        if (sym.size == 4 && memcmp(sym.str, "main", 4) == 0) saw_main = true;
+        if (!func_is_reachable(ctx, mb, nops, sym)) continue;
+        MLIR_OpHandle fn = select_func(ctx, op, sym);
+        if (fn == MLIR_INVALID_HANDLE) return MLIR_INVALID_HANDLE;
+        MLIR_AppendBlockOp(ctx, out_body, fn);
+    }
+
+    if (!saw_main) {
+        fprintf(stderr, "llvm->x86_64: no defined 'main' function\n");
+        return MLIR_INVALID_HANDLE;
+    }
+
+    MLIR_RegionHandle regs[1] = { out_region };
+    return MLIR_CreateOp(ctx, OP_TYPE_MODULE, str_lit("module"),
+        NULL, 0, NULL, 0, NULL, 0, NULL, 0, regs, 1,
+        MLIR_CreateLocationUnknown(ctx, (string){0}),
+        MLIR_INVALID_HANDLE, (string){0}, -1);
 }
 
-LlvmX86SelState *mlir_llvm_x86_sel_begin(MLIR_Context *ctx,
-                                         MLIR_OpHandle llvm_module,
-                                         uint8_t **out_gblob,
-                                         uint32_t *out_gblob_len) {
-    (void)ctx;
-    (void)llvm_module;
+// ---------------------------------------------------------------------------
+// Streaming selection API (mirrors AArch64; used by mlir_llvm_to_elf).
+// ---------------------------------------------------------------------------
+struct LlvmX86SelState {
+    MLIR_BlockHandle mb;
+    MLIR_OpHandle   *funcs;
+    string          *syms;
+    size_t           n_funcs;
+    bool             saw_main;
+};
+
+LlvmX86SelState *mlir_llvm_x86_sel_begin(MLIR_Context *ctx, MLIR_OpHandle llvm_module,
+                                         uint8_t **out_gblob, uint32_t *out_gblob_len) {
     if (out_gblob) *out_gblob = NULL;
     if (out_gblob_len) *out_gblob_len = 0;
-    fprintf(stderr, "llvm->x86_64: streaming selector skeleton is not implemented yet\n");
-    return NULL;
+
+    MLIR_RegionHandle mr = MLIR_GetOpRegion(llvm_module, 0);
+    MLIR_BlockHandle mb = MLIR_GetRegionBlock(mr, 0);
+    size_t nops = MLIR_GetBlockNumOps(mb);
+
+    LlvmX86SelState *st = (LlvmX86SelState *)calloc(1, sizeof(LlvmX86SelState));
+    if (!st) return NULL;
+    st->mb = mb;
+    st->funcs = (MLIR_OpHandle *)calloc(nops ? nops : 1, sizeof(MLIR_OpHandle));
+    st->syms = (string *)calloc(nops ? nops : 1, sizeof(string));
+    if (!st->funcs || !st->syms) {
+        free(st->funcs);
+        free(st->syms);
+        free(st);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < nops; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
+        if (!name_eq(MLIR_GetOpName(op), "llvm.func")) continue;
+        if (!func_has_body(op)) continue;
+        MLIR_AttributeHandle sa = MLIR_GetOpAttributeByName(op, "sym_name");
+        if (sa == MLIR_INVALID_HANDLE) {
+            fprintf(stderr, "llvm->x86_64: llvm.func without sym_name\n");
+            free(st->funcs);
+            free(st->syms);
+            free(st);
+            return NULL;
+        }
+        string sym = MLIR_GetAttributeString(sa);
+        if (sym.size == 4 && memcmp(sym.str, "main", 4) == 0) st->saw_main = true;
+        st->funcs[st->n_funcs] = op;
+        st->syms[st->n_funcs] = sym;
+        st->n_funcs++;
+    }
+    return st;
 }
 
 size_t mlir_llvm_x86_sel_num_funcs(LlvmX86SelState *st) {
-    (void)st;
-    return 0;
-}
-
-MLIR_OpHandle mlir_llvm_x86_sel_synth_start(MLIR_Context *ctx,
-                                            LlvmX86SelState *st) {
-    (void)ctx;
-    (void)st;
-    return MLIR_INVALID_HANDLE;
-}
-
-MLIR_OpHandle mlir_llvm_x86_sel_func(MLIR_Context *ctx,
-                                     LlvmX86SelState *st,
-                                     size_t idx) {
-    (void)ctx;
-    (void)st;
-    (void)idx;
-    return MLIR_INVALID_HANDLE;
+    return st ? st->n_funcs : 0;
 }
 
 bool mlir_llvm_x86_sel_saw_main(LlvmX86SelState *st) {
+    return st ? st->saw_main : false;
+}
+
+MLIR_OpHandle mlir_llvm_x86_sel_synth_start(MLIR_Context *ctx, LlvmX86SelState *st) {
     (void)st;
-    return false;
+    return synth_start(ctx, str_lit("main"));
+}
+
+MLIR_OpHandle mlir_llvm_x86_sel_func(MLIR_Context *ctx, LlvmX86SelState *st,
+                                     size_t idx) {
+    if (!st || idx >= st->n_funcs) return MLIR_INVALID_HANDLE;
+    return select_func(ctx, st->funcs[idx], st->syms[idx]);
 }
 
 void mlir_llvm_x86_sel_end(LlvmX86SelState *st) {
-    (void)st;
+    if (!st) return;
+    free(st->funcs);
+    free(st->syms);
+    free(st);
 }
