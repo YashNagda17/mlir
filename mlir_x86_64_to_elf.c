@@ -599,10 +599,10 @@ bool mlir_x86_64_to_elf(MLIR_Context *ctx, MLIR_OpHandle x86_64_module,
 
 bool mlir_llvm_to_elf(MLIR_Context *ctx, MLIR_OpHandle llvm_module,
                       uint8_t **out_data, size_t *out_size) {
-    (void)ctx;
-    (void)llvm_module;
     if (out_data) *out_data = NULL;
     if (out_size) *out_size = 0;
-    fprintf(stderr, "llvm->elf: streaming backend skeleton is not implemented yet\n");
-    return false;
+
+    MLIR_OpHandle x86 = mlir_llvm_to_x86_64(ctx, llvm_module);
+    if (x86 == MLIR_INVALID_HANDLE) return false;
+    return mlir_x86_64_to_elf(ctx, x86, out_data, out_size);
 }
