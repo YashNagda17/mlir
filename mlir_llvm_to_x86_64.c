@@ -243,6 +243,306 @@ static void emit_jcc(MLIR_Context *ctx, MLIR_BlockHandle blk,
 
 // ---------------------------------------------------------------------------
 // LLVM dialect helpers.
+// ---------------------------------------------------------------------------
+static bool name_eq(string s, const char *cstr) {
+    size_t n = strlen(cstr);
+    return s.size == n && memcmp(s.str, cstr, n) == 0;
+}
+
+static unsigned x64_type_size(MLIR_Context *ctx, MLIR_TypeHandle ty) {
+    string s = MLIR_GetTypeString(ctx, ty);
+    if (s.size >= 9 && memcmp(s.str, "!llvm.ptr", 9) == 0) return 8;
+    if (name_eq(s, "ptr") || name_eq(s, "!llvm.ptr")) return 8;
+    if (name_eq(s, "f32")) return 4;
+    if (name_eq(s, "f64")) return 8;
+    if (s.size > 1 && s.str[0] == 'i') {
+        int w = 0;
+        for (size_t i = 1; i < s.size; i++) {
+            if (s.str[i] < '0' || s.str[i] > '9') { w = -1; break; }
+            w = w * 10 + (s.str[i] - '0');
+        }
+        if (w == 1 || w == 8) return 1;
+        if (w == 16) return 2;
+        if (w == 32) return 4;
+        if (w == 64) return 8;
+    }
+    if (MLIR_IsTypeLLVMArray(ty)) {
+        unsigned esz = x64_type_size(ctx, MLIR_GetTypeLLVMArrayElement(ty));
+        if (esz == 0) return 0;
+        return esz * (unsigned)MLIR_GetTypeLLVMArrayNumElements(ty);
+    }
+    return 0;
+}
+
+static int int_type_bits(MLIR_Context *ctx, MLIR_ValueHandle v) {
+    string s = MLIR_GetTypeString(ctx, MLIR_GetValueType(v));
+    if (s.size < 2 || s.str[0] != 'i') return 0;
+    int w = 0;
+    for (size_t i = 1; i < s.size; i++) {
+        if (s.str[i] < '0' || s.str[i] > '9') return 0;
+        w = w * 10 + (s.str[i] - '0');
+    }
+    return w;
+}
+
+static bool type_is_gp64(MLIR_Context *ctx, MLIR_ValueHandle v) {
+    return x64_type_size(ctx, MLIR_GetValueType(v)) == 8;
+}
+
+static bool func_has_body(MLIR_OpHandle fn) {
+    return MLIR_GetOpNumRegions(fn) > 0 &&
+           MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(fn, 0)) > 0;
+}
+
+static size_t parse_i32_array(string cs, int32_t *out, size_t cap) {
+    size_t p = 0, got = 0;
+    while (p < cs.size && cs.str[p] != ':') p++;
+    if (p < cs.size) p++;
+    while (p < cs.size && got < cap) {
+        while (p < cs.size && (cs.str[p] == ' ' || cs.str[p] == ',')) p++;
+        if (p >= cs.size || cs.str[p] == '>') break;
+        int64_t sign = 1;
+        if (cs.str[p] == '-') { sign = -1; p++; }
+        int64_t v = 0;
+        while (p < cs.size && cs.str[p] >= '0' && cs.str[p] <= '9')
+            v = v * 10 + (cs.str[p++] - '0');
+        out[got++] = (int32_t)(sign * v);
+    }
+    return got;
+}
+
+static bool const_int_val(MLIR_Context *ctx, MLIR_OpHandle op,
+                          int64_t *val, uint8_t *is64) {
+    if (!name_eq(MLIR_GetOpName(op), "llvm.mlir.constant")) return false;
+    if (MLIR_GetOpNumResults(op) != 1) return false;
+    MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+    MLIR_AttributeHandle va = MLIR_GetOpAttributeByName(op, "value");
+    if (va == MLIR_INVALID_HANDLE) return false;
+    *val = MLIR_GetAttributeInteger(va);
+    *is64 = type_is_gp64(ctx, res) ? 1 : 0;
+    return true;
+}
+
+#define X64_FAIL(...) do { fprintf(stderr, __VA_ARGS__); return MLIR_INVALID_HANDLE; } while (0)
+
+// Map LLVM icmp predicate to x86 SETCC/JCC condition (0..15).
+static int icmp_pred_to_x86_cond(int64_t p) {
+    switch (p) {
+        case 0: return 4;   // eq  -> ZF
+        case 1: return 5;   // ne  -> NZ
+        case 2: return 12;  // slt -> NLT
+        case 3: return 14;  // sle -> NG
+        case 4: return 15;  // sgt -> NGT
+        case 5: return 13;  // sge -> NL
+        case 6: return 12;  // ult -> LT (unsigned cmp)
+        case 7: return 14;  // ule -> LE
+        case 8: return 15;  // ugt -> GT
+        case 9: return 13;  // uge -> GE
+        default: return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slot map: every SSA value -> 8-byte frame slot index.
+// ---------------------------------------------------------------------------
+typedef struct { uintptr_t key; int32_t slot; } SlotEnt;
+typedef struct { SlotEnt *t; size_t cap; size_t n; Arena *arena; } SlotMap;
+
+static size_t sm_hash(uintptr_t k) {
+    k *= 0x9E3779B97F4A7C15ull;
+    return (size_t)(k >> 32);
+}
+static void sm_grow(SlotMap *m) {
+    size_t ncap = m->cap ? m->cap * 2 : 64;
+    SlotEnt *nt = (SlotEnt *)arena_alloc(m->arena, ncap * sizeof(SlotEnt));
+    memset(nt, 0, ncap * sizeof(SlotEnt));
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->t[i].key == 0) continue;
+        size_t j = sm_hash(m->t[i].key) & (ncap - 1);
+        while (nt[j].key != 0) j = (j + 1) & (ncap - 1);
+        nt[j] = m->t[i];
+    }
+    m->t = nt;
+    m->cap = ncap;
+}
+static void sm_put(SlotMap *m, MLIR_ValueHandle k, int32_t slot) {
+    if ((m->n + 1) * 4 >= m->cap * 3) sm_grow(m);
+    size_t mask = m->cap - 1;
+    size_t i = sm_hash((uintptr_t)k) & mask;
+    while (m->t[i].key != 0) {
+        if (m->t[i].key == (uintptr_t)k) return;
+        i = (i + 1) & mask;
+    }
+    m->t[i].key = (uintptr_t)k;
+    m->t[i].slot = slot;
+    m->n++;
+}
+static bool sm_get(SlotMap *m, MLIR_ValueHandle k, int32_t *out) {
+    if (m->cap == 0) return false;
+    size_t mask = m->cap - 1;
+    size_t i = sm_hash((uintptr_t)k) & mask;
+    while (m->t[i].key != 0) {
+        if (m->t[i].key == (uintptr_t)k) { *out = m->t[i].slot; return true; }
+        i = (i + 1) & mask;
+    }
+    return false;
+}
+
+static int32_t slot_disp(int32_t slot) {
+    return -(int32_t)((slot + 1) * 8);
+}
+
+static void load_slot(MLIR_Context *ctx, MLIR_BlockHandle blk, SlotMap *sm,
+                      MLIR_ValueHandle v, uint8_t rd) {
+    int32_t slot;
+    if (!sm_get(sm, v, &slot)) return;
+    emit_mov_rm(ctx, blk, rd, R_RBP, slot_disp(slot), 8);
+}
+static bool store_slot(MLIR_Context *ctx, MLIR_BlockHandle blk, SlotMap *sm,
+                       MLIR_ValueHandle v, uint8_t rs) {
+    int32_t slot;
+    if (!sm_get(sm, v, &slot)) return false;
+    emit_mov_mr(ctx, blk, R_RBP, slot_disp(slot), rs, 8);
+    return true;
+}
+
+// Constant rematerialization map.
+typedef struct { uintptr_t key; int64_t val; uint8_t is64; } ConstEnt;
+typedef struct { ConstEnt *t; size_t cap; size_t n; Arena *arena; } ConstMap;
+
+static void cm_put(ConstMap *m, MLIR_ValueHandle k, int64_t val, uint8_t is64) {
+    if ((m->n + 1) * 4 >= m->cap * 3) {
+        size_t ncap = m->cap ? m->cap * 2 : 64;
+        ConstEnt *nt = (ConstEnt *)arena_alloc(m->arena, ncap * sizeof(ConstEnt));
+        memset(nt, 0, ncap * sizeof(ConstEnt));
+        for (size_t i = 0; i < m->cap; i++) {
+            if (m->t[i].key == 0) continue;
+            size_t j = sm_hash(m->t[i].key) & (ncap - 1);
+            while (nt[j].key != 0) j = (j + 1) & (ncap - 1);
+            nt[j] = m->t[i];
+        }
+        m->t = nt;
+        m->cap = ncap;
+    }
+    size_t mask = m->cap - 1;
+    size_t i = sm_hash((uintptr_t)k) & mask;
+    while (m->t[i].key != 0) {
+        if (m->t[i].key == (uintptr_t)k) return;
+        i = (i + 1) & mask;
+    }
+    m->t[i].key = (uintptr_t)k;
+    m->t[i].val = val;
+    m->t[i].is64 = is64;
+    m->n++;
+}
+static bool cm_get(ConstMap *m, MLIR_ValueHandle k, int64_t *val, uint8_t *is64) {
+    if (m->cap == 0) return false;
+    size_t mask = m->cap - 1;
+    size_t i = sm_hash((uintptr_t)k) & mask;
+    while (m->t[i].key != 0) {
+        if (m->t[i].key == (uintptr_t)k) {
+            *val = m->t[i].val;
+            *is64 = m->t[i].is64;
+            return true;
+        }
+        i = (i + 1) & mask;
+    }
+    return false;
+}
+
+static void build_const_map(MLIR_Context *ctx, ConstMap *cm, MLIR_BlockHandle block) {
+    size_t no = MLIR_GetBlockNumOps(block);
+    for (size_t i = 0; i < no; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(block, i);
+        int64_t v; uint8_t is64;
+        if (const_int_val(ctx, op, &v, &is64))
+            cm_put(cm, MLIR_GetOpResult(op, 0), v, is64);
+    }
+}
+
+static void assign_slots_block(MLIR_Context *ctx, SlotMap *sm,
+                               MLIR_BlockHandle block, int32_t *nslots) {
+    size_t na = MLIR_GetBlockNumArgs(block);
+    for (size_t i = 0; i < na; i++)
+        sm_put(sm, MLIR_GetBlockArg(block, i), (*nslots)++);
+    size_t no = MLIR_GetBlockNumOps(block);
+    for (size_t i = 0; i < no; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(block, i);
+        int64_t cv; uint8_t c64;
+        if (const_int_val(ctx, op, &cv, &c64)) continue;
+        size_t nr = MLIR_GetOpNumResults(op);
+        for (size_t r = 0; r < nr; r++)
+            sm_put(sm, MLIR_GetOpResult(op, r), (*nslots)++);
+    }
+}
+
+static bool collect_allocas(MLIR_Context *ctx, SlotMap *am,
+                            MLIR_BlockHandle block, uint32_t *bytes) {
+    size_t no = MLIR_GetBlockNumOps(block);
+    for (size_t i = 0; i < no; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(block, i);
+        if (name_eq(MLIR_GetOpName(op), "llvm.alloca") &&
+            MLIR_GetOpNumResults(op) == 1) {
+            MLIR_AttributeHandle eta = MLIR_GetOpAttributeByName(op, "elem_type");
+            if (eta == MLIR_INVALID_HANDLE) return false;
+            MLIR_TypeHandle et = MLIR_GetAttributeTypeValue(eta);
+            unsigned esz = x64_type_size(ctx, et);
+            if (esz == 0) return false;
+            int64_t cnt = 1;
+            if (MLIR_GetOpNumOperands(op) >= 1) {
+                MLIR_OpHandle cd = MLIR_GetValueDefiningOp(MLIR_GetOpOperand(op, 0));
+                if (cd == MLIR_INVALID_HANDLE ||
+                    !name_eq(MLIR_GetOpName(cd), "llvm.mlir.constant")) return false;
+                cnt = MLIR_GetAttributeInteger(
+                          MLIR_GetOpAttributeByName(cd, "value"));
+            }
+            unsigned al = esz < 8 ? 8u : esz;
+            *bytes = (*bytes + al - 1u) & ~(al - 1u);
+            sm_put(am, MLIR_GetOpResult(op, 0), (int32_t)*bytes);
+            *bytes += (uint32_t)(esz * cnt);
+        }
+        size_t ng = MLIR_GetOpNumRegions(op);
+        for (size_t g = 0; g < ng; g++) {
+            MLIR_RegionHandle rg = MLIR_GetOpRegion(op, g);
+            size_t nbk = MLIR_GetRegionNumBlocks(rg);
+            for (size_t b = 0; b < nbk; b++)
+                if (!collect_allocas(ctx, am, MLIR_GetRegionBlock(rg, b), bytes))
+                    return false;
+        }
+    }
+    return true;
+}
+
+static void build_const_map_region(MLIR_Context *ctx, ConstMap *cm,
+                                   MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t b = 0; b < nb; b++)
+        build_const_map(ctx, cm, MLIR_GetRegionBlock(region, b));
+}
+
+static void assign_slots_region(MLIR_Context *ctx, SlotMap *sm,
+                                MLIR_RegionHandle region, int32_t *nslots) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t b = 0; b < nb; b++)
+        assign_slots_block(ctx, sm, MLIR_GetRegionBlock(region, b), nslots);
+}
+
+static bool collect_allocas_region(MLIR_Context *ctx, SlotMap *am,
+                                     MLIR_RegionHandle region, uint32_t *bytes) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t b = 0; b < nb; b++)
+        if (!collect_allocas(ctx, am, MLIR_GetRegionBlock(region, b), bytes))
+            return false;
+    return true;
+}
+
+static MLIR_BlockHandle map_block(MLIR_BlockHandle *src, MLIR_BlockHandle *dst,
+                                  size_t n, MLIR_BlockHandle s) {
+    for (size_t i = 0; i < n; i++)
+        if (src[i] == s) return dst[i];
+    return MLIR_INVALID_HANDLE;
+}
+
 
 MLIR_OpHandle mlir_llvm_to_x86_64(MLIR_Context *ctx,
                                   MLIR_OpHandle llvm_module) {
