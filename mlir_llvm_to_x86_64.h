@@ -18,13 +18,13 @@ extern "C" {
 #endif
 
 // Lower an `llvm`-dialect module to an `x86_64`-dialect module suitable
-// for `mlir_x86_64_to_elf`. This is a skeleton entry point for now and
-// returns MLIR_INVALID_HANDLE until lowering is implemented.
+// for `mlir_x86_64_to_elf`. Returns MLIR_INVALID_HANDLE on failure or on an
+// as-yet-unsupported construct (with diagnostics on stderr).
 MLIR_OpHandle mlir_llvm_to_x86_64(MLIR_Context *ctx,
                                   MLIR_OpHandle llvm_module);
 
-// Streaming selection API placeholder. This mirrors the AArch64 streaming
-// interface so the ELF finalizer can later lower one function at a time.
+// Streaming selection API. Mirrors the AArch64
+// interface so the ELF finalizer can lower one function at a time.
 typedef struct LlvmX86SelState LlvmX86SelState;
 
 LlvmX86SelState *mlir_llvm_x86_sel_begin(MLIR_Context *ctx,
@@ -41,7 +41,7 @@ MLIR_OpHandle mlir_llvm_x86_sel_func(MLIR_Context *ctx,
 bool mlir_llvm_x86_sel_saw_main(LlvmX86SelState *st);
 void mlir_llvm_x86_sel_end(LlvmX86SelState *st);
 
-// Stream an `llvm`-dialect module straight to an ELF image. Skeleton only.
+// Stream an `llvm`-dialect module straight to an ELF image.
 bool mlir_llvm_to_elf(MLIR_Context *ctx, MLIR_OpHandle llvm_module,
                       uint8_t **out_data, size_t *out_size);
 
