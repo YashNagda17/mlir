@@ -18,7 +18,7 @@ extern "C" {
 #endif
 
 // Translate an MLIR module whose body is x86_64.* ops into a Linux ELF64
-// executable. Skeleton only for now.
+// executable. executable.
 bool mlir_x86_64_to_elf(MLIR_Context *ctx, MLIR_OpHandle x86_64_module,
                         uint8_t **out_data, size_t *out_size);
 
