@@ -47,8 +47,9 @@ LOWERING_FLAG = [f"--lowering={LOWERING}"] if LOWERING else []
 # Code-generation/runtime target for the suite. "native" (default) emits
 # LLVM IR via tinyc, then llc + host CC + runtime.c. "wasm" emits a
 # wasm32 object via tinyc, then wasm-ld + runtime_wasm.c, and runs the
-# resulting .wasm via wasmtime. Both TINYC_LOWERING values are valid
-# with the wasm target.
+# resulting .wasm via wasmtime. "elf" emits a native x86-64 Linux ELF
+# executable via tinyc and runs it directly. Both TINYC_LOWERING values
+# are valid with the wasm target.
 TARGET = os.environ.get("TINYC_TARGET", "native")
 # Selects which macho backend to use when TARGET=macho. The default
 # `wasm` backend goes wasmssa -> wasmstack -> wasm.o -> Mach-O. The
@@ -193,6 +194,15 @@ def main():
         import platform as _platform
         if sys.platform != "darwin" or _platform.machine() != "arm64":
             print(f"error: TINYC_TARGET=macho is only supported on Darwin/arm64 "
+                  f"(got sys.platform={sys.platform!r}, machine={_platform.machine()!r})",
+                  file=sys.stderr)
+            return 2
+    # The ELF backend only runs on Linux/x86_64. It produces a native
+    # executable that the test runner launches directly.
+    if TARGET == "elf":
+        import platform as _platform
+        if not sys.platform.startswith("linux") or _platform.machine() not in ("x86_64", "AMD64"):
+            print(f"error: TINYC_TARGET=elf is only supported on Linux/x86_64 "
                   f"(got sys.platform={sys.platform!r}, machine={_platform.machine()!r})",
                   file=sys.stderr)
             return 2
