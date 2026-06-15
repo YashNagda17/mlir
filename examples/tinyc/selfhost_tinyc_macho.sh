@@ -100,6 +100,7 @@ NATIVE_C_FILES=(
     mlir_llvm_dce.c
     mlir_regalloc.c
     mlir_llvm_to_aarch64.c
+    mlir_aarch64_asm.c
     mlir_aarch64_to_macho.c
     tokenizer.c
     mlir_parser.c
