@@ -2267,6 +2267,8 @@ extern "C" bool MLIR_LiftCfToScf(MLIR_Context *ctx, MLIR_OpHandle module_h) {
     return MLIR_LiftCfToScfNative(ctx, module_h);
 }
 
+#ifdef LFORTRAN_MLIR_WASM_LOWERING
+
 extern "C" bool MLIR_LowerToLLVMDialectForWasmUpstream(MLIR_Context *ctx,
                                                        MLIR_OpHandle module_h) {
     (void)ctx;
@@ -2323,6 +2325,8 @@ extern "C" bool MLIR_LowerToLLVMDialectForWasmUpstream(MLIR_Context *ctx,
     return true;
 }
 
+#endif // LFORTRAN_MLIR_WASM_LOWERING
+
 extern "C" string MLIR_TranslateModuleToLLVMIRUpstream(MLIR_Context *ctx,
                                                        MLIR_OpHandle module_h) {
     auto *op = F<mlir::Operation>(module_h);
@@ -2361,6 +2365,8 @@ extern "C" string MLIR_TranslateModuleToLLVMIRUpstream(MLIR_Context *ctx,
 // target. The returned bytes are NOT a runnable wasm module — they
 // still need to be linked (typically with `wasm-ld`) against any
 // runtime/imports the program uses.
+#ifdef LFORTRAN_MLIR_WASM_LOWERING
+
 extern "C" string MLIR_TranslateModuleToWasmUpstream(MLIR_Context *ctx,
                                                      MLIR_OpHandle module_h) {
     auto *op = F<mlir::Operation>(module_h);
@@ -2438,3 +2444,5 @@ extern "C" string MLIR_TranslateModuleToWasmUpstream(MLIR_Context *ctx,
     result.size = obj_bytes.size();
     return result;
 }
+
+#endif // LFORTRAN_MLIR_WASM_LOWERING
