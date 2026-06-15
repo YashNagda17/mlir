@@ -1000,33 +1000,33 @@ name = "struct_field_designated_init"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "3\n"
 
-# Mach-O backend tests. Only run under `TINYC_TARGET=macho`
-# (pixi run test_tinyc_macho); the existing native/wasm targets skip them.
+# Native LP64 backend smoke tests (Mach-O on Darwin/arm64, ELF on
+# Linux/x86_64). Run under `TINYC_TARGET=macho` or `TINYC_TARGET=elf`.
 
 [[test]]
 name = "macho_exit"
 expected_exit_code = 42
-targets = ["macho"]
+targets = ["macho", "elf"]
 
 [[test]]
 name = "macho_arith"
 expected_exit_code = 42
-targets = ["macho"]
+targets = ["macho", "elf"]
 
 [[test]]
 name = "macho_if"
 expected_exit_code = 0
-targets = ["macho"]
+targets = ["macho", "elf"]
 
 [[test]]
 name = "macho_loop"
 expected_exit_code = 3
-targets = ["macho"]
+targets = ["macho", "elf"]
 
 [[test]]
 name = "macho_hello"
 expected_stdout = "3\n"
-targets = ["macho"]
+targets = ["macho", "elf"]
 
 [[test]]
 name = "splice_block_ops_cap"
