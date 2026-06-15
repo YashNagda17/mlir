@@ -573,6 +573,13 @@ int app_main(void) {
             println(str_lit("{}"), s);
         }
     }
+    if (emit_x86_64 || emit_elf) {
+        if (!getenv("TINYC_NO_LOAD_CSE"))
+            mlir_llvm_load_cse(&ctx, module);
+        mlir_llvm_arith_gvn(&ctx, module);
+        if (!getenv("TINYC_NO_DCE"))
+            mlir_llvm_dce(&ctx, module);
+    }
     string out;
     if (emit_wasmssa) {
         MLIR_OpHandle ssa = mlir_llvm_to_wasmssa(&ctx, module);
