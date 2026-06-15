@@ -280,8 +280,9 @@ def main():
             continue
         # Inverse opt-out: tests that exercise wasm-only semantics (WASI
         # imports, wasm32 long-sizing) which cannot run on the LP64
-        # `llvm` macho backend — there is no WASI host there.
-        if (TARGET == "macho" and MACHO_BACKEND == "llvm"
+        # native llvm backends (Mach-O `llvm` or Linux ELF) — there is no
+        # WASI host there.
+        if (((TARGET == "macho" and MACHO_BACKEND == "llvm") or TARGET == "elf")
                 and t.get("macho_llvm_skip")):
             print(f"SKIP {name} (macho_llvm_skip)")
             skipped += 1
@@ -469,6 +470,28 @@ def main():
                 failures += 1
                 continue
 
+            print(f"PASS {name}")
+            continue
+
+        if TARGET == "elf":
+            exe = HERE / "tests" / f"{name}.elf"
+            r = run([str(TINYC), "--emit=elf", *LOWERING_FLAG,
+                     "-I", str(HERE / "tests"),
+                     "-o", str(exe),
+                     *[str(s) for s in srcs]])
+            if r.returncode != 0:
+                print(f"FAIL {name}: tinyc returned {r.returncode}\nstderr:\n{r.stderr}")
+                failures += 1
+                continue
+            r = run([str(exe)])
+            if r.returncode != expected_rc:
+                print(f"FAIL {name}: elf exited with status {r.returncode} (expected {expected_rc})\nstdout: {r.stdout!r}\nstderr: {r.stderr!r}")
+                failures += 1
+                continue
+            if r.stdout != expected:
+                print(f"FAIL {name}: stdout mismatch\n  expected: {expected!r}\n  got:      {r.stdout!r}")
+                failures += 1
+                continue
             print(f"PASS {name}")
             continue
 
