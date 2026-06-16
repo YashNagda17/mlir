@@ -623,16 +623,42 @@ static void collect_globals(MLIR_Context *ctx, MLIR_BlockHandle mb, GMap *gm, Bu
         if (!str_eqz(MLIR_GetOpName(op), "llvm.mlir.global")) continue;
         string name = attr_str(op, "sym_name");
         uint32_t off = (uint32_t)data->len;
+        MLIR_AttributeHandle gt = MLIR_GetOpAttributeByName(op, "global_type");
+        size_t sz = 0;
+        if (gt) {
+            MLIR_TypeHandle t = MLIR_GetAttributeTypeValue(gt);
+            if (t != MLIR_INVALID_HANDLE) sz = x64_type_size(ctx, t);
+        }
         MLIR_AttributeHandle va = MLIR_GetOpAttributeByName(op, "value");
         if (va) {
-            string s = MLIR_GetAttributeString(va);
-            buf_append(data, s.str, s.size);
+            // Serialize the initializer per its actual attribute kind. Using the
+            // string accessor for an integer/float/bool attribute would read an
+            // unrelated field and emit garbage (or read an invalid pointer).
+            MLIR_AttrKind vk = MLIR_GetAttributeKind(va);
+            if (vk == MLIR_ATTR_KIND_STRING) {
+                string s = MLIR_GetAttributeString(va);
+                buf_append(data, s.str, s.size);
+                for (size_t z = s.size; z < sz; z++) buf_u8(data, 0);   // zero-fill tail
+            } else if (vk == MLIR_ATTR_KIND_INTEGER || vk == MLIR_ATTR_KIND_BOOL) {
+                if (sz == 0) sz = 8;
+                uint64_t v = (uint64_t)MLIR_GetAttributeInteger(va);
+                for (size_t b = 0; b < sz; b++)
+                    buf_u8(data, (uint8_t)(b < 8 ? (v >> (8 * b)) : 0));
+            } else if (vk == MLIR_ATTR_KIND_FLOAT) {
+                if (sz != 4 && sz != 8) sz = 8;
+                double d = MLIR_GetAttributeFloat(va);
+                uint64_t bits = 0;
+                if (sz == 4) { float f = (float)d; uint32_t b32; memcpy(&b32, &f, 4); bits = b32; }
+                else         { memcpy(&bits, &d, 8); }
+                for (size_t b = 0; b < sz; b++) buf_u8(data, (uint8_t)(bits >> (8 * b)));
+            } else {
+                fprintf(stderr, "x64: unsupported global initializer kind for '%.*s'\n",
+                        (int)name.size, name.str);
+                g_x64_ok = false;
+                for (size_t z = 0; z < (sz ? sz : 8); z++) buf_u8(data, 0);
+            }
         } else {
-            // zero-initialized: size from global_type array length
-            MLIR_AttributeHandle gt = MLIR_GetOpAttributeByName(op, "global_type");
-            size_t sz = 8;
-            if (gt) { MLIR_TypeHandle t = MLIR_GetAttributeType(gt);
-                if (t != MLIR_INVALID_HANDLE && MLIR_IsTypeLLVMArray(t)) sz = (size_t)MLIR_GetTypeLLVMArrayNumElements(t); }
+            if (sz == 0) sz = 8;   // unknown layout: conservative 8-byte zero slot
             for (size_t z = 0; z < sz; z++) buf_u8(data, 0);
         }
         gmap_put(gm, name, off);
