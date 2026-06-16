@@ -37,9 +37,7 @@
 #include <base/string.h>
 
 #include "mlir_api.h"
-
-// Growable byte buffer used for a function's encoded instruction stream.
-typedef struct { uint8_t *data; size_t len, cap; } Buf;
+#include "mlir_codegen_buf.h"  // Buf (growable byte buffer for encoded code)
 
 // -----------------------------------------------------------------------------
 // Relocations. These are symbolic: they name *what* a site references, not the
