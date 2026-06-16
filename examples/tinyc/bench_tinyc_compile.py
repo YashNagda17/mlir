@@ -63,8 +63,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 BENCH_DIR = ROOT / "bench_tinyc_out"
 
-# Source set mirrors examples/tinyc/build_tinyc_wasm.sh and
-# examples/tinyc/selfhost_tinyc_wasm.sh — every .c file that makes up
+# Source set mirrors examples/tinyc/build_tinyc_wasm.py and
+# examples/tinyc/selfhost_tinyc_wasm.py — every .c file that makes up
 # the tinyc.wasm self-host build, in the same order. Keep in sync.
 COREC_C_FILES = [
     "corec/base/io.c",
@@ -689,7 +689,7 @@ def main() -> int:
             out_wasm = cfg_dir / "tinyc_bench.wasm"
             # Pull in the tinyc_va_arg_* shim so the produced wasm is
             # actually runnable under wasmtime (this is also what
-            # selfhost_tinyc_wasm.sh does at its final link). The shim
+            # selfhost_tinyc_wasm.py does at its final link). The shim
             # is built lazily by `pixi run build_tinyc_wasm`; if it
             # isn't there, just link without it.
             extras: list[Path] = []

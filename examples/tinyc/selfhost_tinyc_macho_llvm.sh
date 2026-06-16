@@ -26,7 +26,7 @@
 # Anything else is invoked directly (must be an executable native
 # Mach-O binary built by a prior stage).
 #
-# The source set mirrors `selfhost_tinyc_wasm.sh` exactly so stage-2
+# The source set mirrors `selfhost_tinyc_wasm.py` exactly so stage-2
 # and stage-3 binaries can be compared bit-for-bit to verify
 # self-hosting reproducibility through the llvm backend.
 
@@ -57,7 +57,7 @@ case "$INPUT_TINYC" in
         ;;
 esac
 
-# Source set mirrors `selfhost_tinyc_wasm.sh`. Keep these in sync.
+# Source set mirrors `selfhost_tinyc_wasm.py`. Keep these in sync.
 COREC_C_FILES=(
     corec/base/io.c
     corec/base/buddy.c
@@ -128,7 +128,7 @@ INCLUDES=(-I corec -I corec-stdlib/stdlib -I .)
 
 # A tinyC-compiled wasm executable needs a tiny clang-built runtime
 # shim with the `tinyc_va_arg_*` helpers (tinyC lowers va_arg to
-# direct calls into them). Mirrors `selfhost_tinyc_wasm.sh`.
+# direct calls into them). Mirrors `selfhost_tinyc_wasm.py`.
 VARARG_OBJ=tinyc_wasm_vararg.wasm.o
 if [ ! -f "$VARARG_OBJ" ]; then
     echo "error: required object $VARARG_OBJ not found; run \`pixi run build_tinyc_wasm\` first" >&2
@@ -155,7 +155,7 @@ done
 # our `.wasm.o` set: the resulting `_start` faults on the first
 # dereference inside `emit_line_directive_if_needed` (likely a
 # relocation or data-segment layout mismatch). tinyc's own linker
-# produces a working binary byte-identical to `selfhost_tinyc_wasm.sh`.
+# produces a working binary byte-identical to `selfhost_tinyc_wasm.py`.
 LINKED_WASM="$STAGE_DIR/linked.wasm"
 printf '[selfhost-macho-llvm] tinyc --link -> %s\n' "$LINKED_WASM"
 "${TINYC_INVOKE[@]}" --link --export=_start \

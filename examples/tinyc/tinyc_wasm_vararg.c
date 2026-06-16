@@ -28,7 +28,7 @@ void          *tinyc_va_arg_ptr(va_list *ap) { return va_arg(*ap, void *); }
 // The helper must match: read that many i64 words straight out of the
 // va_list and write them into the destination buffer. This is the same
 // implementation as `runtime_wasm.c`'s `tinyc_va_arg_struct`, kept in
-// sync intentionally — the selfhost (`selfhost_tinyc_wasm.sh`) links
+// sync intentionally — the selfhost (`selfhost_tinyc_wasm.py`) links
 // THIS object instead of `runtime_wasm.c` to avoid pulling in printf /
 // malloc symbols.
 void tinyc_va_arg_struct(va_list *ap, void *out, long long size) {

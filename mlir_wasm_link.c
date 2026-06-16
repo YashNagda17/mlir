@@ -1357,7 +1357,7 @@ enum {
                                         // routinely overflows the 64 KB
                                         // default. Matches the explicit
                                         // `-z stack-size=4194304` used by
-                                        // build_tinyc_wasm.sh's clang link.
+                                        // build_tinyc_wasm.py's clang link.
     INITIAL_PAGES = 2u,             // grown as needed below
     GLOBAL_BASE_OFFSET = 1024u,     // wasm-ld default: leave low 1 KB unused
 };

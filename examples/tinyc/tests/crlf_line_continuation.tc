@@ -15,7 +15,7 @@
 //
 // on the macOS/Linux clones of any header that defined a multi-line macro
 // (e.g. corec/base/io.h's `println`). The Windows CI selfhost step
-// (build_tinyc_wasm.sh → wasmtime + tinyc.wasm on Windows-checked-out
+// (build_tinyc_wasm.py → wasmtime + tinyc.wasm on Windows-checked-out
 // sources) failed at the very first source file because of this.
 //
 // The MRE embeds CRLF line endings literally in a multi-line macro so the

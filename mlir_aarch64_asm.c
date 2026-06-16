@@ -1281,4 +1281,3 @@ bool patch_branches(EmittedFunc *e) {
     free(byhandle); free(fwd);
     return ok;
 }
-
