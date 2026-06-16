@@ -290,11 +290,10 @@ def main():
             print(f"SKIP {name} (macho_llvm_skip)")
             skipped += 1
             continue
-        # Inverse opt-in: tests that exercise the native llvm->aarch64
-        # backend's synthesised intrinsics (e.g. __builtin_syscall6, which
-        # lowers to a `svc` stub) only make sense on the direct `llvm` macho
-        # backend. The wasm / llvm_via_wasm macho backends compile through the
-        # wasm pipeline first, where __tinyc_syscall6 is an unresolved import.
+        # Inverse opt-in: tests that only make sense on the direct `llvm` macho
+        # backend (not the wasm / llvm_via_wasm macho backends, which compile
+        # through the wasm pipeline first). Currently unused, but kept as a
+        # general gate for native-aarch64-only behaviour.
         if t.get("macho_llvm_only") and not (TARGET == "macho" and MACHO_BACKEND == "llvm"):
             print(f"SKIP {name} (macho_llvm_only)")
             skipped += 1

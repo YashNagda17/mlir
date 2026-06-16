@@ -1032,8 +1032,7 @@ targets = ["macho"]
 name = "builtin_syscall"
 expected_stdout = "syscall6 ok\n"
 expected_exit_code = 5
-targets = ["macho"]
-macho_llvm_only = true
+targets = ["elf"]
 
 [[test]]
 name = "splice_block_ops_cap"
