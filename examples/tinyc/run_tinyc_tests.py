@@ -99,6 +99,7 @@ COREC_BASE_SOURCES = [
     "base/string.c",
     "base/numconv.c",
     "base/format.c",
+    "base/strbuf.c",
     "base/io.c",
     "base/buddy.c",
     "base/arena.c",
@@ -155,7 +156,7 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
         lines.append("#define PLATFORM_SKIP_ENTRY 1")
     lines += [
         "",
-        "#ifdef __clang__",
+        "#ifdef TINYC_CLANG_UNITY",
         "void printI64(long long v);",
         "void printI32(int v);",
         "void printF32(float v);",
@@ -196,7 +197,7 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
         lines.append(f'#include "{_inc(COREC_STDLIB_DIR / src)}"')
     lines += [
         "",
-        "#ifdef __clang__",
+        "#ifdef TINYC_CLANG_UNITY",
         "void tinyc_print_i64(long long v) { printI64(v); printNewline(); }",
         "void tinyc_print_f32(float v) { printF32(v); printNewline(); }",
         "void tinyc_print_f64(double v) { printF64(v); printNewline(); }",
