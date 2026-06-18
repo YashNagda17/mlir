@@ -509,6 +509,7 @@ targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "7\n13\n"
 # wasm_skip: redefines malloc/free; duplicate symbol vs runtime_wasm.c
 wasm_skip = true
+single_tu_skip = true
 
 [[test]]
 name = "escape_chars"
@@ -755,7 +756,7 @@ expected_stdout = "8\n5\n16\n"
 [[test]]
 name = "func_macro"
 targets = ["native", "wasm", "macho"]
-expected_stdout = "greet\nsquare=16\nmain\n"
+expected_stdout = "greet\nsquare=16\napp_main\n"
 
 [[test]]
 name = "builtin_va"

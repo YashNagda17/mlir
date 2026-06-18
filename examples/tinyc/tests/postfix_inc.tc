@@ -9,7 +9,7 @@ int writes(char *buf, int len, char ch) {
     return len;
 }
 
-int int_to_str(long val, char *buf) {
+int postfix_int_to_str(long val, char *buf) {
     if (val == 0) { buf[0] = '0'; return 1; }
     int len = 0;
     while (val > 0) {
@@ -40,9 +40,8 @@ int main() {
     printf("buf=%s len=%d\n", buf, len);   // "hi" 2
 
     char nb[32];
-    int nlen = int_to_str(786432, nb);
+    int nlen = postfix_int_to_str(786432, nb);
     nb[nlen] = 0;
     printf("n=%s nlen=%d\n", nb, nlen);    // 786432 6
     return 0;
 }
-

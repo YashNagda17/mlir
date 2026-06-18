@@ -15,7 +15,7 @@
 // would trap. With the new 4 MB default it comfortably runs to
 // completion.
 
-int printf(char *fmt, ...);
+int printf(const char *fmt, ...);
 
 int recurse(int depth, int target) {
     int frame[64];  // ~256 bytes per call frame

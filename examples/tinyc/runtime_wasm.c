@@ -322,6 +322,7 @@ int printf(const char *fmt, ...) {
 // since tinyC's parser sizes `long` per-target (32-bit when emitting
 // wasm) the signatures we expose here match exactly what tinyC-
 // compiled tests reference.
+#ifndef TINYC_WASM_RUNTIME_NO_LIBC
 
 unsigned long strlen(const char *s) {
     unsigned long n = 0;
@@ -376,6 +377,7 @@ void *calloc(unsigned long n, unsigned long size) {
 }
 
 void free(void *p) { (void)p; }
+#endif
 
 // Note: `_start` (the WASI entry point) is provided by start_wasm.s,
 // which calls `main` directly to bypass clang's wasm32-wasi rewrite of
