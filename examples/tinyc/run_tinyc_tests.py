@@ -118,6 +118,12 @@ def uses_wasm_runtime() -> bool:
     return TARGET == "wasm" or (TARGET == "macho" and MACHO_BACKEND != "llvm")
 
 
+def use_unity_source() -> bool:
+    # tinyC's Windows frontend path cannot compile corec's raw Win32 platform
+    # layer as part of every native test in CI within the per-test timeout.
+    return not (IS_WIN and TARGET == "native")
+
+
 def platform_source_for_unity() -> Path:
     if uses_wasm_runtime():
         return COREC_STDLIB_COREC_DIR / "platform" / "platform_wasm.c"
@@ -155,20 +161,6 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
     ]
     lines += [
         "",
-        "#ifdef TINYC_CLANG_UNITY",
-        "void printI64(long long v);",
-        "void printI32(int v);",
-        "void printF32(float v);",
-        "void printF64(double v);",
-        "void printStr(const char *s);",
-        "void printNewline(void);",
-        "void tinyc_print_i64(long long v);",
-        "void tinyc_print_f32(float v);",
-        "void tinyc_print_f64(double v);",
-        "void tinyc_print_str(const char *s);",
-        "#define _tinyc_print(x) _Generic((x), char*: tinyc_print_str, const char*: tinyc_print_str, float: tinyc_print_f32, double: tinyc_print_f64, default: tinyc_print_i64)(x)",
-        "#endif",
-        "",
         "#include <stddef.h>",
         "#include <stdint.h>",
         "#include <stdarg.h>",
@@ -193,19 +185,59 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
         stdlib_sources.remove("stdlib/printf.c")
     for src in stdlib_sources:
         lines.append(f'#include "{_inc(COREC_STDLIB_DIR / src)}"')
-    lines += [
-        "",
-        "#ifdef TINYC_CLANG_UNITY",
-        "void tinyc_print_i64(long long v) { printI64(v); printNewline(); }",
-        "void tinyc_print_f32(float v) { printF32(v); printNewline(); }",
-        "void tinyc_print_f64(double v) { printF64(v); printNewline(); }",
-        "void tinyc_print_str(const char *s) { printStr(s); }",
-        "#endif",
-        "",
-    ]
-    lines.append(f'#include "{_inc(platform_source_for_unity())}"')
+    lines += ["", ""]
+    if TARGET == "macho" and MACHO_BACKEND == "llvm":
+        lines += [
+            "extern long _write(int fd, const void *buf, unsigned long n);",
+            "extern long _read(int fd, void *buf, unsigned long n);",
+            "extern int _open(const char *path, int flags, ...);",
+            "extern int _close(int fd);",
+            "extern long _lseek(int fd, long offset, int whence);",
+            "extern void _exit(int status);",
+            "static char tinyc_static_heap_raw[16842752];",
+            "void ensure_heap_initialized(void) { }",
+            "void platform_init(int argc, char **argv, char **envp) { (void)argc; (void)argv; (void)envp; buddy_init(); }",
+            "void *platform_heap_base(void) { unsigned long p = (unsigned long)tinyc_static_heap_raw; p = (p + 65535) & ~65535UL; return (void*)p; }",
+            "unsigned long platform_heap_size(void) { return 16777216; }",
+            "void *platform_heap_grow(unsigned long n) { (void)n; return (void*)0; }",
+            "unsigned int platform_fd_write(int fd, const ciovec_t *iovs, unsigned long iovs_len, unsigned long *nwritten) {",
+            "  unsigned long total = 0;",
+            "  for (unsigned long i = 0; i < iovs_len; i = i + 1) total = total + (unsigned long)_write(fd, iovs[i].buf, iovs[i].buf_len);",
+            "  *nwritten = total; return 0;",
+            "}",
+            "void platform_exit(int status) { _exit(status); }",
+            "int platform_args_sizes_get(unsigned long *argc, unsigned long *argv_buf_size) { *argc = 0; *argv_buf_size = 0; return 0; }",
+            "int platform_args_get(char **argv, char *argv_buf) { (void)argv; (void)argv_buf; return 0; }",
+            "int platform_environ_sizes_get(unsigned long *n, unsigned long *s) { *n = 0; *s = 0; return 0; }",
+            "int platform_environ_get(char **e, char *b) { (void)e; (void)b; return 0; }",
+            "int platform_path_open(const char *path, unsigned long path_len, unsigned long long rights, int oflags) {",
+            "  (void)path_len; (void)rights; return _open(path, oflags, 0644);",
+            "}",
+            "int platform_fd_close(int fd) { return _close(fd); }",
+            "int platform_fd_read(int fd, const iovec_t *iovs, unsigned long iovs_len, unsigned long *nread) {",
+            "  unsigned long total = 0;",
+            "  for (unsigned long i = 0; i < iovs_len; i = i + 1) total = total + (unsigned long)_read(fd, iovs[i].iov_base, iovs[i].iov_len);",
+            "  *nread = total; return 0;",
+            "}",
+            "int platform_fd_seek(int fd, long long offset, int whence, unsigned long long *newoffset) { long r = _lseek(fd, (long)offset, whence); *newoffset = (unsigned long long)r; return r < 0; }",
+            "int platform_fd_tell(int fd, unsigned long long *offset) { long r = _lseek(fd, 0, 1); *offset = (unsigned long long)r; return r < 0; }",
+            "int platform_read_file_mmap(const char *filename, unsigned long long *out_handle, void **out_data, unsigned long *out_size) { (void)filename; *out_handle = 0; *out_data = (void*)0; *out_size = 0; return 0; }",
+            "void platform_file_unmap(unsigned long long handle) { (void)handle; }",
+            "double fast_sqrt(double x) { return __builtin_sqrt(x); }",
+            "float fast_sqrtf(float x) { return __builtin_sqrtf(x); }",
+        ]
+    else:
+        lines.append(f'#include "{_inc(platform_source_for_unity())}"')
     if host_main:
         if uses_wasm_runtime():
+            lines += [
+                "",
+                "int main(void) {",
+                "    platform_init(0, 0, 0);",
+                "    return app_main();",
+                "}",
+            ]
+        elif TARGET == "macho" and MACHO_BACKEND == "llvm":
             lines += [
                 "",
                 "int main(void) {",
@@ -477,7 +509,7 @@ def main():
         # default to `<name>.tc` for backwards compatibility.
         sources = t.get("sources", [f"{name}.tc"])
         srcs = [HERE / "tests" / s for s in sources]
-        unity_src = write_unity_source(name, srcs)
+        unity_src = write_unity_source(name, srcs) if use_unity_source() else None
 
         if TARGET == "wasm":
             obj  = HERE / "tests" / f"{name}.wasm.o"
@@ -638,9 +670,14 @@ def main():
         exe = HERE / "tests" / (f"{name}.exe" if IS_WIN else f"{name}.bin")
 
         # Stage 1: emit LLVM IR from the generated single-TU root.
-        r = run([str(TINYC), "--emit=llvm", *LOWERING_FLAG,
-                 *unity_include_flags(),
-                 str(unity_src)])
+        if unity_src is not None:
+            tinyc_llvm_cmd = [str(TINYC), "--emit=llvm", *LOWERING_FLAG,
+                              *unity_include_flags(), str(unity_src)]
+        else:
+            tinyc_llvm_cmd = [str(TINYC), "--emit=llvm", *LOWERING_FLAG,
+                              "-I", str(HERE / "tests"),
+                              *[str(s) for s in srcs]]
+        r = run(tinyc_llvm_cmd)
         if r.returncode != 0:
             print(f"FAIL {name}: tinyc returned {r.returncode}\nstderr:\n{r.stderr}\nstdout (first 200 chars):\n{r.stdout[:200]}")
             failures += 1
