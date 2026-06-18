@@ -6,6 +6,43 @@
 #include <stdint.h>
 
 #ifndef TINYC_RUNTIME_VA_ONLY
+#ifndef _WIN32
+extern long write(int fd, const void *buf, unsigned long n);
+static void tinyc_host_write(const char *buf, unsigned long n) {
+    if (n) write(1, buf, n);
+}
+static unsigned long tinyc_host_strlen(const char *s) {
+    unsigned long n = 0;
+    if (!s) return 0;
+    while (s[n]) n++;
+    return n;
+}
+void printI64(int64_t v) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%lld", (long long)v);
+    if (n > 0) tinyc_host_write(buf, (unsigned long)n);
+}
+void printNewline(void)  { tinyc_host_write("\n", 1); }
+void printI32(int32_t v) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%d\n", v);
+    if (n > 0) tinyc_host_write(buf, (unsigned long)n);
+}
+static void printF64Trimmed(double v) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%.6f", v);
+    if (n < 0) return;
+    while (n > 0 && buf[n - 1] == '0') n--;
+    if (n > 0 && buf[n - 1] == '.') n--;
+    tinyc_host_write(buf, (unsigned long)n);
+}
+void printF32(float v) { printF64Trimmed((double)v); }
+void printF64(double v) { printF64Trimmed(v); }
+void printStr(const char *s) {
+    tinyc_host_write(s ? s : "", tinyc_host_strlen(s));
+    tinyc_host_write("\n", 1);
+}
+#else
 void printI64(int64_t v) { printf("%lld", (long long)v); }
 void printNewline(void)  { printf("\n"); }
 // vector.print on i32 actually lowers via signext to printI64 above, but
@@ -34,6 +71,7 @@ void printF64(double v) { printF64Trimmed(v); }
 void printStr(const char *s) {
     printf("%s\n", s ? s : "");
 }
+#endif
 #endif
 
 
