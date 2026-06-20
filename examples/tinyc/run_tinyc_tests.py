@@ -265,6 +265,16 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
             "void printStr(char *s) { ciovec_t io; unsigned long n; n=0; if(s){ while(s[n]) n=n+1; io.buf=s; io.buf_len=n; write_all(1,&io,1); } printNewline(); }",
             "void printF32(float v) { (void)v; }",
             "void printF64(double v) { (void)v; }",
+            "int tinyc_va_arg_i32(char **ap) { char *p; int *q; p=*ap; *ap=p+8; q=(int*)p; return *q; }",
+            "long long tinyc_va_arg_i64(char **ap) { char *p; long long *q; p=*ap; *ap=p+8; q=(long long*)p; return *q; }",
+            "double tinyc_va_arg_f64(char **ap) { char *p; double *q; p=*ap; *ap=p+8; q=(double*)p; return *q; }",
+            "void *tinyc_va_arg_ptr(char **ap) { char *p; void **q; p=*ap; *ap=p+8; q=(void**)p; return *q; }",
+            "void tinyc_va_arg_struct(char **ap, void *out, long long size) {",
+            "  char *p; long long words; long long i; long long *o; long long *s;",
+            "  p=*ap; words=(size+7)/8; o=(long long*)out; s=(long long*)p;",
+            "  for(i=0;i<words;i=i+1){ o[i]=s[i]; }",
+            "  *ap=p+words*8;",
+            "}",
             "",
         ]
     if host_main:
