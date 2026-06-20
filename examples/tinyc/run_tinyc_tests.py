@@ -16,7 +16,6 @@ HERE = Path(__file__).parent
 ROOT = HERE.parent.parent
 IS_WIN = sys.platform == "win32"
 TINYC = Path(os.environ.get("TINYC", str(ROOT / ("tinyc.exe" if IS_WIN else "tinyc")))).resolve()
-RUNTIME_WASM = HERE / "runtime_wasm.c"
 RUNTIME_WASM_START = HERE / "start_wasm.s"
 # corec platform_<os>.c whose file-I/O + exit primitives the via-wasm Mach-O
 # backend's WASI adapters call (spliced in via --host-platform).
@@ -54,7 +53,7 @@ LOWERING_FLAG = [f"--lowering={LOWERING}"] if LOWERING else []
 
 # Code-generation/runtime target for the suite. "native" (default) emits
 # LLVM IR via tinyc, then llc + host CC. "wasm" emits a
-# wasm32 object via tinyc, then wasm-ld + runtime_wasm.c, and runs the
+# wasm32 object via tinyc, then wasm-ld + generated support objects, and runs the
 # resulting .wasm via wasmtime. Both TINYC_LOWERING values are valid
 # with the wasm target.
 TARGET = os.environ.get("TINYC_TARGET", "native")
@@ -180,10 +179,6 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
     for src in COREC_BASE_SOURCES:
         lines.append(f'#include "{_inc(COREC_STDLIB_COREC_DIR / src)}"')
     stdlib_sources = list(STDLIB_SOURCES)
-    if uses_wasm_runtime():
-        # runtime_wasm.c supplies printf/vprintf for wasm-shaped tests. Keep the
-        # rest of stdio (FILE, fputs, fputc, fopen, ...) in the unity root.
-        stdlib_sources.remove("stdlib/printf.c")
     if TARGET == "native" or TARGET == "elf":
         # Native tests link against the host C library; use its variadic printf
         # ABI instead of compiling corec-stdlib's printf with tinyC. ELF uses
@@ -193,6 +188,16 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
     for src in stdlib_sources:
         lines.append(f'#include "{_inc(COREC_STDLIB_DIR / src)}"')
     lines += ["", ""]
+    if uses_wasm_runtime():
+        lines += [
+            "void printI64(long long v) { printf(\"%lld\", v); }",
+            "void printI32(int v) { printf(\"%d\\n\", v); }",
+            "void printF32(float v) { printf(\"%g\", (double)v); }",
+            "void printF64(double v) { printf(\"%g\", v); }",
+            "void printStr(char *s) { printf(\"%s\\n\", s ? s : \"\"); }",
+            "void printNewline(void) { printf(\"\\n\"); }",
+            "",
+        ]
     if uses_inline_platform():
         prefix = "_" if (TARGET == "macho" or IS_WIN) else ""
         if IS_WIN:
@@ -248,6 +253,16 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
         ]
     else:
         lines.append(f'#include "{_inc(platform_source_for_unity())}"')
+    if TARGET == "elf":
+        lines += [
+            "void printI64(long long v) { char b[32]; unsigned long n; ciovec_t io; n=int64_to_str(v,b); io.buf=b; io.buf_len=n; write_all(1,&io,1); }",
+            "void printI32(int v) { printI64((long long)v); printNewline(); }",
+            "void printNewline(void) { ciovec_t io; io.buf=\"\\n\"; io.buf_len=1; write_all(1,&io,1); }",
+            "void printStr(char *s) { ciovec_t io; unsigned long n; n=0; if(s){ while(s[n]) n=n+1; io.buf=s; io.buf_len=n; write_all(1,&io,1); } printNewline(); }",
+            "void printF32(float v) { (void)v; }",
+            "void printF64(double v) { (void)v; }",
+            "",
+        ]
     if host_main:
         if uses_wasm_runtime():
             lines += [
@@ -311,20 +326,19 @@ def link_native(obj_path: Path, exe_path: Path):
     return run(cmd)
 
 
-def build_wasm_runtime(out_path: Path, start_obj: Path):
-    """Compile runtime_wasm.c (and the _start asm shim) into wasm32
-    relocatable object files once per test run. Cached on disk; only
-    rebuilt if missing or older than the source."""
-    runtime_stale = (
-        not out_path.exists()
-        or out_path.stat().st_mtime < RUNTIME_WASM.stat().st_mtime
+def build_wasm_runtime(vararg_obj: Path, start_obj: Path):
+    """Compile wasm support objects once per test run."""
+    vararg_stale = (
+        not vararg_obj.exists()
+        or vararg_obj.stat().st_mtime < (HERE / "tinyc_wasm_vararg.c").stat().st_mtime
     )
-    if runtime_stale:
+    if vararg_stale:
         r = run([
             WASM_CC, "--target=wasm32-wasi",
-            "-nostdlib", "-nostdlibinc", "-fno-builtin", "-O1",
-            "-DTINYC_WASM_RUNTIME_NO_LIBC",
-            "-c", str(RUNTIME_WASM), "-o", str(out_path),
+            "-nostdlib", "-nostdinc", "-fno-builtin", "-O1",
+            "-I", str(COREC_STDLIB_DIR / "stdlib"),
+            "-I", str(COREC_STDLIB_COREC_DIR),
+            "-c", str(HERE / "tinyc_wasm_vararg.c"), "-o", str(vararg_obj),
         ])
         if r.returncode != 0:
             return r
@@ -365,7 +379,7 @@ def link_wasm(obj_paths, runtime_obj: Path, start_obj: Path,
             *obj_args, *runtime_args,
         ])
     return run([
-        WASM_LD, "--no-entry", "--export=_start",
+        WASM_LD, "--no-entry", "--allow-undefined", "--export=_start",
         *obj_args, *runtime_args,
         "-o", str(wasm_path),
     ])
@@ -399,13 +413,13 @@ def main():
     # and the lowering choice only affects how MLIR is reduced to the LLVM
     # dialect beforehand.
 
-    # Pre-build the tinyC wasm runtime object once per run. The generated
-    # single-TU root contains corec + stdlib + the test; runtime_wasm.c still
-    # supplies tinyC's lowered print/va_arg hooks and the WASI _start shim.
-    wasm_runtime_obj = HERE / "tests" / "runtime_wasm.o"
+    # Pre-build wasm support objects once per run. The generated single-TU root
+    # contains corec + stdlib + print hooks; tinyc_wasm_vararg.c supplies
+    # tinyC's lowered va_arg hooks, and start_wasm.s supplies _start.
+    wasm_vararg_obj = HERE / "tests" / "tinyc_wasm_vararg.o"
     wasm_start_obj   = HERE / "tests" / "start_wasm.o"
     if uses_wasm_runtime():
-        r = build_wasm_runtime(wasm_runtime_obj, wasm_start_obj)
+        r = build_wasm_runtime(wasm_vararg_obj, wasm_start_obj)
         if r is not None and r.returncode != 0:
             print(f"error: failed to compile wasm runtime\nstderr:\n{r.stderr}",
                   file=sys.stderr)
@@ -549,9 +563,9 @@ def main():
                 failures += 1
                 continue
 
-            # Stage 2: link with runtime_wasm.o + start_wasm.o for tinyC's
-            # lowered print/va_arg hooks and the WASI entry shim.
-            r = link_wasm([obj], wasm_runtime_obj, wasm_start_obj, wasm)
+            # Stage 2: link with tinyc_wasm_vararg.o + start_wasm.o for
+            # tinyC's lowered va_arg hooks and the WASI entry shim.
+            r = link_wasm([obj], wasm_vararg_obj, wasm_start_obj, wasm)
             if r.returncode != 0:
                 print(f"FAIL {name}: wasm-ld failed\nstderr:\n{r.stderr}\nstdout:\n{r.stdout}")
                 failures += 1
@@ -618,7 +632,7 @@ def main():
                     failures += 1
                     continue
                 linked_wasm = HERE / "tests" / f"{name}.macho.linked.wasm"
-                r = link_wasm([obj_j], wasm_runtime_obj, wasm_start_obj, linked_wasm)
+                r = link_wasm([obj_j], wasm_vararg_obj, wasm_start_obj, linked_wasm)
                 if r.returncode != 0:
                     print(f"FAIL {name}: wasm-ld failed\nstderr:\n{r.stderr}\nstdout:\n{r.stdout}")
                     failures += 1
@@ -658,7 +672,7 @@ def main():
             if MACHO_BACKEND == "llvm":
                 tinyc_cmd.append("--macho-backend=llvm")
             else:
-                tinyc_cmd.append(f"--wasm-runtime-obj={wasm_runtime_obj}")
+                tinyc_cmd.append(f"--wasm-runtime-obj={wasm_vararg_obj}")
                 tinyc_cmd.append(f"--wasm-runtime-obj={wasm_start_obj}")
             tinyc_cmd.append(str(unity_src))
             r = run(tinyc_cmd)

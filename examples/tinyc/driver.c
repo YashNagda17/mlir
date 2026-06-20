@@ -35,7 +35,6 @@
 #define TINYC_HAS_ELF 1
 #endif
 #include "tinyc.h"
-#include "tinyc_native_runtime.h"
 
 #if !defined(_WIN32) && !defined(__wasm__) && !defined(__TINYC__)
 #include <sys/stat.h>
@@ -250,7 +249,7 @@ int app_main(void) {
     // --wasm-runtime-obj=PATH (repeatable). Paths of additional .wasm.o
     // objects to link into the module when producing a Mach-O binary.
     // For the macho_exit test, the test runner passes
-    // `runtime_wasm.wasm.o` and `start_wasm.wasm.o`.
+    // `start_wasm.wasm.o` and optional support objects.
     char **wasm_runtime_objs = arena_new_array(boot_arena, char *, argc + 1);
     size_t n_wasm_runtime_objs = 0;
 
@@ -737,17 +736,6 @@ int app_main(void) {
         }
     }
 
-    // The native llvm backend has no libc; provide its runtime (printI64,
-    // printStr, ...) as tinyC-subset C parsed into this same module, so it
-    // lowers through the llvm -> aarch64 path alongside user code. Only
-    // functions the user hasn't defined are injected.
-    if (macho_backend_llvm || emit_aarch64 || emit_elf) {
-        bool runtime_uses_platform =
-            (emit_elf && host_platform_path != NULL)
-            ;
-        tinyc_inject_native_runtime(arena, prog, target_wasm32,
-                                    runtime_uses_platform);
-    }
     MLIR_OpHandle module = tinyc_emit_module(&ctx, prog);
     if (tinyc_last_emit_errors() > 0) {
         arena_destroy(arena);

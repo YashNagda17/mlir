@@ -102,7 +102,7 @@ unrelated reasons).
 ./tinyc --emit=wasm --lowering=upstream \
     -o /tmp/p.wasm.o examples/tinyc/tests/sum_to_10.tc
 wasm-ld --no-entry --export=_start --allow-undefined \
-    /tmp/p.wasm.o examples/tinyc/runtime_wasm.o examples/tinyc/start_wasm.o \
+    /tmp/p.wasm.o examples/tinyc/start_wasm.o \
     -o /tmp/p.wasm
 wasmtime /tmp/p.wasm   # prints 55
 

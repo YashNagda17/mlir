@@ -512,7 +512,7 @@ expected_stdout = "3\n17\n"
 name = "define_malloc_free"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "7\n13\n"
-# wasm_skip: redefines malloc/free; duplicate symbol vs runtime_wasm.c
+# wasm_skip: redefines malloc/free; duplicate symbol vs generated stdlib root
 wasm_skip = true
 single_tu_skip = true
 
@@ -589,7 +589,7 @@ name = "libc_fputs_stdout"
 targets = ["native", "wasm", "macho"]
 platforms = ["linux"]
 expected_stdout = "hello\nworld\n"
-# wasm_skip: needs fputs/stdout (not provided by runtime_wasm.c).
+# wasm_skip: needs fputs/stdout as a portable symbol.
 wasm_skip = true
 
 [[test]]
@@ -597,21 +597,21 @@ name = "libc_fputc_stdout"
 targets = ["native", "wasm", "macho"]
 platforms = ["linux"]
 expected_stdout = "AB\n"
-# wasm_skip: needs fputc/stdout (not provided by runtime_wasm.c).
+# wasm_skip: needs fputc/stdout as a portable symbol.
 wasm_skip = true
 
 [[test]]
 name = "libc_file_io"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "read 11 bytes: hello libc\n"
-# wasm_skip: needs fopen/fputs/fclose (no libc/wasi sysroot in runtime_wasm.c)
+# wasm_skip: needs host-style file I/O not provided in wasm tests.
 wasm_skip = true
 
 [[test]]
 name = "libc_qsort"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "1\n2\n3\n5\n8\n9\n"
-# wasm_skip: needs qsort (no libc in runtime_wasm.c)
+# wasm_skip: needs qsort in the wasm test environment.
 wasm_skip = true
 
 [[test]]

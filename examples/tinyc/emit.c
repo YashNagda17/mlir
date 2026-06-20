@@ -6241,6 +6241,15 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
     }
 
     if (e.use_print_str) {
+        bool have_print_str = false;
+        for (size_t i = 0; i < program->funcs.size; i++) {
+            Func *f = program->funcs.data[i];
+            if (!f->is_forward && str_eq(f->name, str_lit("printStr"))) {
+                have_print_str = true;
+                break;
+            }
+        }
+        if (!have_print_str) {
         MLIR_TypeHandle *ins = arena_new_array(arena, MLIR_TypeHandle, 1); ins[0] = e.ptr;
         MLIR_TypeHandle fty = MLIR_CreateTypeFunction(ctx, ins, 1, NULL, 0);
         MLIR_AttributeHandle a0 = MLIR_CreateAttributeString(ctx, str_lit("sym_name"), str_lit("printStr"));
@@ -6254,6 +6263,7 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
                                            attrs, 3, NULL, 0, NULL, 0, NULL, 0,
                                            regs, 1, e.loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
         MLIR_AppendBlockOp(ctx, mb, decl);
+        }
     }
 
     // Emit any string-literal globals collected by ST_PRINT/EX_STR.
