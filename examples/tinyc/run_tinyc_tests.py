@@ -188,16 +188,6 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
     for src in stdlib_sources:
         lines.append(f'#include "{_inc(COREC_STDLIB_DIR / src)}"')
     lines += ["", ""]
-    if uses_wasm_runtime():
-        lines += [
-            "void printI64(long long v) { printf(\"%lld\", v); }",
-            "void printI32(int v) { printf(\"%d\\n\", v); }",
-            "void printF32(float v) { printf(\"%g\", (double)v); }",
-            "void printF64(double v) { printf(\"%g\", v); }",
-            "void printStr(char *s) { printf(\"%s\\n\", s ? s : \"\"); }",
-            "void printNewline(void) { printf(\"\\n\"); }",
-            "",
-        ]
     if uses_inline_platform():
         prefix = "_" if (TARGET == "macho" or IS_WIN) else ""
         if IS_WIN:
