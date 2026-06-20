@@ -4901,7 +4901,7 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
         case ST_PRINT: {
             EVal v = emit_expr(e, sc, st->expr);
             bool have_printf_for_print = e->program->print_via_printf ||
-                (find_sig(e, str_lit("printf")) != NULL);
+                (e->target_wasm32 && find_sig(e, str_lit("printf")) != NULL);
             if (!have_printf_for_print) {
                 if (v.is_str) {
                     e->use_print_str = true;
