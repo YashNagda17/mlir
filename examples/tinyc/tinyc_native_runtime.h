@@ -59,7 +59,8 @@ static void tinyc_rt_add(Arena *arena, Program *prog, string *combined,
 //
 // Definitions are ordered so that a function only calls ones added earlier.
 static void tinyc_inject_native_runtime(Arena *arena, Program *prog,
-                                        bool target_wasm32, bool use_host_platform) {
+                                        bool target_wasm32, bool use_host_platform,
+                                        bool linux_elf) {
     string combined = (string){0};
     bool any = false;
 
@@ -130,14 +131,26 @@ static void tinyc_inject_native_runtime(Arena *arena, Program *prog,
     // so malloc cannot keep a bump pointer; each call mmaps its own anonymous
     // region (rounded up to a 16 KiB page) and free is a no-op. Wasteful but
     // correct for the test suite.
-    tinyc_rt_add(arena, prog, &combined, &any, "malloc",
-        "void *malloc(long n){\n"
-        "  long sz; char *p;\n"
-        "  if(n<=0){ n=1; }\n"
-        "  sz=(n+16383)/16384*16384;\n"
-        "  p=_mmap(0, sz, 3, 4098, -1, 0);\n"
-        "  return p;\n"
-        "}\n");
+    // Darwin MAP_PRIVATE|MAP_ANONYMOUS = 0x1002 (4098); Linux = 0x22 (34).
+    if (linux_elf) {
+        tinyc_rt_add(arena, prog, &combined, &any, "malloc",
+            "void *malloc(long n){\n"
+            "  long sz; char *p;\n"
+            "  if(n<=0){ n=1; }\n"
+            "  sz=(n+16383)/16384*16384;\n"
+            "  p=_mmap(0, sz, 3, 34, -1, 0);\n"
+            "  return p;\n"
+            "}\n");
+    } else {
+        tinyc_rt_add(arena, prog, &combined, &any, "malloc",
+            "void *malloc(long n){\n"
+            "  long sz; char *p;\n"
+            "  if(n<=0){ n=1; }\n"
+            "  sz=(n+16383)/16384*16384;\n"
+            "  p=_mmap(0, sz, 3, 4098, -1, 0);\n"
+            "  return p;\n"
+            "}\n");
+    }
     tinyc_rt_add(arena, prog, &combined, &any, "free",
         "void free(void *p){ }\n");
     // Variadic support. tinyC lowers `va_arg(ap, T)` to a call to one of these

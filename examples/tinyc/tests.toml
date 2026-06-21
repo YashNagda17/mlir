@@ -432,7 +432,7 @@ expected_stdout = "10\n300\n"
 
 [[test]]
 name = "extern_malloc_free"
-targets = ["native", "wasm", "macho"]
+targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "42\n99\n"
 
 [[test]]

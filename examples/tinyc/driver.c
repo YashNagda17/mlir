@@ -742,7 +742,8 @@ int app_main(void) {
     // functions the user hasn't defined are injected.
     if (macho_backend_llvm || emit_aarch64 || emit_elf)
         tinyc_inject_native_runtime(arena, prog, target_wasm32,
-                                    emit_elf && host_platform_path != NULL);
+                                    emit_elf && host_platform_path != NULL,
+                                    emit_elf);
     MLIR_OpHandle module = tinyc_emit_module(&ctx, prog);
     if (tinyc_last_emit_errors() > 0) {
         arena_destroy(arena);
