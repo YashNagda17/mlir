@@ -262,7 +262,7 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
             "void printI64(long long v) { char b[32]; unsigned long n; ciovec_t io; n=int64_to_str(v,b); io.buf=b; io.buf_len=n; write_all(1,&io,1); }",
             "void printI32(int v) { printI64((long long)v); printNewline(); }",
             "void printNewline(void) { ciovec_t io; io.buf=\"\\n\"; io.buf_len=1; write_all(1,&io,1); }",
-            "void printStr(char *s) { ciovec_t io; unsigned long n; n=0; if(s){ while(s[n]) n=n+1; io.buf=s; io.buf_len=n; write_all(1,&io,1); } printNewline(); }",
+            "void printStr(char *s) { ciovec_t io; unsigned long n; n=0; if(s){ while(s[n]) n=n+1; if(n){ io.buf=s; io.buf_len=n; write_all(1,&io,1); } } printNewline(); }",
             "void printF32(float v) { (void)v; }",
             "void printF64(double v) { (void)v; }",
             "int tinyc_va_arg_i32(char **ap) { char *p; int *q; p=*ap; *ap=p+8; q=(int*)p; return *q; }",
