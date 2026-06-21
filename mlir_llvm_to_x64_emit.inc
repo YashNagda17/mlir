@@ -563,6 +563,10 @@ static void lower_op(FnCtx *F, MLIR_OpHandle op, SymSet *refs) {
             if (is_dyn) {
                 if (op_idx >= MLIR_GetOpNumOperands(op)) { fail(F, "gep dynamic index operand missing", (string){0}); return; }
                 load_val(F, MLIR_GetOpOperand(op, op_idx++), RCX);
+                // LLVM GEP indices are i32; on LP64 pointer math is 64-bit. Without
+                // sign-extension, e.g. index -1 (p--) leaves garbage in rcx[63:32]
+                // and the scaled offset points past the object (segfault on *p).
+                movsxd_rr(F, RCX, RCX);
                 if (stride != 1) imul_ri(F, RCX, RCX, (int32_t)stride, 1);  // rcx *= stride
                 alu_rr(F, 0x01, RAX, RCX, 1);              // add rax, rcx
             } else if (cidx[i] != 0) {

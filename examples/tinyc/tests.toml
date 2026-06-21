@@ -957,7 +957,7 @@ found_at=9
 
 [[test]]
 name = "ptr_postfix_stride"
-targets = ["native", "wasm", "macho"]
+targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = """\
 long: 20 30 20
 int: 8 7

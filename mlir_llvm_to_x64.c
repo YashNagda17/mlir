@@ -280,6 +280,12 @@ static void add_imm_reg(FnCtx *F, uint8_t reg, int8_t imm, int w) {
     modrm(F, 3, 0, reg);
     eb(F, (uint8_t)imm);
 }
+// movsxd dst, src: sign-extend 32-bit src into 64-bit dst (GEP i32 indices on LP64).
+static void movsxd_rr(FnCtx *F, uint8_t dst, uint8_t src) {
+    rex(F, 1, dst, 0, src);
+    eb(F, 0x63);
+    modrm(F, 3, dst, src);
+}
 
 // ---------------------------------------------------------------------------
 // type / constant helpers
