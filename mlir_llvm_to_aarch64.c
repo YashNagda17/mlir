@@ -1908,8 +1908,17 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
             if (is_dyn) {
                 if (op_idx >= MLIR_GetOpNumOperands(op))
                     LFAIL("llvm->aarch64: gep dynamic index operand missing\n");
-                uint8_t ri = use_val(L, MLIR_GetOpOperand(op, op_idx++), 10);
+                MLIR_ValueHandle idx_v = MLIR_GetOpOperand(op, op_idx++);
+                uint8_t ri = use_val(L, idx_v, 10);
                 if (!L->ok) return;
+                // LLVM GEP indices are signed and sign-extend to the pointer
+                // width. A 32-bit index sits zero-extended in its 64-bit slot,
+                // so a negative index (e.g. `p - 1`) would otherwise scale as a
+                // huge positive byte offset. Sign-extend narrow indices first.
+                if (a64_type_size(ctx, MLIR_GetValueType(idx_v)) == 4) {
+                    emit_sxtw(ctx, blk, 10, ri);
+                    ri = 10;
+                }
                 // Power-of-2 stride folds into a single shifted-add; otherwise
                 // materialise the stride and multiply.
                 if (stride != 0 && (stride & (stride - 1)) == 0) {
