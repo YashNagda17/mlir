@@ -33,6 +33,8 @@ enum { RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7,
        R8=8, R9=9, R10=10, R11=11, R12=12, R13=13, R14=14, R15=15 };
 // SysV integer argument registers, in order.
 static const uint8_t ARG_REGS[6] = { RDI, RSI, RDX, RCX, R8, R9 };
+// Fixed SSE scratch registers for FP lowering (all caller-saved on SysV).
+enum { XMM0 = 0, XMM1 = 1 };
 // Linux x86_64 syscall numbers.
 #define NR_READ  0
 #define NR_WRITE 1
@@ -236,6 +238,36 @@ static int val_w(MLIR_Context *ctx, MLIR_ValueHandle v) {
     int b = int_bits(ctx, v);
     return (b == 0 || b > 32) ? 1 : 0;  // ptr and i64 -> 64-bit; else 32-bit
 }
+static int fp_width(MLIR_Context *ctx, MLIR_ValueHandle v) {
+    string s = MLIR_GetTypeString(ctx, MLIR_GetValueType(v));
+    if (s.size == 3 && memcmp(s.str, "f32", 3) == 0) return 32;
+    if (s.size == 3 && memcmp(s.str, "f64", 3) == 0) return 64;
+    return 0;
+}
+static int fp_width_ty(MLIR_Context *ctx, MLIR_TypeHandle ty) {
+    string s = MLIR_GetTypeString(ctx, ty);
+    if (s.size == 3 && memcmp(s.str, "f32", 3) == 0) return 32;
+    if (s.size == 3 && memcmp(s.str, "f64", 3) == 0) return 64;
+    return 0;
+}
+static bool is_float_const(MLIR_OpHandle def, int fw, uint64_t *bits) {
+    if (def == MLIR_INVALID_HANDLE || fw == 0) return false;
+    if (!op_is(def, "llvm.mlir.constant")) return false;
+    MLIR_AttributeHandle a = MLIR_GetOpAttributeByName(def, "value");
+    if (a == MLIR_INVALID_HANDLE ||
+        MLIR_GetAttributeKind(a) != MLIR_ATTR_KIND_FLOAT)
+        return false;
+    double d = MLIR_GetAttributeFloat(a);
+    if (fw == 32) {
+        float f = (float)d;
+        uint32_t b32;
+        memcpy(&b32, &f, 4);
+        *bits = b32;
+    } else {
+        memcpy(bits, &d, 8);
+    }
+    return true;
+}
 static bool is_const(MLIR_OpHandle def, int64_t *val) {
     if (def == MLIR_INVALID_HANDLE) return false;
     string nm = MLIR_GetOpName(def);
@@ -260,6 +292,124 @@ static bool op_is(MLIR_OpHandle op, const char *n) {
     return nm.size == l && memcmp(nm.str, n, l) == 0;
 }
 
+// ---- Floating-point op builders ----------------
+static void sse_rr(FnCtx *F, uint8_t prefix, uint8_t opcode, uint8_t dst, uint8_t src) {
+    if (prefix) eb(F, prefix);
+    eb(F, 0x0F);
+    eb(F, opcode);
+    modrm(F, 3, dst, src);
+}
+static void fp_movss_rbp(FnCtx *F, uint8_t xmm, int32_t off, bool store) {
+    eb(F, 0xF3); eb(F, 0x0F); eb(F, store ? 0x11 : 0x10);
+    modrm(F, 2, xmm, RBP);
+    e32(F, (uint32_t)(-off));
+}
+static void fp_movsd_rbp(FnCtx *F, uint8_t xmm, int32_t off, bool store) {
+    eb(F, 0xF2); eb(F, 0x0F); eb(F, store ? 0x11 : 0x10);
+    modrm(F, 2, xmm, RBP);
+    e32(F, (uint32_t)(-off));
+}
+// Slot <-> XMM (x64 analogue of emit_fmov_gp_v on aarch64).
+static void use_fp(FnCtx *F, MLIR_ValueHandle v, uint8_t xmm) {
+    MLIR_Context *ctx = F->ctx;
+    int fw = fp_width(ctx, v);
+    if (fw == 0) { fail(F, "use_fp non-float", (string){0}); return; }
+    MLIR_OpHandle def = MLIR_GetValueDefiningOp(v);
+    uint64_t bits;
+    if (is_float_const(def, fw, &bits)) {
+        if (fw == 32) {
+            mov_ri(F, RAX, (int32_t)(uint32_t)bits, 0);
+            sse_rr(F, 0xF3, 0x6E, xmm, RAX);
+        } else {
+            mov_ri(F, RAX, (int64_t)bits, 1);
+            eb(F, 0x66); rex(F, 1, xmm, 0, RAX);
+            eb(F, 0x0F); eb(F, 0x6E);
+            modrm(F, 3, xmm, RAX);
+        }
+        return;
+    }
+    int32_t slot;
+    if (!vmap_get(&F->slots, v, &slot)) {
+        fail(F, "float value with no slot", (string){0});
+        return;
+    }
+    if (fw == 32) fp_movss_rbp(F, xmm, slot, false);
+    else          fp_movsd_rbp(F, xmm, slot, false);
+}
+static void fin_fp(FnCtx *F, MLIR_ValueHandle v, uint8_t xmm) {
+    MLIR_Context *ctx = F->ctx;
+    int fw = fp_width(ctx, v);
+    if (fw == 0) { fail(F, "fin_fp non-float", (string){0}); return; }
+    int32_t slot;
+    if (!vmap_get(&F->slots, v, &slot)) {
+        fail(F, "float result with no slot", (string){0});
+        return;
+    }
+    if (fw == 32) fp_movss_rbp(F, xmm, slot, true);
+    else          fp_movsd_rbp(F, xmm, slot, true);
+}
+// FADD/FSUB/FMUL/FDIV on XMM regs. kind = "fadd"|"fsub"|"fmul"|"fdiv".
+static void emit_fp_binop(FnCtx *F, const char *kind, int fwidth,
+                          uint8_t rd, uint8_t rn, uint8_t rm) {
+    (void)rn;
+    uint8_t pref = (uint8_t)(fwidth == 32 ? 0xF3 : 0xF2);
+    uint8_t opc = 0x58;
+    if (strcmp(kind, "fsub") == 0) opc = 0x5C;
+    else if (strcmp(kind, "fmul") == 0) opc = 0x59;
+    else if (strcmp(kind, "fdiv") == 0) opc = 0x5E;
+    sse_rr(F, pref, opc, rd, rm);
+}
+// FNEG on XMM regs.
+static void emit_fp_unop(FnCtx *F, const char *kind, int fwidth,
+                         uint8_t rd, uint8_t rn) {
+    (void)kind; (void)rn;
+    if (fwidth == 32) {
+        mov_ri(F, RAX, (int32_t)0x80000000u, 0);
+        sse_rr(F, 0xF3, 0x6E, XMM1, RAX);
+        sse_rr(F, 0, 0x57, rd, XMM1);
+    } else {
+        mov_ri(F, RAX, (int64_t)0x8000000000000000ull, 1);
+        eb(F, 0x66); rex(F, 1, XMM1, 0, RAX);
+        eb(F, 0x0F); eb(F, 0x6E);
+        modrm(F, 3, XMM1, RAX);
+        eb(F, 0x66); sse_rr(F, 0, 0x57, rd, XMM1);
+    }
+}
+// FCMP XMM,XMM (sets EFLAGS via ucomiss/ucomisd).
+static void emit_fcmp(FnCtx *F, int fwidth, uint8_t rn, uint8_t rm) {
+    if (fwidth == 32) sse_rr(F, 0, 0x2E, rn, rm);
+    else              { eb(F, 0x66); sse_rr(F, 0, 0x2E, rn, rm); }
+}
+// FP conversion. kind ∈ {"f2f","f2i","i2f"}; sign matters for f2i/i2f only.
+static void emit_fp_cvt(FnCtx *F, const char *kind, int src_w, int dst_w,
+                        bool sign, uint8_t rd, uint8_t rn) {
+    (void)sign;
+    if (strcmp(kind, "f2f") == 0) {
+        if (src_w == 32 && dst_w == 64) sse_rr(F, 0xF3, 0x5A, rd, rn);
+        else if (src_w == 64 && dst_w == 32) sse_rr(F, 0xF2, 0x5A, rd, rn);
+        return;
+    }
+    if (strcmp(kind, "i2f") == 0) {
+        if (dst_w == 32) sse_rr(F, 0xF3, 0x2A, rd, rn);
+        else               sse_rr(F, 0xF2, 0x2A, rd, rn);
+        return;
+    }
+    // f2i: rn is XMM, rd is GP
+    if (src_w == 32) sse_rr(F, 0xF3, 0x2C, rd, rn);
+    else               sse_rr(F, 0xF2, 0x2C, rd, rn);
+}
+// LLVM FCmpPredicate (ordered only; matches aarch64/wasm) -> x86 setcc code.
+static int fcmp_pred_to_cond(int64_t pred) {
+    switch (pred) {
+    case 1: return CC_E;   // oeq
+    case 2: return CC_A;   // ogt
+    case 3: return CC_AE;  // oge
+    case 4: return CC_B;   // olt
+    case 5: return CC_BE;  // ole
+    case 6: return CC_NE;  // one
+    default: return -1;
+    }
+}
 // SymbolRef attributes print with a leading '@' (e.g. "@printI64"); function
 // sym_name attributes do not. Strip it so the two match.
 static string strip_at(string s) {
@@ -295,6 +445,34 @@ static void store_val(FnCtx *F, MLIR_ValueHandle v, uint8_t reg) {
     int32_t slot;
     if (!vmap_get(&F->slots, v, &slot)) { fail(F, "result with no slot", (string){0}); return; }
     store_rbp(F, slot, reg, val_w(F->ctx, v));
+}
+
+// SysV AMD64 argument layout (separate integer and SSE register files).
+typedef struct { bool sse; bool stack; int idx; } SysVArg;
+static size_t sysv_layout(MLIR_Context *ctx, MLIR_TypeHandle *pty, size_t n,
+                          SysVArg *out) {
+    int ir = 0, sr = 0, st = 0;
+    for (size_t i = 0; i < n; i++) {
+        out[i].sse = fp_width_ty(ctx, pty[i]) != 0;
+        if (out[i].sse) {
+            if (sr < 8) { out[i].stack = false; out[i].idx = sr++; }
+            else { out[i].stack = true; out[i].idx = st++; }
+        } else {
+            if (ir < 6) { out[i].stack = false; out[i].idx = ir++; }
+            else { out[i].stack = true; out[i].idx = st++; }
+        }
+    }
+    return (size_t)st;
+}
+static int32_t sysv_stack_off(int idx) {
+    return -(int32_t)(16 + (unsigned)idx * 8);
+}
+static void movd_gp_xmm(FnCtx *F, uint8_t reg, uint8_t xmm) {
+    sse_rr(F, 0xF3, 0x7E, xmm, reg);
+}
+static void movq_gp_xmm(FnCtx *F, uint8_t reg, uint8_t xmm) {
+    eb(F, 0x66); rex(F, 1, xmm, 0, reg);
+    eb(F, 0x0F); eb(F, 0x7E); modrm(F, 3, xmm, reg);
 }
 
 #include "mlir_llvm_to_x64_emit.inc"
