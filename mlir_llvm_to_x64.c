@@ -234,21 +234,29 @@ static int int_bits(MLIR_Context *ctx, MLIR_ValueHandle v) {
     }
     return 0;  // ptr / other
 }
-static int val_w(MLIR_Context *ctx, MLIR_ValueHandle v) {
-    int b = int_bits(ctx, v);
-    return (b == 0 || b > 32) ? 1 : 0;  // ptr and i64 -> 64-bit; else 32-bit
-}
 static int fp_width(MLIR_Context *ctx, MLIR_ValueHandle v) {
     string s = MLIR_GetTypeString(ctx, MLIR_GetValueType(v));
     if (s.size == 3 && memcmp(s.str, "f32", 3) == 0) return 32;
     if (s.size == 3 && memcmp(s.str, "f64", 3) == 0) return 64;
     return 0;
 }
+static int val_w(MLIR_Context *ctx, MLIR_ValueHandle v) {
+    int fw = fp_width(ctx, v);
+    if (fw == 64) return 1;
+    if (fw == 32) return 0;
+    int b = int_bits(ctx, v);
+    return (b == 0 || b > 32) ? 1 : 0;  // ptr and i64 -> 64-bit; else 32-bit
+}
 static int fp_width_ty(MLIR_Context *ctx, MLIR_TypeHandle ty) {
     string s = MLIR_GetTypeString(ctx, ty);
     if (s.size == 3 && memcmp(s.str, "f32", 3) == 0) return 32;
     if (s.size == 3 && memcmp(s.str, "f64", 3) == 0) return 64;
     return 0;
+}
+static bool op_is(MLIR_OpHandle op, const char *n) {
+    string nm = MLIR_GetOpName(op);
+    size_t l = strlen(n);
+    return nm.size == l && memcmp(nm.str, n, l) == 0;
 }
 static bool is_float_const(MLIR_OpHandle def, int fw, uint64_t *bits) {
     if (def == MLIR_INVALID_HANDLE || fw == 0) return false;
@@ -286,11 +294,6 @@ static bool is_const(MLIR_OpHandle def, int64_t *val) {
     }
     return false;
 }
-static bool op_is(MLIR_OpHandle op, const char *n) {
-    string nm = MLIR_GetOpName(op);
-    size_t l = strlen(n);
-    return nm.size == l && memcmp(nm.str, n, l) == 0;
-}
 
 // ---- Floating-point op builders ----------------
 static void sse_rr(FnCtx *F, uint8_t prefix, uint8_t opcode, uint8_t dst, uint8_t src) {
@@ -309,7 +312,34 @@ static void fp_movsd_rbp(FnCtx *F, uint8_t xmm, int32_t off, bool store) {
     modrm(F, 2, xmm, RBP);
     e32(F, (uint32_t)(-off));
 }
-// Slot <-> XMM (x64 analogue of emit_fmov_gp_v on aarch64).
+// GP <-> XMM transfer when an FP op needs XMM but the cached home is a GP reg.
+static void movd_xmm_gp(FnCtx *F, uint8_t xmm, uint8_t reg) {
+    eb(F, 0x66);
+    rex(F, 0, xmm, 0, reg);
+    eb(F, 0x0F); eb(F, 0x6E);
+    modrm(F, 3, xmm, reg);
+}
+static void movq_xmm_gp(FnCtx *F, uint8_t xmm, uint8_t reg) {
+    eb(F, 0x66);
+    rex(F, 1, xmm, 0, reg);
+    eb(F, 0x0F); eb(F, 0x6E);
+    modrm(F, 3, xmm, reg);
+}
+static void movd_gp_xmm(FnCtx *F, uint8_t reg, uint8_t xmm) {
+    eb(F, 0x66);
+    rex(F, 0, xmm, 0, reg);
+    eb(F, 0x0F); eb(F, 0x7E);
+    modrm(F, 3, xmm, reg);
+}
+static void movq_gp_xmm(FnCtx *F, uint8_t reg, uint8_t xmm) {
+    eb(F, 0x66);
+    rex(F, 1, xmm, 0, reg);
+    eb(F, 0x0F); eb(F, 0x7E);
+    modrm(F, 3, xmm, reg);
+}
+static void load_val(FnCtx *F, MLIR_ValueHandle v, uint8_t reg);
+static void store_val(FnCtx *F, MLIR_ValueHandle v, uint8_t reg);
+// Load float into XMM: GP register home (same F.rm as ints) or load_val fallback.
 static void use_fp(FnCtx *F, MLIR_ValueHandle v, uint8_t xmm) {
     MLIR_Context *ctx = F->ctx;
     int fw = fp_width(ctx, v);
@@ -317,36 +347,36 @@ static void use_fp(FnCtx *F, MLIR_ValueHandle v, uint8_t xmm) {
     MLIR_OpHandle def = MLIR_GetValueDefiningOp(v);
     uint64_t bits;
     if (is_float_const(def, fw, &bits)) {
-        if (fw == 32) {
-            mov_ri(F, RAX, (int32_t)(uint32_t)bits, 0);
-            sse_rr(F, 0xF3, 0x6E, xmm, RAX);
-        } else {
-            mov_ri(F, RAX, (int64_t)bits, 1);
-            eb(F, 0x66); rex(F, 1, xmm, 0, RAX);
-            eb(F, 0x0F); eb(F, 0x6E);
-            modrm(F, 3, xmm, RAX);
-        }
+        if (fw == 32) mov_ri(F, RAX, (int32_t)(uint32_t)bits, 0);
+        else          mov_ri(F, RAX, (int64_t)bits, 1);
+        if (fw == 32) movd_xmm_gp(F, xmm, RAX);
+        else          movq_xmm_gp(F, xmm, RAX);
         return;
     }
-    int32_t slot;
-    if (!vmap_get(&F->slots, v, &slot)) {
-        fail(F, "float value with no slot", (string){0});
+    uint8_t rH;
+    if (val_in_reg(F, v, &rH)) {
+        if (fw == 32) movd_xmm_gp(F, xmm, rH);
+        else          movq_xmm_gp(F, xmm, rH);
         return;
     }
-    if (fw == 32) fp_movss_rbp(F, xmm, slot, false);
-    else          fp_movsd_rbp(F, xmm, slot, false);
+    load_val(F, v, RAX);
+    if (fw == 32) movd_xmm_gp(F, xmm, RAX);
+    else          movq_xmm_gp(F, xmm, RAX);
 }
+// Store XMM float result: GP register home (same F.rm as ints) or store_val fallback.
 static void fin_fp(FnCtx *F, MLIR_ValueHandle v, uint8_t xmm) {
     MLIR_Context *ctx = F->ctx;
     int fw = fp_width(ctx, v);
     if (fw == 0) { fail(F, "fin_fp non-float", (string){0}); return; }
-    int32_t slot;
-    if (!vmap_get(&F->slots, v, &slot)) {
-        fail(F, "float result with no slot", (string){0});
+    uint8_t rH;
+    if (val_in_reg(F, v, &rH)) {
+        if (fw == 32) movd_gp_xmm(F, rH, xmm);
+        else          movq_gp_xmm(F, rH, xmm);
         return;
     }
-    if (fw == 32) fp_movss_rbp(F, xmm, slot, true);
-    else          fp_movsd_rbp(F, xmm, slot, true);
+    if (fw == 32) movd_gp_xmm(F, RAX, xmm);
+    else          movq_gp_xmm(F, RAX, xmm);
+    store_val(F, v, RAX);
 }
 // FADD/FSUB/FMUL/FDIV on XMM regs. kind = "fadd"|"fsub"|"fmul"|"fdiv".
 static void emit_fp_binop(FnCtx *F, const char *kind, int fwidth,
@@ -365,13 +395,11 @@ static void emit_fp_unop(FnCtx *F, const char *kind, int fwidth,
     (void)kind; (void)rn;
     if (fwidth == 32) {
         mov_ri(F, RAX, (int32_t)0x80000000u, 0);
-        sse_rr(F, 0xF3, 0x6E, XMM1, RAX);
+        movd_xmm_gp(F, XMM1, RAX);
         sse_rr(F, 0, 0x57, rd, XMM1);
     } else {
         mov_ri(F, RAX, (int64_t)0x8000000000000000ull, 1);
-        eb(F, 0x66); rex(F, 1, XMM1, 0, RAX);
-        eb(F, 0x0F); eb(F, 0x6E);
-        modrm(F, 3, XMM1, RAX);
+        movq_xmm_gp(F, XMM1, RAX);
         eb(F, 0x66); sse_rr(F, 0, 0x57, rd, XMM1);
     }
 }
@@ -417,13 +445,31 @@ static string strip_at(string s) {
     return s;
 }
 
-// Load an operand value into `reg`. Handles constants, globals, slots.
+// Load an operand value into `reg`. Handles constants, globals, slots, F.rm homes.
 static void load_val(FnCtx *F, MLIR_ValueHandle v, uint8_t reg) {
+    MLIR_Context *ctx = F->ctx;
     MLIR_OpHandle def = MLIR_GetValueDefiningOp(v);
+    int fw = fp_width(ctx, v);
+    if (fw != 0) {
+        uint64_t bits;
+        if (is_float_const(def, fw, &bits)) {
+            if (fw == 32) mov_ri(F, reg, (int32_t)(uint32_t)bits, 0);
+            else          mov_ri(F, reg, (int64_t)bits, 1);
+            return;
+        }
+        uint8_t rH;
+        if (val_in_reg(F, v, &rH)) { mov_rr(F, reg, rH, val_w(ctx, v)); return; }
+        int32_t slot;
+        if (!vmap_get(&F->slots, v, &slot)) {
+            fail(F, "float value with no slot", (string){0}); return;
+        }
+        load_rbp(F, reg, slot, val_w(ctx, v));
+        return;
+    }
     int64_t c;
-    if (is_const(def, &c)) { mov_ri(F, reg, c, val_w(F->ctx, v)); return; }
+    if (is_const(def, &c)) { mov_ri(F, reg, c, val_w(ctx, v)); return; }
     if (def != MLIR_INVALID_HANDLE && op_is(def, "llvm.mlir.undef")) {
-        mov_ri(F, reg, 0, val_w(F->ctx, v)); return;
+        mov_ri(F, reg, 0, val_w(ctx, v)); return;
     }
     if (def != MLIR_INVALID_HANDLE && op_is(def, "llvm.mlir.addressof")) {
         MLIR_AttributeHandle a = MLIR_GetOpAttributeByName(def, "global_name");
@@ -434,17 +480,29 @@ static void load_val(FnCtx *F, MLIR_ValueHandle v, uint8_t reg) {
         lea_rip_data(F, reg, off); return;
     }
     uint8_t rH;
-    if (val_in_reg(F, v, &rH)) { mov_rr(F, reg, rH, val_w(F->ctx, v)); return; }
+    if (val_in_reg(F, v, &rH)) { mov_rr(F, reg, rH, val_w(ctx, v)); return; }
     int32_t slot;
     if (!vmap_get(&F->slots, v, &slot)) { fail(F, "value with no slot", (string){0}); return; }
-    load_rbp(F, reg, slot, val_w(F->ctx, v));
+    load_rbp(F, reg, slot, val_w(ctx, v));
 }
 static void store_val(FnCtx *F, MLIR_ValueHandle v, uint8_t reg) {
+    MLIR_Context *ctx = F->ctx;
+    int fw = fp_width(ctx, v);
+    if (fw != 0) {
+        uint8_t rH;
+        if (val_in_reg(F, v, &rH)) { mov_rr(F, rH, reg, val_w(ctx, v)); return; }
+        int32_t slot;
+        if (!vmap_get(&F->slots, v, &slot)) {
+            fail(F, "float result with no slot", (string){0}); return;
+        }
+        store_rbp(F, slot, reg, val_w(ctx, v));
+        return;
+    }
     uint8_t rH;
-    if (val_in_reg(F, v, &rH)) { mov_rr(F, rH, reg, val_w(F->ctx, v)); return; }
+    if (val_in_reg(F, v, &rH)) { mov_rr(F, rH, reg, val_w(ctx, v)); return; }
     int32_t slot;
     if (!vmap_get(&F->slots, v, &slot)) { fail(F, "result with no slot", (string){0}); return; }
-    store_rbp(F, slot, reg, val_w(F->ctx, v));
+    store_rbp(F, slot, reg, val_w(ctx, v));
 }
 
 // SysV AMD64 argument layout (separate integer and SSE register files).
@@ -466,13 +524,6 @@ static size_t sysv_layout(MLIR_Context *ctx, MLIR_TypeHandle *pty, size_t n,
 }
 static int32_t sysv_stack_off(int idx) {
     return -(int32_t)(16 + (unsigned)idx * 8);
-}
-static void movd_gp_xmm(FnCtx *F, uint8_t reg, uint8_t xmm) {
-    sse_rr(F, 0xF3, 0x7E, xmm, reg);
-}
-static void movq_gp_xmm(FnCtx *F, uint8_t reg, uint8_t xmm) {
-    eb(F, 0x66); rex(F, 1, xmm, 0, reg);
-    eb(F, 0x0F); eb(F, 0x7E); modrm(F, 3, xmm, reg);
 }
 
 #include "mlir_llvm_to_x64_emit.inc"
