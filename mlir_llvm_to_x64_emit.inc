@@ -236,6 +236,40 @@ static MLIR_TypeHandle call_param_type(MLIR_Context *ctx, MLIR_OpHandle decl,
     return MLIR_GetValueType(fallback);
 }
 
+// Inline tinyc_va_arg_* (char **ap): p=*ap; v=*(T*)p; *ap=p+8; return v.
+// Inlined so cursor updates are guaranteed 64-bit stores on LP64.
+static void emit_va_arg_i32(FnCtx *F, MLIR_OpHandle op) {
+    MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
+    load_val(F, MLIR_GetOpOperand(op, 0), RDI);
+    load_mem(F, R11, RDI, 8, false);
+    load_mem(F, RAX, R11, 4, false);
+    add_imm_reg(F, R11, 8, 1);
+    store_mem(F, RDI, R11, 8);
+    store_val(F, r, RAX);
+}
+static void emit_va_arg_i64(FnCtx *F, MLIR_OpHandle op) {
+    MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
+    load_val(F, MLIR_GetOpOperand(op, 0), RDI);
+    load_mem(F, R11, RDI, 8, false);
+    load_mem(F, RAX, R11, 8, false);
+    add_imm_reg(F, R11, 8, 1);
+    store_mem(F, RDI, R11, 8);
+    store_val(F, r, RAX);
+}
+static void emit_va_arg_ptr(FnCtx *F, MLIR_OpHandle op) {
+    emit_va_arg_i64(F, op);
+}
+static void emit_va_arg_f64(FnCtx *F, MLIR_OpHandle op) {
+    MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
+    load_val(F, MLIR_GetOpOperand(op, 0), RDI);
+    load_mem(F, R11, RDI, 8, false);
+    load_mem(F, RAX, R11, 8, false);
+    movq_xmm_gp(F, XMM0, RAX);
+    add_imm_reg(F, R11, 8, 1);
+    store_mem(F, RDI, R11, 8);
+    fin_fp(F, r, XMM0);
+}
+
 // SysV AMD64 call with separate integer (RDI..R9) and SSE (XMM0..XMM7) arg slots.
 static void emit_sysv_call(FnCtx *F, MLIR_OpHandle op, string callee, SymSet *refs) {
     MLIR_Context *ctx = F->ctx;
@@ -246,13 +280,26 @@ static void emit_sysv_call(FnCtx *F, MLIR_OpHandle op, string callee, SymSet *re
     SysVArg loc[16];
     for (size_t i = 0; i < no; i++)
         pty[i] = call_param_type(ctx, decl, i, MLIR_GetOpOperand(op, i));
-    size_t nstack = sysv_layout(ctx, pty, no, loc);
+    bool is_variadic = false;
+    size_t n_fixed = 0;
+    MLIR_AttributeHandle vct = MLIR_GetOpAttributeByName(op, "var_callee_type");
+    if (vct != MLIR_INVALID_HANDLE) {
+        MLIR_TypeHandle ft = MLIR_GetAttributeTypeValue(vct);
+        if (MLIR_GetTypeFunctionIsVarArg(ft)) {
+            is_variadic = true;
+            n_fixed = MLIR_GetTypeFunctionNumInputs(ft);
+            if (n_fixed > no) { fail(F, "variadic call missing args", callee); return; }
+        }
+    }
+    size_t nstack = is_variadic
+        ? sysv_vararg_layout(ctx, pty, no, n_fixed, loc)
+        : sysv_layout(ctx, pty, no, loc);
     size_t pad = nstack & 1;
     if (pad) { eb(F, 0x48); eb(F, 0x83); modrm(F, 3, 5, RSP); eb(F, 0x08); }
     for (size_t i = no; i > 0; i--) {
         size_t k = i - 1;
         if (!loc[k].stack) continue;
-        if (loc[k].sse) {
+        if (loc[k].sse || (is_variadic && fp_width_ty(ctx, pty[k]) != 0)) {
             use_fp(F, MLIR_GetOpOperand(op, k), XMM0);
             if (fp_width_ty(ctx, pty[k]) == 32) movd_gp_xmm(F, RAX, XMM0);
             else                               movq_gp_xmm(F, RAX, XMM0);
@@ -449,6 +496,19 @@ static void lower_op(FnCtx *F, MLIR_OpHandle op, SymSet *refs) {
         store_val(F, r, RAX);
         return;
     }
+    if (str_eqz(nm, "llvm.intr.vastart")) {
+        if (!F->is_vararg) { fail(F, "vastart in non-variadic function", (string){0}); return; }
+        // Stack-based va_list: cursor points at the first variadic stack slot
+        // (after any fixed args that arrived on the stack). tinyc_va_arg_* walk
+        // 8-byte slots from here — same model as the aarch64 Mach-O backend.
+        load_val(F, MLIR_GetOpOperand(op, 0), RCX);
+        lea_rbp_disp(F, RAX, 16 + (int32_t)F->va_stack_skip);
+        store_mem(F, RCX, RAX, 8);
+        return;
+    }
+    if (str_eqz(nm, "llvm.intr.vaend")) {
+        return;
+    }
     // memory
     if (str_eqz(nm, "llvm.load")) {
         MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
@@ -625,6 +685,10 @@ static void lower_op(FnCtx *F, MLIR_OpHandle op, SymSet *refs) {
                 store_val(F, MLIR_GetOpResult(op, 0), RAX);
             return;
         }
+        if (str_eqz(callee, "tinyc_va_arg_i32") && no == 1) { emit_va_arg_i32(F, op); return; }
+        if (str_eqz(callee, "tinyc_va_arg_i64") && no == 1) { emit_va_arg_i64(F, op); return; }
+        if (str_eqz(callee, "tinyc_va_arg_ptr") && no == 1) { emit_va_arg_ptr(F, op); return; }
+        if (str_eqz(callee, "tinyc_va_arg_f64") && no == 1) { emit_va_arg_f64(F, op); return; }
         emit_sysv_call(F, op, callee, refs);
         return;
     }
@@ -723,6 +787,22 @@ static void emit_func(MLIR_Context *ctx, MLIR_OpHandle fn, ObjModule *m, SymSet 
     F.ctx = ctx; F.f = f; F.ok = true;
     F.gm = g_x64_gmap;
 
+    MLIR_AttributeHandle fta_var = MLIR_GetOpAttributeByName(fn, "function_type");
+    if (fta_var) {
+        MLIR_TypeHandle fty_v = MLIR_GetAttributeTypeValue(fta_var);
+        if (MLIR_GetTypeFunctionIsVarArg(fty_v)) {
+            F.is_vararg = true;
+            size_t nf = MLIR_GetTypeFunctionNumInputs(fty_v);
+            MLIR_TypeHandle pty_v[16];
+            size_t nn = nf < 16 ? nf : 16;
+            for (size_t i = 0; i < nn; i++)
+                pty_v[i] = MLIR_GetTypeFunctionInput(fty_v, i);
+            F.va_named_gp = sysv_named_gp(ctx, pty_v, nn);
+            SysVArg loc_v[16];
+            F.va_stack_skip = (uint32_t)(sysv_layout(ctx, pty_v, nn, loc_v) * 8u);
+        }
+    }
+
     MLIR_RegionHandle reg = MLIR_GetOpRegion(fn, 0);
     size_t nb = MLIR_GetRegionNumBlocks(reg);
     F.n_blocks = nb;
@@ -784,6 +864,10 @@ static void emit_func(MLIR_Context *ctx, MLIR_OpHandle fn, ObjModule *m, SymSet 
     F.edge_tmp = (uint32_t)cur;          // temps occupy [rbp-cur .. ]
     F.cs_base = cur;                     // callee-saved spill area follows
     cur += (int32_t)(F.n_cs * 8);
+    if (F.is_vararg) {
+        F.va_save_base = cur + 8;
+        cur += VA_REG_SAVE_BYTES;
+    }
     F.frame = (uint32_t)((cur + 15) & ~15);
 
     // --- prologue: push rbp ; mov rbp,rsp ; sub rsp, frame ---
@@ -795,6 +879,9 @@ static void emit_func(MLIR_Context *ctx, MLIR_OpHandle fn, ObjModule *m, SymSet 
     for (int j = 0; j < F.n_cs; j++)
         store_rbp(&F, F.cs_base + 8 * (j + 1), F.cs_reg[j], 1);
 
+    if (F.is_vararg)
+        spill_va_save(&F);
+    
     // --- entry params: incoming SysV arg regs -> entry block-arg homes -------
     home_entry_params(&F, fn, reg);
 

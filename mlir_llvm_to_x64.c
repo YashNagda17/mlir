@@ -106,7 +106,14 @@ typedef struct {
     size_t        n_blocks;
     BrFix        *fix; size_t n_fix, c_fix;
     bool          ok;
+    // Variadic: register save cache at entry + stack cursor for `...` args.
+    bool          is_vararg;
+    size_t        va_named_gp;   // fixed GP params in RDI..R9 (skip in save walk)
+    int32_t       va_save_base;  // rbp offset of cached RDI in the save area
+    uint32_t      va_stack_skip; // bytes above rbp+16 before first `...` stack slot
 } FnCtx;
+
+#define VA_REG_SAVE_BYTES 176  // 6 GP regs + 8 XMM regs (16 B each)
 
 // Register pool for the x86_64 backend. Arg registers (rcx/rdx/rsi/rdi/r8/r9)
 // and the implicit-clobber registers (rdx by mul/div, rcx by shifts) are kept
@@ -195,6 +202,18 @@ static void lea_rbp(FnCtx *F, uint8_t reg, int32_t off) {
     modrm(F, 2, reg, RBP);
     e32(F, (uint32_t)(-off));
 }
+// lea reg, [rbp + disp]  (incoming stack args sit above rbp)
+static void lea_rbp_disp(FnCtx *F, uint8_t reg, int32_t disp) {
+    rex(F, 1, reg, 0, RBP);
+    eb(F, 0x8D);
+    if (disp >= -128 && disp <= 127) {
+        modrm(F, 1, reg, RBP);
+        eb(F, (uint8_t)disp);
+    } else {
+        modrm(F, 2, reg, RBP);
+        e32(F, (uint32_t)disp);
+    }
+}
 // lea reg, [rip + disp32]  (records a data reloc onto the global at `data_off`)
 static void lea_rip_data(FnCtx *F, uint8_t reg, int64_t data_off) {
     rex(F, 1, reg, 0, 0);
@@ -205,18 +224,38 @@ static void lea_rip_data(FnCtx *F, uint8_t reg, int64_t data_off) {
     obj_add_reloc(F->f, field, field + 4, true, NULL, data_off);
 }
 // width-aware memory load/store through an address already in `addr`
+// Use mod=2 disp32=0 ([reg+0]) for 4/8-byte ops: mod=00 rm=5 is RIP-relative on x64.
+static void load_mem(FnCtx *F, uint8_t dst, uint8_t addr, int bytes, bool sgn);
+static void store_mem(FnCtx *F, uint8_t addr, uint8_t src, int bytes);
 static void load_mem(FnCtx *F, uint8_t dst, uint8_t addr, int bytes, bool sgn) {
-    if (bytes == 8) { rex(F,1,dst,0,addr); eb(F,0x8B); modrm(F,0,dst,addr); }
-    else if (bytes == 4) { rex(F,0,dst,0,addr); eb(F,0x8B); modrm(F,0,dst,addr);
-                           if (sgn) { /* movsxd done by caller width */ } }
-    else if (bytes == 2) { rex(F,1,dst,0,addr); eb(F,0x0F); eb(F, sgn?0xBF:0xB7); modrm(F,0,dst,addr); }
-    else { rex(F,1,dst,0,addr); eb(F,0x0F); eb(F, sgn?0xBE:0xB6); modrm(F,0,dst,addr); }
+    if (bytes == 8) {
+        rex(F, 1, dst, 0, addr); eb(F, 0x8B); modrm(F, 2, dst, addr); e32(F, 0);
+    } else if (bytes == 4) {
+        rex(F, 0, dst, 0, addr); eb(F, 0x8B); modrm(F, 2, dst, addr); e32(F, 0);
+    } else if (bytes == 2) {
+        rex(F, 1, dst, 0, addr); eb(F, 0x0F); eb(F, sgn ? 0xBF : 0xB7);
+        modrm(F, 2, dst, addr); e32(F, 0);
+    } else {
+        rex(F, 1, dst, 0, addr); eb(F, 0x0F); eb(F, sgn ? 0xBE : 0xB6);
+        modrm(F, 2, dst, addr); e32(F, 0);
+    }
 }
 static void store_mem(FnCtx *F, uint8_t addr, uint8_t src, int bytes) {
-    if (bytes == 1) { rex(F,0,src,0,addr); eb(F,0x88); modrm(F,0,src,addr); }
-    else if (bytes == 2) { eb(F,0x66); rex(F,0,src,0,addr); eb(F,0x89); modrm(F,0,src,addr); }
-    else if (bytes == 4) { rex(F,0,src,0,addr); eb(F,0x89); modrm(F,0,src,addr); }
-    else { rex(F,1,src,0,addr); eb(F,0x89); modrm(F,0,src,addr); }
+    if (bytes == 8) {
+        rex(F, 1, src, 0, addr); eb(F, 0x89); modrm(F, 2, src, addr); e32(F, 0);
+    } else if (bytes == 4) {
+        rex(F, 0, src, 0, addr); eb(F, 0x89); modrm(F, 2, src, addr); e32(F, 0);
+    } else if (bytes == 1) {
+        rex(F, 0, src, 0, addr); eb(F, 0x88); modrm(F, 0, src, addr);
+    } else if (bytes == 2) {
+        eb(F, 0x66); rex(F, 0, src, 0, addr); eb(F, 0x89); modrm(F, 0, src, addr);
+    }
+}
+static void add_imm_reg(FnCtx *F, uint8_t reg, int8_t imm, int w) {
+    rex(F, w, 0, 0, reg);
+    eb(F, 0x83);
+    modrm(F, 3, 0, reg);
+    eb(F, (uint8_t)imm);
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +563,36 @@ static size_t sysv_layout(MLIR_Context *ctx, MLIR_TypeHandle *pty, size_t n,
 }
 static int32_t sysv_stack_off(int idx) {
     return -(int32_t)(16 + (unsigned)idx * 8);
+}
+// Fixed GP params passed in RDI..R9 (skip these in the va_list register save walk).
+static size_t sysv_named_gp(MLIR_Context *ctx, MLIR_TypeHandle *pty, size_t n) {
+    int ir = 0;
+    size_t count = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (fp_width_ty(ctx, pty[i])) continue;
+        if (ir < 6) { count++; ir++; }
+    }
+    return count;
+}
+// Cache incoming GP + XMM arg registers before the body can clobber them.
+static void spill_va_save(FnCtx *F) {
+    int32_t b = F->va_save_base;
+    for (int i = 0; i < 6; i++)
+        store_rbp(F, b + 8 * i, ARG_REGS[i], 1);
+    for (int i = 0; i < 8; i++)
+        fp_movsd_rbp(F, (uint8_t)i, b + 48 + 16 * i, true);
+}
+// Variadic calls: fixed params in regs/stack as usual; all `...` args on stack
+// (aarch64 Mach-O model). Non-variadic calls use plain sysv_layout unchanged.
+static size_t sysv_vararg_layout(MLIR_Context *ctx, MLIR_TypeHandle *pty,
+                                 size_t no, size_t n_fixed, SysVArg *out) {
+    size_t st = sysv_layout(ctx, pty, n_fixed, out);
+    for (size_t i = n_fixed; i < no; i++) {
+        out[i].sse = false;
+        out[i].stack = true;
+        out[i].idx = (int)st++;
+    }
+    return st;
 }
 
 #include "mlir_llvm_to_x64_emit.inc"

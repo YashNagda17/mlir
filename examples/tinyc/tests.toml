@@ -854,12 +854,12 @@ expected_stdout = "33\n"
 
 [[test]]
 name = "float_ptr"
-targets = ["native", "wasm", "macho"]
+targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "4 6\n"
 
 [[test]]
 name = "float_exp_lit"
-targets = ["native", "wasm", "macho"]
+targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "1000 200 150\n"
 
 [[test]]
