@@ -584,8 +584,7 @@ int app_main(void) {
                 MLIR_SetArenaAllocator(&ctx, late_arena);
                 MLIR_ResetInternRegistry();
                 uint8_t *macho_data = NULL; size_t macho_size = 0;
-                MLIR_OpHandle llvm_mod = mlir_wasmssa_to_llvm(&ctx, ssa,
-                                                              wasi_adapter_path != NULL);
+                MLIR_OpHandle llvm_mod = mlir_wasmssa_to_llvm(&ctx, ssa);
                 if (llvm_mod == MLIR_INVALID_HANDLE) {
                     arena_destroy(late_arena);
                     arena_destroy(arena);
@@ -659,7 +658,7 @@ int app_main(void) {
                     arena_destroy(boot_arena);
                     return 1;
                 }
-                MLIR_OpHandle llvm_mod = mlir_wasmssa_to_llvm(&ctx, ssa, false);
+                MLIR_OpHandle llvm_mod = mlir_wasmssa_to_llvm(&ctx, ssa);
                 if (llvm_mod == MLIR_INVALID_HANDLE) {
                     arena_destroy(arena);
                     arena_destroy(boot_arena);

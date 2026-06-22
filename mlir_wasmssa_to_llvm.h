@@ -26,12 +26,11 @@
 extern "C" {
 #endif
 
-// When use_wasi_adapter is true, the WASI shims (fd_write/path_open/args_*/
-// environ_*) are NOT synthesised here — a C adapter (corec/wasm/wasi_adapter.c)
-// is spliced into the module by the driver to provide them instead.
+// The WASI shims (fd_write/path_open/args_*/environ_*) are not synthesised
+// here; a C adapter (corec/wasm/wasi_adapter.c) is spliced into the module by
+// the driver (--wasi-adapter) to provide them.
 MLIR_OpHandle mlir_wasmssa_to_llvm(MLIR_Context *ctx,
-                                   MLIR_OpHandle ssa_module,
-                                   bool use_wasi_adapter);
+                                   MLIR_OpHandle ssa_module);
 
 #ifdef __cplusplus
 }
