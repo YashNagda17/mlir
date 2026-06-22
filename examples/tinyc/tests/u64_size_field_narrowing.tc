@@ -17,7 +17,7 @@
 // into a `string` (which has a uint64_t size field). Then we
 // read back .size and .str.
 
-int printf(char *fmt, ...);
+int printf(const char *fmt, ...);
 
 typedef struct { char *str; unsigned long long size; } str_t;
 

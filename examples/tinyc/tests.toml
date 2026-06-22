@@ -1,6 +1,6 @@
-# tinyC end-to-end tests. Each entry compiles tests/<name>.tc to LLVM IR
-# via the tinyc driver, links it with runtime.c using $CC, runs the
-# resulting binary, and compares stdout to expected_stdout exactly.
+# tinyC end-to-end tests. Each entry compiles tests/<name>.tc through a
+# generated single-TU root, runs the result, and compares stdout to
+# expected_stdout exactly.
 
 [[test]]
 name = "simple"
@@ -417,7 +417,7 @@ expected_stdout = "1 2 3\nanswer = 42\n"
 
 [[test]]
 name = "variadic_define_sum"
-targets = ["native", "wasm", "macho"]
+targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "60\n15\n99\n"
 
 [[test]]
@@ -427,13 +427,18 @@ expected_stdout = "int=7\nlong=1234567890123\nstr=hi\n"
 
 [[test]]
 name = "variadic_forward_decl"
-targets = ["native", "wasm", "macho"]
+targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "10\n300\n"
 
 [[test]]
 name = "extern_malloc_free"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "42\n99\n"
+
+[[test]]
+name = "negative_ptr_index"
+targets = ["native", "wasm", "macho"]
+expected_stdout = "OK\n"
 
 [[test]]
 name = "struct_multi_decl_field"
@@ -507,8 +512,9 @@ expected_stdout = "3\n17\n"
 name = "define_malloc_free"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "7\n13\n"
-# wasm_skip: redefines malloc/free; duplicate symbol vs runtime_wasm.c
+# wasm_skip: redefines malloc/free; duplicate symbol vs generated stdlib root
 wasm_skip = true
+single_tu_skip = true
 
 [[test]]
 name = "escape_chars"
@@ -549,7 +555,7 @@ expected_stdout = "20\n100\n8\n"
 # libc interop: tinyC programs that declare libc functions via `extern`
 # and link against the system libc through the test harness's $CC. These
 # tests prove that the language can be used end-to-end against the real
-# libc surface, not just runtime.c. FILE* is modeled as `void *` (Option
+# libc surface. FILE* is modeled as `void *` (Option
 # A in PR #120) — tinyC has no need for the layout of FILE.
 # ---------------------------------------------------------------------------
 
@@ -582,7 +588,7 @@ name = "libc_fputs_stdout"
 targets = ["native", "wasm", "macho"]
 platforms = ["linux"]
 expected_stdout = "hello\nworld\n"
-# wasm_skip: needs fputs/stdout (not provided by runtime_wasm.c).
+# wasm_skip: needs fputs/stdout as a portable symbol.
 wasm_skip = true
 
 [[test]]
@@ -590,21 +596,21 @@ name = "libc_fputc_stdout"
 targets = ["native", "wasm", "macho"]
 platforms = ["linux"]
 expected_stdout = "AB\n"
-# wasm_skip: needs fputc/stdout (not provided by runtime_wasm.c).
+# wasm_skip: needs fputc/stdout as a portable symbol.
 wasm_skip = true
 
 [[test]]
 name = "libc_file_io"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "read 11 bytes: hello libc\n"
-# wasm_skip: needs fopen/fputs/fclose (no libc/wasi sysroot in runtime_wasm.c)
+# wasm_skip: needs host-style file I/O not provided in wasm tests.
 wasm_skip = true
 
 [[test]]
 name = "libc_qsort"
 targets = ["native", "wasm", "macho"]
 expected_stdout = "1\n2\n3\n5\n8\n9\n"
-# wasm_skip: needs qsort (no libc in runtime_wasm.c)
+# wasm_skip: needs qsort in the wasm test environment.
 wasm_skip = true
 
 [[test]]
@@ -755,7 +761,7 @@ expected_stdout = "8\n5\n16\n"
 [[test]]
 name = "func_macro"
 targets = ["native", "wasm", "macho"]
-expected_stdout = "greet\nsquare=16\nmain\n"
+expected_stdout = "greet\nsquare=16\napp_main\n"
 
 [[test]]
 name = "builtin_va"

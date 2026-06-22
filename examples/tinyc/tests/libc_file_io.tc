@@ -5,7 +5,7 @@ extern void *fopen(char *path, char *mode);
 extern int fputs(char *s, void *stream);
 extern long fread(void *buf, long size, long nmemb, void *stream);
 extern int fclose(void *stream);
-extern int printf(char *fmt, ...);
+extern int printf(const char *fmt, ...);
 extern void *calloc(long nmemb, long size);
 extern void free(void *p);
 

@@ -9,10 +9,7 @@
 //
 // We intentionally keep this file tiny — no printf / malloc / strlen
 // definitions — so it can be linked alongside a tinyC-compiled
-// corec-stdlib without causing duplicate-symbol errors. The fuller
-// `runtime_wasm.c` is shipped separately and used by tinyC-in-the-
-// browser to compile and run hand-typed test snippets that don't pull
-// in the corec stdlib.
+// corec-stdlib without causing duplicate-symbol errors.
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -27,10 +24,9 @@ void          *tinyc_va_arg_ptr(va_list *ap) { return va_arg(*ap, void *); }
 // i64 words at the call site (see the variadic-struct loop in emit.c).
 // The helper must match: read that many i64 words straight out of the
 // va_list and write them into the destination buffer. This is the same
-// implementation as `runtime_wasm.c`'s `tinyc_va_arg_struct`, kept in
-// sync intentionally — the selfhost (`selfhost_tinyc_wasm.py`) links
-// THIS object instead of `runtime_wasm.c` to avoid pulling in printf /
-// malloc symbols.
+// implementation used by the old wasm runtime. The selfhost
+// (`selfhost_tinyc_wasm.py`) links THIS object to avoid pulling in
+// printf / malloc symbols.
 void tinyc_va_arg_struct(va_list *ap, void *out, long long size) {
     long long *o = (long long *)out;
     long long words = (size + 7) / 8;

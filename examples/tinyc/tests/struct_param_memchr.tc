@@ -2,11 +2,7 @@
 // `string` parameter feeds `p` and `end` must find characters correctly.
 extern int printf(const char *fmt, ...);
 extern void *memchr(const void *s, int c, unsigned long n);
-
-typedef struct {
-    char *str;
-    long size;
-} string;
+#include <base/string.h>
 
 void scan(string fmt) {
     const char *p = fmt.str;

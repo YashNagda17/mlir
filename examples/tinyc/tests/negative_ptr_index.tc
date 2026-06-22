@@ -1,0 +1,30 @@
+extern int printf(const char *fmt, ...);
+
+// A heap-style block header placed *before* the pointer handed back to the
+// caller, exactly like a malloc/free allocator (corec's buddy_free does
+// `((struct block *)ptr) - 1`). Reaching it needs a negative pointer index,
+// which the GEP lowering must sign-extend to 64 bits before scaling by the
+// (24-byte) element size — otherwise `-1` scales as 0xFFFFFFFF*24.
+struct block { int order; long a; long b; };
+
+static char arena[256];
+
+// Pass `ptr` through a call so the `- 1` index is a runtime (dynamic) GEP
+// index rather than a foldable constant.
+static void set_order(void *ptr, int v) {
+    struct block *p = ((struct block *)ptr) - 1;
+    p->order = v;
+}
+static int get_order(void *ptr) {
+    struct block *p = ((struct block *)ptr) - 1;
+    return p->order;
+}
+
+int main(void) {
+    void *user = &arena[128];
+    set_order(user, 1234);
+    int got = get_order(user);
+    if (got != 1234) { printf("FAIL got=%d\n", got); return 1; }
+    printf("OK\n");
+    return 0;
+}

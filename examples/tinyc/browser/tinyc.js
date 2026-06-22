@@ -1,8 +1,8 @@
 // Browser host for tinyc.wasm. Drives the full pipeline:
-//   1. fetch tinyc.wasm + runtime_wasm.wasm.o + start_wasm.wasm.o
+//   1. fetch tinyc.wasm + start_wasm.wasm.o
 //   2. compile tinyC source via `tinyc.wasm --emit=wasm` (in an in-memory
 //      FS over the WASI shim we already use for Node.js / wasmtime)
-//   3. link the produced object + the runtime/start objects via
+//   3. link the produced object + the start object via
 //      `tinyc.wasm --link --export=_start`
 //   4. instantiate the resulting wasm + the same WASI shim, route its
 //      stdout/stderr into the output panel.
@@ -20,18 +20,15 @@ const clearOutput = () => { $("output").textContent = ""; };
 
 // Pre-fetched assets, populated once at page load.
 let tinycWasmBytes = null;
-let runtimeObj    = null;
 let startObj      = null;
 
 async function loadAssets() {
     status("loading tinyc.wasm…");
-    const [tc, rt, st] = await Promise.all([
+    const [tc, st] = await Promise.all([
         fetch("./tinyc.wasm").then(r => r.arrayBuffer()),
-        fetch("./runtime_wasm.wasm.o").then(r => r.arrayBuffer()),
         fetch("./start_wasm.wasm.o").then(r => r.arrayBuffer()),
     ]);
     tinycWasmBytes = new Uint8Array(tc);
-    runtimeObj    = new Uint8Array(rt);
     startObj      = new Uint8Array(st);
     status(`ready (${(tinycWasmBytes.length / 1024).toFixed(0)} KB)`);
     $("runBtn").disabled = false;
@@ -86,13 +83,12 @@ async function compileAndRun() {
         status("linking…");
         const fs2 = makeMemoryFS({
             "hello.wasm.o":      obj,
-            "runtime_wasm.o":    runtimeObj,
             "start_wasm.o":      startObj,
         });
         const r2 = await runTinyc(
             ["tinyc", "--link", "--export=_start",
              "-o", "hello.wasm",
-             "hello.wasm.o", "runtime_wasm.o", "start_wasm.o"], fs2);
+             "hello.wasm.o", "start_wasm.o"], fs2);
         if (r2.stderr) appendOutput(r2.stderr);
         if (r2.status !== 0) {
             status(`link failed (exit ${r2.status})`, true);
