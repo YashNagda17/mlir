@@ -101,7 +101,7 @@ fi
 # tinyc.wasm + vararg shim + tinyc_stage1_macho_llvm : tinyc-codegen'd tinyc.
 # selfhost_tinyc_macho_llvm_stage1 (wasm env) drives tinyc.wasm to recompile
 # the tree and lift+lower it to a native Mach-O binary via tinyc's own backend.
-if need_build tinyc_stage1_macho_llvm || need_build tinyc.wasm || need_build tinyc_wasm_vararg.wasm.o; then
+if need_build tinyc_stage1_macho_llvm || need_build tinyc.wasm; then
     echo "    building tinyc.wasm + tinyc_stage1_macho_llvm (tinyc self-codegen) ..."
     pixi run -e wasm selfhost_tinyc_macho_llvm_stage1 >/dev/null
 fi
@@ -111,7 +111,7 @@ fi
 echo "    building tinyc_native (clang -O0) ..."
 bash examples/tinyc/build_tinyc_native.sh >/dev/null
 
-for f in tinyc_native_opt tinyc_native tinyc_stage1_macho_llvm tinyc_wasm_vararg.wasm.o; do
+for f in tinyc_native_opt tinyc_native tinyc_stage1_macho_llvm; do
     [ -e "$f" ] || { echo "error: prerequisite '$f' missing after build" >&2; exit 1; }
 done
 

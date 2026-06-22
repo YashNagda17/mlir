@@ -224,6 +224,7 @@ int app_main(void) {
     // wasm->macho path. "llvm" routes the `llvm` dialect directly through
     // the unified llvm -> aarch64 -> macho backend.
     bool macho_backend_llvm = false;
+    bool host_varargs = false;
     // `--emit=elf` lowers the (native, LP64) `llvm` dialect through the flat
     // (scf->cf) standard lowering and the in-tree x86_64 code generator to a
     // statically-linked Linux ELF executable (direct syscalls, no libc).
@@ -417,6 +418,9 @@ int app_main(void) {
 #endif
             // In the native-only build this is already the only option;
             // accept it silently.
+        }
+        else if (strcmp(argv[i], "--host-varargs") == 0) {
+            host_varargs = true;
         }
         else if (strncmp(argv[i], "-I", 2) == 0 && argv[i][2] != '\0') {
             include_dirs[n_include_dirs++] = str_from_cstr_view(argv[i] + 2);
@@ -736,6 +740,7 @@ int app_main(void) {
     Program *prog = arena_new(arena, Program);
     *prog = (Program){0};
     prog->print_via_printf = emit_llvm || (emit_macho && macho_backend_llvm);
+    prog->host_varargs = host_varargs;
     int total_errs = 0;
     for (size_t k = 0; k < n_input_files; k++) {
         string src = tinyc_preprocess(arena, str_from_cstr_view(input_files[k]),

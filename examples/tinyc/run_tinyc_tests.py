@@ -53,6 +53,14 @@ NATIVE_LINK = Path(os.environ.get("NATIVE_LINK", str(TINYC))).resolve()
 LOWERING = os.environ.get("TINYC_LOWERING")
 LOWERING_FLAG = [f"--lowering={LOWERING}"] if LOWERING else []
 
+# The native-llc and ELF paths link the host C library's variadic printf, so
+# tinyC must keep the target's native varargs ABI for extern variadic callees
+# (--host-varargs). Every other target compiles all variadic functions with
+# tinyC, so it uses the portable cursor va_list (the default).
+HOST_VARARGS_FLAG = (["--host-varargs"]
+                     if os.environ.get("TINYC_TARGET", "native") in ("native", "elf")
+                     else [])
+
 # Code-generation/runtime target for the suite. "native" (default) emits
 # LLVM IR via tinyc, then llc + host CC. "wasm" emits a
 # wasm32 object via tinyc, then wasm-ld + generated support objects, and runs the
@@ -541,6 +549,7 @@ def main():
             # compare stdout + exit code against the LP64 expectations.
             exe = HERE / "tests" / f"{name}.elf"
             tinyc_cmd = [str(TINYC), "--emit=elf", *LOWERING_FLAG,
+                         *HOST_VARARGS_FLAG,
                          *unity_include_flags(),
                          "-o", str(exe)]
             tinyc_cmd.append(str(unity_src))
@@ -659,9 +668,11 @@ def main():
         # Stage 1: emit LLVM IR from the generated single-TU root.
         if unity_src is not None:
             tinyc_llvm_cmd = [str(TINYC), "--emit=llvm", *LOWERING_FLAG,
+                              *HOST_VARARGS_FLAG,
                               *unity_include_flags(), str(unity_src)]
         else:
             tinyc_llvm_cmd = [str(TINYC), "--emit=llvm", *LOWERING_FLAG,
+                              *HOST_VARARGS_FLAG,
                               *unity_include_flags(),
                               *[str(s) for s in srcs]]
         r = run(tinyc_llvm_cmd)

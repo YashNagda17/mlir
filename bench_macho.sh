@@ -35,7 +35,6 @@ if [ ! -d bench_objs ] || [ "$(ls bench_objs/*.wasm.o 2>/dev/null | wc -l | tr -
     ./tinyc_native_opt --emit=wasm --lowering=native "${INCLUDES[@]}" \
         -o "bench_objs/${base}.wasm.o" "$src" >/dev/null
   done
-  cp tinyc_wasm_vararg.wasm.o bench_objs/
 fi
 
 OBJS=(bench_objs/*.wasm.o)

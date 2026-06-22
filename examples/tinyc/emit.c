@@ -5276,16 +5276,15 @@ static void build_signatures(E *e) {
         bool is_void = (sig->ret.type.kind == TY_VOID);
         // A variadic function lowered with tinyC's portable 8-byte cursor
         // va_list takes one extra hidden trailing `ptr` parameter (the
-        // caller-packed varargs buffer). Use the cursor model whenever the
-        // callee is (or will be) tinyC-compiled:
-        //   * target_wasm32 (wasm / macho-via-wasm): EVERY variadic function
-        //     is tinyC-compiled — including ones that are extern in this TU
-        //     but defined in another (separate-compilation selfhost/browser).
-        //   * otherwise (native-llc / elf / macho-llvm single-TU): only
-        //     functions DEFINED in this TU are tinyC's; extern variadic
-        //     callees (host libc printf) keep the target's native varargs ABI.
+        // caller-packed varargs buffer). Use the cursor model unless the
+        // build links host libc for variadic functions (--host-varargs, the
+        // native-llc / ELF test path) AND this callee is extern in this TU
+        // (i.e. it is the host libc printf, not a tinyC-defined function).
+        // The default (cursor for ALL variadic functions) is correct for
+        // wasm/macho and for separate-compilation builds where a tinyC-defined
+        // variadic function is extern in the caller's TU but defined elsewhere.
         sig->cursor_va = sig->is_variadic &&
-            (e->program->target_wasm32 || (f && !f->is_forward));
+            (!e->program->host_varargs || (f && !f->is_forward));
         size_t in_total = sig->n_params + (sig->sret ? 1 : 0) +
                           (sig->cursor_va ? 1 : 0);
         size_t out_total = (sig->sret || is_void) ? 0 : 1;
