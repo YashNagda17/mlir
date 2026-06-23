@@ -136,13 +136,12 @@ def main() -> int:
         if not cmp_bytes(obj_n, obj_u, flat):
             diffs += 1
 
-    # Link both and cmp the final wasm.
-    vararg = ROOT / "tinyc_wasm_vararg.wasm.o"
-    extras = [vararg] if vararg.exists() else None
+    # Link both and cmp the final wasm. tinyC lowers va_arg inline, so no
+    # external support object is linked.
     out_n = obj_dir_n / "tinyc_bench.wasm"
     out_u = obj_dir_u / "tinyc_bench.wasm"
-    link_all(cfg_n, objs_n, out_n, extras)
-    link_all(cfg_u, objs_u, out_u, extras)
+    link_all(cfg_n, objs_n, out_n, None)
+    link_all(cfg_u, objs_u, out_u, None)
     linked_ok = cmp_bytes(out_n, out_u, "tinyc_bench.wasm")
 
     print()

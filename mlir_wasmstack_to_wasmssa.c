@@ -15,7 +15,7 @@
 // matches a known runtime helper that the backend synthesises
 // from scratch (printI64, printNewline, printStr, printf, malloc,
 // free, strlen, strcmp, memcmp, memchr, fd_write, proc_exit,
-// printF32, printF64, tinyc_va_arg_*) is replaced by a body-less
+// printF32, printF64) is replaced by a body-less
 // `wasmssa.import_func` declaration. This avoids having to lift the
 // full WASI runtime — its definition will be ignored anyway when the
 // backend emits its own version of the helper.
@@ -76,8 +76,6 @@ static bool is_synth_helper(string nm) {
         "printI64", "printNewline", "printStr",
         "printF32", "printF64",
         "fd_write", "proc_exit",
-        "tinyc_va_arg_i32", "tinyc_va_arg_i64", "tinyc_va_arg_ptr",
-        "tinyc_va_arg_struct", "tinyc_va_arg_f64",
         // WASI host imports synthesised in the aarch64 backend.
         "path_open", "fd_close", "fd_read", "fd_seek", "fd_tell",
         "args_get", "args_sizes_get",

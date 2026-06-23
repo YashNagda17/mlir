@@ -53,6 +53,14 @@ NATIVE_LINK = Path(os.environ.get("NATIVE_LINK", str(TINYC))).resolve()
 LOWERING = os.environ.get("TINYC_LOWERING")
 LOWERING_FLAG = [f"--lowering={LOWERING}"] if LOWERING else []
 
+# The native-llc and ELF paths link the host C library's variadic printf, so
+# tinyC must keep the target's native varargs ABI for extern variadic callees
+# (--host-varargs). Every other target compiles all variadic functions with
+# tinyC, so it uses the portable cursor va_list (the default).
+HOST_VARARGS_FLAG = (["--host-varargs"]
+                     if os.environ.get("TINYC_TARGET", "native") in ("native", "elf")
+                     else [])
+
 # Code-generation/runtime target for the suite. "native" (default) emits
 # LLVM IR via tinyc, then llc + host CC. "wasm" emits a
 # wasm32 object via tinyc, then wasm-ld + generated support objects, and runs the
@@ -197,20 +205,6 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
     for src in stdlib_sources:
         lines.append(f'#include "{_inc(COREC_STDLIB_DIR / src)}"')
     lines += ["", ""]
-    if TARGET == "macho" and MACHO_BACKEND == "llvm":
-        lines += [
-            "int tinyc_va_arg_i32(char **ap) { char *p; int *q; p=*ap; *ap=p+8; q=(int*)p; return *q; }",
-            "long long tinyc_va_arg_i64(char **ap) { char *p; long long *q; p=*ap; *ap=p+8; q=(long long*)p; return *q; }",
-            "double tinyc_va_arg_f64(char **ap) { char *p; double *q; p=*ap; *ap=p+8; q=(double*)p; return *q; }",
-            "void *tinyc_va_arg_ptr(char **ap) { char *p; void **q; p=*ap; *ap=p+8; q=(void**)p; return *q; }",
-            "void tinyc_va_arg_struct(char **ap, void *out, long long size) {",
-            "  char *p; long long words; long long i; long long *o; long long *s;",
-            "  p=*ap; words=(size+7)/8; o=(long long*)out; s=(long long*)p;",
-            "  for(i=0;i<words;i=i+1){ o[i]=s[i]; }",
-            "  *ap=p+words*8;",
-            "}",
-            "",
-        ]
     if uses_inline_platform():
         prefix = "_" if (TARGET == "macho" or IS_WIN) else ""
         if IS_WIN:
@@ -274,16 +268,6 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
             "void printStr(char *s) { ciovec_t io; unsigned long n; n=0; if(s){ while(s[n]) n=n+1; if(n){ io.buf=s; io.buf_len=n; write_all(1,&io,1); } } printNewline(); }",
             "void printF32(float v) { (void)v; }",
             "void printF64(double v) { (void)v; }",
-            "int tinyc_va_arg_i32(char **ap) { char *p; int *q; p=*ap; *ap=p+8; q=(int*)p; return *q; }",
-            "long long tinyc_va_arg_i64(char **ap) { char *p; long long *q; p=*ap; *ap=p+8; q=(long long*)p; return *q; }",
-            "double tinyc_va_arg_f64(char **ap) { char *p; double *q; p=*ap; *ap=p+8; q=(double*)p; return *q; }",
-            "void *tinyc_va_arg_ptr(char **ap) { char *p; void **q; p=*ap; *ap=p+8; q=(void**)p; return *q; }",
-            "void tinyc_va_arg_struct(char **ap, void *out, long long size) {",
-            "  char *p; long long words; long long i; long long *o; long long *s;",
-            "  p=*ap; words=(size+7)/8; o=(long long*)out; s=(long long*)p;",
-            "  for(i=0;i<words;i=i+1){ o[i]=s[i]; }",
-            "  *ap=p+words*8;",
-            "}",
             "",
         ]
     if host_main and not uses_wasm_runtime():
@@ -327,13 +311,18 @@ def link_native(obj_path: Path, exe_path: Path):
     """Link the llc-produced single-TU object."""
     if IS_WIN:
         # MSVC: cl /nologo /MD obj /Fe:exe.exe
+        # The llc-produced object carries no /DEFAULTLIB directive, so name the
+        # /MD CRT umbrella lib (msvcrt.lib) explicitly — it provides the
+        # mainCRTStartup entry point. (Previously cl added it implicitly because
+        # we also handed it a .c source to compile.)
         return run([
             CC, "/nologo", "/MD",
-            str(obj_path), str(HERE / "tinyc_wasm_vararg.c"),
-            "ucrt.lib", "vcruntime.lib", "legacy_stdio_definitions.lib",
+            str(obj_path),
+            "msvcrt.lib", "ucrt.lib", "vcruntime.lib",
+            "legacy_stdio_definitions.lib",
             f"/Fe:{exe_path}",
         ])
-    cmd = [CC, str(obj_path), str(HERE / "tinyc_wasm_vararg.c"), "-o", str(exe_path)]
+    cmd = [CC, str(obj_path), "-o", str(exe_path)]
     # llc emits non-PIC by default; some Linux toolchains default to -pie which
     # rejects R_X86_64_32 relocations from .rodata. Force -no-pie on Linux.
     if sys.platform.startswith("linux"):
@@ -341,55 +330,26 @@ def link_native(obj_path: Path, exe_path: Path):
     return run(cmd)
 
 
-def build_wasm_runtime(vararg_obj: Path):
-    """Compile the wasm va_arg support object once per test run.
-
-    `_start` is provided by tinyC-compiled platform_wasm.c (the same real
-    corec entry point the selfhost build uses), so no external `_start`
-    shim object is built or linked here.
-    """
-    vararg_stale = (
-        not vararg_obj.exists()
-        or vararg_obj.stat().st_mtime < (HERE / "tinyc_wasm_vararg.c").stat().st_mtime
-    )
-    if vararg_stale:
-        r = run([
-            WASM_CC, "--target=wasm32-wasi",
-            "-nostdlib", "-nostdinc", "-fno-builtin", "-O1",
-            "-I", str(COREC_STDLIB_DIR / "stdlib"),
-            "-I", str(COREC_STDLIB_COREC_DIR),
-            "-c", str(HERE / "tinyc_wasm_vararg.c"), "-o", str(vararg_obj),
-        ])
-        if r.returncode != 0:
-            return r
-    return None
-
-
-def link_wasm(obj_paths, runtime_obj: Path, start_obj: Path,
-              wasm_path: Path):
-    """Link tinyc-emitted wasm32 object(s) together with the wasm runtime
-    + _start shim. Accepts either a single Path or a list of Paths so
-    that multi-object tests (one .wasm.o per source) can be linked in
-    the same call. Either uses host `wasm-ld` (default) or the in-tree
-    native linker (`TINYC_USE_NATIVE_LINK=1`)."""
+def link_wasm(obj_paths, wasm_path: Path):
+    """Link tinyc-emitted wasm32 object(s) into a runnable module. tinyC now
+    lowers va_arg inline and `_start` comes from tinyC-compiled
+    platform_wasm.c, so no external support objects are linked. Accepts either
+    a single Path or a list of Paths so multi-object tests (one .wasm.o per
+    source) can be linked together. Either uses host `wasm-ld` (default) or the
+    in-tree native linker (`TINYC_USE_NATIVE_LINK=1`)."""
     if isinstance(obj_paths, Path):
         obj_paths = [obj_paths]
     obj_args = [str(p) for p in obj_paths]
-    runtime_args = []
-    if runtime_obj is not None:
-        runtime_args.append(str(runtime_obj))
-    if start_obj is not None:
-        runtime_args.append(str(start_obj))
     if USE_NATIVE_LINK:
         return run([
             str(NATIVE_LINK), "--link",
             "-o", str(wasm_path),
             "--export=_start",
-            *obj_args, *runtime_args,
+            *obj_args,
         ])
     return run([
         WASM_LD, "--no-entry", "--allow-undefined", "--export=_start",
-        *obj_args, *runtime_args,
+        *obj_args,
         "-o", str(wasm_path),
     ])
 
@@ -422,17 +382,10 @@ def main():
     # and the lowering choice only affects how MLIR is reduced to the LLVM
     # dialect beforehand.
 
-    # Pre-build wasm support objects once per run. The generated single-TU root
-    # contains corec + stdlib + print hooks; tinyc_wasm_vararg.c supplies
-    # tinyC's lowered va_arg hooks. `_start` comes from tinyC-compiled
-    # platform_wasm.c (no external start_wasm.o shim).
-    wasm_vararg_obj = HERE / "tests" / "tinyc_wasm_vararg.o"
-    if uses_wasm_runtime():
-        r = build_wasm_runtime(wasm_vararg_obj)
-        if r is not None and r.returncode != 0:
-            print(f"error: failed to compile wasm runtime\nstderr:\n{r.stderr}",
-                  file=sys.stderr)
-            return 2
+    # The generated single-TU root contains corec + stdlib + print hooks, and
+    # tinyC now lowers va_arg inline (the portable 8-byte cursor model), so no
+    # external va_arg object is built or linked. `_start` comes from
+    # tinyC-compiled platform_wasm.c (no external start_wasm.o shim).
 
     # The macho backend only runs on Apple Silicon (arm64). The binary it
     # produces is a Mach-O ARM64 executable.
@@ -572,10 +525,10 @@ def main():
                 failures += 1
                 continue
 
-            # Stage 2: link with tinyc_wasm_vararg.o for tinyC's lowered
-            # va_arg hooks. `_start` is provided by tinyC-compiled
-            # platform_wasm.c, so no external entry shim is linked.
-            r = link_wasm([obj], wasm_vararg_obj, None, wasm)
+            # Stage 2: link the tinyc-emitted object into a runnable module.
+            # va_arg is lowered inline and `_start` comes from tinyC-compiled
+            # platform_wasm.c, so no external support objects are linked.
+            r = link_wasm([obj], wasm)
             if r.returncode != 0:
                 print(f"FAIL {name}: wasm-ld failed\nstderr:\n{r.stderr}\nstdout:\n{r.stdout}")
                 failures += 1
@@ -601,6 +554,7 @@ def main():
             # compare stdout + exit code against the LP64 expectations.
             exe = HERE / "tests" / f"{name}.elf"
             tinyc_cmd = [str(TINYC), "--emit=elf", *LOWERING_FLAG,
+                         *HOST_VARARGS_FLAG,
                          *unity_include_flags(),
                          "-o", str(exe)]
             tinyc_cmd.append(str(unity_src))
@@ -642,7 +596,7 @@ def main():
                     failures += 1
                     continue
                 linked_wasm = HERE / "tests" / f"{name}.macho.linked.wasm"
-                r = link_wasm([obj_j], wasm_vararg_obj, None, linked_wasm)
+                r = link_wasm([obj_j], linked_wasm)
                 if r.returncode != 0:
                     print(f"FAIL {name}: wasm-ld failed\nstderr:\n{r.stderr}\nstdout:\n{r.stdout}")
                     failures += 1
@@ -676,16 +630,14 @@ def main():
             # runtime + _start shim, and translates the linked module to
             # a signed Mach-O ARM64 binary — all in one invocation.
             # The `llvm` backend uses native host pointers and synthesises
-            # its own runtime, so the wasm runtime objects are not needed.
-            # `_start` is supplied by tinyC-compiled platform_wasm.c folded
-            # into the single-TU root, so only the va_arg object is spliced.
+            # its own runtime. The wasm backend needs no external support
+            # objects either: va_arg is lowered inline and `_start` comes from
+            # tinyC-compiled platform_wasm.c folded into the single-TU root.
             tinyc_cmd = [str(TINYC), "--emit=macho", *LOWERING_FLAG,
                          *unity_include_flags(),
                          "-o", str(exe)]
             if MACHO_BACKEND == "llvm":
                 tinyc_cmd.append("--macho-backend=llvm")
-            else:
-                tinyc_cmd.append(f"--wasm-runtime-obj={wasm_vararg_obj}")
             tinyc_cmd.append(str(unity_src))
             r = run(tinyc_cmd)
             if r.returncode != 0:
@@ -721,9 +673,11 @@ def main():
         # Stage 1: emit LLVM IR from the generated single-TU root.
         if unity_src is not None:
             tinyc_llvm_cmd = [str(TINYC), "--emit=llvm", *LOWERING_FLAG,
+                              *HOST_VARARGS_FLAG,
                               *unity_include_flags(), str(unity_src)]
         else:
             tinyc_llvm_cmd = [str(TINYC), "--emit=llvm", *LOWERING_FLAG,
+                              *HOST_VARARGS_FLAG,
                               *unity_include_flags(),
                               *[str(s) for s in srcs]]
         r = run(tinyc_llvm_cmd)

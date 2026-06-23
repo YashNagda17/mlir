@@ -371,12 +371,9 @@ def run_wasmtime_stage(
     link_errors: dict[str, str | None] = {}
     compile_totals: dict[str, float] = {}
 
-    vararg = ROOT / "tinyc_wasm_vararg.wasm.o"
-    extras = [vararg] if vararg.exists() else []
-    if not extras:
-        print("warning: tinyc_wasm_vararg.wasm.o not found; the produced "
-              "tinyc.wasm may not be runnable under wasmtime. "
-              "Run `pixi run build_tinyc_wasm` first.")
+    # tinyC lowers va_arg inline, so the produced tinyc.wasm needs no external
+    # support object to be runnable under wasmtime.
+    extras: list[Path] = []
 
     print("\n" + "=" * 90)
     print(" wasmtime stage: use each produced tinyc.wasm under wasmtime to")
@@ -687,15 +684,9 @@ def main() -> int:
                 for src in ALL_SOURCES
             ]
             out_wasm = cfg_dir / "tinyc_bench.wasm"
-            # Pull in the tinyc_va_arg_* shim so the produced wasm is
-            # actually runnable under wasmtime (this is also what
-            # selfhost_tinyc_wasm.py does at its final link). The shim
-            # is built lazily by `pixi run build_tinyc_wasm`; if it
-            # isn't there, just link without it.
+            # tinyC lowers va_arg inline, so the produced wasm is runnable
+            # under wasmtime with no external support object.
             extras: list[Path] = []
-            vararg = ROOT / "tinyc_wasm_vararg.wasm.o"
-            if vararg.exists():
-                extras.append(vararg)
             link_t, link_err = bench_link(c, objs, out_wasm, args.repeats, extras)
             link_times[c.name] = link_t
             link_errors[c.name] = link_err

@@ -70,7 +70,7 @@ done
 
 printf '[clang   ] link -> %s\n' "$BIN"
 clang -nostdlib -fno-builtin -o "$BIN" \
-    "${LL_FILES[@]}" examples/tinyc/tinyc_wasm_vararg.c \
+    "${LL_FILES[@]}" \
     -lSystem -Wl,-e,__start
 
 printf 'Built %s via tinyC.\n' "$BIN"

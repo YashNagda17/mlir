@@ -77,6 +77,6 @@ clang -c -nostdlib -fno-builtin -I corec -I corec-stdlib/stdlib -I . -DNDEBUG \
 
 printf '[clang   ] link -> %s\n' "$BIN"
 clang -nostdlib -fno-builtin -Wl,--gc-sections -o "$BIN" \
-    "${LL_FILES[@]}" "$PLATFORM_OBJ" examples/tinyc/tinyc_wasm_vararg.c
+    "${LL_FILES[@]}" "$PLATFORM_OBJ"
 
 printf 'Built %s via tinyC.\n' "$BIN"

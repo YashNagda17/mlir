@@ -452,6 +452,13 @@ typedef struct Program {
     // ELF keeps the older injected-runtime path because the x64 backend
     // intentionally supports only a smaller operation subset.
     bool print_via_printf;
+    // When set, variadic functions that are NOT defined in this TU keep the
+    // target's native C varargs ABI (for linking against host libc printf on
+    // the native-llc / ELF test path). When clear (the default), EVERY
+    // variadic function uses tinyC's portable 8-byte cursor va_list — correct
+    // for wasm/macho and for separate-compilation builds where a tinyC-defined
+    // variadic function (e.g. corec-stdlib printf) is extern in the caller's TU.
+    bool host_varargs;
 } Program;
 
 // ---------------- Lexer ----------------
