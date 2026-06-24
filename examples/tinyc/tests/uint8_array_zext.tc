@@ -1,3 +1,4 @@
+extern int printf(const char *fmt, ...);
 // MRE: tinyc sign-extends loads from `uint8_t` arrays and `uint8_t *`
 // dereferences, treating them as signed `char`. Any byte with the high
 // bit set then propagates as 0xffffffXX instead of 0x000000XX. Even an
