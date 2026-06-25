@@ -941,8 +941,10 @@ static void synth_start(ObjModule *m) {
     eb(&F, 0x0F); eb(&F, 0x05);                                 // syscall
 }
 
-// synth a Linux syscall thunk for `name`; returns false if `name` is not a
-// known syscall primitive.
+// synth the raw-syscall thunk for `name`; returns false if `name` is not a
+// known syscall primitive. The only primitive is __tinyc_syscall6 — every
+// platform_<os>.c raw syscall (write / read / exit / mmap / ...) is built on
+// top of it (see corec/platform/syscall6.h), so there are no per-call thunks.
 static bool synth_thunk(ObjModule *m, const char *name) {
     // __tinyc_syscall6(num, a1..a6): the runtime syscall number is the first C
     // argument, so we cannot bake an NR_* constant — instead reshuffle the SysV
@@ -964,19 +966,7 @@ static bool synth_thunk(ObjModule *m, const char *name) {
         eb(&F, 0xC3);                                                      // ret
         return true;
     }
-    int nr; bool needs_r10 = false;
-    if (!strcmp(name, "_write")) nr = NR_WRITE;
-    else if (!strcmp(name, "_read")) nr = NR_READ;
-    else if (!strcmp(name, "_exit")) nr = NR_EXIT;
-    else if (!strcmp(name, "_mmap")) { nr = NR_MMAP; needs_r10 = true; }
-    else return false;
-    ObjFunc *f = obj_add_func(m, strdup(name), false);
-    FnCtx F; memset(&F,0,sizeof(F)); F.f = f;
-    if (needs_r10) { eb(&F,0x49); eb(&F,0x89); modrm(&F,3,RCX,R10); }  // mov r10, rcx
-    mov_ri(&F, RAX, nr, 0);                                            // mov eax, nr
-    eb(&F, 0x0F); eb(&F, 0x05);                                        // syscall
-    eb(&F, 0xC3);                                                      // ret
-    return true;
+    return false;
 }
 
 bool mlir_llvm_to_elf(MLIR_Context *ctx, MLIR_OpHandle llvm_module,
