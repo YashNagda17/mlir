@@ -760,7 +760,7 @@ expected_stdout = "8\n5\n16\n"
 
 [[test]]
 name = "func_macro"
-targets = ["native", "wasm", "macho"]
+targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "greet\nsquare=16\napp_main\n"
 
 [[test]]
