@@ -33,11 +33,10 @@ enum { RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7,
        R8=8, R9=9, R10=10, R11=11, R12=12, R13=13, R14=14, R15=15 };
 // SysV integer argument registers, in order.
 static const uint8_t ARG_REGS[6] = { RDI, RSI, RDX, RCX, R8, R9 };
-// Linux x86_64 syscall numbers.
-#define NR_READ  0
-#define NR_WRITE 1
+// Linux x86_64 syscall number used by the synthesised _start crt0 (exit).
+// Every other syscall goes through the __tinyc_syscall6 thunk (the runtime
+// number is its first argument), so no other NR_* constants are needed.
 #define NR_EXIT  60
-#define NR_MMAP  9
 
 // condition codes (jcc/setcc low nibble)
 enum { CC_E=0x4, CC_NE=0x5, CC_B=0x2, CC_AE=0x3, CC_BE=0x6, CC_A=0x7,
