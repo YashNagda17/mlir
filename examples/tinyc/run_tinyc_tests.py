@@ -218,11 +218,11 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
         "#include <string.h>",
         "",
     ]
-    if host_main or TARGET == "elf":
+    if host_main:
         lines.append("#define main app_main")
     for src in srcs:
         lines.append(f'#include "{_inc(src)}"')
-    if host_main or TARGET == "elf":
+    if host_main:
         lines.append("#undef main")
     lines += [""]
     for src in COREC_BASE_SOURCES:
@@ -317,16 +317,6 @@ def write_unity_source(name: str, srcs: list[Path]) -> Path:
                 f"    return {'app_main(argc, argv)' if main_takes_args(srcs) else 'app_main()'};",
                 "}",
             ]
-    elif TARGET == "elf":
-        # Synthesised _start already calls platform_init(); only bridge _start's
-        # `main` to the test body renamed to app_main (same as other targets).
-        lines += [
-            "",
-            "int main(int argc, char **argv, char **envp) {",
-            "    (void)argc; (void)argv; (void)envp;",
-            f"    return {'app_main(argc, argv)' if main_takes_args(srcs) else 'app_main()'};",
-            "}",
-        ]
     unity.write_text("\n".join(lines) + "\n")
     return unity
 
@@ -458,7 +448,7 @@ def main():
         if (TARGET in ("wasm", "macho") and "expected_stdout_wasm" in t
                 and not (TARGET == "macho" and MACHO_BACKEND == "llvm")):
             expected = t["expected_stdout_wasm"]
-        if name == "func_macro" and not use_unity_source():
+        if name == "func_macro" and (not use_unity_source() or TARGET == "elf"):
             expected = "greet\nsquare=16\nmain\n"
         # `targets` lists the runner targets a test may run under. Default
         # (omitted) is ["native", "wasm"] — the established backends.
