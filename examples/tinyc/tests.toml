@@ -478,6 +478,11 @@ targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "5\n9\n42\n"
 
 [[test]]
+name = "void_fnptr_struct_field"
+targets = ["native", "wasm", "macho", "elf"]
+expected_stdout = "2\n"
+
+[[test]]
 name = "addr_of_struct_field_index"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "1\n10\n2\n20\n3\n30\n"
@@ -812,6 +817,11 @@ expected_stdout = "0 0\n1 10\n2 20\n3 30\n24\n1000000005\n"
 name = "global_array_int_init"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "100\n"
+
+[[test]]
+name = "global_array_enum_init"
+targets = ["native", "wasm", "macho", "elf"]
+expected_stdout = "0\n1\n2\n3\n"
 
 [[test]]
 name = "typedef_array_in_multidecl"
