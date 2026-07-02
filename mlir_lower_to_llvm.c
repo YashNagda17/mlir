@@ -624,6 +624,353 @@ static bool lower_scf_if(LowerState *st, MLIR_OpHandle op,
     return true;
 }
 
+static int string_to_int(MLIR_Context *ctx, MLIR_TypeHandle ty) {
+    if (MLIR_IsTypeIndex(ty)) return 64;
+    string s = MLIR_GetTypeString(ctx, ty);
+    if (s.size < 2 || s.str[0] != 'i') return 0;
+    int w = 0;
+    for (size_t i = 1; i < s.size; i++) {
+        if (s.str[i] < '0' || s.str[i] > '9') return 0;
+        w = w * 10 + (s.str[i] - '0');
+    }
+    return w;
+}
+
+static void move_region_blocks_to_parent(LowerState *st, MLIR_RegionHandle reg,
+                                         MLIR_RegionHandle parent_region) {
+    while (MLIR_GetRegionNumBlocks(reg) > 0) {
+        MLIR_MoveBlockToRegionEnd(st->ctx,
+            MLIR_GetRegionBlock(reg, 0), parent_region);
+    }
+}
+
+// in scf dialect, regions add with scf.yield, which is being translated to llvm.br
+static void rewrite_yields_in_region(LowerState *st, MLIR_RegionHandle reg,
+                                     MLIR_BlockHandle target) {
+    size_t nb = MLIR_GetRegionNumBlocks(reg);
+    for (size_t bi = 0; bi < nb; bi++)
+        rewrite_yield_to_br(st, MLIR_GetRegionBlock(reg, bi), target);
+}
+
+static void rewrite_condition_to_cbr(LowerState *st, MLIR_BlockHandle blk,
+                                       MLIR_BlockHandle body,
+                                       MLIR_BlockHandle exit) {
+    size_t n = MLIR_GetBlockNumOps(blk);
+    if (n == 0) return;
+    MLIR_OpHandle term = MLIR_GetBlockOp(blk, n - 1);
+    if (!name_eq(MLIR_GetOpName(term), "scf.condition")) return;
+    Arena *alloc = MLIR_GetArenaAllocator(st->ctx);
+    size_t no = MLIR_GetOpNumOperands(term);
+    if (no < 1) return;
+    MLIR_ValueHandle cond = MLIR_GetOpOperand(term, 0);
+    size_t nf = no - 1;
+    MLIR_ValueHandle *fwd = nf ? (MLIR_ValueHandle *)arena_alloc(
+        alloc, nf * sizeof(MLIR_ValueHandle)) : NULL;
+    for (size_t i = 0; i < nf; i++) fwd[i] = MLIR_GetOpOperand(term, i + 1);
+    MLIR_BlockHandle succs[2] = { body, exit };
+    MLIR_ValueHandle *succ_ops_arr[2] = { fwd, fwd };
+    size_t n_succ_ops_arr[2] = { nf, nf };
+    MLIR_ValueHandle cond_arr[1] = { cond };
+    MLIR_LocationHandle term_loc = MLIR_GetOpLocation(term);
+    MLIR_OpHandle cbr = MLIR_CreateOpWithSuccessors(
+        st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.cond_br"),
+        NULL, 0, NULL, 0, NULL, 0,
+        cond_arr, 1, NULL, 0,
+        succs, 2, succ_ops_arr, n_succ_ops_arr,
+        term_loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_AppendBlockOp(st->ctx, blk, cbr);
+    MLIR_EraseOp(st->ctx, term);
+}
+
+static void rewrite_conditions_in_region(LowerState *st, MLIR_RegionHandle reg,
+                                         MLIR_BlockHandle body,
+                                         MLIR_BlockHandle exit) {
+    size_t nb = MLIR_GetRegionNumBlocks(reg);
+    for (size_t bi = 0; bi < nb; bi++)
+        rewrite_condition_to_cbr(st, MLIR_GetRegionBlock(reg, bi), body, exit);
+}
+
+static bool lower_scf_while(LowerState *st, MLIR_OpHandle op,
+                            MLIR_BlockHandle parent, size_t pos) {
+    MLIR_LocationHandle loc = MLIR_GetOpLocation(op);
+    MLIR_RegionHandle parent_region = MLIR_GetBlockParentRegion(parent);
+    if (parent_region == MLIR_INVALID_HANDLE) return false;
+    if (MLIR_GetOpNumRegions(op) < 2) return false;
+
+    MLIR_RegionHandle before_reg = MLIR_TakeOpRegion(st->ctx, op, 0);
+    MLIR_RegionHandle after_reg  = MLIR_TakeOpRegion(st->ctx, op, 1);
+    if (before_reg == MLIR_INVALID_HANDLE || after_reg == MLIR_INVALID_HANDLE)
+        return false;
+    if (MLIR_GetRegionNumBlocks(before_reg) < 1 ||
+        MLIR_GetRegionNumBlocks(after_reg) < 1)
+        return false;
+
+    MLIR_BlockHandle header = MLIR_GetRegionBlock(before_reg, 0);
+    MLIR_BlockHandle body   = MLIR_GetRegionBlock(after_reg, 0);
+    size_t n_inits = MLIR_GetOpNumOperands(op);
+    size_t n_res   = MLIR_GetOpNumResults(op);
+
+    MLIR_BlockHandle exit = MLIR_CreateBlock(st->ctx);
+    MLIR_BlockHandle cont = MLIR_CreateBlock(st->ctx);
+    Arena *alloc = MLIR_GetArenaAllocator(st->ctx);
+    for (size_t i = 0; i < n_res; i++) {
+        MLIR_ValueHandle old = MLIR_GetOpResult(op, i);
+        MLIR_TypeHandle ty = MLIR_GetValueType(old);
+        MLIR_ValueHandle barg = MLIR_CreateValueBlockArg(
+            st->ctx, str_lit(""), (uint32_t)i, ty, loc);
+        MLIR_AppendBlockArg(st->ctx, exit, barg);
+        MLIR_ReplaceAllUsesOfValue(st->ctx, old, barg);
+    }
+
+    while (MLIR_GetBlockNumOps(parent) > pos + 1) {
+        MLIR_OpHandle tail = MLIR_GetBlockOp(parent, pos + 1);
+        MLIR_MoveOpToBlockEnd(st->ctx, tail, cont);
+    }
+
+    rewrite_conditions_in_region(st, before_reg, body, exit);
+    rewrite_yields_in_region(st, after_reg, header);
+
+    move_region_blocks_to_parent(st, before_reg, parent_region);
+    move_region_blocks_to_parent(st, after_reg, parent_region);
+    MLIR_MoveBlockToRegionEnd(st->ctx, exit, parent_region);
+    MLIR_MoveBlockToRegionEnd(st->ctx, cont, parent_region);
+
+    MLIR_ValueHandle *inits = n_inits ? (MLIR_ValueHandle *)arena_alloc(
+        alloc, n_inits * sizeof(MLIR_ValueHandle)) : NULL;
+    for (size_t i = 0; i < n_inits; i++) inits[i] = MLIR_GetOpOperand(op, i);
+    MLIR_BlockHandle succs[1] = { header };
+    MLIR_ValueHandle *succ_ops_arr[1] = { inits };
+    size_t n_succ_ops_arr[1] = { n_inits };
+    MLIR_OpHandle br = MLIR_CreateOpWithSuccessors(
+        st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.br"),
+        NULL, 0, NULL, 0, NULL, 0,
+        NULL, 0, NULL, 0,
+        succs, 1, succ_ops_arr, n_succ_ops_arr,
+        loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_InsertBlockOpAtIndex(st->ctx, parent, br, pos);
+    return true;
+}
+
+static bool parse_cases(string cs, int64_t *out, size_t n) {
+    size_t p = 0;
+    while (p < cs.size && cs.str[p] != ':') p++;
+    if (p < cs.size) p++;
+    size_t got = 0;
+    while (p < cs.size && got < n) {
+        while (p < cs.size && (cs.str[p] == ' ' || cs.str[p] == ',')) p++;
+        if (p >= cs.size || cs.str[p] == '>') break;
+        int64_t sign = 1;
+        if (cs.str[p] == '-') { sign = -1; p++; }
+        int64_t v = 0;
+        while (p < cs.size && cs.str[p] >= '0' && cs.str[p] <= '9')
+            v = v * 10 + (cs.str[p++] - '0');
+        out[got++] = sign * v;
+    }
+    return got == n;
+}
+
+static MLIR_OpHandle emit_icmp_eq(LowerState *st, MLIR_LocationHandle loc,
+                                  MLIR_ValueHandle sel, MLIR_ValueHandle cval) {
+    MLIR_TypeHandle i1 = MLIR_CreateTypeInteger(st->ctx, 1, false);
+    MLIR_ValueHandle res = make_result_value(st->ctx, i1, loc);
+    MLIR_TypeHandle rts[1] = { i1 };
+    MLIR_ValueHandle results[1] = { res };
+    MLIR_ValueHandle ops[2] = { sel, cval };
+    MLIR_TypeHandle i64 = MLIR_CreateTypeInteger(st->ctx, 64, true);
+    MLIR_AttributeHandle pred = MLIR_CreateAttributeInteger(
+        st->ctx, str_lit("predicate"), 0, i64);
+    MLIR_AttributeHandle attrs[1] = { pred };
+    MLIR_OpHandle nop = create_simple_op(
+        st->ctx, OP_TYPE_LLVM_ICMP, str_lit("llvm.icmp"),
+        attrs, 1, rts, 1, results, 1, ops, 2, NULL, 0, loc);
+    return nop;
+}
+
+static MLIR_OpHandle emit_int_constant(LowerState *st, MLIR_LocationHandle loc,
+                                       MLIR_TypeHandle ty, int64_t val) {
+    MLIR_ValueHandle res = make_result_value(st->ctx, ty, loc);
+    MLIR_TypeHandle rts[1] = { ty };
+    MLIR_ValueHandle results[1] = { res };
+    MLIR_AttributeHandle val_attr = MLIR_CreateAttributeInteger(
+        st->ctx, str_lit("value"), val, ty);
+    MLIR_AttributeHandle attrs[1] = { val_attr };
+    return create_simple_op(
+        st->ctx, OP_TYPE_LLVM_MLIR_CONSTANT, str_lit("llvm.mlir.constant"),
+        attrs, 1, rts, 1, results, 1, NULL, 0, NULL, 0, loc);
+}
+
+static void emit_br_to_merge(LowerState *st, MLIR_BlockHandle blk,
+                             MLIR_BlockHandle merge, MLIR_OpHandle owner) {
+    size_t nr = MLIR_GetOpNumResults(owner);
+    MLIR_LocationHandle loc = MLIR_GetOpLocation(owner);
+    if (nr == 0) {
+        MLIR_BlockHandle succs[1] = { merge };
+        MLIR_OpHandle br = MLIR_CreateOpWithSuccessors(
+            st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.br"),
+            NULL, 0, NULL, 0, NULL, 0,
+            NULL, 0, NULL, 0,
+            succs, 1, NULL, NULL,
+            loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+        MLIR_AppendBlockOp(st->ctx, blk, br);
+        return;
+    }
+    Arena *alloc = MLIR_GetArenaAllocator(st->ctx);
+    MLIR_ValueHandle *zeros = (MLIR_ValueHandle *)arena_alloc(
+        alloc, nr * sizeof(MLIR_ValueHandle));
+    for (size_t i = 0; i < nr; i++) {
+        MLIR_TypeHandle ty = MLIR_GetValueType(MLIR_GetOpResult(owner, i));
+        MLIR_OpHandle c = emit_int_constant(st, loc, ty, 0);
+        MLIR_AppendBlockOp(st->ctx, blk, c);
+        zeros[i] = MLIR_GetOpResult(c, 0);
+    }
+    MLIR_BlockHandle succs[1] = { merge };
+    MLIR_ValueHandle *succ_ops_arr[1] = { zeros };
+    size_t n_succ_ops_arr[1] = { nr };
+    MLIR_OpHandle br = MLIR_CreateOpWithSuccessors(
+        st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.br"),
+        NULL, 0, NULL, 0, NULL, 0,
+        NULL, 0, NULL, 0,
+        succs, 1, succ_ops_arr, n_succ_ops_arr,
+        loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_AppendBlockOp(st->ctx, blk, br);
+}
+
+static bool lower_scf_index_switch(LowerState *st, MLIR_OpHandle op,
+                                   MLIR_BlockHandle parent, size_t pos) {
+    MLIR_LocationHandle loc = MLIR_GetOpLocation(op);
+    MLIR_RegionHandle parent_region = MLIR_GetBlockParentRegion(parent);
+    if (parent_region == MLIR_INVALID_HANDLE) return false;
+    if (MLIR_GetOpNumOperands(op) < 1) return false;
+    size_t n_regions = MLIR_GetOpNumRegions(op);
+    if (n_regions < 1) return false;
+
+    MLIR_ValueHandle sel = MLIR_GetOpOperand(op, 0);
+    MLIR_TypeHandle sel_ty = MLIR_GetValueType(sel);
+    size_t n_cases = n_regions - 1;
+    int64_t case_vals[256];
+    if (n_cases > 256) return false;
+    if (n_cases > 0) {
+        MLIR_AttributeHandle ca = MLIR_GetOpAttributeByName(op, "cases");
+        if (ca == MLIR_INVALID_HANDLE) return false;
+        string cs = MLIR_GetAttributeAsString(st->ctx, ca);
+        if (!cs.size) cs = MLIR_GetAttributeString(ca);
+        if (!parse_cases(cs, case_vals, n_cases)) return false;
+    }
+
+    size_t nr = MLIR_GetOpNumResults(op);
+    Arena *alloc = MLIR_GetArenaAllocator(st->ctx);
+    MLIR_RegionHandle *regs = (MLIR_RegionHandle *)arena_alloc(
+        alloc, n_regions * sizeof(MLIR_RegionHandle));
+    for (size_t i = 0; i < n_regions; i++)
+        regs[i] = MLIR_TakeOpRegion(st->ctx, op, i);
+
+    MLIR_BlockHandle merge = MLIR_CreateBlock(st->ctx);
+    MLIR_BlockHandle cont = MLIR_CreateBlock(st->ctx);
+    for (size_t i = 0; i < nr; i++) {
+        MLIR_ValueHandle old = MLIR_GetOpResult(op, i);
+        MLIR_TypeHandle ty = MLIR_GetValueType(old);
+        MLIR_ValueHandle barg = MLIR_CreateValueBlockArg(
+            st->ctx, str_lit(""), (uint32_t)i, ty, loc);
+        MLIR_AppendBlockArg(st->ctx, merge, barg);
+        MLIR_ReplaceAllUsesOfValue(st->ctx, old, barg);
+    }
+
+    while (MLIR_GetBlockNumOps(parent) > pos + 1) {
+        MLIR_OpHandle tail = MLIR_GetBlockOp(parent, pos + 1);
+        MLIR_MoveOpToBlockEnd(st->ctx, tail, cont);
+    }
+
+    MLIR_BlockHandle *arm_blks = (MLIR_BlockHandle *)arena_alloc(
+        alloc, n_regions * sizeof(MLIR_BlockHandle));
+    for (size_t i = 0; i < n_regions; i++) {
+        if (MLIR_GetRegionNumBlocks(regs[i]) == 0) {
+            MLIR_BlockHandle empty = MLIR_CreateBlock(st->ctx);
+            emit_br_to_merge(st, empty, merge, op);
+            arm_blks[i] = empty;
+            MLIR_MoveBlockToRegionEnd(st->ctx, empty, parent_region);
+            continue;
+        }
+        arm_blks[i] = MLIR_GetRegionBlock(regs[i], 0);
+        rewrite_yields_in_region(st, regs[i], merge);
+        move_region_blocks_to_parent(st, regs[i], parent_region);
+    }
+    MLIR_MoveBlockToRegionEnd(st->ctx, merge, parent_region);
+    MLIR_MoveBlockToRegionEnd(st->ctx, cont, parent_region);
+
+    MLIR_BlockHandle def_blk = arm_blks[0];
+    if (n_cases == 0) {
+        MLIR_BlockHandle succs[1] = { def_blk };
+        MLIR_OpHandle br = MLIR_CreateOpWithSuccessors(
+            st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.br"),
+            NULL, 0, NULL, 0, NULL, 0,
+            NULL, 0, NULL, 0,
+            succs, 1, NULL, NULL,
+            loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+        MLIR_InsertBlockOpAtIndex(st->ctx, parent, br, pos);
+        return true;
+    }
+
+    MLIR_BlockHandle entry = MLIR_CreateBlock(st->ctx);
+    MLIR_BlockHandle entry_succs[1] = { entry };
+    MLIR_OpHandle entry_br = MLIR_CreateOpWithSuccessors(
+        st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.br"),
+        NULL, 0, NULL, 0, NULL, 0,
+        NULL, 0, NULL, 0,
+        entry_succs, 1, NULL, NULL,
+        loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_InsertBlockOpAtIndex(st->ctx, parent, entry_br, pos);
+    MLIR_MoveBlockToRegionEnd(st->ctx, entry, parent_region);
+
+    MLIR_BlockHandle cur = entry;
+    for (size_t i = 0; i < n_cases; i++) {
+        MLIR_BlockHandle next = (i + 1 < n_cases)
+            ? MLIR_CreateBlock(st->ctx) : def_blk;
+        if (i + 1 < n_cases)
+            MLIR_MoveBlockToRegionEnd(st->ctx, next, parent_region);
+
+        MLIR_OpHandle cval_op = emit_int_constant(st, loc, sel_ty, case_vals[i]);
+        MLIR_AppendBlockOp(st->ctx, cur, cval_op);
+        MLIR_OpHandle eq_op = emit_icmp_eq(st, loc, sel, MLIR_GetOpResult(cval_op, 0));
+        MLIR_AppendBlockOp(st->ctx, cur, eq_op);
+        MLIR_BlockHandle succs[2] = { arm_blks[i + 1], next };
+        MLIR_ValueHandle cond_arr[1] = { MLIR_GetOpResult(eq_op, 0) };
+        MLIR_OpHandle cbr = MLIR_CreateOpWithSuccessors(
+            st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.cond_br"),
+            NULL, 0, NULL, 0, NULL, 0,
+            cond_arr, 1, NULL, 0,
+            succs, 2, NULL, NULL,
+            loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+        MLIR_AppendBlockOp(st->ctx, cur, cbr);
+        cur = next;
+    }
+    return true;
+}
+
+static bool lower_arith_index_cast(LowerState *st, MLIR_OpHandle op,
+                                   MLIR_BlockHandle parent, size_t pos,
+                                   bool is_unsigned) {
+    if (MLIR_GetOpNumOperands(op) != 1 || MLIR_GetOpNumResults(op) != 1)
+        return false;
+    MLIR_ValueHandle src = MLIR_GetOpOperand(op, 0);
+    MLIR_ValueHandle old_res = MLIR_GetOpResult(op, 0);
+    MLIR_TypeHandle src_ty = MLIR_GetValueType(src);
+    MLIR_TypeHandle dst_ty = MLIR_GetValueType(old_res);
+    int sw = string_to_int(st->ctx, src_ty);
+    int dw = string_to_int(st->ctx, dst_ty);
+    if (sw == 0 || dw == 0) return false;
+    if (sw == dw) {
+        MLIR_ReplaceAllUsesOfValue(st->ctx, old_res, src);
+        return true;
+    }
+    string cast_name;
+    if (dw > sw) {
+        cast_name = (sw < 32 || is_unsigned) ? str_lit("llvm.zext") : str_lit("llvm.sext");
+    } else {
+        cast_name = str_lit("llvm.trunc");
+    }
+    return lower_rename(st, op, parent, pos, cast_name, OP_TYPE_UNREGISTERED);
+}
+
 // Return values from try_lower_op:
 //   LOWER_NONE      — op not handled; walker should leave it in place.
 //   LOWER_REPLACED  — lowering inserted N replacement ops at position
@@ -657,6 +1004,22 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
         }
         return LOWER_NONE;
     }
+    if (name_eq(name, "scf.while")) {
+        if (st->keep_scf) return LOWER_NONE;
+        if (lower_scf_while(st, op, parent, pos)) {
+            MLIR_EraseOp(st->ctx, op);
+            return LOWER_DONE_BLOCK;
+        }
+        return LOWER_NONE;
+    }
+    if (name_eq(name, "scf.index_switch")) {
+        if (st->keep_scf) return LOWER_NONE;
+        if (lower_scf_index_switch(st, op, parent, pos)) {
+            MLIR_EraseOp(st->ctx, op);
+            return LOWER_DONE_BLOCK;
+        }
+        return LOWER_NONE;
+    }
     bool ok = false;
     if (name_eq(name, "func.func"))      ok = lower_func_func(st, op, parent, pos);
     else if (name_eq(name, "func.return") ||
@@ -668,6 +1031,10 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
              name_eq(name, "unrealized_conversion_cast"))
                                          ok = lower_unrealized_cast(st, op, parent, pos);
     else if (name_eq(name, "arith.constant")) ok = lower_arith_constant(st, op, parent, pos);
+    else if (name_eq(name, "arith.index_cast"))
+        ok = st->keep_scf ? false : lower_arith_index_cast(st, op, parent, pos, false);
+    else if (name_eq(name, "arith.index_castui"))
+        ok = st->keep_scf ? false : lower_arith_index_cast(st, op, parent, pos, true);
     else if (name_eq(name, "arith.addi"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.add"),  OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.subi"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.sub"),  OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.muli"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.mul"),  OP_TYPE_UNREGISTERED);
