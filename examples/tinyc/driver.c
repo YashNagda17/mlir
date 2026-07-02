@@ -27,11 +27,12 @@
 #include "mlir_llvm_to_aarch64.h"
 #include "mlir_aarch64_to_macho.h"
 // The x86_64 -> ELF backend is native-Linux-only (it emits x86_64 machine code
-// and a Linux ELF, and is not part of the tinyC self-host source set), so it is
-// compiled in only for Linux/x86_64 hosts, where mlir_llvm_to_x64.c /
-// mlir_elf.c are linked. Every other build (wasm/self-host, macOS, Windows)
-// omits it.
-#if defined(__linux__) && defined(__x86_64__) && !defined(__TINYC__)
+// and a Linux ELF). It is compiled in for:
+//   - native Linux/x86_64 host builds (tinyc_native), and
+//   - self-hosted ELF stages (tinyc compiled to wasm with -DTINYC_ENABLE_ELF=1,
+//     then lifted back to a native ELF that must retain --emit=elf / --from-wasm).
+#if (defined(__linux__) && defined(__x86_64__) && !defined(__TINYC__)) \
+    || defined(TINYC_ENABLE_ELF)
 #include "mlir_llvm_to_x64.h"
 #define TINYC_HAS_ELF 1
 #endif
@@ -82,26 +83,181 @@ static bool driver_llvm_func_has_body(MLIR_OpHandle op) {
     return MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 0)) > 0;
 }
 
-// Compile corec's platform_<os>.c as LP64 and return its file-I/O + exit
-// function definitions (as `llvm.func` ops) in `picks`, so a caller can splice
-// them into a lifted wasm->llvm module. MUST be called BEFORE the wasm module
-// is lifted: the optimization passes (mem2reg / lowering) mutate per-value
-// def-use chains, and compiling this second module after the lifted one is
-// already built corrupts its operands. Compiling first — when the interning
-// epoch is clean — keeps it correct, exactly like a standalone compile.
+typedef enum {
+    TINYC_HELPER_PLATFORM,
+    TINYC_HELPER_BUDDY,
+    TINYC_HELPER_WASI_MACHO,
+    TINYC_HELPER_WASI_ELF,
+} TinycHelperKind;
+
+static bool driver_is_host_platform_support_symbol(string s) {
+    return (s.size == 6 && memcmp(s.str, "memcpy", 6) == 0) ||
+           (s.size == 6 && memcmp(s.str, "memset", 6) == 0) ||
+           (s.size == 18 && memcmp(s.str, "platform_heap_base", 18) == 0) ||
+           (s.size == 18 && memcmp(s.str, "platform_heap_size", 18) == 0) ||
+           (s.size == 18 && memcmp(s.str, "platform_heap_grow", 18) == 0);
+}
+
+static bool driver_is_llvm_global_op(MLIR_OpHandle op) {
+    if (MLIR_GetOpType(op) == OP_TYPE_LLVM_MLIR_GLOBAL) return true;
+    string nm = MLIR_GetOpName(op);
+    if (nm.size == 17 && memcmp(nm.str, "llvm.mlir.global", 17) == 0) return true;
+    if (MLIR_GetOpAttributeByName(op, "global_type") == MLIR_INVALID_HANDLE) return false;
+    if (MLIR_GetOpAttributeByName(op, "sym_name") == MLIR_INVALID_HANDLE) return false;
+    if (MLIR_GetOpAttributeByName(op, "function_type") != MLIR_INVALID_HANDLE) return false;
+    return true;
+}
+
+static bool driver_llvm_op_is_internal(MLIR_OpHandle op) {
+    MLIR_AttributeHandle linka = MLIR_GetOpAttributeByName(op, "llvm.linkage");
+    if (linka == MLIR_INVALID_HANDLE)
+        linka = MLIR_GetOpAttributeByName(op, "linkage");
+    if (linka != MLIR_INVALID_HANDLE) {
+        string ls = MLIR_GetAttributeString(linka);
+        const char *want = "#llvm.linkage<internal>";
+        size_t wantn = strlen(want);
+        if (ls.size == wantn && memcmp(ls.str, want, wantn) == 0)
+            return true;
+    }
+    MLIR_AttributeHandle visa = MLIR_GetOpAttributeByName(op, "sym_visibility");
+    if (visa != MLIR_INVALID_HANDLE) {
+        string vs = MLIR_GetAttributeString(visa);
+        if (vs.size == 7 && memcmp(vs.str, "private", 7) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void driver_erase_module_func_by_name(MLIR_Context *ctx, MLIR_OpHandle mod,
+                                             string name) {
+    MLIR_BlockHandle mb = MLIR_GetRegionBlock(MLIR_GetOpRegion(mod, 0), 0);
+    size_t no = MLIR_GetBlockNumOps(mb);
+    for (size_t i = no; i > 0; i--) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i - 1);
+        if (!driver_llvm_func_has_body(op)) continue;
+        MLIR_AttributeHandle sa = MLIR_GetOpAttributeByName(op, "sym_name");
+        if (sa == MLIR_INVALID_HANDLE) continue;
+        string s = MLIR_GetAttributeString(sa);
+        if (s.size == name.size && memcmp(s.str, name.str, name.size) == 0)
+            MLIR_EraseOp(ctx, op);
+    }
+}
+
+static void driver_erase_module_global_by_name(MLIR_Context *ctx, MLIR_OpHandle mod,
+                                               string name) {
+    MLIR_BlockHandle mb = MLIR_GetRegionBlock(MLIR_GetOpRegion(mod, 0), 0);
+    size_t no = MLIR_GetBlockNumOps(mb);
+    for (size_t i = no; i > 0; i--) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i - 1);
+        if (!driver_is_llvm_global_op(op)) continue;
+        MLIR_AttributeHandle sa = MLIR_GetOpAttributeByName(op, "sym_name");
+        if (sa == MLIR_INVALID_HANDLE) continue;
+        string s = MLIR_GetAttributeString(sa);
+        if (s.size == name.size && memcmp(s.str, name.str, name.size) == 0)
+            MLIR_EraseOp(ctx, op);
+    }
+}
+
+static void driver_splice_module_globals(MLIR_Context *ctx, MLIR_OpHandle llvm_mod,
+                                         MLIR_OpHandle src_mod) {
+    if (src_mod == MLIR_INVALID_HANDLE) return;
+    MLIR_BlockHandle sbody =
+        MLIR_GetRegionBlock(MLIR_GetOpRegion(src_mod, 0), 0);
+    MLIR_BlockHandle dbody =
+        MLIR_GetRegionBlock(MLIR_GetOpRegion(llvm_mod, 0), 0);
+    size_t no = MLIR_GetBlockNumOps(sbody);
+    for (size_t i = no; i > 0; i--) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(sbody, i - 1);
+        if (!driver_is_llvm_global_op(op)) continue;
+        MLIR_AttributeHandle sa = MLIR_GetOpAttributeByName(op, "sym_name");
+        if (sa != MLIR_INVALID_HANDLE)
+            driver_erase_module_global_by_name(ctx, llvm_mod,
+                                               MLIR_GetAttributeString(sa));
+        MLIR_MoveOpToBlockEnd(ctx, op, dbody);
+    }
+}
+
+static bool driver_helper_func_should_splice(MLIR_OpHandle op,
+                                             TinycHelperKind kind) {
+    if (!driver_llvm_func_has_body(op)) return false;
+    MLIR_AttributeHandle sa = MLIR_GetOpAttributeByName(op, "sym_name");
+    if (sa == MLIR_INVALID_HANDLE) return false;
+    string s = MLIR_GetAttributeString(sa);
+    if (kind == TINYC_HELPER_BUDDY || kind == TINYC_HELPER_WASI_MACHO
+            || kind == TINYC_HELPER_WASI_ELF)
+        return true;
+    bool is_host = s.size >= 16 && memcmp(s.str, "__host_platform_", 16) == 0;
+    if (is_host) return true;
+    if (driver_llvm_op_is_internal(op)) return true;
+    if (driver_is_host_platform_support_symbol(s)) return true;
+    return false;
+}
+
+static void driver_splice_module_funcs(MLIR_Context *ctx, MLIR_OpHandle llvm_mod,
+                                       MLIR_OpHandle src_mod,
+                                       TinycHelperKind kind) {
+    if (src_mod == MLIR_INVALID_HANDLE) return;
+    MLIR_BlockHandle sbody =
+        MLIR_GetRegionBlock(MLIR_GetOpRegion(src_mod, 0), 0);
+    MLIR_BlockHandle dbody =
+        MLIR_GetRegionBlock(MLIR_GetOpRegion(llvm_mod, 0), 0);
+    size_t no = MLIR_GetBlockNumOps(sbody);
+    for (size_t i = no; i > 0; i--) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(sbody, i - 1);
+        if (driver_is_llvm_global_op(op)) continue;
+        if (!driver_helper_func_should_splice(op, kind)) continue;
+        MLIR_AttributeHandle sa = MLIR_GetOpAttributeByName(op, "sym_name");
+        if (sa != MLIR_INVALID_HANDLE) {
+            string sym = MLIR_GetAttributeString(sa);
+            driver_erase_module_func_by_name(ctx, llvm_mod, sym);
+            driver_erase_module_global_by_name(ctx, llvm_mod, sym);
+        }
+        MLIR_MoveOpToBlockEnd(ctx, op, dbody);
+    }
+}
+
+static void driver_splice_helper_mod(MLIR_Context *ctx, MLIR_OpHandle llvm_mod,
+                                     MLIR_OpHandle helper_mod, TinycHelperKind kind) {
+    if (helper_mod == MLIR_INVALID_HANDLE) return;
+    driver_splice_module_globals(ctx, llvm_mod, helper_mod);
+    driver_splice_module_funcs(ctx, llvm_mod, helper_mod, kind);
+}
+
+static bool driver_lower_for_native_codegen(
+        MLIR_Context *ctx, MLIR_OpHandle module,
+        bool (*lower_fn)(MLIR_Context *, MLIR_OpHandle)) {
+    bool saved_no_def_use = ctx->no_def_use_tracking;
+    ctx->no_def_use_tracking = false;
+    bool ok = lower_fn(ctx, module);
+    ctx->no_def_use_tracking = saved_no_def_use;
+    return ok;
+}
+
+static const char *driver_buddy_source_path(void) {
+    return "corec/base/buddy.c";
+}
+
+// Compile corec's platform_<os>.c (or buddy.c / WASI adapter) as LP64 into a
+// standalone lowered MLIR module. A caller splices its globals and selected
+// llvm.func ops into a lifted wasm->llvm module via driver_splice_helper_mod.
+// MUST be called BEFORE the wasm module is lifted: the optimization passes
+// (mem2reg / lowering) mutate per-value def-use chains, and compiling this
+// second module after the lifted one is already built corrupts its operands.
+// Compiling first — when the interning epoch is clean — keeps it correct,
+// exactly like a standalone compile.
 //
 // The public platform_* entry points are renamed to __host_platform_* (the
 // lifted module already contains the wasm-side platform_* from platform_wasm.c)
 // and libc calls are renamed to the underscored libSystem symbols the Mach-O
-// import table binds. pmod's arena is intentionally leaked so its funcs stay
+// import table binds. pmod's arena is intentionally leaked so its ops stay
 // live after they are later moved into the lifted module.
 static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
                                         string *include_dirs, size_t n_include_dirs,
                                         bool (*lower_fn)(MLIR_Context *, MLIR_OpHandle),
-                                        bool is_wasi_adapter,
-                                        MLIR_OpHandle *picks, size_t *n_picks,
-                                        size_t max_picks) {
-    *n_picks = 0;
+                                        TinycHelperKind kind,
+                                        MLIR_OpHandle *out_mod) {
+    bool is_wasi_adapter = kind == TINYC_HELPER_WASI_MACHO || kind == TINYC_HELPER_WASI_ELF;
+    *out_mod = MLIR_INVALID_HANDLE;
     Arena *saved_arena = MLIR_GetArenaAllocator(ctx);
     Arena *pmod_arena = arena_create(16 * 1024 * 1024);
     MLIR_SetArenaAllocator(ctx, pmod_arena);
@@ -115,26 +271,27 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
     ctx->no_def_use_tracking = false;
 
     string defs[16]; size_t nd = 0;
-    if (is_wasi_adapter) {
-        // The WASI adapter defines fd_write/path_open/... and calls the
-        // already-renamed __host_platform_* plus fchmod (Mach-O: _fchmod).
+    if (kind == TINYC_HELPER_WASI_ELF)
+        defs[nd++] = str_from_cstr_view((char *)"TINYC_ELF_NATIVE_HOST=1");
+    if (kind == TINYC_HELPER_WASI_MACHO)
         defs[nd++] = str_from_cstr_view((char *)"fchmod=_fchmod");
-    } else {
-    defs[nd++] = str_from_cstr_view((char *)"PLATFORM_SKIP_ENTRY=1");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_write=__host_platform_fd_write");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_read=__host_platform_fd_read");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_close=__host_platform_fd_close");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_seek=__host_platform_fd_seek");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_tell=__host_platform_fd_tell");
-    defs[nd++] = str_from_cstr_view((char *)"platform_path_open=__host_platform_path_open");
-    defs[nd++] = str_from_cstr_view((char *)"platform_exit=__host_platform_exit");
-    defs[nd++] = str_from_cstr_view((char *)"writev=_writev");
-    defs[nd++] = str_from_cstr_view((char *)"readv=_readv");
-    defs[nd++] = str_from_cstr_view((char *)"fcntl=_fcntl");
-    defs[nd++] = str_from_cstr_view((char *)"open=_open");
-    defs[nd++] = str_from_cstr_view((char *)"close=_close");
-    defs[nd++] = str_from_cstr_view((char *)"lseek=_lseek");
-    defs[nd++] = str_from_cstr_view((char *)"__error=___error");
+    if (kind == TINYC_HELPER_PLATFORM) {
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_SKIP_ENTRY=1");
+        defs[nd++] = str_from_cstr_view((char *)"platform_init=__host_platform_init");
+        defs[nd++] = str_from_cstr_view((char *)"platform_fd_write=__host_platform_fd_write");
+        defs[nd++] = str_from_cstr_view((char *)"platform_fd_read=__host_platform_fd_read");
+        defs[nd++] = str_from_cstr_view((char *)"platform_fd_close=__host_platform_fd_close");
+        defs[nd++] = str_from_cstr_view((char *)"platform_fd_seek=__host_platform_fd_seek");
+        defs[nd++] = str_from_cstr_view((char *)"platform_fd_tell=__host_platform_fd_tell");
+        defs[nd++] = str_from_cstr_view((char *)"platform_path_open=__host_platform_path_open");
+        defs[nd++] = str_from_cstr_view((char *)"platform_exit=__host_platform_exit");
+        defs[nd++] = str_from_cstr_view((char *)"writev=_writev");
+        defs[nd++] = str_from_cstr_view((char *)"readv=_readv");
+        defs[nd++] = str_from_cstr_view((char *)"fcntl=_fcntl");
+        defs[nd++] = str_from_cstr_view((char *)"open=_open");
+        defs[nd++] = str_from_cstr_view((char *)"close=_close");
+        defs[nd++] = str_from_cstr_view((char *)"lseek=_lseek");
+        defs[nd++] = str_from_cstr_view((char *)"__error=___error");
     }
 
     string src = tinyc_preprocess(pmod_arena, str_from_cstr_view((char *)path),
@@ -164,29 +321,35 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
         ctx->no_def_use_tracking = saved_no_def_use;
         return false;
     }
+    if (out_mod) *out_mod = pmod;
+
     MLIR_BlockHandle pbody = MLIR_GetRegionBlock(MLIR_GetOpRegion(pmod, 0), 0);
     size_t pn = MLIR_GetBlockNumOps(pbody);
-    size_t np = 0;
-    for (size_t i = 0; i < pn && np < max_picks; i++) {
+    size_t n_funcs = 0;
+    bool has_globals = false;
+    for (size_t i = 0; i < pn; i++) {
         MLIR_OpHandle op = MLIR_GetBlockOp(pbody, i);
-        if (!driver_llvm_func_has_body(op)) continue;
-        MLIR_AttributeHandle sa = MLIR_GetOpAttributeByName(op, "sym_name");
-        if (sa == MLIR_INVALID_HANDLE) continue;
-        string s = MLIR_GetAttributeString(sa);
-        // The platform file also defines non-renamed platform_* that collide
-        // with the wasm-side copies, so pick only the __host_platform_* entry
-        // points. The WASI adapter has no such collisions: pick every func.
-        if (!is_wasi_adapter &&
-            (s.size < 16 || memcmp(s.str, "__host_platform_", 16) != 0)) continue;
-        picks[np++] = op;
+        if (driver_is_llvm_global_op(op)) {
+            has_globals = true;
+            continue;
+        }
+        if (driver_helper_func_should_splice(op, kind))
+            n_funcs++;
     }
     MLIR_SetArenaAllocator(ctx, saved_arena);
         ctx->no_def_use_tracking = saved_no_def_use;
-    if (np == 0) {
+    if (is_wasi_adapter && n_funcs == 0) {
         fprintf(stderr, "tinyc: no spliceable definitions in '%s'\n", path);
         return false;
     }
-    *n_picks = np;
+    if (kind == TINYC_HELPER_BUDDY && n_funcs == 0) {
+        fprintf(stderr, "tinyc: no spliceable definitions in '%s'\n", path);
+        return false;
+    }
+    if (n_funcs == 0 && !has_globals) {
+        fprintf(stderr, "tinyc: no spliceable definitions in '%s'\n", path);
+        return false;
+    }
     return true;
 }
 
@@ -594,24 +757,33 @@ int app_main(void) {
                 // Compile the host platform file FIRST, while the interning
                 // epoch is clean: its funcs are spliced into the lifted module
                 // after the opt passes (see tinyc_compile_host_platform).
-                MLIR_OpHandle hp_picks[8]; size_t hp_n = 0;
+                MLIR_OpHandle hp_mod = MLIR_INVALID_HANDLE;
                 if (!tinyc_compile_host_platform(&ctx, host_platform_path,
                                                  include_dirs, n_include_dirs,
-                                                 lower_for_wasm_fn, false,
-                                                 hp_picks, &hp_n, 8)) {
+                                                 lower_for_wasm_fn,
+                                                 TINYC_HELPER_PLATFORM,
+                                                 &hp_mod)) {
                     arena_destroy(arena);
                     arena_destroy(boot_arena);
                     return 1;
                 }
-                // Compile + splice the C WASI adapter (fd_write/path_open/...)
-                // the same way, when provided; otherwise the lifter's
-                // synthesised shims are used. Baked while the epoch is clean.
-                MLIR_OpHandle ad_picks[16]; size_t ad_n = 0;
+                MLIR_OpHandle buddy_mod = MLIR_INVALID_HANDLE;
+                if (!tinyc_compile_host_platform(&ctx, driver_buddy_source_path(),
+                                                 include_dirs, n_include_dirs,
+                                                 lower_for_wasm_fn,
+                                                 TINYC_HELPER_BUDDY,
+                                                 &buddy_mod)) {
+                    arena_destroy(arena);
+                    arena_destroy(boot_arena);
+                    return 1;
+                }
+                MLIR_OpHandle ad_mod = MLIR_INVALID_HANDLE;
                 if (wasi_adapter_path &&
                     !tinyc_compile_host_platform(&ctx, wasi_adapter_path,
                                                  include_dirs, n_include_dirs,
-                                                 lower_for_wasm_fn, true,
-                                                 ad_picks, &ad_n, 16)) {
+                                                 lower_for_wasm_fn,
+                                                 TINYC_HELPER_WASI_MACHO,
+                                                 &ad_mod)) {
                     arena_destroy(arena);
                     arena_destroy(boot_arena);
                     return 1;
@@ -665,19 +837,13 @@ int app_main(void) {
                 // iteration in hot mem/str helpers). Remove them at the source.
                 // Skippable via TINYC_NO_DCE.
                 mlir_llvm_dce(&ctx, llvm_mod);
-                // Splice the pre-compiled host platform funcs into the lifted
-                // module now (after the wasm-oriented opt passes, which assume
-                // linmem shapes and must not see the LP64 platform funcs). The
-                // funcs were baked while the epoch was clean; moving them is a
-                // pure re-parent that preserves their operands.
-                if (hp_n > 0 || ad_n > 0) {
-                    MLIR_BlockHandle dbody =
-                        MLIR_GetRegionBlock(MLIR_GetOpRegion(llvm_mod, 0), 0);
-                    for (size_t hi = 0; hi < hp_n; hi++)
-                        MLIR_MoveOpToBlockEnd(&ctx, hp_picks[hi], dbody);
-                    for (size_t hi = 0; hi < ad_n; hi++)
-                        MLIR_MoveOpToBlockEnd(&ctx, ad_picks[hi], dbody);
-                }
+                // Splice pre-compiled host helpers (globals + funcs).
+                driver_splice_helper_mod(&ctx, llvm_mod, hp_mod,
+                                         TINYC_HELPER_PLATFORM);
+                driver_splice_helper_mod(&ctx, llvm_mod, buddy_mod,
+                                         TINYC_HELPER_BUDDY);
+                driver_splice_helper_mod(&ctx, llvm_mod, ad_mod,
+                                         TINYC_HELPER_WASI_MACHO);
                 arena_destroy(arena);
                 arena = late_arena;
                 if (!mlir_llvm_to_macho(&ctx, llvm_mod,
@@ -688,18 +854,99 @@ int app_main(void) {
                 }
                 out_fw.str = (char *)macho_data;
                 out_fw.size = macho_size;
+#ifdef TINYC_HAS_ELF
+            } else if (emit_elf) {
+                if (!host_platform_path) {
+                    fprintf(stderr,
+                        "tinyc --from-wasm --emit=elf: --host-platform=PATH "
+                        "is required (e.g. corec/platform/platform_linux.c)\n");
+                    arena_destroy(arena);
+                    arena_destroy(boot_arena);
+                    return 1;
+                }
+                MLIR_OpHandle hp_mod = MLIR_INVALID_HANDLE;
+                if (!tinyc_compile_host_platform(&ctx, host_platform_path,
+                                                 include_dirs, n_include_dirs,
+                                                 lower_fn,
+                                                 TINYC_HELPER_PLATFORM,
+                                                 &hp_mod)) {
+                    arena_destroy(arena);
+                    arena_destroy(boot_arena);
+                    return 1;
+                }
+                MLIR_OpHandle buddy_mod = MLIR_INVALID_HANDLE;
+                if (!tinyc_compile_host_platform(&ctx, driver_buddy_source_path(),
+                                                 include_dirs, n_include_dirs,
+                                                 lower_fn,
+                                                 TINYC_HELPER_BUDDY,
+                                                 &buddy_mod)) {
+                    arena_destroy(arena);
+                    arena_destroy(boot_arena);
+                    return 1;
+                }
+                MLIR_OpHandle ad_mod = MLIR_INVALID_HANDLE;
+                if (wasi_adapter_path &&
+                    !tinyc_compile_host_platform(&ctx, wasi_adapter_path,
+                                                 include_dirs, n_include_dirs,
+                                                 lower_fn,
+                                                 TINYC_HELPER_WASI_ELF,
+                                                 &ad_mod)) {
+                    arena_destroy(arena);
+                    arena_destroy(boot_arena);
+                    return 1;
+                }
+                Arena *late_arena = arena_create(64 * 1024 * 1024 - 64 * 1024);
+                MLIR_SetArenaAllocator(&ctx, late_arena);
+                MLIR_ResetInternRegistry();
+                uint8_t *elf_data = NULL; size_t elf_size = 0;
+                MLIR_OpHandle llvm_mod = mlir_wasmssa_to_llvm(&ctx, ssa);
+                if (llvm_mod == MLIR_INVALID_HANDLE) {
+                    arena_destroy(late_arena);
+                    arena_destroy(arena);
+                    arena_destroy(boot_arena);
+                    return 1;
+                }
+                if (!getenv("TINYC_NO_MEM2REG"))
+                    mlir_llvm_mem2reg(&ctx, llvm_mod);
+                if (!getenv("TINYC_NO_LOAD_CSE"))
+                    mlir_llvm_load_cse(&ctx, llvm_mod);
+                mlir_llvm_arith_gvn(&ctx, llvm_mod);
+                mlir_llvm_dce(&ctx, llvm_mod);
+                driver_splice_helper_mod(&ctx, llvm_mod, hp_mod,
+                                         TINYC_HELPER_PLATFORM);
+                driver_splice_helper_mod(&ctx, llvm_mod, buddy_mod,
+                                         TINYC_HELPER_BUDDY);
+                driver_splice_helper_mod(&ctx, llvm_mod, ad_mod,
+                                         TINYC_HELPER_WASI_ELF);
+                if (!driver_lower_for_native_codegen(&ctx, llvm_mod, lower_fn)) {
+                    arena_destroy(late_arena);
+                    arena_destroy(arena);
+                    arena_destroy(boot_arena);
+                    return 1;
+                }
+                arena_destroy(arena);
+                arena = late_arena;
+                if (!mlir_llvm_to_elf(&ctx, llvm_mod, &elf_data, &elf_size)) {
+                    arena_destroy(arena);
+                    arena_destroy(boot_arena);
+                    return 1;
+                }
+                out_fw.str = (char *)elf_data;
+                out_fw.size = elf_size;
+#endif
             } else if (emit_aarch64) {
                 // Same wasmssa -> llvm lift + optimization passes as the
                 // macho path above, but stop at the physical-register
                 // `aarch64` dialect and print it (the "MachO MLIR"). No
                 // late-arena swap: this is a debug view, not the memory-
                 // constrained self-host emit.
-                MLIR_OpHandle hp_picks2[8]; size_t hp_n2 = 0;
+                MLIR_OpHandle hp_mod2 = MLIR_INVALID_HANDLE;
                 if (host_platform_path &&
                     !tinyc_compile_host_platform(&ctx, host_platform_path,
                                                  include_dirs, n_include_dirs,
-                                                 lower_for_wasm_fn, false,
-                                                 hp_picks2, &hp_n2, 8)) {
+                                                 lower_for_wasm_fn,
+                                                 TINYC_HELPER_PLATFORM,
+                                                 &hp_mod2)) {
                     arena_destroy(arena);
                     arena_destroy(boot_arena);
                     return 1;
@@ -716,12 +963,8 @@ int app_main(void) {
                     mlir_llvm_load_cse(&ctx, llvm_mod);
                 mlir_llvm_arith_gvn(&ctx, llvm_mod);
                 mlir_llvm_dce(&ctx, llvm_mod);
-                if (hp_n2 > 0) {
-                    MLIR_BlockHandle dbody =
-                        MLIR_GetRegionBlock(MLIR_GetOpRegion(llvm_mod, 0), 0);
-                    for (size_t hi = 0; hi < hp_n2; hi++)
-                        MLIR_MoveOpToBlockEnd(&ctx, hp_picks2[hi], dbody);
-                }
+                driver_splice_helper_mod(&ctx, llvm_mod, hp_mod2,
+                                         TINYC_HELPER_PLATFORM);
                 MLIR_OpHandle aarch64 = mlir_llvm_to_aarch64(&ctx, llvm_mod);
                 if (aarch64 == MLIR_INVALID_HANDLE) {
                     arena_destroy(arena);
@@ -731,16 +974,18 @@ int app_main(void) {
                 out_fw = MLIR_PrintOperationGeneric(&ctx, aarch64);
             } else {
                 fprintf(stderr,
-                    "tinyc --from-wasm: requires --emit=wasmstack|wasmssa|aarch64|macho\n");
+                    "tinyc --from-wasm: requires --emit=wasmstack|wasmssa|aarch64|macho|elf\n");
                 arena_destroy(arena);
                 arena_destroy(boot_arena);
                 return 1;
             }
         }
         int wr;
-        if (emit_macho) {
+        if (emit_macho || emit_elf) {
             if (!output_file) {
-                fprintf(stderr, "tinyc --from-wasm --emit=macho: -o OUT required\n");
+                fprintf(stderr, "tinyc --from-wasm --emit=%s: -o OUT required\n",
+                        emit_elf ? "elf" : "macho");
+                if (emit_elf) free(out_fw.str);
                 arena_destroy(arena);
                 arena_destroy(boot_arena);
                 return 1;
@@ -751,6 +996,7 @@ int app_main(void) {
                 chmod(output_file, 0755);
             }
 #endif
+            if (emit_elf) free(out_fw.str);
         } else if (output_file) {
             wr = write_string_to_file(out_fw, output_file);
         } else {
