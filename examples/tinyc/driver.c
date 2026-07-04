@@ -272,19 +272,12 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
 
     string defs[16]; size_t nd = 0;
     if (kind == TINYC_HELPER_WASI_ELF)
-        defs[nd++] = str_from_cstr_view((char *)"TINYC_ELF_NATIVE_HOST=1");
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_HOST_SHIM=1");
     if (kind == TINYC_HELPER_WASI_MACHO)
         defs[nd++] = str_from_cstr_view((char *)"fchmod=_fchmod");
     if (kind == TINYC_HELPER_PLATFORM) {
         defs[nd++] = str_from_cstr_view((char *)"PLATFORM_SKIP_ENTRY=1");
-        defs[nd++] = str_from_cstr_view((char *)"platform_init=__host_platform_init");
-        defs[nd++] = str_from_cstr_view((char *)"platform_fd_write=__host_platform_fd_write");
-        defs[nd++] = str_from_cstr_view((char *)"platform_fd_read=__host_platform_fd_read");
-        defs[nd++] = str_from_cstr_view((char *)"platform_fd_close=__host_platform_fd_close");
-        defs[nd++] = str_from_cstr_view((char *)"platform_fd_seek=__host_platform_fd_seek");
-        defs[nd++] = str_from_cstr_view((char *)"platform_fd_tell=__host_platform_fd_tell");
-        defs[nd++] = str_from_cstr_view((char *)"platform_path_open=__host_platform_path_open");
-        defs[nd++] = str_from_cstr_view((char *)"platform_exit=__host_platform_exit");
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_HOST_SHIM=1");
         defs[nd++] = str_from_cstr_view((char *)"writev=_writev");
         defs[nd++] = str_from_cstr_view((char *)"readv=_readv");
         defs[nd++] = str_from_cstr_view((char *)"fcntl=_fcntl");
