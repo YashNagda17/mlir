@@ -273,8 +273,6 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
     string defs[16]; size_t nd = 0;
     if (kind == TINYC_HELPER_WASI_ELF)
         defs[nd++] = str_from_cstr_view((char *)"PLATFORM_HOST_SHIM=1");
-    if (kind == TINYC_HELPER_WASI_MACHO)
-        defs[nd++] = str_from_cstr_view((char *)"fchmod=_fchmod");
     if (kind == TINYC_HELPER_PLATFORM) {
         defs[nd++] = str_from_cstr_view((char *)"PLATFORM_SKIP_ENTRY=1");
         defs[nd++] = str_from_cstr_view((char *)"PLATFORM_HOST_SHIM=1");
@@ -285,6 +283,7 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
         defs[nd++] = str_from_cstr_view((char *)"close=_close");
         defs[nd++] = str_from_cstr_view((char *)"lseek=_lseek");
         defs[nd++] = str_from_cstr_view((char *)"__error=___error");
+        defs[nd++] = str_from_cstr_view((char *)"fchmod=_fchmod");
     }
 
     string src = tinyc_preprocess(pmod_arena, str_from_cstr_view((char *)path),
