@@ -211,6 +211,27 @@ typedef enum {
     OP_TYPE_ARITH_SHLI,
     OP_TYPE_ARITH_SHRSI,
 
+    // Additional LLVM-dialect operations. These are appended so existing
+    // operation-number values remain stable while LLVM passes can dispatch
+    // without comparing operation-name strings.
+    OP_TYPE_LLVM_BR,
+    OP_TYPE_LLVM_COND_BR,
+    OP_TYPE_LLVM_INTTOPTR,
+    OP_TYPE_LLVM_BITCAST,
+    OP_TYPE_LLVM_SELECT,
+    OP_TYPE_LLVM_FCMP,
+    OP_TYPE_LLVM_FADD,
+    OP_TYPE_LLVM_FSUB,
+    OP_TYPE_LLVM_FMUL,
+    OP_TYPE_LLVM_FDIV,
+    OP_TYPE_LLVM_FNEG,
+    OP_TYPE_LLVM_FPEXT,
+    OP_TYPE_LLVM_FPTRUNC,
+    OP_TYPE_LLVM_SITOFP,
+    OP_TYPE_LLVM_UITOFP,
+    OP_TYPE_LLVM_FPTOSI,
+    OP_TYPE_LLVM_FPTOUI,
+
     // Return operations
     OP_TYPE_RETURN,
     OP_TYPE_TT_REDUCE_RETURN,
@@ -542,6 +563,9 @@ void MLIR_ResetInternRegistry(void);
 // -----------------------------------------------------------------------------
 
 // Creation & structural mutation
+// For registered `type` values, pass str_lit("") for `opname`; the textual
+// name is derived from the enum. Only OP_TYPE_UNREGISTERED needs a custom
+// `opname` string.
 MLIR_OpHandle MLIR_CreateOp(
     MLIR_Context *ctx,
     MLIR_OpType type,

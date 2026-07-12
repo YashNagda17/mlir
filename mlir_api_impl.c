@@ -594,7 +594,14 @@ MLIR_OpHandle MLIR_CreateOpWithSuccessors(
     // def-use arrays) or when any printer/parser metadata diverges from the
     // getter defaults. The wasm->macho lift passes defaults and opts out of
     // tracking, so aux stays NULL on the hot path.
-    bool store_name = !str_eq(opname, op_type_to_string(type));
+    // Registered op kinds carry a canonical name via op_type; only
+    // OP_TYPE_UNREGISTERED needs the caller-supplied textual name stored.
+    bool store_name;
+    if (type != OP_TYPE_UNREGISTERED) {
+        store_name = false;
+    } else {
+        store_name = !str_eq(opname, op_type_to_string(type));
+    }
     if (arena && (track_uses || store_name ||
                   unnumbered_loc_def != MLIR_INVALID_HANDLE ||
                   trailing_comment.size != 0 || source_line_start != -1)) {
