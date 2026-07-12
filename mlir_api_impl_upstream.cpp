@@ -1112,6 +1112,11 @@ extern "C" uint64_t MLIR_GetTypeLLVMArrayNumElements(MLIR_TypeHandle h) {
     return at.getNumElements();
 }
 
+extern "C" uint32_t MLIR_GetTypeLLVMPointerAddressSpace(MLIR_TypeHandle h) {
+    auto p = llvm::dyn_cast<mlir::LLVM::LLVMPointerType>(typeF(h));
+    return p ? p.getAddressSpace() : 0;
+}
+
 extern "C" string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle h) {
     auto t = typeF(h);
     // Normalize opaque "unknown" types (dialect `?`, type `unknown`) to the
@@ -1256,8 +1261,14 @@ extern "C" MLIR_AttributeHandle MLIR_CreateAttributeDenseI64Array(MLIR_Context *
 }
 
 extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMPointer(MLIR_Context *) {
+    return MLIR_CreateTypeLLVMPointerInAddressSpace(nullptr, 0);
+}
+
+// Adds address space to the pointer type, e.g. !llvm.ptr<3> for address space 3.
+extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMPointerInAddressSpace(
+    MLIR_Context *, uint32_t address_space) {
     auto &ctx = globalCtx().mctx;
-    return typeH(mlir::LLVM::LLVMPointerType::get(&ctx));
+    return typeH(mlir::LLVM::LLVMPointerType::get(&ctx, address_space));
 }
 
 extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMStructIdentified(MLIR_Context *, string name) {
