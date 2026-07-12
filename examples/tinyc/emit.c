@@ -5187,15 +5187,21 @@ static void build_signatures(E *e) {
         bool is_void = (sig->ret.type.kind == TY_VOID);
         // A variadic function lowered with tinyC's portable 8-byte cursor
         // va_list takes one extra hidden trailing `ptr` parameter (the
-        // caller-packed varargs buffer). Use the cursor model unless the
-        // build links host libc for variadic functions (--host-varargs, the
-        // native-llc / ELF test path) AND this callee is extern in this TU
-        // (i.e. it is the host libc printf, not a tinyC-defined function).
-        // The default (cursor for ALL variadic functions) is correct for
-        // wasm/macho and for separate-compilation builds where a tinyC-defined
-        // variadic function is extern in the caller's TU but defined elsewhere.
-        sig->cursor_va = sig->is_variadic &&
-            (!e->program->host_varargs || (f && !f->is_forward));
+        // caller-packed varargs buffer). Use the cursor model only for
+        // variadic functions DEFINED in this TU (tinyc va_list / wasm path).
+        // Extern variadic callees (libc `open`, `printf`, `fcntl`, ...) lower
+        // as real `llvm.func` variadic + `llvm.call` and bypass `func.func`.
+        // is_forward distinguishes the cases: a prototype ends with ';' and
+        // stays forward-only; a later definition replaces it and enables (A).
+        // Extern decls never get a tinyc body, so they always take (B).
+        //
+        // Gate (B) on program->host_varargs (--host-varargs): native tests that
+        // link host libc need real ABI for forward decls. wasm/ELF self-host
+        // compiles each .c to a separate .wasm.o without --host-varargs; forward
+        // decls there must keep cursor_va so calls match tinyc-defined printf
+        // etc. in other objects (restores pre-fix wasm self-host behavior).
+        sig->cursor_va = sig->is_variadic && f &&
+            (!f->is_forward || !e->program->host_varargs);
         size_t in_total = sig->n_params + (sig->sret ? 1 : 0) +
                           (sig->cursor_va ? 1 : 0);
         size_t out_total = (sig->sret || is_void) ? 0 : 1;
