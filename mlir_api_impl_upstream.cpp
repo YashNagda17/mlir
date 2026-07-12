@@ -190,8 +190,8 @@ MLIR_OpType opTypeFromName(llvm::StringRef name) {
     static llvm::DenseMap<llvm::StringRef, MLIR_OpType> *map = nullptr;
     if (!map) {
         map = new llvm::DenseMap<llvm::StringRef, MLIR_OpType>();
-        map->reserve(256);
-        for (int t = 0; t < 256; t++) {
+        map->reserve(OP_TYPE_COUNT);
+        for (unsigned t = 0; t < (unsigned)OP_TYPE_COUNT; t++) {
             string s = op_type_to_string((MLIR_OpType)t);
             if (s.size == 0) continue;
             // The canonical table entries are static string literals, so
@@ -204,6 +204,63 @@ MLIR_OpType opTypeFromName(llvm::StringRef name) {
     auto it = map->find(name);
     if (it != map->end()) return it->second;
     return OP_TYPE_UNREGISTERED;
+}
+
+// Registered MLIR_OpType values map to mlir::OperationName once at first
+// use. Callers pass the enum + str_lit(""); only OP_TYPE_UNREGISTERED
+// carries a custom textual name through `opname`.
+// Create a cache to avoid the repeated operation name lookup on every op creation.
+struct OpTypeOperationNameCache {
+    llvm::DenseMap<MLIR_OpType, llvm::StringRef> canonicalRefs;
+    llvm::DenseMap<MLIR_OpType, mlir::OperationName> cachedNames;
+
+    void ensureCanonicalRefs() {
+        if (!canonicalRefs.empty()) return;
+        canonicalRefs.reserve(OP_TYPE_COUNT);
+        for (unsigned t = 0; t < (unsigned)OP_TYPE_COUNT; t++) {
+            MLIR_OpType ty = (MLIR_OpType)t;
+            if (ty == OP_TYPE_UNREGISTERED) continue;
+            string s = op_type_to_string(ty);
+            if (s.size == 0 || !s.str) continue;
+            if (ty == OP_TYPE_MODULE) {
+                canonicalRefs[ty] = llvm::StringRef("builtin.module");
+            } else {
+                canonicalRefs[ty] = llvm::StringRef(s.str, s.size);
+            }
+        }
+    }
+
+    mlir::OperationName getRegistered(MLIR_OpType type, mlir::MLIRContext &ctx) {
+        ensureCanonicalRefs();
+        auto cit = cachedNames.find(type);
+        if (cit != cachedNames.end()) return cit->second;
+        auto rit = canonicalRefs.find(type);
+        if (rit == canonicalRefs.end()) {
+            mlir::OperationName unknown("unknown", &ctx);
+            cachedNames[type] = unknown;
+            return unknown;
+        }
+        mlir::OperationName on(rit->second, &ctx);
+        cachedNames[type] = on;
+        return on;
+    }
+};
+
+OpTypeOperationNameCache &opTypeNameCache() {
+    static OpTypeOperationNameCache c;
+    return c;
+}
+
+mlir::OperationName resolveOperationName(MLIR_OpType type, string opname,
+                                         mlir::MLIRContext &ctx) {
+    if (type != OP_TYPE_UNREGISTERED) {
+        return opTypeNameCache().getRegistered(type, ctx);
+    }
+    if (opname.size > 0 && opname.str) {
+        return mlir::OperationName(llvm::StringRef(opname.str, opname.size),
+                                   &ctx);
+    }
+    return mlir::OperationName("unknown", &ctx);
 }
 
 // Copy a std::string into the C-API arena so the returned `string` is
@@ -404,20 +461,11 @@ extern "C" MLIR_OpHandle MLIR_CreateOpWithSuccessors(
     MLIR_LocationHandle location, MLIR_LocationHandle, string, int64_t) {
     auto &ctx = globalCtx().mctx;
 
-    std::string nm(opname.str, opname.size);
-    if (nm.empty()) {
-        string s = op_type_to_string(type);
-        if (s.size > 0) nm.assign(s.str, s.size);
-        else nm = "unknown";
-    }
-    if (type == OP_TYPE_MODULE && nm == "module") {
-        nm = "builtin.module";
-    }
-
     mlir::Location loc = (location == MLIR_INVALID_HANDLE)
                              ? mlir::Location(mlir::UnknownLoc::get(&ctx))
                              : locF(location);
-    mlir::OperationState state(loc, llvm::StringRef(nm));
+    mlir::OperationName opName = resolveOperationName(type, opname, ctx);
+    mlir::OperationState state(loc, opName);
 
     for (size_t i = 0; i < n_operands; i++) {
         state.addOperands(F<ValueBox>(operands[i])->v);
@@ -443,7 +491,8 @@ extern "C" MLIR_OpHandle MLIR_CreateOpWithSuccessors(
         // attribute type doesn't match, which then makes the
         // intermediate cf.switch fail to lift to scf.index_switch.
         // Convert here so the typed property storage accepts it.
-        if (nm == "cf.switch" && na->getName().strref() == "case_values") {
+        if (type == OP_TYPE_CF_SWITCH &&
+            na->getName().strref() == "case_values") {
             if (auto arr = mlir::dyn_cast<mlir::DenseI32ArrayAttr>(val)) {
                 auto i32Ty = mlir::IntegerType::get(&ctx, 32);
                 auto shaped = mlir::RankedTensorType::get(
@@ -469,7 +518,7 @@ extern "C" MLIR_OpHandle MLIR_CreateOpWithSuccessors(
                                                 state.attributes.end());
 
     if (n_successors > 0 && n_successor_operands) {
-        if (nm == "cf.cond_br" || nm == "llvm.cond_br") {
+        if (type == OP_TYPE_CF_COND_BR || type == OP_TYPE_LLVM_COND_BR) {
             // Both ops use AttrSizedOperandSegments with the layout
             // [condition, trueDestOperands, falseDestOperands]; without the
             // synthesized operandSegmentSizes the BranchOpInterface slices
@@ -483,7 +532,7 @@ extern "C" MLIR_OpHandle MLIR_CreateOpWithSuccessors(
             }
             state.addAttribute("operandSegmentSizes",
                 mlir::DenseI32ArrayAttr::get(&ctx, seg));
-        } else if (nm == "cf.switch") {
+        } else if (type == OP_TYPE_CF_SWITCH) {
             // cf.switch has 3 operand segments: flag (always 1), default
             // operands (successor 0), and case operands (sum across
             // successors 1..N-1). It also needs case_operand_segments —
