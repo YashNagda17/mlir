@@ -121,25 +121,30 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
 
     string defs[16]; size_t nd = 0;
     if (is_wasi_adapter) {
-        // The WASI adapter defines fd_write/path_open/... and calls the
-        // already-renamed __host_platform_* plus fchmod (Mach-O: _fchmod).
-        defs[nd++] = str_from_cstr_view((char *)"fchmod=_fchmod");
+        // wasi_adapter.c calls platform_* for host I/O; PLATFORM_HOST_SHIM
+        // (platform.h) renames those to __host_platform_* so the adapter
+        // reaches the spliced host copies instead of the wasm-side ones.
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_HOST_SHIM=1");
     } else {
-    defs[nd++] = str_from_cstr_view((char *)"PLATFORM_SKIP_ENTRY=1");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_write=__host_platform_fd_write");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_read=__host_platform_fd_read");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_close=__host_platform_fd_close");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_seek=__host_platform_fd_seek");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_tell=__host_platform_fd_tell");
-    defs[nd++] = str_from_cstr_view((char *)"platform_path_open=__host_platform_path_open");
-    defs[nd++] = str_from_cstr_view((char *)"platform_exit=__host_platform_exit");
-    defs[nd++] = str_from_cstr_view((char *)"writev=_writev");
-    defs[nd++] = str_from_cstr_view((char *)"readv=_readv");
-    defs[nd++] = str_from_cstr_view((char *)"fcntl=_fcntl");
-    defs[nd++] = str_from_cstr_view((char *)"open=_open");
-    defs[nd++] = str_from_cstr_view((char *)"close=_close");
-    defs[nd++] = str_from_cstr_view((char *)"lseek=_lseek");
-    defs[nd++] = str_from_cstr_view((char *)"__error=___error");
+        // Mach-O platform splice: rename only the I/O entry points, not
+        // platform_init (which would pull in ensure_heap_initialized /
+        // buddy_init callees that the pick-based splice does not move).
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_SKIP_ENTRY=1");
+        defs[nd++] = str_from_cstr_view((char *)"platform_fd_write=__host_platform_fd_write");
+        defs[nd++] = str_from_cstr_view((char *)"platform_fd_read=__host_platform_fd_read");
+        defs[nd++] = str_from_cstr_view((char *)"platform_fd_close=__host_platform_fd_close");
+        defs[nd++] = str_from_cstr_view((char *)"platform_fd_seek=__host_platform_fd_seek");
+        defs[nd++] = str_from_cstr_view((char *)"platform_fd_tell=__host_platform_fd_tell");
+        defs[nd++] = str_from_cstr_view((char *)"platform_path_open=__host_platform_path_open");
+        defs[nd++] = str_from_cstr_view((char *)"platform_exit=__host_platform_exit");
+        defs[nd++] = str_from_cstr_view((char *)"writev=_writev");
+        defs[nd++] = str_from_cstr_view((char *)"readv=_readv");
+        defs[nd++] = str_from_cstr_view((char *)"fcntl=_fcntl");
+        defs[nd++] = str_from_cstr_view((char *)"open=_open");
+        defs[nd++] = str_from_cstr_view((char *)"close=_close");
+        defs[nd++] = str_from_cstr_view((char *)"lseek=_lseek");
+        defs[nd++] = str_from_cstr_view((char *)"__error=___error");
+        defs[nd++] = str_from_cstr_view((char *)"fchmod=_fchmod");
     }
 
     string src = tinyc_preprocess(pmod_arena, str_from_cstr_view((char *)path),
