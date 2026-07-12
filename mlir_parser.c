@@ -437,6 +437,8 @@ MLIR_OpType op_string_to_type(string opname) {
         return OP_TYPE_LLVM_GEP;
     } else if (str_eq(opname, str_lit("llvm.mlir.zero"))) {
         return OP_TYPE_LLVM_MLIR_ZERO;
+    } else if (str_eq(opname, str_lit("llvm.mlir.null"))) {
+        return OP_TYPE_LLVM_MLIR_NULL;
     } else if (str_eq(opname, str_lit("llvm.mlir.constant"))) {
         return OP_TYPE_LLVM_MLIR_CONSTANT;
     } else if (str_eq(opname, str_lit("llvm.icmp"))) {

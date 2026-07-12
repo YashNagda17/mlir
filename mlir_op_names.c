@@ -102,6 +102,7 @@ static string op_type_to_string_half1(MLIR_OpType type) {
         case OP_TYPE_LLVM_STORE: return str_lit("llvm.store");
         case OP_TYPE_LLVM_GEP: return str_lit("llvm.getelementptr");
         case OP_TYPE_LLVM_MLIR_ZERO: return str_lit("llvm.mlir.zero");
+        case OP_TYPE_LLVM_MLIR_NULL: return str_lit("llvm.mlir.null");
         case OP_TYPE_LLVM_MLIR_CONSTANT: return str_lit("llvm.mlir.constant");
         case OP_TYPE_LLVM_ICMP: return str_lit("llvm.icmp");
         case OP_TYPE_LLVM_MLIR_ADDRESSOF: return str_lit("llvm.mlir.addressof");

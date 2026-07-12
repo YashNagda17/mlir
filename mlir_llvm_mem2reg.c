@@ -865,7 +865,7 @@ static MLIR_ValueHandle sroa_field_alloca(S *s, size_t ai, const int32_t *path,
     MLIR_ValueHandle rv[1] = { res };
     MLIR_ValueHandle ops[1] = { s->a_size[ai] };
     MLIR_AttributeHandle attrs[1] = { ea };
-    MLIR_OpHandle op = MLIR_CreateOp(ctx, OP_TYPE_LLVM_ALLOCA, str_lit("llvm.alloca"),
+    MLIR_OpHandle op = MLIR_CreateOp(ctx, OP_TYPE_LLVM_ALLOCA, str_lit(""),
                                      attrs, 1, rty, 1, rv, 1, ops, 1, NULL, 0,
                                      loc, MLIR_INVALID_HANDLE, (string){0}, -1);
     size_t at = sroa_block_op_index(s->a_blk[ai], s->a_op[ai]);
@@ -1021,18 +1021,7 @@ void mlir_llvm_mem2reg(MLIR_Context *ctx, MLIR_OpHandle module) {
     for (size_t i = 0; i < nops; i++) {
         MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
         MLIR_OpType ft = MLIR_GetOpType(op);
-        // `func.func` is a registered op (matched by type), but `llvm.func`
-        // is UNREGISTERED in the native MLIR API impl, so MLIR_GetOpType
-        // returns OP_TYPE_UNREGISTERED for it there — only the upstream C++
-        // impl maps it to OP_TYPE_LLVM_FUNC. Variadic functions are emitted
-        // as `llvm.func`, so matching by name keeps mem2reg behaviour
-        // identical across both API impls (see verify_native_upstream_identical).
-        bool is_func = (ft == OP_TYPE_FUNC_FUNC || ft == OP_TYPE_LLVM_FUNC);
-        if (!is_func) {
-            string on = MLIR_GetOpName(op);
-            is_func = (on.size == 9 && memcmp(on.str, "llvm.func", 9) == 0);
-        }
-        if (!is_func) continue;
+        if (ft != OP_TYPE_FUNC_FUNC && ft != OP_TYPE_LLVM_FUNC) continue;
         if (MLIR_GetOpNumRegions(op) == 0) continue;
         MLIR_RegionHandle body = MLIR_GetOpRegion(op, 0);
         sroa_region(ctx, body);
