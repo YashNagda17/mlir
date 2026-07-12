@@ -329,8 +329,9 @@ def unity_include_flags() -> list[str]:
     ]
 
 
-def link_native(obj_path: Path, exe_path: Path):
-    """Link the llc-produced single-TU object."""
+def link_native(obj_path: Path, exe_path: Path, host_sources: list[Path] | None = None):
+    """Link the llc-produced single-TU object, optionally with host .c files."""
+    extra = [str(p) for p in (host_sources or [])]
     if IS_WIN:
         # MSVC: cl /nologo /MD obj /Fe:exe.exe
         # The llc-produced object carries no /DEFAULTLIB directive, so name the
@@ -340,11 +341,12 @@ def link_native(obj_path: Path, exe_path: Path):
         return run([
             CC, "/nologo", "/MD",
             str(obj_path),
+            *extra,
             "msvcrt.lib", "ucrt.lib", "vcruntime.lib",
             "legacy_stdio_definitions.lib",
             f"/Fe:{exe_path}",
         ])
-    cmd = [CC, str(obj_path), "-o", str(exe_path)]
+    cmd = [CC, str(obj_path), *extra, "-o", str(exe_path)]
     # llc emits non-PIC by default; some Linux toolchains default to -pie which
     # rejects R_X86_64_32 relocations from .rodata. Force -no-pie on Linux.
     if sys.platform.startswith("linux"):
@@ -528,7 +530,7 @@ def main():
             continue
         # Multi-file tests pass `sources = [...]`; single-file tests
         # default to `<name>.tc` for backwards compatibility.
-        sources = t.get("sources", [f"{name}.tc"])
+        sources = list(t.get("sources", [f"{name}.tc"]))
         srcs = [HERE / "tests" / s for s in sources]
         unity_src = write_unity_source(name, srcs) if use_unity_source() else None
 
@@ -720,7 +722,8 @@ def main():
             print(f"FAIL {name}: llc failed\nstderr:\n{r.stderr}")
             failures += 1
             continue
-        r = link_native(obj, exe)
+        host_srcs = [HERE / "tests" / s for s in t.get("host_sources", [])]
+        r = link_native(obj, exe, host_srcs)
         if r.returncode != 0:
             print(f"FAIL {name}: link failed\nstderr:\n{r.stderr}\nstdout:\n{r.stdout}")
             failures += 1
