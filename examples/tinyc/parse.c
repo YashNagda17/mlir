@@ -2174,14 +2174,17 @@ static Func *parse_func(P *p) {
             if (!parse_sig_type(p, &pty)) {
                 perror_at(p, cur(p).line, str_lit("expected parameter type"));
             }
-            if (pty.kind == TY_VOID) {
-                perror_at(p, pline,
-                    str_lit("'void' is only valid as the lone parameter spec"));
-            }
             string pname = (string){0};
-            // Optional function-pointer parameter declarator: `int (*f)(int)`.
+            // Optional function-pointer parameter declarator:
+            // `int (*f)(int)` or `void (*progress)(const char *)`.
             if (try_parse_fnptr_suffix(p, &pty, &pname)) {
                 // pname (if any) was captured inside `(*name)`.
+            } else if (pty.kind == TY_VOID) {
+                if (cur(p).kind == TC_TK_IDENT ||
+                    (cur(p).kind == TC_TK_LPAREN && peek(p, 1).kind == TC_TK_STAR)) {
+                    perror_at(p, pline,
+                        str_lit("'void' is only valid as the lone parameter spec"));
+                }
             } else if (cur(p).kind == TC_TK_IDENT) {
                 pname = cur(p).text;
                 p->i++;
@@ -2407,9 +2410,15 @@ static StructDef *parse_struct_def(P *p) {
                     ft.kind = TY_PTR_PTR;
                     ft.pointee = inner;
                 }
-            } else if (k == TY_VOID) {
-                perror_at(p, cur(p).line, str_lit("'void' is not a valid struct field type"));
             }
+        }
+        // Inline function-pointer field: `void (*progress)(const char *);`
+        string fnptr_field_name = (string){0};
+        if (try_parse_fnptr_suffix(p, &ft, &fnptr_field_name)) {
+            (void)is_ptr;
+        } else if (ft.kind == TY_VOID) {
+            perror_at(p, cur(p).line,
+                str_lit("'void' is not a valid struct field type"));
         }
         // One or more comma-separated declarators sharing the base type
         // `ft` parsed above. Each may add its own `[N]`/`[N][M]` suffix.
@@ -2431,8 +2440,15 @@ static StructDef *parse_struct_def(P *p) {
             if (accept(p, TC_TK_STAR)) {
                 (void)accept(p, TC_TK_STAR);
             }
-            TcTok fn = cur(p);
-            expect(p, TC_TK_IDENT, str_lit("expected field name"));
+            TcTok fn;
+            if (fnptr_field_name.size > 0) {
+                fn = (TcTok){.kind = TC_TK_IDENT, .text = fnptr_field_name,
+                             .line = cur(p).line};
+                fnptr_field_name = (string){0};
+            } else {
+                fn = cur(p);
+                expect(p, TC_TK_IDENT, str_lit("expected field name"));
+            }
             // Optional array suffix `[N]` or `[N][M]`.
             if (accept(p, TC_TK_LBRACK)) {
                 if (cur(p).kind == TC_TK_RBRACK) {
@@ -3041,6 +3057,10 @@ int tinyc_parse_into(Arena *arena, Program *prog, VecTcTok toks, bool target_was
                                             have_int_val = true;
                                             p.i++;
                                         }
+                                        ok = true;
+                                    } else if (el.kind == TC_TK_IDENT && enum_lookup(&p, el.text)) {
+                                        val = enum_lookup(&p, el.text)->value;
+                                        have_int_val = true;
                                         ok = true;
                                     }
                                     if (!ok) {
