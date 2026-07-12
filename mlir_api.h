@@ -498,6 +498,8 @@ typedef enum {
     //   attrs: sym_name (string, debug), offset (i32), init_data (string).
     OP_TYPE_AARCH64_DATA_INIT,
 
+    OP_TYPE_LLVM_MLIR_NULL,
+
     OP_TYPE_COUNT
 } MLIR_OpType;
 
