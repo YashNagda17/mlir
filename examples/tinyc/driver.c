@@ -116,19 +116,19 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
 
     string defs[16]; size_t nd = 0;
     if (is_wasi_adapter) {
-        // The WASI adapter defines fd_write/path_open/... and calls the
-        // already-renamed __host_platform_* plus fchmod (Mach-O: _fchmod).
-        defs[nd++] = str_from_cstr_view((char *)"fchmod=_fchmod");
+        // wasi_adapter.c calls platform_*; PLATFORM_HOST_SHIM (platform.h) renames
+        // those to __host_platform_* so they reach the spliced host copies.
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_HOST_SHIM=1");
     } else {
-    defs[nd++] = str_from_cstr_view((char *)"PLATFORM_SKIP_ENTRY=1");
-    defs[nd++] = str_from_cstr_view((char *)"PLATFORM_HOST_SHIM=1");
-    defs[nd++] = str_from_cstr_view((char *)"writev=_writev");
-    defs[nd++] = str_from_cstr_view((char *)"readv=_readv");
-    defs[nd++] = str_from_cstr_view((char *)"fcntl=_fcntl");
-    defs[nd++] = str_from_cstr_view((char *)"open=_open");
-    defs[nd++] = str_from_cstr_view((char *)"close=_close");
-    defs[nd++] = str_from_cstr_view((char *)"lseek=_lseek");
-    defs[nd++] = str_from_cstr_view((char *)"__error=___error");
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_SKIP_ENTRY=1");
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_HOST_SHIM=1");
+        defs[nd++] = str_from_cstr_view((char *)"writev=_writev");
+        defs[nd++] = str_from_cstr_view((char *)"readv=_readv");
+        defs[nd++] = str_from_cstr_view((char *)"fcntl=_fcntl");
+        defs[nd++] = str_from_cstr_view((char *)"open=_open");
+        defs[nd++] = str_from_cstr_view((char *)"close=_close");
+        defs[nd++] = str_from_cstr_view((char *)"lseek=_lseek");
+        defs[nd++] = str_from_cstr_view((char *)"__error=___error");
     }
 
     string src = tinyc_preprocess(pmod_arena, str_from_cstr_view((char *)path),
@@ -169,9 +169,15 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
         string s = MLIR_GetAttributeString(sa);
         // The platform file also defines non-renamed platform_* that collide
         // with the wasm-side copies, so pick only the __host_platform_* entry
-        // points. The WASI adapter has no such collisions: pick every func.
-        if (!is_wasi_adapter &&
-            (s.size < 16 || memcmp(s.str, "__host_platform_", 16) != 0)) continue;
+        // points. Skip init only: it calls ensure_heap_initialized helpers the
+        // pick-based splice does not move (wasm crt0 handles init). Keep exit:
+        // mlir_wasmssa_to_llvm rewrites proc_exit -> __host_platform_exit.
+        // The WASI adapter has no such collisions: pick every func.
+        if (!is_wasi_adapter) {
+            if (s.size < 16 || memcmp(s.str, "__host_platform_", 16) != 0) continue;
+            if (s.size == 20 && memcmp(s.str, "__host_platform_init", 20) == 0)
+                continue;
+        }
         picks[np++] = op;
     }
     MLIR_SetArenaAllocator(ctx, saved_arena);
