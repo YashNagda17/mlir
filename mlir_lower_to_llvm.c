@@ -341,6 +341,47 @@ static bool lower_rename(LowerState *st, MLIR_OpHandle op,
     return true;
 }
 
+// Return the bit width of an integer or index type, or 0 if unknown.
+static int type_bitwidth(MLIR_Context *ctx, MLIR_TypeHandle ty) {
+    if (MLIR_IsTypeIndex(ty)) return 64;
+    string s = MLIR_GetTypeString(ctx, ty);
+    if (s.size < 2 || s.str[0] != 'i') return 0;
+    int w = 0;
+    for (size_t i = 1; i < s.size; i++) {
+        if (s.str[i] < '0' || s.str[i] > '9') return 0;
+        w = w * 10 + (s.str[i] - '0');
+    }
+    return w;
+}
+
+// Lower `arith.index_cast` / `arith.index_castui` to llvm.sext, llvm.zext, or
+// llvm.trunc depending on source/destination width (index = 64 bits here).
+static bool lower_arith_index_cast(LowerState *st, MLIR_OpHandle op,
+                                   MLIR_BlockHandle parent, size_t pos,
+                                   bool is_unsigned) {
+    if (MLIR_GetOpNumOperands(op) != 1 || MLIR_GetOpNumResults(op) != 1)
+        return false;
+    MLIR_ValueHandle src = MLIR_GetOpOperand(op, 0);
+    MLIR_ValueHandle old_res = MLIR_GetOpResult(op, 0);
+    MLIR_TypeHandle src_ty = MLIR_GetValueType(src);
+    MLIR_TypeHandle dst_ty = MLIR_GetValueType(old_res);
+    int sw = type_bitwidth(st->ctx, src_ty);
+    int dw = type_bitwidth(st->ctx, dst_ty);
+    if (sw == 0 || dw == 0) return false;
+    if (sw == dw) {
+        MLIR_ReplaceAllUsesOfValue(st->ctx, old_res, src);
+        return true;
+    }
+    string cast_name;
+    if (dw > sw) {
+        cast_name = (sw < 32 || is_unsigned) ? str_lit("llvm.zext")
+                                            : str_lit("llvm.sext");
+    } else {
+        cast_name = str_lit("llvm.trunc");
+    }
+    return lower_rename(st, op, parent, pos, cast_name, OP_TYPE_UNREGISTERED);
+}
+
 // Lower `cf.br` / `cf.cond_br` to `llvm.br` / `llvm.cond_br`. These ops
 // carry block successors plus per-successor operand lists; we have to
 // use the successor-aware op constructor.
@@ -1081,6 +1122,10 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
              name_eq(name, "unrealized_conversion_cast"))
                                          ok = lower_unrealized_cast(st, op, parent, pos);
     else if (name_eq(name, "arith.constant")) ok = lower_arith_constant(st, op, parent, pos);
+    else if (name_eq(name, "arith.index_cast"))
+        ok = st->keep_scf ? false : lower_arith_index_cast(st, op, parent, pos, false);
+    else if (name_eq(name, "arith.index_castui")) 
+        ok = st->keep_scf ? false : lower_arith_index_cast(st, op, parent, pos, true);
     else if (name_eq(name, "arith.addi"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.add"),  OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.subi"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.sub"),  OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.muli"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.mul"),  OP_TYPE_UNREGISTERED);
