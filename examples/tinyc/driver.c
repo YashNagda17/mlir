@@ -836,7 +836,12 @@ int app_main(void) {
         mlir_llvm_mem2reg(&ctx, module);
 
     if (emit_lowered || emit_llvm || emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho || emit_aarch64 || emit_elf) {
-        bool needs_wasm_lowering = emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho || emit_aarch64;
+        // Wasm pipelines (emit wasm / wasmssa / wasmstack / wat, and the
+        // default wasm-link Mach-O path) need cf->scf + keep_scf for wasmssa.
+        // The native llvm -> aarch64 backend (--macho-backend=llvm,
+        // --emit=aarch64) needs flat llvm.br / llvm.cond_br instead.
+        bool needs_wasm_lowering = emit_wasm || emit_wasmssa || emit_wasmstack
+            || emit_wat || (emit_macho && !macho_backend_llvm);
         bool ok = needs_wasm_lowering
                       ? lower_for_wasm_fn(&ctx, module)
                       : lower_fn(&ctx, module);
