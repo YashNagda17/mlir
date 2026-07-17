@@ -2798,7 +2798,7 @@ static bool operand_is_const_val(LowerCtx *L, MLIR_ValueHandle v, int64_t want) 
     return L->cm && cm_get(L->cm, v, &cv, &c64) && cv == want;
 }
 
-// Branch-condition fusion plan for a cf.cond_br terminator. tinyC lowers a
+// Branch-condition fusion plan for an llvm.cond_br terminator. tinyC lowers a
 // comparison condition as `icmp <pred>` -> `select(.,1,0)` -> `icmp ne(.,0)`
 // -> cond_br, ~10 instructions where `cmp; b.<cond>` suffices. We walk the
 // condition backward through the redundant boolean ops (each used exactly once
@@ -3270,7 +3270,7 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
         // is lowered cmp-only).
         FusePlan plan = { false, MLIR_INVALID_HANDLE, 0 };
         MLIR_OpHandle term0 = MLIR_GetBlockOp(sb, no - 1);
-        if (do_fuse && name_eq(MLIR_GetOpName(term0), "cf.cond_br") &&
+        if (do_fuse && name_eq(MLIR_GetOpName(term0), "llvm.cond_br") &&
             MLIR_GetOpNumOperands(term0) >= 1) {
             plan = analyze_cond_fusion(&L, term0, sb, &uc, &skip);
         }
@@ -3303,15 +3303,15 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
             emit_callee_saves(ctx, L.cur, saved_mask, save_base, true);
             emit_epilogue(ctx, L.cur, frame_size);
             emit_ret(ctx, L.cur);
-        } else if (name_eq(tn, "cf.br")) {
+        } else if (name_eq(tn, "llvm.br")) {
             emit_edge_copies(&L, term, 0);
             if (!L.ok) { free(src_blks); free(out_blks); return MLIR_INVALID_HANDLE; }
             MLIR_BlockHandle d = map_block(src_blks, out_blks, n_blocks,
                                            MLIR_GetOpSuccessor(term, 0));
             emit_b(ctx, L.cur, d);
-        } else if (name_eq(tn, "cf.cond_br")) {
+        } else if (name_eq(tn, "llvm.cond_br")) {
             if (MLIR_GetOpNumOperands(term) < 1) {
-                fprintf(stderr, "llvm->aarch64: cf.cond_br missing condition "
+                fprintf(stderr, "llvm->aarch64: llvm.cond_br missing condition "
                         "in '%.*s'\n", (int)sym.size, sym.str);
                 free(src_blks); free(out_blks);
                 return MLIR_INVALID_HANDLE;
