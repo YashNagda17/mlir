@@ -1122,10 +1122,8 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
              name_eq(name, "unrealized_conversion_cast"))
                                          ok = lower_unrealized_cast(st, op, parent, pos);
     else if (name_eq(name, "arith.constant")) ok = lower_arith_constant(st, op, parent, pos);
-    else if (name_eq(name, "arith.index_cast"))
-        ok = st->keep_scf ? false : lower_arith_index_cast(st, op, parent, pos, false);
-    else if (name_eq(name, "arith.index_castui")) 
-        ok = st->keep_scf ? false : lower_arith_index_cast(st, op, parent, pos, true);
+    else if (name_eq(name, "arith.index_cast")) ok = lower_arith_index_cast(st, op, parent, pos, false);
+    else if (name_eq(name, "arith.index_castui")) ok = lower_arith_index_cast(st, op, parent, pos, true);
     else if (name_eq(name, "arith.addi"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.add"),  OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.subi"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.sub"),  OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.muli"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.mul"),  OP_TYPE_UNREGISTERED);
