@@ -2668,7 +2668,66 @@ static bool cfg_lower_edge_arm(CfgCtx *C, CfgEdge edge,
     *out_flow = flow;
     return true;
 }
-// CFG driver skeleton: straight-line and forward branches only.
+static CfgFlow cfg_lower_cond_br(CfgCtx *C, MLIR_BlockHandle parent,
+                                 MLIR_OpHandle cbr,
+                                 const CfgStops *outer_stops) {
+    if (MLIR_GetOpNumOperands(cbr) != 1 ||
+        MLIR_GetOpNumSuccessors(cbr) != 2)
+        return CFG_FLOW_ERROR;
+    MLIR_ValueHandle cond;
+    if (!vmap_get(C->F, MLIR_GetOpOperand(cbr, 0), &cond))
+        return CFG_FLOW_ERROR;
+    MLIR_BlockHandle roots[2] = {
+        MLIR_GetOpSuccessor(cbr, 0), MLIR_GetOpSuccessor(cbr, 1)};
+    MLIR_BlockHandle merge = MLIR_INVALID_HANDLE;
+    bool have_merge = cfg_find_arm_merge(
+        C, parent, roots, 2, outer_stops, &merge);
+
+    // With no normal join, retain both terminating paths inside the if.  This
+    // covers early returns and else-if trees without treating return as merge.
+    if (!have_merge) {
+        MLIR_BlockHandle then_wasm, else_wasm;
+        CfgFlow tf, ef;
+        if (!cfg_lower_edge_arm(C, (CfgEdge){cbr, 0, roots[0]},
+                                outer_stops, &then_wasm, &tf) ||
+            !cfg_lower_edge_arm(C, (CfgEdge){cbr, 1, roots[1]},
+                                outer_stops, &else_wasm, &ef) ||
+            !emit_wasmssa_if(C->F, cond, then_wasm, else_wasm, true,
+                             NULL, 0, NULL))
+            return CFG_FLOW_ERROR;
+        return (tf == CFG_FLOW_STOP || ef == CFG_FLOW_STOP)
+            ? CFG_FLOW_STOP : CFG_FLOW_TERMINATED;
+    }
+
+    bool has_else = roots[0] == roots[1] || roots[1] != merge;
+    uint8_t *res_vts = NULL;
+    size_t n_res = 0;
+    if (!cfg_block_arg_vts(C, merge, &res_vts, &n_res))
+        return CFG_FLOW_ERROR;
+    // Preserve false-edge phi inputs instead of silently dropping them.
+    if (n_res && !has_else) has_else = true;
+    CfgStops arm_stops;
+    cfg_stops_with(&arm_stops, outer_stops, merge,
+                   CFG_STOP_BLOCK_RETURN, 0);
+    MLIR_BlockHandle then_wasm, else_wasm = MLIR_INVALID_HANDLE;
+    CfgFlow tf, ef;
+    if (!cfg_lower_edge_arm(C, (CfgEdge){cbr, 0, roots[0]},
+                            &arm_stops, &then_wasm, &tf))
+        return CFG_FLOW_ERROR;
+    if (has_else &&
+        !cfg_lower_edge_arm(C, (CfgEdge){cbr, 1, roots[1]},
+                            &arm_stops, &else_wasm, &ef))
+        return CFG_FLOW_ERROR;
+    MLIR_ValueHandle *results = n_res ? (MLIR_ValueHandle *)arena_alloc(
+        C->F->arena, n_res * sizeof(MLIR_ValueHandle)) : NULL;
+    if (!emit_wasmssa_if(C->F, cond, then_wasm, else_wasm, has_else,
+                         res_vts, n_res, results) ||
+        !cfg_map_results(C, merge, results, n_res))
+        return CFG_FLOW_ERROR;
+    return lower_block_cfg(C, merge, outer_stops);
+}
+// Classify the most specific llvm.br shapes first.  A generic forward branch
+// is only a fallthrough after loop and switch entry recognition have failed.
 static CfgFlow lower_block_cfg(CfgCtx *C, MLIR_BlockHandle blk,
                                const CfgStops *stops) {
     const CfgStop *entry_stop = cfg_find_stop(stops, blk);
@@ -2697,27 +2756,18 @@ static CfgFlow lower_block_cfg(CfgCtx *C, MLIR_BlockHandle blk,
         emit_unreachable(C->F);
         return CFG_FLOW_TERMINATED;
     }
+    if (name_eq(tn, "llvm.switch")) {
+        fprintf(stderr, "wasmssa-lower: llvm.switch not yet lowered\n");
+        return CFG_FLOW_ERROR;
+    }
+    if (name_eq(tn, "llvm.cond_br"))
+        return cfg_lower_cond_br(C, blk, term, stops);
     if (name_eq(tn, "llvm.br")) {
         if (MLIR_GetOpNumSuccessors(term) != 1)
             return CFG_FLOW_ERROR;
         MLIR_BlockHandle target = MLIR_GetOpSuccessor(term, 0);
         const CfgStop *stop = cfg_find_stop(stops, target);
         if (stop) return cfg_emit_stop_edge(C, term, 0, stop);
-        size_t ti = cfg_block_index(C, target);
-        if (ti == SIZE_MAX || ti <= bi) {
-            fprintf(stderr,
-                    "wasmssa-lower: block %zu has unrecognized llvm.br\n", bi);
-            return CFG_FLOW_ERROR;
-        }
-        if (!cfg_bind_edge(C, term, 0)) return CFG_FLOW_ERROR;
-        return lower_block_cfg(C, target, stops);
-    }
-    fprintf(stderr,
-            "wasmssa-lower: block %zu has unsupported terminator '%.*s'\n",
-            bi, (int)tn.size, tn.str);
-    return CFG_FLOW_ERROR;
-}
-
 
 // Lower a defined `llvm.func` into a `wasmssa.func` op appended to the
 // module body. The function's signature attrs are passed in (param_types
