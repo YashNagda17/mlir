@@ -2,8 +2,8 @@
 // dialects (func, arith, cf, scf, vector, memref) down to the `llvm`
 // dialect. Structured control flow (`scf.if`, `scf.while`,
 // `scf.index_switch`) becomes flat `llvm.br` / `llvm.cond_br` CFG here for
-// machine backends (aarch64, x64). The wasm pipeline keeps `scf.*` in place
-// (`MLIR_LowerToLLVMDialectForWasm`); wasmssa lowers structured CF directly.
+// every backend. The wasm pipeline reconstructs the same structured control
+// flow from these LLVM terminators in `mlir_llvm_to_wasmssa.c`.
 // Uses ONLY the public mlir_api.h surface — no upstream MLIR types — so
 // this same translation unit is linked into both the upstream-backed and
 // the native-backed builds.
@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <base/arena.h>
@@ -83,7 +84,6 @@ typedef struct LowerState {
     MLIR_Context *ctx;
     MLIR_OpHandle module;
     MLIR_BlockHandle module_body;
-    bool keep_scf;
 } LowerState;
 
 // -----------------------------------------------------------------------------
@@ -1088,7 +1088,6 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
                         MLIR_BlockHandle parent, size_t pos) {
     string name = MLIR_GetOpName(op);
     if (name_eq(name, "scf.if")) {
-        if (st->keep_scf) return LOWER_NONE;
         if (lower_scf_if(st, op, parent, pos)) {
             MLIR_EraseOp(st->ctx, op);
             return LOWER_DONE_BLOCK;
@@ -1096,7 +1095,6 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
         return LOWER_NONE;
     }
     if (name_eq(name, "scf.while")) {
-        if (st->keep_scf) return LOWER_NONE;
         if (lower_scf_while(st, op, parent, pos)) {
             MLIR_EraseOp(st->ctx, op);
             return LOWER_DONE_BLOCK;
@@ -1104,7 +1102,6 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
         return LOWER_NONE;
     }
     if (name_eq(name, "scf.index_switch")) {
-        if (st->keep_scf) return LOWER_NONE;
         if (lower_scf_index_switch(st, op, parent, pos)) {
             MLIR_EraseOp(st->ctx, op);
             return LOWER_DONE_BLOCK;
@@ -1154,8 +1151,8 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
     else if (name_eq(name, "arith.fptosi"))ok = lower_rename(st, op, parent, pos, str_lit("llvm.fptosi"), OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.fptoui"))ok = lower_rename(st, op, parent, pos, str_lit("llvm.fptoui"), OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.bitcast"))ok = lower_rename(st, op, parent, pos, str_lit("llvm.bitcast"),OP_TYPE_UNREGISTERED);
-    else if (name_eq(name, "cf.br"))      ok = st->keep_scf ? false : lower_cf_branch(st, op, parent, pos, str_lit("llvm.br"));
-    else if (name_eq(name, "cf.cond_br")) ok = st->keep_scf ? false : lower_cf_branch(st, op, parent, pos, str_lit("llvm.cond_br"));
+    else if (name_eq(name, "cf.br"))      ok = lower_cf_branch(st, op, parent, pos, str_lit("llvm.br"));
+    else if (name_eq(name, "cf.cond_br")) ok = lower_cf_branch(st, op, parent, pos, str_lit("llvm.cond_br"));
 
     return ok ? LOWER_REPLACED : LOWER_NONE;
 }
@@ -1198,6 +1195,29 @@ static void walk_block(LowerState *st, MLIR_BlockHandle block) {
     }
 }
 
+static bool verify_llvm_only_block(MLIR_BlockHandle block) {
+    size_t n = MLIR_GetBlockNumOps(block);
+    for (size_t i = 0; i < n; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(block, i);
+        string name = MLIR_GetOpName(op);
+        if (name.size < 5 || memcmp(name.str, "llvm.", 5) != 0) {
+            fprintf(stderr,
+                    "wasm-llvm-lower: non-LLVM operation remains: '%.*s'\n",
+                    (int)name.size, name.str);
+            return false;
+        }
+        for (size_t r = 0; r < MLIR_GetOpNumRegions(op); r++) {
+            MLIR_RegionHandle region = MLIR_GetOpRegion(op, r);
+            for (size_t b = 0; b < MLIR_GetRegionNumBlocks(region); b++) {
+                if (!verify_llvm_only_block(
+                        MLIR_GetRegionBlock(region, b)))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module) {
     if (module == MLIR_INVALID_HANDLE) return false;
     if (MLIR_GetOpNumRegions(module) == 0) return false;
@@ -1213,10 +1233,9 @@ bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module) {
     return true;
 }
 
-// Wasm-tailored lowering: lift cf.br / cf.cond_br into scf, then run the
-// regular LLVM-dialect lowering with `keep_scf = true` so structured
-// `scf.*` ops survive for mlir_llvm_to_wasmssa. cf->llvm.br rewrites are
-// skipped; any surviving cf op is a hard error caught by wasmssa-lower.
+// Wasm-tailored lowering first normalizes cf CFG into the structured forms
+// understood by this pass, then lowers those forms back to the canonical LLVM
+// CFG shapes consumed by the WasmSSA reconstructor.
 bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx, MLIR_OpHandle module) {
     if (module == MLIR_INVALID_HANDLE) return false;
     if (!MLIR_LiftCfToScf(ctx, module)) return false;
@@ -1228,8 +1247,7 @@ bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx, MLIR_OpHandle module) {
     st.ctx = ctx;
     st.module = module;
     st.module_body = MLIR_GetRegionBlock(body_region, 0);
-    st.keep_scf = true;
 
     walk_block(&st, st.module_body);
-    return true;
+    return verify_llvm_only_block(st.module_body);
 }
