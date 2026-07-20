@@ -2668,6 +2668,276 @@ static bool cfg_lower_edge_arm(CfgCtx *C, CfgEdge edge,
     *out_flow = flow;
     return true;
 }
+
+static bool cfg_emit_loop(FnCtx *F,
+                          MLIR_ValueHandle *init_vals, size_t n_iter,
+                          MLIR_BlockHandle loop_body,
+                          const uint8_t *res_vts, size_t n_res,
+                          MLIR_ValueHandle *out_results) {
+    MLIR_RegionHandle loop_r = MLIR_CreateRegion(F->ctx);
+    MLIR_AppendRegionBlock(F->ctx, loop_r, loop_body);
+    MLIR_OpHandle loop = make_op_n(F->ctx, OP_TYPE_WASMSSA_LOOP, NULL, 0,
+                                   init_vals, n_iter, &loop_r, 1,
+                                   NULL, 0, NULL);
+    MLIR_BlockHandle outer = MLIR_CreateBlock(F->ctx);
+    MLIR_AppendBlockOp(F->ctx, outer, loop);
+    MLIR_OpHandle unreach = make_op_n(
+        F->ctx, OP_TYPE_WASMSSA_UNREACHABLE, NULL, 0,
+        NULL, 0, NULL, 0, NULL, 0, NULL);
+    MLIR_AppendBlockOp(F->ctx, outer, unreach);
+    MLIR_RegionHandle block_r = MLIR_CreateRegion(F->ctx);
+    MLIR_AppendRegionBlock(F->ctx, block_r, outer);
+    MLIR_OpHandle block = make_op_n(
+        F->ctx, OP_TYPE_WASMSSA_BLOCK, NULL, 0,
+        NULL, 0, &block_r, 1, res_vts, n_res, out_results);
+    MLIR_AppendBlockOp(F->ctx, F->body_block, block);
+    return true;
+}
+
+typedef struct {
+    MLIR_BlockHandle header, condition, body, exit, cont;
+    MLIR_OpHandle header_cbr, exit_br;
+} CfgWhile;
+
+static bool cfg_has_edge_to(CfgCtx *C, MLIR_BlockHandle start,
+                            MLIR_BlockHandle target) {
+    size_t *dist = (size_t *)arena_alloc(
+        C->F->arena, C->n_blocks * sizeof(size_t));
+    if (!cfg_distances(C, start, NULL, dist)) return false;
+    size_t ti = cfg_block_index(C, target);
+    return ti != SIZE_MAX && dist[ti] != SIZE_MAX;
+}
+
+static size_t cfg_distance_to_avoiding(CfgCtx *C, MLIR_BlockHandle start,
+                                       MLIR_BlockHandle target,
+                                       MLIR_BlockHandle avoid) {
+    size_t si = cfg_block_index(C, start);
+    size_t ti = cfg_block_index(C, target);
+    size_t ai = cfg_block_index(C, avoid);
+    if (si == SIZE_MAX || ti == SIZE_MAX || ai == SIZE_MAX || si == ai)
+        return SIZE_MAX;
+    size_t *dist = (size_t *)arena_alloc(
+        C->F->arena, C->n_blocks * sizeof(size_t));
+    for (size_t i = 0; i < C->n_blocks; i++) dist[i] = SIZE_MAX;
+    size_t *queue = (size_t *)arena_alloc(
+        C->F->arena, C->n_blocks * sizeof(size_t));
+    size_t head = 0, tail = 0;
+    dist[si] = 0;
+    queue[tail++] = si;
+    while (head < tail) {
+        size_t bi = queue[head++];
+        MLIR_OpHandle term = cfg_terminator(C->blocks[bi]);
+        if (term == MLIR_INVALID_HANDLE) continue;
+        for (size_t s = 0; s < MLIR_GetOpNumSuccessors(term); s++) {
+            size_t ni = cfg_block_index(C, MLIR_GetOpSuccessor(term, s));
+            if (ni == ti) {
+                // The inverse lowering expects the yield/backedge emitted by
+                // scf.while, not a forward predecessor that happens to enter
+                // this block after traversing an enclosing cycle.
+                if (bi >= ti) return dist[bi] + 1;
+                continue;
+            }
+            if (ni == SIZE_MAX || ni == ai || dist[ni] != SIZE_MAX) continue;
+            dist[ni] = dist[bi] + 1;
+            queue[tail++] = ni;
+        }
+    }
+    return SIZE_MAX;
+}
+
+// Match the br/before-CFG/condition/body-CFG/exit-stub/continuation shape
+// emitted for scf.while.  The before and body regions may themselves contain
+// lowered scf.if operations, so the loop condition need not be the terminator
+// of the entry target.  Identify it by the exact condition-edge invariants:
+// the true edge can reach the header, the false edge cannot, and the false
+// edge goes through the phi-forwarding exit stub.
+static bool cfg_match_while(CfgCtx *C, MLIR_OpHandle entry_br, CfgWhile *W,
+                            const char **why) {
+    if (why) *why = "not a single-successor entry";
+    if (MLIR_GetOpNumSuccessors(entry_br) != 1) return false;
+    MLIR_BlockHandle header = MLIR_GetOpSuccessor(entry_br, 0);
+    size_t ni = MLIR_GetOpNumSuccessorOperands(entry_br, 0);
+    if (why) *why = "entry edge and header argument arities differ";
+    if (ni != MLIR_GetBlockNumArgs(header)) return false;
+    size_t hi = cfg_block_index(C, header);
+    if (hi == SIZE_MAX) return false;
+
+    if (why) *why = "no reachable structured loop condition";
+    size_t best_back_distance = SIZE_MAX;
+    CfgWhile best = {0};
+    for (size_t bi = hi; bi < C->n_blocks; bi++) {
+        MLIR_BlockHandle condition = C->blocks[bi];
+        if (!cfg_has_edge_to(C, header, condition)) continue;
+        MLIR_OpHandle cbr = cfg_terminator(condition);
+        if (cbr == MLIR_INVALID_HANDLE ||
+            !name_eq(MLIR_GetOpName(cbr), "llvm.cond_br") ||
+            MLIR_GetOpNumOperands(cbr) < 1 ||
+            MLIR_GetOpNumSuccessors(cbr) != 2)
+            continue;
+        MLIR_BlockHandle body = MLIR_GetOpSuccessor(cbr, 0);
+        MLIR_BlockHandle exit = MLIR_GetOpSuccessor(cbr, 1);
+        size_t back_distance = cfg_distance_to_avoiding(
+            C, body, header, exit);
+        if (back_distance == SIZE_MAX) continue;
+        MLIR_OpHandle exit_br = cfg_terminator(exit);
+        if (exit_br == MLIR_INVALID_HANDLE ||
+            MLIR_GetBlockNumOps(exit) != 1 ||
+            !name_eq(MLIR_GetOpName(exit_br), "llvm.br") ||
+            MLIR_GetOpNumSuccessors(exit_br) != 1)
+            continue;
+        MLIR_BlockHandle cont = MLIR_GetOpSuccessor(exit_br, 0);
+        size_t nt = MLIR_GetOpNumSuccessorOperands(cbr, 0);
+        size_t nf = MLIR_GetOpNumSuccessorOperands(cbr, 1);
+        size_t nx = MLIR_GetOpNumSuccessorOperands(exit_br, 0);
+        if (nt != MLIR_GetBlockNumArgs(body) ||
+            nf != MLIR_GetBlockNumArgs(exit) ||
+            nx != MLIR_GetBlockNumArgs(cont) ||
+            nt != nf || nf != nx)
+            continue;
+        bool same = true;
+        for (size_t i = 0; i < nt; i++) {
+            if (MLIR_GetOpSuccessorOperand(cbr, 0, i) !=
+                MLIR_GetOpSuccessorOperand(cbr, 1, i)) {
+                same = false;
+                break;
+            }
+        }
+        if (!same) continue;
+        if (back_distance < best_back_distance) {
+            best_back_distance = back_distance;
+            best = (CfgWhile){
+                header, condition, body, exit, cont, cbr, exit_br};
+        }
+    }
+    if (best_back_distance == SIZE_MAX) return false;
+    if (why) *why = NULL;
+    *W = best;
+    return true;
+}
+
+static CfgFlow cfg_lower_while(CfgCtx *C, MLIR_OpHandle entry_br,
+                               const CfgWhile *W,
+                               const CfgStops *outer_stops) {
+    FnCtx *F = C->F;
+    size_t hi = cfg_block_index(C, W->header);
+    size_t ei = cfg_block_index(C, W->exit);
+    if (hi == SIZE_MAX || ei == SIZE_MAX || C->state[hi] ||
+        C->state[ei])
+        return CFG_FLOW_ERROR;
+
+    MLIR_ValueHandle *inits = NULL;
+    size_t n_iter = 0;
+    if (!cfg_edge_values(C, entry_br, 0, &inits, &n_iter))
+        return CFG_FLOW_ERROR;
+    uint8_t *iter_vts = n_iter ? (uint8_t *)arena_alloc(F->arena, n_iter)
+                               : NULL;
+    for (size_t i = 0; i < n_iter; i++) {
+        iter_vts[i] = wasm_vt(F->ctx,
+            MLIR_GetValueType(MLIR_GetBlockArg(W->header, i)));
+        if (!iter_vts[i]) return CFG_FLOW_ERROR;
+    }
+    uint8_t *res_vts = NULL;
+    size_t n_res = 0;
+    if (!cfg_block_arg_vts(C, W->cont, &res_vts, &n_res))
+        return CFG_FLOW_ERROR;
+
+    MLIR_BlockHandle loop_body = make_block_with_args(
+        F->ctx, iter_vts, n_iter, NULL);
+    for (size_t i = 0; i < n_iter; i++)
+        vmap_set(F, MLIR_GetBlockArg(W->header, i),
+                 MLIR_GetBlockArg(loop_body, i));
+
+    MLIR_BlockHandle saved = F->body_block;
+    F->body_block = loop_body;
+
+    // Reconstruct any nested if/switch CFG in the scf.while before-region,
+    // but stop before consuming the rewritten scf.condition terminator.  The
+    // stop is emission-free: structured merges still map condition-block
+    // arguments, while a direct edge simply binds them.
+    CfgStops before_stops;
+    cfg_stops_with(&before_stops, outer_stops, W->condition,
+                   CFG_STOP_REACH, 0);
+    if (lower_block_cfg(C, W->header, &before_stops) != CFG_FLOW_STOP) {
+        fprintf(stderr,
+                "wasmssa-lower: function '%.*s' failed while lowering "
+                "the before-CFG for loop header %zu and condition %zu\n",
+                (int)F->fn_name.size, F->fn_name.str, hi,
+                cfg_block_index(C, W->condition));
+        F->body_block = saved;
+        return CFG_FLOW_ERROR;
+    }
+    size_t ci = cfg_block_index(C, W->condition);
+    if (ci == SIZE_MAX || C->state[ci]) {
+        fprintf(stderr,
+                "wasmssa-lower: loop condition block is already consumed\n");
+        F->body_block = saved;
+        return CFG_FLOW_ERROR;
+    }
+    C->state[ci] = 1;
+    size_t nc = MLIR_GetBlockNumOps(W->condition);
+    for (size_t i = 0; i + 1 < nc; i++) {
+        if (!lower_op(F, MLIR_GetBlockOp(W->condition, i))) {
+            fprintf(stderr,
+                    "wasmssa-lower: failed to lower a loop condition op\n");
+            F->body_block = saved;
+            return CFG_FLOW_ERROR;
+        }
+    }
+    C->state[ci] = 2;
+
+    MLIR_ValueHandle cond;
+    if (!vmap_get(F, MLIR_GetOpOperand(W->header_cbr, 0), &cond)) {
+        fprintf(stderr, "wasmssa-lower: loop condition is not mapped\n");
+        F->body_block = saved;
+        return CFG_FLOW_ERROR;
+    }
+    MLIR_ValueHandle exit_cond = emit_eqz(F, cond);
+    MLIR_ValueHandle *exit_vals = NULL;
+    size_t n_exit = 0;
+    if (!cfg_edge_values(C, W->header_cbr, 1, &exit_vals, &n_exit) ||
+        n_exit != n_res) {
+        fprintf(stderr,
+                "wasmssa-lower: loop exit values do not match results\n");
+        F->body_block = saved;
+        return CFG_FLOW_ERROR;
+    }
+    MLIR_BlockHandle exit_then = MLIR_CreateBlock(F->ctx);
+    F->body_block = exit_then;
+    emit_br_args(F, 2, exit_vals, n_exit);
+    F->body_block = loop_body;
+    if (!emit_wasmssa_if(F, exit_cond, exit_then, MLIR_INVALID_HANDLE,
+                         false, NULL, 0, NULL) ||
+        !cfg_bind_edge(C, W->header_cbr, 0)) {
+        fprintf(stderr,
+                "wasmssa-lower: failed to bind the loop body edge\n");
+        F->body_block = saved;
+        return CFG_FLOW_ERROR;
+    }
+    CfgStops header_stop, loop_stops;
+    cfg_stops_with(&header_stop, outer_stops, W->header, CFG_STOP_BR, 0);
+    cfg_stops_with(&loop_stops, &header_stop, W->exit, CFG_STOP_BR, 2);
+    CfgFlow body_flow = lower_block_cfg(C, W->body, &loop_stops);
+    F->body_block = saved;
+    if (body_flow == CFG_FLOW_ERROR) {
+        fprintf(stderr,
+                "wasmssa-lower: function '%.*s' failed while lowering "
+                "the body-CFG for loop header %zu\n",
+                (int)F->fn_name.size, F->fn_name.str, hi);
+        return CFG_FLOW_ERROR;
+    }
+
+    C->state[ei] = 2;  // consumed phi-forwarding stub
+    MLIR_ValueHandle *results = n_res ? (MLIR_ValueHandle *)arena_alloc(
+        F->arena, n_res * sizeof(MLIR_ValueHandle)) : NULL;
+    if (!cfg_emit_loop(F, inits, n_iter, loop_body,
+                       res_vts, n_res, results) ||
+        !cfg_map_results(C, W->cont, results, n_res)) {
+        fprintf(stderr,
+                "wasmssa-lower: failed to map structured loop results\n");
+        return CFG_FLOW_ERROR;
+    }
+    return lower_block_cfg(C, W->cont, outer_stops);
+}
 static CfgFlow cfg_lower_cond_br(CfgCtx *C, MLIR_BlockHandle parent,
                                  MLIR_OpHandle cbr,
                                  const CfgStops *outer_stops) {
@@ -2768,6 +3038,53 @@ static CfgFlow lower_block_cfg(CfgCtx *C, MLIR_BlockHandle blk,
         MLIR_BlockHandle target = MLIR_GetOpSuccessor(term, 0);
         const CfgStop *stop = cfg_find_stop(stops, target);
         if (stop) return cfg_emit_stop_edge(C, term, 0, stop);
+        CfgWhile W;
+        const char *while_why = NULL;
+        if (cfg_match_while(C, term, &W, &while_why))
+            return cfg_lower_while(C, term, &W, stops);
+        size_t ti = cfg_block_index(C, target);
+        if (ti == SIZE_MAX || ti <= bi) {
+            cfg_dump(C);
+            fprintf(stderr,
+                    "wasmssa-lower: function '%.*s' has unrecognized "
+                    "backward llvm.br from block %zu to block %zu (%s)\n",
+                    (int)C->F->fn_name.size, C->F->fn_name.str,
+                    bi, ti, while_why ? while_why : "not a while loop");
+            MLIR_OpHandle ht = cfg_terminator(target);
+            if (ht != MLIR_INVALID_HANDLE &&
+                name_eq(MLIR_GetOpName(ht), "llvm.cond_br") &&
+                MLIR_GetOpNumSuccessors(ht) == 2) {
+                MLIR_BlockHandle hb = MLIR_GetOpSuccessor(ht, 0);
+                MLIR_BlockHandle he = MLIR_GetOpSuccessor(ht, 1);
+                MLIR_OpHandle xe = cfg_terminator(he);
+                size_t nx = xe != MLIR_INVALID_HANDLE &&
+                            MLIR_GetOpNumSuccessors(xe) == 1
+                    ? MLIR_GetOpNumSuccessorOperands(xe, 0) : SIZE_MAX;
+                size_t nc = xe != MLIR_INVALID_HANDLE &&
+                            MLIR_GetOpNumSuccessors(xe) == 1
+                    ? MLIR_GetBlockNumArgs(MLIR_GetOpSuccessor(xe, 0))
+                    : SIZE_MAX;
+                fprintf(stderr,
+                        "wasmssa-lower: while candidate arities: "
+                        "entry=%zu/header=%zu, true=%zu/body=%zu, "
+                        "false=%zu/exit=%zu, exit=%zu/continuation=%zu\n",
+                        MLIR_GetOpNumSuccessorOperands(term, 0),
+                        MLIR_GetBlockNumArgs(target),
+                        MLIR_GetOpNumSuccessorOperands(ht, 0),
+                        MLIR_GetBlockNumArgs(hb),
+                        MLIR_GetOpNumSuccessorOperands(ht, 1),
+                        MLIR_GetBlockNumArgs(he), nx, nc);
+            }
+            return CFG_FLOW_ERROR;
+        }
+        if (!cfg_bind_edge(C, term, 0)) return CFG_FLOW_ERROR;
+        return lower_block_cfg(C, target, stops);
+    }
+    fprintf(stderr,
+            "wasmssa-lower: block %zu has unsupported terminator '%.*s'\n",
+            bi, (int)tn.size, tn.str);
+    return CFG_FLOW_ERROR;
+}
 
 // Lower a defined `llvm.func` into a `wasmssa.func` op appended to the
 // module body. The function's signature attrs are passed in (param_types
