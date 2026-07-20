@@ -2,8 +2,10 @@
 // LLVM-dialect builtin.module --(walk)--> wasmssa-form `builtin.module`.
 //
 // Each `llvm.func` / `llvm.mlir.global` is lowered directly to `wasmssa.*`
-// MLIR ops appended into the output module body. Inside a function, each
-// emit-helper / inline call site builds a stack-local `wasmssa_op_t`
+// MLIR ops appended into the output module body. Function bodies are walked
+// as flat LLVM CFG (llvm.br / llvm.cond_br) and reconstructed into
+// wasmssa.if / wasmssa.loop / switch trees. Straight-line ops use
+// emit-helper / inline call sites that build a stack-local `wasmssa_op_t`
 // describing one op and hands it to `commit_op`, which materializes the
 // matching MLIR op into the function's body block and returns the
 // MLIR_ValueHandle of its result. The per-function `vmap` then keys
@@ -556,14 +558,25 @@ static bool is_function_symbol(const ModCtx *m, const char *nm, size_t nlen) {
 static bool lower_op(FnCtx *F, MLIR_OpHandle op);
 static bool va_call_layout(FnCtx *F, MLIR_OpHandle op, uint32_t *total_size,
                            size_t *n_fixed, uint32_t *out_offsets);
-static bool lower_block(FnCtx *F, MLIR_BlockHandle blk);
-
 static MLIR_ValueHandle emit_eqz(FnCtx *F, MLIR_ValueHandle v) {
     MLIR_ValueHandle ops[1] = { v };
     wasmssa_op_t o = {0};
     o.type = OP_TYPE_WASMSSA_EQZ;
     o.valtype = WT_I32;
     o.n_operands = 1;
+    o.operands = ops;
+    o.has_result = true;
+    return commit_op(F, &o);
+}
+
+static MLIR_ValueHandle emit_i32_eq(FnCtx *F, MLIR_ValueHandle a,
+                                    MLIR_ValueHandle b) {
+    MLIR_ValueHandle ops[2] = { a, b };
+    wasmssa_op_t o = {0};
+    o.type = OP_TYPE_WASMSSA_BINOP;
+    o.valtype = WT_I32;
+    o.wasm_opcode = 0x46;  // i32.eq
+    o.n_operands = 2;
     o.operands = ops;
     o.has_result = true;
     return commit_op(F, &o);
@@ -659,7 +672,7 @@ static MLIR_BlockHandle make_block_with_args(MLIR_Context *ctx,
 }
 
 // Build a `wasmssa.if (%cond) : (R*)` op with pre-lowered then/else wasmssa
-// blocks. Shared by the scf.if and llvm.cond_br lowering paths.
+// blocks (used by LLVM CFG if and switch lowering).
 static bool emit_wasmssa_if(FnCtx *F, MLIR_ValueHandle cond_wasm,
                             MLIR_BlockHandle then_wasm,
                             MLIR_BlockHandle else_wasm,
@@ -690,415 +703,6 @@ static bool emit_wasmssa_if(FnCtx *F, MLIR_ValueHandle cond_wasm,
     return true;
 }
 
-// ---- scf.if ----------------------------------------------------------------
-// Block-arg form: build a `wasmssa.if (%cond) : (R*)` op with two regions,
-// each terminated by `wasmssa.block_return (yield_vals:R*)`. scf.if results
-// map 1:1 to the wasmssa.if's results.
-static bool lower_scf_if(FnCtx *F, MLIR_OpHandle op) {
-    if (MLIR_GetOpNumOperands(op) != 1) return false;
-    MLIR_ValueHandle cond_v = MLIR_GetOpOperand(op, 0);
-    MLIR_ValueHandle cond_idx;
-    if (!vmap_get(F, cond_v, &cond_idx)) return false;
-
-    size_t n_res = MLIR_GetOpNumResults(op);
-    uint8_t *res_vts = NULL;
-    if (n_res) {
-        res_vts = (uint8_t *)arena_alloc(F->arena, n_res);
-        for (size_t i = 0; i < n_res; i++) {
-            uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(MLIR_GetOpResult(op, i)));
-            if (vt == 0) return false;
-            res_vts[i] = vt;
-        }
-    }
-
-    if (MLIR_GetOpNumRegions(op) < 1) return false;
-    MLIR_RegionHandle src_then = MLIR_GetOpRegion(op, 0);
-    if (MLIR_GetRegionNumBlocks(src_then) != 1) return false;
-    bool has_else = MLIR_GetOpNumRegions(op) >= 2 &&
-                    MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 1)) > 0;
-    if (n_res && !has_else) return false;  // result-bearing scf.if needs else
-
-    // Save outer body; walk each scf.if region into a fresh wasmssa block.
-    MLIR_BlockHandle saved = F->body_block;
-
-    // --- then-region ---
-    MLIR_BlockHandle then_blk = MLIR_CreateBlock(F->ctx);
-    F->body_block = then_blk;
-    bool ok = lower_block(F, MLIR_GetRegionBlock(src_then, 0));
-    if (!ok) { F->body_block = saved; return false; }
-
-    // --- else-region (may be empty) ---
-    MLIR_BlockHandle else_blk = MLIR_INVALID_HANDLE;
-    if (has_else) {
-        else_blk = MLIR_CreateBlock(F->ctx);
-        F->body_block = else_blk;
-        ok = lower_block(F, MLIR_GetRegionBlock(MLIR_GetOpRegion(op, 1), 0));
-        if (!ok) { F->body_block = saved; return false; }
-    }
-    F->body_block = saved;
-
-    MLIR_ValueHandle res_vals_inline[16];
-    MLIR_ValueHandle *res_vals = n_res <= 16 ? res_vals_inline
-        : (MLIR_ValueHandle *)arena_alloc(F->arena, n_res * sizeof(MLIR_ValueHandle));
-    if (!emit_wasmssa_if(F, cond_idx, then_blk, else_blk, has_else,
-                         res_vts, n_res, res_vals)) {
-        return false;
-    }
-
-    for (size_t i = 0; i < n_res; i++) {
-        vmap_set(F, MLIR_GetOpResult(op, i), res_vals[i]);
-    }
-    return true;
-}
-
-// ---- scf.while -------------------------------------------------------------
-// General shape (with iter args / results):
-//   %res:R = scf.while (%a:T = %init:T) : (T...) -> (R...) {
-//     ^before(%a:T...): ...; scf.condition(%cond) %r:R...
-//   } do {
-//     ^after(%b:R...): ...; scf.yield %y:T...
-//   }
-//
-// Lowered to (block-arg form):
-//   %res:R* = wasmssa.block () : (R*) {
-//     wasmssa.loop (%init:T*) : () {
-//     ^entry(%t:T*):                                ; bound to %a in before
-//       <before-body>
-//       wasmssa.if (eqz_cond) : () {
-//         wasmssa.br {depth=2} (r:R*)               ; exit outer block
-//       }                                            ; (no else)
-//       ; fall through if cond was true.
-//       <after-body>                                 ; uses r as %b
-//       wasmssa.br {depth=0} (y:T*)                  ; back-edge
-//     }
-//     wasmssa.unreachable
-//   }
-static bool lower_scf_while(FnCtx *F, MLIR_OpHandle op) {
-    if (MLIR_GetOpNumRegions(op) < 2) return false;
-    MLIR_RegionHandle before_r = MLIR_GetOpRegion(op, 0);
-    MLIR_RegionHandle after_r  = MLIR_GetOpRegion(op, 1);
-    if (MLIR_GetRegionNumBlocks(before_r) != 1) return false;
-    if (MLIR_GetRegionNumBlocks(after_r)  != 1) return false;
-    MLIR_BlockHandle before_b = MLIR_GetRegionBlock(before_r, 0);
-    MLIR_BlockHandle after_b  = MLIR_GetRegionBlock(after_r, 0);
-
-    size_t n_iter = MLIR_GetOpNumOperands(op);
-    size_t n_res  = MLIR_GetOpNumResults(op);
-
-    if (n_iter != MLIR_GetBlockNumArgs(before_b)) return false;
-    if (n_res  != MLIR_GetBlockNumArgs(after_b))  return false;
-
-    // Collect iter (T*) and result (R*) wasm valtypes.
-    uint8_t *iter_vts = NULL;
-    if (n_iter) {
-        iter_vts = (uint8_t *)arena_alloc(F->arena, n_iter);
-        for (size_t i = 0; i < n_iter; i++) {
-            uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(MLIR_GetOpOperand(op, i)));
-            if (vt == 0) return false;
-            iter_vts[i] = vt;
-        }
-    }
-    uint8_t *res_vts = NULL;
-    if (n_res) {
-        res_vts = (uint8_t *)arena_alloc(F->arena, n_res);
-        for (size_t i = 0; i < n_res; i++) {
-            uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(MLIR_GetOpResult(op, i)));
-            if (vt == 0) return false;
-            res_vts[i] = vt;
-        }
-    }
-
-    // Resolve init operands in the outer scope.
-    MLIR_ValueHandle *init_vals = NULL;
-    if (n_iter) {
-        init_vals = (MLIR_ValueHandle *)arena_alloc(F->arena, n_iter * sizeof(MLIR_ValueHandle));
-        for (size_t i = 0; i < n_iter; i++) {
-            if (!vmap_get(F, MLIR_GetOpOperand(op, i), &init_vals[i])) return false;
-        }
-    }
-
-    // Build the loop body block with entry block args = T*; bind before-region's
-    // block args to these so the before-body sees them as %a:T*.
-    MLIR_BlockHandle loop_body = MLIR_CreateBlock(F->ctx);
-    for (size_t i = 0; i < n_iter; i++) {
-        MLIR_TypeHandle ty = vt_to_type(F->ctx, iter_vts[i]);
-        MLIR_ValueHandle a = MLIR_CreateValueBlockArg(F->ctx, (string){0}, (uint32_t)i, ty,
-                                                     MLIR_CreateLocationUnknown(F->ctx, (string){0}));
-        MLIR_AppendBlockArg(F->ctx, loop_body, a);
-        vmap_set(F, MLIR_GetBlockArg(before_b, i), a);
-    }
-
-    MLIR_BlockHandle saved = F->body_block;
-    F->body_block = loop_body;
-
-    // Walk before-block ops. scf.condition (which must be the terminator)
-    // triggers emission of the exit-if + after-body walk in the same loop_body.
-    size_t nb = MLIR_GetBlockNumOps(before_b);
-    bool saw_cond = false;
-    for (size_t i = 0; i < nb; i++) {
-        MLIR_OpHandle bop = MLIR_GetBlockOp(before_b, i);
-        string n = MLIR_GetOpName(bop);
-        if (name_eq(n, "scf.condition")) {
-            saw_cond = true;
-            if (MLIR_GetOpNumOperands(bop) < 1) { F->body_block = saved; return false; }
-            if (MLIR_GetOpNumOperands(bop) - 1 != n_res) { F->body_block = saved; return false; }
-
-            MLIR_ValueHandle cidx;
-            if (!vmap_get(F, MLIR_GetOpOperand(bop, 0), &cidx)) { F->body_block = saved; return false; }
-            MLIR_ValueHandle z = emit_eqz(F, cidx);
-
-            // Resolve the scf.condition payload values in the loop_body scope.
-            MLIR_ValueHandle r_vals_inline[16];
-            MLIR_ValueHandle *r_vals = n_res <= 16 ? r_vals_inline
-                : (MLIR_ValueHandle *)arena_alloc(F->arena, n_res * sizeof(MLIR_ValueHandle));
-            for (size_t k = 0; k < n_res; k++) {
-                if (!vmap_get(F, MLIR_GetOpOperand(bop, k + 1), &r_vals[k])) {
-                    F->body_block = saved; return false;
-                }
-            }
-
-            // Build the exit-if: wasmssa.if (z) : () { wasmssa.br {depth=2} (r_vals) }.
-            MLIR_BlockHandle then_blk = MLIR_CreateBlock(F->ctx);
-            F->body_block = then_blk;
-            emit_br_args(F, /*depth*/2, r_vals, n_res);
-            F->body_block = loop_body;
-
-            MLIR_RegionHandle then_r2 = MLIR_CreateRegion(F->ctx);
-            MLIR_AppendRegionBlock(F->ctx, then_r2, then_blk);
-            MLIR_RegionHandle regs[1] = { then_r2 };
-            MLIR_ValueHandle cond_ops[1] = { z };
-            MLIR_OpHandle ifop = make_op_n(F->ctx, OP_TYPE_WASMSSA_IF, NULL, 0,
-                                           cond_ops, 1, regs, 1,
-                                           NULL, 0, NULL);
-            MLIR_AppendBlockOp(F->ctx, F->body_block, ifop);
-
-            // Bind after-region's block args to the scf.condition payload.
-            for (size_t k = 0; k < n_res; k++) {
-                vmap_set(F, MLIR_GetBlockArg(after_b, k), r_vals[k]);
-            }
-
-            // Walk after-region ops; scf.yield becomes the back-edge.
-            size_t na = MLIR_GetBlockNumOps(after_b);
-            bool saw_yield = false;
-            for (size_t j = 0; j < na; j++) {
-                MLIR_OpHandle aop = MLIR_GetBlockOp(after_b, j);
-                string an = MLIR_GetOpName(aop);
-                if (name_eq(an, "scf.yield")) {
-                    saw_yield = true;
-                    if (MLIR_GetOpNumOperands(aop) != n_iter) { F->body_block = saved; return false; }
-                    MLIR_ValueHandle y_vals_inline[16];
-                    MLIR_ValueHandle *y_vals = n_iter <= 16 ? y_vals_inline
-                        : (MLIR_ValueHandle *)arena_alloc(F->arena, n_iter * sizeof(MLIR_ValueHandle));
-                    for (size_t k = 0; k < n_iter; k++) {
-                        if (!vmap_get(F, MLIR_GetOpOperand(aop, k), &y_vals[k])) {
-                            F->body_block = saved; return false;
-                        }
-                    }
-                    emit_br_args(F, /*depth*/0, y_vals, n_iter);
-                } else {
-                    if (!lower_op(F, aop)) { F->body_block = saved; return false; }
-                }
-            }
-            if (!saw_yield && n_iter) { F->body_block = saved; return false; }
-            break;  // scf.condition is the terminator of before-region.
-        } else {
-            if (!lower_op(F, bop)) { F->body_block = saved; return false; }
-        }
-    }
-    if (!saw_cond) { F->body_block = saved; return false; }
-    F->body_block = saved;
-
-    // Build the wasmssa.loop op (no results; never falls through).
-    MLIR_RegionHandle loop_r = MLIR_CreateRegion(F->ctx);
-    MLIR_AppendRegionBlock(F->ctx, loop_r, loop_body);
-    MLIR_OpHandle loop_op = make_op_n(F->ctx, OP_TYPE_WASMSSA_LOOP, NULL, 0,
-                                      init_vals, n_iter, &loop_r, 1,
-                                      NULL, 0, NULL);
-
-    // Build the outer wasmssa.block containing [loop_op; wasmssa.unreachable].
-    MLIR_BlockHandle outer_blk = MLIR_CreateBlock(F->ctx);
-    MLIR_AppendBlockOp(F->ctx, outer_blk, loop_op);
-    {
-        MLIR_OpHandle u = make_op_n(F->ctx, OP_TYPE_WASMSSA_UNREACHABLE, NULL, 0,
-                                    NULL, 0, NULL, 0, NULL, 0, NULL);
-        MLIR_AppendBlockOp(F->ctx, outer_blk, u);
-    }
-    MLIR_RegionHandle block_r = MLIR_CreateRegion(F->ctx);
-    MLIR_AppendRegionBlock(F->ctx, block_r, outer_blk);
-    MLIR_ValueHandle block_res_inline[16];
-    MLIR_ValueHandle *block_res_vals = n_res <= 16 ? block_res_inline
-        : (MLIR_ValueHandle *)arena_alloc(F->arena, n_res * sizeof(MLIR_ValueHandle));
-    MLIR_OpHandle block_op = make_op_n(F->ctx, OP_TYPE_WASMSSA_BLOCK, NULL, 0,
-                                       NULL, 0, &block_r, 1,
-                                       res_vts, n_res, block_res_vals);
-    MLIR_AppendBlockOp(F->ctx, F->body_block, block_op);
-
-    for (size_t i = 0; i < n_res; i++) {
-        vmap_set(F, MLIR_GetOpResult(op, i), block_res_vals[i]);
-    }
-    return true;
-}
-
-// ---- scf.index_switch ------------------------------------------------------
-// Lowered as a chain of `wasmssa.if (cond==case_i) : (R*) { case_body }
-// else { recurse }` — innermost else holds the default region. Results
-// propagate via block_return up the chain.
-static MLIR_ValueHandle emit_i32_eq(FnCtx *F, MLIR_ValueHandle a, MLIR_ValueHandle b) {
-    MLIR_ValueHandle ops[2] = { a, b };
-    wasmssa_op_t o = {0};
-    o.type = OP_TYPE_WASMSSA_BINOP;
-    o.valtype = WT_I32;
-    o.wasm_opcode = 0x46;  // i32.eq
-    o.n_operands = 2;
-    o.operands = ops;
-    o.has_result = true;
-    return commit_op(F, &o);
-}
-
-// Recursively build the case chain. The wasmssa.if op for case `i` is
-// appended to F->body_block; its R* results are copied into *out_res.
-static bool isw_build_chain(FnCtx *F, MLIR_OpHandle op,
-                            size_t i, size_t n_cases,
-                            const int64_t *case_vals,
-                            MLIR_ValueHandle cond_idx,
-                            size_t n_res, const uint8_t *res_vts,
-                            MLIR_ValueHandle *out_res /* size n_res */) {
-    MLIR_ValueHandle kc = emit_const_i32(F, (int32_t)case_vals[i]);
-    MLIR_ValueHandle cmp = emit_i32_eq(F, cond_idx, kc);
-
-    MLIR_BlockHandle saved = F->body_block;
-
-    // then = case i body.
-    MLIR_BlockHandle then_blk = MLIR_CreateBlock(F->ctx);
-    F->body_block = then_blk;
-    bool ok = lower_block(F, MLIR_GetRegionBlock(MLIR_GetOpRegion(op, i + 1), 0));
-    if (!ok) { F->body_block = saved; return false; }
-
-    // else = inner chain or default region.
-    MLIR_BlockHandle else_blk = MLIR_CreateBlock(F->ctx);
-    F->body_block = else_blk;
-    if (i + 1 == n_cases) {
-        ok = lower_block(F, MLIR_GetRegionBlock(MLIR_GetOpRegion(op, 0), 0));
-        if (!ok) { F->body_block = saved; return false; }
-    } else {
-        MLIR_ValueHandle inner_inline[16];
-        MLIR_ValueHandle *inner_res = n_res <= 16 ? inner_inline
-            : (MLIR_ValueHandle *)arena_alloc(F->arena, n_res * sizeof(MLIR_ValueHandle));
-        if (!isw_build_chain(F, op, i + 1, n_cases, case_vals, cond_idx,
-                             n_res, res_vts, inner_res)) {
-            F->body_block = saved; return false;
-        }
-        emit_block_return(F, inner_res, n_res);
-    }
-
-    F->body_block = saved;
-
-    MLIR_RegionHandle then_r = MLIR_CreateRegion(F->ctx);
-    MLIR_AppendRegionBlock(F->ctx, then_r, then_blk);
-    MLIR_RegionHandle else_r = MLIR_CreateRegion(F->ctx);
-    MLIR_AppendRegionBlock(F->ctx, else_r, else_blk);
-    MLIR_RegionHandle regs[2] = { then_r, else_r };
-
-    MLIR_AttributeHandle as[1];
-    size_t nas = 0;
-    if (n_res) as[nas++] = attr_s_hex(F->ctx, F->arena, "result_types", res_vts, n_res);
-    MLIR_ValueHandle cond_ops[1] = { cmp };
-    MLIR_ValueHandle res_inline[16];
-    MLIR_ValueHandle *res_vals = n_res <= 16 ? res_inline
-        : (MLIR_ValueHandle *)arena_alloc(F->arena, n_res * sizeof(MLIR_ValueHandle));
-    MLIR_OpHandle ifop = make_op_n(F->ctx, OP_TYPE_WASMSSA_IF, as, nas,
-                                   cond_ops, 1, regs, 2,
-                                   res_vts, n_res, res_vals);
-    MLIR_AppendBlockOp(F->ctx, F->body_block, ifop);
-    for (size_t k = 0; k < n_res; k++) out_res[k] = res_vals[k];
-    return true;
-}
-
-static bool lower_scf_index_switch(FnCtx *F, MLIR_OpHandle op) {
-    if (MLIR_GetOpNumOperands(op) != 1) return false;
-    MLIR_ValueHandle cond_v = MLIR_GetOpOperand(op, 0);
-    MLIR_ValueHandle cond_idx;
-    if (!vmap_get(F, cond_v, &cond_idx)) return false;
-    if (wasm_vt(F->ctx, MLIR_GetValueType(cond_v)) != WT_I32) return false;
-
-    size_t n_regions = MLIR_GetOpNumRegions(op);
-    if (n_regions < 1) return false;
-    size_t n_cases = n_regions - 1;  // region 0 = default
-
-    // Parse "cases" attribute: prints as "array<i64: 1, 2, 3>".
-    int64_t *case_vals = NULL;
-    if (n_cases > 0) {
-        MLIR_AttributeHandle ca = find_attr(op, "cases");
-        if (ca == MLIR_INVALID_HANDLE) return false;
-        string cs = MLIR_GetAttributeAsString(F->ctx, ca);
-        case_vals = (int64_t *)arena_alloc(F->arena, n_cases * sizeof(int64_t));
-        size_t p = 0;
-        while (p < cs.size && cs.str[p] != ':') p++;
-        if (p < cs.size) p++;
-        size_t n_parsed = 0;
-        while (p < cs.size && n_parsed < n_cases) {
-            while (p < cs.size && (cs.str[p] == ' ' || cs.str[p] == ',')) p++;
-            if (p >= cs.size || cs.str[p] == '>') break;
-            int64_t sign = 1;
-            if (cs.str[p] == '-') { sign = -1; p++; }
-            int64_t v = 0;
-            while (p < cs.size && cs.str[p] >= '0' && cs.str[p] <= '9') {
-                v = v * 10 + (cs.str[p] - '0');
-                p++;
-            }
-            case_vals[n_parsed++] = sign * v;
-        }
-        if (n_parsed != n_cases) return false;
-    }
-
-    // Collect result types.
-    size_t n_res = MLIR_GetOpNumResults(op);
-    uint8_t *res_vts = NULL;
-    if (n_res) {
-        res_vts = (uint8_t *)arena_alloc(F->arena, n_res);
-        for (size_t i = 0; i < n_res; i++) {
-            uint8_t vt = wasm_vt(F->ctx, MLIR_GetValueType(MLIR_GetOpResult(op, i)));
-            if (vt == 0) return false;
-            res_vts[i] = vt;
-        }
-    }
-
-    // Degenerate: no cases. Wrap default in a wasmssa.block.
-    if (n_cases == 0) {
-        MLIR_BlockHandle saved = F->body_block;
-        MLIR_BlockHandle inner = MLIR_CreateBlock(F->ctx);
-        F->body_block = inner;
-        bool ok = lower_block(F, MLIR_GetRegionBlock(MLIR_GetOpRegion(op, 0), 0));
-        F->body_block = saved;
-        if (!ok) return false;
-
-        MLIR_RegionHandle reg = MLIR_CreateRegion(F->ctx);
-        MLIR_AppendRegionBlock(F->ctx, reg, inner);
-        MLIR_AttributeHandle as[1];
-        size_t nas = 0;
-        if (n_res) as[nas++] = attr_s_hex(F->ctx, F->arena, "result_types", res_vts, n_res);
-        MLIR_ValueHandle res_inline[16];
-        MLIR_ValueHandle *res_vals = n_res <= 16 ? res_inline
-            : (MLIR_ValueHandle *)arena_alloc(F->arena, n_res * sizeof(MLIR_ValueHandle));
-        MLIR_OpHandle bop = make_op_n(F->ctx, OP_TYPE_WASMSSA_BLOCK, as, nas,
-                                      NULL, 0, &reg, 1, res_vts, n_res, res_vals);
-        MLIR_AppendBlockOp(F->ctx, F->body_block, bop);
-        for (size_t i = 0; i < n_res; i++) {
-            vmap_set(F, MLIR_GetOpResult(op, i), res_vals[i]);
-        }
-        return true;
-    }
-
-    MLIR_ValueHandle outer_inline[16];
-    MLIR_ValueHandle *res_vals = n_res <= 16 ? outer_inline
-        : (MLIR_ValueHandle *)arena_alloc(F->arena, n_res * sizeof(MLIR_ValueHandle));
-    if (!isw_build_chain(F, op, 0, n_cases, case_vals, cond_idx,
-                         n_res, res_vts, res_vals)) return false;
-    for (size_t i = 0; i < n_res; i++) {
-        vmap_set(F, MLIR_GetOpResult(op, i), res_vals[i]);
-    }
-    return true;
-}
 
 static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op);
 static bool lower_op(FnCtx *F, MLIR_OpHandle op) {
@@ -1113,24 +717,12 @@ static bool lower_op(FnCtx *F, MLIR_OpHandle op) {
 static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
     string name = MLIR_GetOpName(op);
 
-    // ---- scf.if / scf.while / scf.index_switch ---------------------------
-    if (name_eq(name, "scf.if"))    return lower_scf_if(F, op);
-    if (name_eq(name, "scf.while")) return lower_scf_while(F, op);
-    if (name_eq(name, "scf.index_switch")) return lower_scf_index_switch(F, op);
-
-    // ---- scf.yield: emit wasmssa.block_return into the enclosing region's
-    //                 block. The enclosing scf.if / scf.index_switch / scf.while
-    //                 lowering has already set F->body_block to the right block.
-    if (name_eq(name, "scf.yield")) {
-        size_t no = MLIR_GetOpNumOperands(op);
-        MLIR_ValueHandle vs_inline[16];
-        MLIR_ValueHandle *vs = no <= 16 ? vs_inline
-            : (MLIR_ValueHandle *)arena_alloc(F->arena, no * sizeof(MLIR_ValueHandle));
-        for (size_t i = 0; i < no; i++) {
-            if (!vmap_get(F, MLIR_GetOpOperand(op, i), &vs[i])) return false;
-        }
-        emit_block_return(F, vs, no);
-        return true;
+    if (name.size >= 4 && memcmp(name.str, "scf.", 4) == 0) {
+        fprintf(stderr,
+                "wasmssa-lower: '%.*s' should have been lowered to LLVM "
+                "before wasmssa\n",
+                (int)name.size, name.str);
+        return false;
     }
 
     // ---- llvm.select -----------------------------------------------------
@@ -2312,14 +1904,6 @@ static bool prewalk_func(FnCtx *F, MLIR_RegionHandle body) {
     return true;
 }
 
-static bool lower_block(FnCtx *F, MLIR_BlockHandle blk) {
-    size_t nops = MLIR_GetBlockNumOps(blk);
-    for (size_t i = 0; i < nops; i++) {
-        if (!lower_op(F, MLIR_GetBlockOp(blk, i))) return false;
-    }
-    return true;
-}
-
 // =============================================================================
 // LLVM CFG lowering.
 //
@@ -2732,8 +2316,8 @@ static size_t cfg_distance_to_avoiding(CfgCtx *C, MLIR_BlockHandle start,
             size_t ni = cfg_block_index(C, MLIR_GetOpSuccessor(term, s));
             if (ni == ti) {
                 // The inverse lowering expects the yield/backedge emitted by
-                // scf.while, not a forward predecessor that happens to enter
-                // this block after traversing an enclosing cycle.
+                // the while back-edge, not a forward predecessor that happens
+                // to enter this block after traversing an enclosing cycle.
                 if (bi >= ti) return dist[bi] + 1;
                 continue;
             }
@@ -2745,10 +2329,10 @@ static size_t cfg_distance_to_avoiding(CfgCtx *C, MLIR_BlockHandle start,
     return SIZE_MAX;
 }
 
-// Match the br/before-CFG/condition/body-CFG/exit-stub/continuation shape
-// emitted for scf.while.  The before and body regions may themselves contain
-// lowered scf.if operations, so the loop condition need not be the terminator
-// of the entry target.  Identify it by the exact condition-edge invariants:
+// Match the br/header/body/exit-stub/continuation shape emitted by
+// mlir_lower_to_llvm.c's lower_scf_while.  The header and body regions may
+// contain nested lowered ifs, so the loop condition need not be the
+// terminator of the entry target.  Identify it by the exact condition-edge
 // the true edge can reach the header, the false edge cannot, and the false
 // edge goes through the phi-forwarding exit stub.
 static bool cfg_match_while(CfgCtx *C, MLIR_OpHandle entry_br, CfgWhile *W,
@@ -2850,10 +2434,9 @@ static CfgFlow cfg_lower_while(CfgCtx *C, MLIR_OpHandle entry_br,
     MLIR_BlockHandle saved = F->body_block;
     F->body_block = loop_body;
 
-    // Reconstruct any nested if/switch CFG in the scf.while before-region,
-    // but stop before consuming the rewritten scf.condition terminator.  The
-    // stop is emission-free: structured merges still map condition-block
-    // arguments, while a direct edge simply binds them.
+    // Reconstruct nested if/switch CFG in the loop header region, but stop
+    // before consuming the loop condition llvm.cond_br.  CFG_STOP_REACH binds
+    // condition-block phis without emitting ops.
     CfgStops before_stops;
     cfg_stops_with(&before_stops, outer_stops, W->condition,
                    CFG_STOP_REACH, 0);
@@ -3119,7 +2702,8 @@ static CfgFlow cfg_lower_llvm_switch(CfgCtx *C, MLIR_BlockHandle parent,
         merge, outer_stops, merge);
 }
 
-// Recognize one compare-chain step emitted by lower_scf_index_switch:
+// Recognize one compare-chain step emitted by mlir_lower_to_llvm.c's
+// lower_scf_index_switch:
 // constant, icmp eq selector/constant, cond_br case/next.
 static bool cfg_match_switch_step(CfgCtx *C, MLIR_BlockHandle blk,
                                   MLIR_ValueHandle expected_selector,
@@ -3453,13 +3037,7 @@ static bool lower_function(MLIR_Context *ctx, Arena *arena, ModCtx *mod,
         F.sp_value = sp_new;
     }
 
-    size_t n_blocks = MLIR_GetRegionNumBlocks(body);
-    if (n_blocks == 1) {
-        size_t nops = MLIR_GetBlockNumOps(entry);
-        for (size_t i = 0; i < nops; i++) {
-            if (!lower_op(&F, MLIR_GetBlockOp(entry, i))) goto fail;
-        }
-    } else {
+    {
         CfgCtx C;
         CfgStops stops = {0};
         if (!cfg_init(&C, &F, body)) goto fail;
