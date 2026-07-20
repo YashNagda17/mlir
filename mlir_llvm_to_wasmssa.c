@@ -2938,6 +2938,307 @@ static CfgFlow cfg_lower_while(CfgCtx *C, MLIR_OpHandle entry_br,
     }
     return lower_block_cfg(C, W->cont, outer_stops);
 }
+
+// Accept native array<iN: ...> and upstream dense<[...]> spellings without
+// consuming digits from the element type.
+static bool cfg_parse_case_values(CfgCtx *C, MLIR_OpHandle op,
+                                  size_t n, int64_t *out) {
+    if (n == 0) return true;
+    MLIR_AttributeHandle a = find_attr(op, "case_values");
+    if (a == MLIR_INVALID_HANDLE) return false;
+    string s = MLIR_GetAttributeAsString(C->F->ctx, a);
+    size_t begin = 0, end = s.size;
+    for (size_t i = 0; i + 6 <= s.size; i++) {
+        if (memcmp(s.str + i, "array<", 6) == 0) {
+            begin = i + 6;
+            while (begin < s.size && s.str[begin] != ':') begin++;
+            if (begin < s.size) begin++;
+            end = begin;
+            while (end < s.size && s.str[end] != '>') end++;
+            break;
+        }
+        if (memcmp(s.str + i, "dense<", 6) == 0) {
+            begin = i + 6;
+            end = begin;
+            while (end < s.size && s.str[end] != '>') end++;
+            break;
+        }
+    }
+    size_t p = begin, got = 0;
+    while (p < end && got < n) {
+        while (p < end && !((s.str[p] >= '0' && s.str[p] <= '9') ||
+                            s.str[p] == '-')) p++;
+        if (p == end) break;
+        int64_t sign = 1;
+        if (s.str[p] == '-') { sign = -1; p++; }
+        if (p == end || s.str[p] < '0' || s.str[p] > '9') return false;
+        int64_t v = 0;
+        while (p < end && s.str[p] >= '0' && s.str[p] <= '9')
+            v = v * 10 + (s.str[p++] - '0');
+        out[got++] = sign * v;
+    }
+    return got == n;
+}
+
+static bool cfg_emit_switch_rec(FnCtx *F, size_t i, size_t n_cases,
+                                const int64_t *case_vals,
+                                MLIR_ValueHandle selector,
+                                MLIR_BlockHandle *arms,
+                                const uint8_t *res_vts, size_t n_res,
+                                MLIR_ValueHandle *out) {
+    MLIR_ValueHandle kc = emit_const_i32(F, (int32_t)case_vals[i]);
+    MLIR_ValueHandle cmp = emit_i32_eq(F, selector, kc);
+    MLIR_BlockHandle else_blk;
+    if (i + 1 == n_cases) {
+        else_blk = arms[0];
+    } else {
+        MLIR_BlockHandle saved = F->body_block;
+        else_blk = MLIR_CreateBlock(F->ctx);
+        F->body_block = else_blk;
+        MLIR_ValueHandle *inner = n_res ? (MLIR_ValueHandle *)arena_alloc(
+            F->arena, n_res * sizeof(MLIR_ValueHandle)) : NULL;
+        if (!cfg_emit_switch_rec(F, i + 1, n_cases, case_vals,
+                                 selector, arms, res_vts, n_res, inner)) {
+            F->body_block = saved;
+            return false;
+        }
+        emit_block_return(F, inner, n_res);
+        F->body_block = saved;
+    }
+    return emit_wasmssa_if(F, cmp, arms[i + 1], else_blk, true,
+                           res_vts, n_res, out);
+}
+
+static bool cfg_emit_switch(FnCtx *F, const int64_t *case_vals,
+                            size_t n_cases, MLIR_ValueHandle selector,
+                            MLIR_BlockHandle *arms,
+                            const uint8_t *res_vts, size_t n_res,
+                            MLIR_ValueHandle *out) {
+    if (n_cases)
+        return cfg_emit_switch_rec(F, 0, n_cases, case_vals, selector,
+                                   arms, res_vts, n_res, out);
+    MLIR_RegionHandle r = MLIR_CreateRegion(F->ctx);
+    MLIR_AppendRegionBlock(F->ctx, r, arms[0]);
+    MLIR_OpHandle block = make_op_n(
+        F->ctx, OP_TYPE_WASMSSA_BLOCK, NULL, 0,
+        NULL, 0, &r, 1, res_vts, n_res, out);
+    MLIR_AppendBlockOp(F->ctx, F->body_block, block);
+    return true;
+}
+
+static CfgFlow cfg_lower_switch_edges(CfgCtx *C,
+                                      MLIR_ValueHandle selector,
+                                      const int64_t *case_vals,
+                                      size_t n_cases, CfgEdge *edges,
+                                      MLIR_BlockHandle merge,
+                                      const CfgStops *outer_stops,
+                                      MLIR_BlockHandle continuation) {
+    FnCtx *F = C->F;
+    if (wasm_vt(F->ctx, MLIR_GetValueType(selector)) != WT_I32) {
+        fprintf(stderr,
+                "wasmssa-lower: llvm.switch requires an i32 selector\n");
+        return CFG_FLOW_ERROR;
+    }
+    MLIR_ValueHandle selector_wasm;
+    if (!vmap_get(F, selector, &selector_wasm)) return CFG_FLOW_ERROR;
+    uint8_t *res_vts = NULL;
+    size_t n_res = 0;
+    CfgStops arm_stops;
+    const CfgStops *use_stops = outer_stops;
+    if (merge != MLIR_INVALID_HANDLE) {
+        if (!cfg_block_arg_vts(C, merge, &res_vts, &n_res))
+            return CFG_FLOW_ERROR;
+        cfg_stops_with(&arm_stops, outer_stops, merge,
+                       CFG_STOP_BLOCK_RETURN, 0);
+        use_stops = &arm_stops;
+    }
+    size_t n_arms = n_cases + 1;
+    MLIR_BlockHandle *arms = (MLIR_BlockHandle *)arena_alloc(
+        F->arena, n_arms * sizeof(MLIR_BlockHandle));
+    CfgFlow *flows = (CfgFlow *)arena_alloc(
+        F->arena, n_arms * sizeof(CfgFlow));
+    for (size_t i = 0; i < n_arms; i++) {
+        if (!cfg_lower_edge_arm(C, edges[i], use_stops,
+                                &arms[i], &flows[i]))
+            return CFG_FLOW_ERROR;
+    }
+    MLIR_ValueHandle *results = n_res ? (MLIR_ValueHandle *)arena_alloc(
+        F->arena, n_res * sizeof(MLIR_ValueHandle)) : NULL;
+    if (!cfg_emit_switch(F, case_vals, n_cases, selector_wasm,
+                         arms, res_vts, n_res, results))
+        return CFG_FLOW_ERROR;
+    if (merge != MLIR_INVALID_HANDLE) {
+        if (!cfg_map_results(C, merge, results, n_res))
+            return CFG_FLOW_ERROR;
+        if (continuation != merge) {
+            MLIR_OpHandle stub = cfg_terminator(merge);
+            MLIR_ValueHandle *forwarded = NULL;
+            size_t nf = 0;
+            if (stub == MLIR_INVALID_HANDLE ||
+                MLIR_GetOpNumSuccessors(stub) != 1 ||
+                !cfg_edge_values(C, stub, 0, &forwarded, &nf) ||
+                nf != n_res ||
+                !cfg_map_results(C, continuation, results, n_res))
+                return CFG_FLOW_ERROR;
+            size_t mi = cfg_block_index(C, merge);
+            if (mi != SIZE_MAX) C->state[mi] = 2;
+        }
+        return lower_block_cfg(C, continuation, outer_stops);
+    }
+    for (size_t i = 0; i < n_arms; i++)
+        if (flows[i] == CFG_FLOW_STOP) return CFG_FLOW_STOP;
+    return CFG_FLOW_TERMINATED;
+}
+
+static CfgFlow cfg_lower_llvm_switch(CfgCtx *C, MLIR_BlockHandle parent,
+                                     MLIR_OpHandle sw,
+                                     const CfgStops *outer_stops) {
+    size_t ns = MLIR_GetOpNumSuccessors(sw);
+    if (MLIR_GetOpNumOperands(sw) != 1 || ns == 0)
+        return CFG_FLOW_ERROR;
+    size_t n_cases = ns - 1;
+    int64_t *case_vals = n_cases ? (int64_t *)arena_alloc(
+        C->F->arena, n_cases * sizeof(int64_t)) : NULL;
+    if (!cfg_parse_case_values(C, sw, n_cases, case_vals)) {
+        fprintf(stderr,
+                "wasmssa-lower: invalid llvm.switch case_values\n");
+        return CFG_FLOW_ERROR;
+    }
+    CfgEdge *edges = (CfgEdge *)arena_alloc(
+        C->F->arena, ns * sizeof(CfgEdge));
+    MLIR_BlockHandle *roots = (MLIR_BlockHandle *)arena_alloc(
+        C->F->arena, ns * sizeof(MLIR_BlockHandle));
+    for (size_t i = 0; i < ns; i++) {
+        roots[i] = MLIR_GetOpSuccessor(sw, i);
+        edges[i] = (CfgEdge){sw, i, roots[i]};
+    }
+    MLIR_BlockHandle merge = MLIR_INVALID_HANDLE;
+    (void)cfg_find_arm_merge(C, parent, roots, ns, outer_stops, &merge);
+    return cfg_lower_switch_edges(
+        C, MLIR_GetOpOperand(sw, 0), case_vals, n_cases, edges,
+        merge, outer_stops, merge);
+}
+
+// Recognize one compare-chain step emitted by lower_scf_index_switch:
+// constant, icmp eq selector/constant, cond_br case/next.
+static bool cfg_match_switch_step(CfgCtx *C, MLIR_BlockHandle blk,
+                                  MLIR_ValueHandle expected_selector,
+                                  MLIR_ValueHandle *selector,
+                                  int64_t *case_value,
+                                  MLIR_OpHandle *cbr) {
+    (void)C;
+    if (MLIR_GetBlockNumOps(blk) != 3) return false;
+    MLIR_OpHandle constant = MLIR_GetBlockOp(blk, 0);
+    MLIR_OpHandle cmp = MLIR_GetBlockOp(blk, 1);
+    MLIR_OpHandle term = MLIR_GetBlockOp(blk, 2);
+    if (!name_eq(MLIR_GetOpName(constant), "llvm.mlir.constant") ||
+        !name_eq(MLIR_GetOpName(cmp), "llvm.icmp") ||
+        !name_eq(MLIR_GetOpName(term), "llvm.cond_br") ||
+        MLIR_GetOpNumOperands(cmp) != 2 ||
+        MLIR_GetOpNumOperands(term) != 1 ||
+        MLIR_GetOpNumSuccessors(term) != 2 ||
+        MLIR_GetOpNumSuccessorOperands(term, 0) ||
+        MLIR_GetOpNumSuccessorOperands(term, 1))
+        return false;
+    MLIR_AttributeHandle pred = find_attr(cmp, "predicate");
+    if (pred == MLIR_INVALID_HANDLE || MLIR_GetAttributeInteger(pred) != 0 ||
+        MLIR_GetValueDefiningOp(MLIR_GetOpOperand(term, 0)) != cmp)
+        return false;
+    bool c0 = MLIR_GetValueDefiningOp(MLIR_GetOpOperand(cmp, 0)) == constant;
+    bool c1 = MLIR_GetValueDefiningOp(MLIR_GetOpOperand(cmp, 1)) == constant;
+    if (c0 == c1) return false;
+    MLIR_ValueHandle sel = MLIR_GetOpOperand(cmp, c0 ? 1 : 0);
+    if (expected_selector != MLIR_INVALID_HANDLE && sel != expected_selector)
+        return false;
+    MLIR_AttributeHandle value = find_attr(constant, "value");
+    if (value == MLIR_INVALID_HANDLE) return false;
+    *selector = sel;
+    *case_value = MLIR_GetAttributeInteger(value);
+    *cbr = term;
+    return true;
+}
+
+static CfgFlow cfg_try_switch_chain(CfgCtx *C, MLIR_BlockHandle parent,
+                                    MLIR_OpHandle entry_br,
+                                    const CfgStops *outer_stops,
+                                    bool *matched) {
+    *matched = false;
+    if (MLIR_GetOpNumSuccessors(entry_br) != 1)
+        return CFG_FLOW_ERROR;
+    MLIR_BlockHandle cur = MLIR_GetOpSuccessor(entry_br, 0);
+    MLIR_ValueHandle selector = MLIR_INVALID_HANDLE;
+    int64_t *case_vals = (int64_t *)arena_alloc(
+        C->F->arena, C->n_blocks * sizeof(int64_t));
+    CfgEdge *case_edges = (CfgEdge *)arena_alloc(
+        C->F->arena, C->n_blocks * sizeof(CfgEdge));
+    MLIR_BlockHandle *chain = (MLIR_BlockHandle *)arena_alloc(
+        C->F->arena, C->n_blocks * sizeof(MLIR_BlockHandle));
+    size_t n_cases = 0;
+    CfgEdge default_edge = {0};
+    while (n_cases < C->n_blocks) {
+        MLIR_ValueHandle step_selector;
+        int64_t value;
+        MLIR_OpHandle cbr;
+        if (!cfg_match_switch_step(C, cur, selector, &step_selector,
+                                   &value, &cbr))
+            break;
+        if (selector == MLIR_INVALID_HANDLE) selector = step_selector;
+        chain[n_cases] = cur;
+        case_vals[n_cases] = value;
+        case_edges[n_cases] = (CfgEdge){
+            cbr, 0, MLIR_GetOpSuccessor(cbr, 0)};
+        n_cases++;
+        MLIR_BlockHandle next = MLIR_GetOpSuccessor(cbr, 1);
+        MLIR_ValueHandle probe_selector;
+        int64_t probe_value;
+        MLIR_OpHandle probe_cbr;
+        if (cfg_match_switch_step(C, next, selector, &probe_selector,
+                                  &probe_value, &probe_cbr)) {
+            cur = next;
+            continue;
+        }
+        default_edge = (CfgEdge){cbr, 1, next};
+        break;
+    }
+    if (n_cases == 0 || default_edge.term == MLIR_INVALID_HANDLE)
+        return CFG_FLOW_ERROR;
+    *matched = true;
+    size_t n_arms = n_cases + 1;
+    CfgEdge *edges = (CfgEdge *)arena_alloc(
+        C->F->arena, n_arms * sizeof(CfgEdge));
+    MLIR_BlockHandle *roots = (MLIR_BlockHandle *)arena_alloc(
+        C->F->arena, n_arms * sizeof(MLIR_BlockHandle));
+    edges[0] = default_edge;
+    roots[0] = default_edge.target;
+    for (size_t i = 0; i < n_cases; i++) {
+        edges[i + 1] = case_edges[i];
+        roots[i + 1] = case_edges[i].target;
+    }
+    MLIR_BlockHandle merge;
+    if (!cfg_find_arm_merge(C, parent, roots, n_arms,
+                            outer_stops, &merge)) {
+        fprintf(stderr,
+                "wasmssa-lower: switch compare chain has no merge\n");
+        return CFG_FLOW_ERROR;
+    }
+    MLIR_OpHandle stub = cfg_terminator(merge);
+    if (stub == MLIR_INVALID_HANDLE || MLIR_GetBlockNumOps(merge) != 1 ||
+        !name_eq(MLIR_GetOpName(stub), "llvm.br") ||
+        MLIR_GetOpNumSuccessors(stub) != 1) {
+        fprintf(stderr,
+                "wasmssa-lower: switch merge is not a phi stub\n");
+        return CFG_FLOW_ERROR;
+    }
+    MLIR_BlockHandle cont = MLIR_GetOpSuccessor(stub, 0);
+    for (size_t i = 0; i < n_cases; i++) {
+        size_t ci = cfg_block_index(C, chain[i]);
+        if (ci == SIZE_MAX || C->state[ci]) return CFG_FLOW_ERROR;
+        C->state[ci] = 2;
+    }
+    return cfg_lower_switch_edges(C, selector, case_vals, n_cases,
+                                  edges, merge, outer_stops, cont);
+}
+
 static CfgFlow cfg_lower_cond_br(CfgCtx *C, MLIR_BlockHandle parent,
                                  MLIR_OpHandle cbr,
                                  const CfgStops *outer_stops) {
@@ -2996,6 +3297,7 @@ static CfgFlow cfg_lower_cond_br(CfgCtx *C, MLIR_BlockHandle parent,
         return CFG_FLOW_ERROR;
     return lower_block_cfg(C, merge, outer_stops);
 }
+
 // Classify the most specific llvm.br shapes first.  A generic forward branch
 // is only a fallthrough after loop and switch entry recognition have failed.
 static CfgFlow lower_block_cfg(CfgCtx *C, MLIR_BlockHandle blk,
@@ -3026,10 +3328,8 @@ static CfgFlow lower_block_cfg(CfgCtx *C, MLIR_BlockHandle blk,
         emit_unreachable(C->F);
         return CFG_FLOW_TERMINATED;
     }
-    if (name_eq(tn, "llvm.switch")) {
-        fprintf(stderr, "wasmssa-lower: llvm.switch not yet lowered\n");
-        return CFG_FLOW_ERROR;
-    }
+    if (name_eq(tn, "llvm.switch"))
+        return cfg_lower_llvm_switch(C, blk, term, stops);
     if (name_eq(tn, "llvm.cond_br"))
         return cfg_lower_cond_br(C, blk, term, stops);
     if (name_eq(tn, "llvm.br")) {
@@ -3042,6 +3342,10 @@ static CfgFlow lower_block_cfg(CfgCtx *C, MLIR_BlockHandle blk,
         const char *while_why = NULL;
         if (cfg_match_while(C, term, &W, &while_why))
             return cfg_lower_while(C, term, &W, stops);
+        bool matched_switch = false;
+        CfgFlow sf = cfg_try_switch_chain(
+            C, blk, term, stops, &matched_switch);
+        if (matched_switch) return sf;
         size_t ti = cfg_block_index(C, target);
         if (ti == SIZE_MAX || ti <= bi) {
             cfg_dump(C);
