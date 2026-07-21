@@ -542,6 +542,7 @@ int app_main(void) {
     // doubled block reservations push the linear-memory high-water past the
     // hard 4 GiB cap, so this halves linmem use on the self-host lift.
     Arena *arena = arena_create(64 * 1024 * 1024 - 64 * 1024);
+    Arena *llvm_arena = arena;  // input IR; wasmssa may switch ctx to out_arena
     MLIR_Context ctx = {0};
     MLIR_SetArenaAllocator(&ctx, arena);
 
@@ -850,6 +851,14 @@ int app_main(void) {
             arena_destroy(boot_arena);
             return 1;
         }
+        // Wasmssa lowering only reads the finished llvm.func CFG; it does not
+        // need the global def-use registry. Skipping registration for wasmssa
+        // (and later wasmstack) ops saves memory on large TUs.
+        if (!getenv("TINYC_NO_DEF_USE") &&
+            (emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat
+             || (emit_macho && !macho_backend_llvm))) {
+            ctx.no_def_use_tracking = true;
+        }
         if (getenv("TINYC_DUMP_LOWERED")) {
             string s = MLIR_PrintOperationGeneric(&ctx, module);
             println(str_lit("{}"), s);
@@ -863,6 +872,7 @@ int app_main(void) {
             arena_destroy(boot_arena);
             return 1;
         }
+        arena = MLIR_GetArenaAllocator(&ctx);
         out = MLIR_PrintOperationGeneric(&ctx, ssa);
     } else if (emit_wasmstack) {
         MLIR_OpHandle ssa = mlir_llvm_to_wasmssa(&ctx, module);
@@ -871,6 +881,7 @@ int app_main(void) {
             arena_destroy(boot_arena);
             return 1;
         }
+        arena = MLIR_GetArenaAllocator(&ctx);
         MLIR_OpHandle stk = mlir_wasmssa_to_wasmstack(&ctx, ssa);
         if (stk == MLIR_INVALID_HANDLE) {
             arena_destroy(arena);
@@ -880,6 +891,7 @@ int app_main(void) {
         out = MLIR_PrintOperationGeneric(&ctx, stk);
     } else if (emit_wat) {
         string bin = translate_to_wasm_fn(&ctx, module);
+        arena = MLIR_GetArenaAllocator(&ctx);
         if (bin.size == 0) {
             arena_destroy(arena);
             arena_destroy(boot_arena);
@@ -888,6 +900,7 @@ int app_main(void) {
         out = mlir_wasm_binary_to_wat(&ctx, bin);
     } else if (emit_wasm) {
         out = translate_to_wasm_fn(&ctx, module);
+        arena = MLIR_GetArenaAllocator(&ctx);
         if (out.size == 0) {
             arena_destroy(arena);
             arena_destroy(boot_arena);
@@ -920,6 +933,7 @@ int app_main(void) {
             // --wasm-runtime-obj inputs, then translate the linked wasm
             // module to a signed Mach-O ARM64 binary.
             string obj = translate_to_wasm_fn(&ctx, module);
+            arena = MLIR_GetArenaAllocator(&ctx);
             if (obj.size == 0) {
                 arena_destroy(arena);
                 arena_destroy(boot_arena);
@@ -1032,6 +1046,8 @@ int app_main(void) {
         free(out.str);
     }
 
+    if (llvm_arena != arena)
+        arena_destroy(llvm_arena);
     arena_destroy(arena);
     arena_destroy(boot_arena);
     return wrc;
