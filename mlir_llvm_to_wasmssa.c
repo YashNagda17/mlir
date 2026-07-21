@@ -13,8 +13,9 @@
 // them; subsequent lookups thread those handles through `o.operands` to
 // stitch up the wasmssa IR.
 //
-// No module-level or per-function scratch buffer is retained: ops flow
-// straight from lower_op into the MLIR module under construction.
+// No module-level scratch buffer is retained: ops flow straight from
+// lower_op into the MLIR module under construction. Per-function vmap and
+// CFG-walk temporaries use a scratch arena reset after each llvm.func.
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -235,7 +236,8 @@ DEFINE_VECTOR_FOR_TYPE(uint8_t,    VecU8)
 
 typedef struct {
     MLIR_Context   *ctx;
-    Arena          *arena;   // for hex-encoded attribute strings
+    Arena          *arena;    // persistent wasmssa attrs (output arena)
+    Arena          *scratch;  // per-function temporaries (reset each llvm.func)
     ModCtx         *mod;     // parent module emit context (for func-name lookups)
     string          fn_name;
     size_t          n_params;
@@ -278,7 +280,7 @@ static size_t map_hash(uintptr_t k) {
 
 static void vmap_grow(FnCtx *F) {
     size_t ncap = F->vmap_cap ? F->vmap_cap * 2 : 32;
-    VMapEntry *nt = (VMapEntry *)arena_alloc(F->arena, ncap * sizeof(VMapEntry));
+    VMapEntry *nt = (VMapEntry *)arena_alloc(F->scratch, ncap * sizeof(VMapEntry));
     memset(nt, 0, ncap * sizeof(VMapEntry));
     size_t mask = ncap - 1;
     for (size_t i = 0; i < F->vmap_cap; i++) {
@@ -315,7 +317,7 @@ static int vmap_get(FnCtx *F, MLIR_ValueHandle k, MLIR_ValueHandle *out) {
 }
 static void amap_grow(FnCtx *F) {
     size_t ncap = F->amap_cap ? F->amap_cap * 2 : 16;
-    AMapEntry *nt = (AMapEntry *)arena_alloc(F->arena, ncap * sizeof(AMapEntry));
+    AMapEntry *nt = (AMapEntry *)arena_alloc(F->scratch, ncap * sizeof(AMapEntry));
     memset(nt, 0, ncap * sizeof(AMapEntry));
     size_t mask = ncap - 1;
     for (size_t i = 0; i < F->amap_cap; i++) {
@@ -1323,7 +1325,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
             size_t no = MLIR_GetOpNumOperands(op);
             if (no < 1) return false;
             size_t snp = no - 1;
-            uint8_t *sp = (uint8_t *)arena_alloc(F->arena, snp ? snp : 1);
+            uint8_t *sp = (uint8_t *)arena_alloc(F->scratch, snp ? snp : 1);
             for (size_t i = 0; i < snp; i++) {
                 uint8_t v = wasm_vt(F->ctx,
                     MLIR_GetValueType(MLIR_GetOpOperand(op, i + 1)));
@@ -1332,7 +1334,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
             }
             size_t nr = MLIR_GetOpNumResults(op);
             if (nr > 1) return false;
-            uint8_t *sr = (uint8_t *)arena_alloc(F->arena, 1);
+            uint8_t *sr = (uint8_t *)arena_alloc(F->scratch, 1);
             size_t snr = 0;
             if (nr == 1) {
                 uint8_t v = wasm_vt(F->ctx,
@@ -1341,7 +1343,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
                 sr[0] = v;
                 snr = 1;
             }
-            MLIR_ValueHandle *opnds = (MLIR_ValueHandle *)arena_alloc(F->arena, no * sizeof(MLIR_ValueHandle));
+            MLIR_ValueHandle *opnds = (MLIR_ValueHandle *)arena_alloc(F->scratch, no * sizeof(MLIR_ValueHandle));
             // wasm call_indirect pops args first then table-index, so order
             // them in operand[] as [args..., funcptr].
             for (size_t i = 0; i < snp; i++) {
@@ -1378,7 +1380,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
                 size_t no = MLIR_GetOpNumOperands(op);
                 size_t nvar = no - nfixed;
                 uint32_t total = 0; size_t nf2 = 0;
-                uint32_t *offs = (uint32_t *)arena_alloc(F->arena, (nvar ? nvar : 1) * sizeof(uint32_t));
+                uint32_t *offs = (uint32_t *)arena_alloc(F->scratch, (nvar ? nvar : 1) * sizeof(uint32_t));
                 if (!va_call_layout(F, op, &total, &nf2, offs)) {
                     return false;
                 }
@@ -1446,7 +1448,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
                 string cstr = nm;
                 if (cstr.size > 0 && cstr.str[0] == '@') { cstr.str++; cstr.size--; }
                 size_t nout = nfixed + 1;
-                MLIR_ValueHandle *opnds = (MLIR_ValueHandle *)arena_alloc(F->arena, nout * sizeof(MLIR_ValueHandle));
+                MLIR_ValueHandle *opnds = (MLIR_ValueHandle *)arena_alloc(F->scratch, nout * sizeof(MLIR_ValueHandle));
                 for (size_t i = 0; i < nfixed; i++) {
                     if (!vmap_get(F, MLIR_GetOpOperand(op, i), &opnds[i]))
                         return false;
@@ -1480,7 +1482,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
         if (cstr.size > 0 && cstr.str[0] == '@') { cstr.str++; cstr.size--; }
 
         size_t no = MLIR_GetOpNumOperands(op);
-        MLIR_ValueHandle *opnds = (MLIR_ValueHandle *)arena_alloc(F->arena, (no ? no : 1) * sizeof(MLIR_ValueHandle));
+        MLIR_ValueHandle *opnds = (MLIR_ValueHandle *)arena_alloc(F->scratch, (no ? no : 1) * sizeof(MLIR_ValueHandle));
         for (size_t i = 0; i < no; i++) {
             if (!vmap_get(F, MLIR_GetOpOperand(op, i), &opnds[i]))
                 return false;
@@ -1522,7 +1524,7 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
         MLIR_AttributeHandle ria = find_attr(op, "rawConstantIndices");
         if (ria == MLIR_INVALID_HANDLE) return false;
         size_t n_idx = 0;
-        int32_t *cidx = parse_dense_i32_array(F->arena,
+        int32_t *cidx = parse_dense_i32_array(F->scratch,
             MLIR_GetAttributeAsString(F->ctx, ria), &n_idx);
         if (!cidx || n_idx == 0) return false;
 
@@ -1966,13 +1968,13 @@ static bool cfg_init(CfgCtx *C, FnCtx *F, MLIR_RegionHandle region) {
     C->n_blocks = MLIR_GetRegionNumBlocks(region);
     if (C->n_blocks == 0) return false;
     C->blocks = (MLIR_BlockHandle *)arena_alloc(
-        F->arena, C->n_blocks * sizeof(MLIR_BlockHandle));
-    C->state = (uint8_t *)arena_alloc(F->arena, C->n_blocks);
+        F->scratch, C->n_blocks * sizeof(MLIR_BlockHandle));
+    C->state = (uint8_t *)arena_alloc(F->scratch, C->n_blocks);
     memset(C->state, 0, C->n_blocks);
     C->bfs_dist = (size_t *)arena_alloc(
-        F->arena, C->n_blocks * sizeof(size_t));
+        F->scratch, C->n_blocks * sizeof(size_t));
     C->bfs_queue = (size_t *)arena_alloc(
-        F->arena, C->n_blocks * sizeof(size_t));
+        F->scratch, C->n_blocks * sizeof(size_t));
     if (!C->blocks || !C->state || !C->bfs_dist || !C->bfs_queue)
         return false;
     for (size_t i = 0; i < C->n_blocks; i++)
@@ -1984,7 +1986,7 @@ static bool cfg_ensure_merge_dist(CfgCtx *C, size_t n_roots) {
     size_t need = n_roots * C->n_blocks;
     if (need <= C->merge_cap) return true;
     C->merge_dist = (size_t *)arena_alloc(
-        C->F->arena, need * sizeof(size_t));
+        C->F->scratch, need * sizeof(size_t));
     if (!C->merge_dist) return false;
     C->merge_cap = need;
     return true;
@@ -2056,7 +2058,7 @@ static bool cfg_edge_values(CfgCtx *C, MLIR_OpHandle term, size_t succ_idx,
         return false;
     }
     MLIR_ValueHandle *vals = n ? (MLIR_ValueHandle *)arena_alloc(
-        F->arena, n * sizeof(MLIR_ValueHandle)) : NULL;
+        F->scratch, n * sizeof(MLIR_ValueHandle)) : NULL;
     for (size_t i = 0; i < n; i++) {
         if (!vmap_get(F, MLIR_GetOpSuccessorOperand(term, succ_idx, i),
                       &vals[i])) {
@@ -2116,7 +2118,7 @@ static CfgFlow cfg_emit_stop_block(CfgCtx *C, MLIR_BlockHandle blk,
     if (stop->kind == CFG_STOP_REACH) return CFG_FLOW_STOP;
     size_t n = MLIR_GetBlockNumArgs(blk);
     MLIR_ValueHandle *vals = n ? (MLIR_ValueHandle *)arena_alloc(
-        C->F->arena, n * sizeof(MLIR_ValueHandle)) : NULL;
+        C->F->scratch, n * sizeof(MLIR_ValueHandle)) : NULL;
     for (size_t i = 0; i < n; i++) {
         if (!vmap_get(C->F, MLIR_GetBlockArg(blk, i), &vals[i]))
             return CFG_FLOW_ERROR;
@@ -2232,7 +2234,7 @@ static bool cfg_find_arm_merge(CfgCtx *C, MLIR_BlockHandle parent,
 static bool cfg_block_arg_vts(CfgCtx *C, MLIR_BlockHandle blk,
                               uint8_t **out_vts, size_t *out_n) {
     size_t n = MLIR_GetBlockNumArgs(blk);
-    uint8_t *vts = n ? (uint8_t *)arena_alloc(C->F->arena, n) : NULL;
+    uint8_t *vts = n ? (uint8_t *)arena_alloc(C->F->scratch, n) : NULL;
     for (size_t i = 0; i < n; i++) {
         vts[i] = wasm_vt(C->F->ctx,
             MLIR_GetValueType(MLIR_GetBlockArg(blk, i)));
@@ -2428,7 +2430,7 @@ static CfgFlow cfg_lower_while(CfgCtx *C, MLIR_OpHandle entry_br,
     size_t n_iter = 0;
     if (!cfg_edge_values(C, entry_br, 0, &inits, &n_iter))
         return CFG_FLOW_ERROR;
-    uint8_t *iter_vts = n_iter ? (uint8_t *)arena_alloc(F->arena, n_iter)
+    uint8_t *iter_vts = n_iter ? (uint8_t *)arena_alloc(F->scratch, n_iter)
                                : NULL;
     for (size_t i = 0; i < n_iter; i++) {
         iter_vts[i] = wasm_vt(F->ctx,
@@ -2526,7 +2528,7 @@ static CfgFlow cfg_lower_while(CfgCtx *C, MLIR_OpHandle entry_br,
 
     C->state[ei] = 2;  // consumed phi-forwarding stub
     MLIR_ValueHandle *results = n_res ? (MLIR_ValueHandle *)arena_alloc(
-        F->arena, n_res * sizeof(MLIR_ValueHandle)) : NULL;
+        F->scratch, n_res * sizeof(MLIR_ValueHandle)) : NULL;
     if (!cfg_emit_loop(F, inits, n_iter, loop_body,
                        res_vts, n_res, results) ||
         !cfg_map_results(C, W->cont, results, n_res)) {
@@ -2594,7 +2596,7 @@ static bool cfg_emit_switch_rec(FnCtx *F, size_t i, size_t n_cases,
         else_blk = MLIR_CreateBlock(F->ctx);
         F->body_block = else_blk;
         MLIR_ValueHandle *inner = n_res ? (MLIR_ValueHandle *)arena_alloc(
-            F->arena, n_res * sizeof(MLIR_ValueHandle)) : NULL;
+            F->scratch, n_res * sizeof(MLIR_ValueHandle)) : NULL;
         if (!cfg_emit_switch_rec(F, i + 1, n_cases, case_vals,
                                  selector, arms, res_vts, n_res, inner)) {
             F->body_block = saved;
@@ -2652,16 +2654,16 @@ static CfgFlow cfg_lower_switch_edges(CfgCtx *C,
     }
     size_t n_arms = n_cases + 1;
     MLIR_BlockHandle *arms = (MLIR_BlockHandle *)arena_alloc(
-        F->arena, n_arms * sizeof(MLIR_BlockHandle));
+        F->scratch, n_arms * sizeof(MLIR_BlockHandle));
     CfgFlow *flows = (CfgFlow *)arena_alloc(
-        F->arena, n_arms * sizeof(CfgFlow));
+        F->scratch, n_arms * sizeof(CfgFlow));
     for (size_t i = 0; i < n_arms; i++) {
         if (!cfg_lower_edge_arm(C, edges[i], use_stops,
                                 &arms[i], &flows[i]))
             return CFG_FLOW_ERROR;
     }
     MLIR_ValueHandle *results = n_res ? (MLIR_ValueHandle *)arena_alloc(
-        F->arena, n_res * sizeof(MLIR_ValueHandle)) : NULL;
+        F->scratch, n_res * sizeof(MLIR_ValueHandle)) : NULL;
     if (!cfg_emit_switch(F, case_vals, n_cases, selector_wasm,
                          arms, res_vts, n_res, results))
         return CFG_FLOW_ERROR;
@@ -2696,16 +2698,16 @@ static CfgFlow cfg_lower_llvm_switch(CfgCtx *C, MLIR_BlockHandle parent,
         return CFG_FLOW_ERROR;
     size_t n_cases = ns - 1;
     int64_t *case_vals = n_cases ? (int64_t *)arena_alloc(
-        C->F->arena, n_cases * sizeof(int64_t)) : NULL;
+        C->F->scratch, n_cases * sizeof(int64_t)) : NULL;
     if (!cfg_parse_case_values(C, sw, n_cases, case_vals)) {
         fprintf(stderr,
                 "wasmssa-lower: invalid llvm.switch case_values\n");
         return CFG_FLOW_ERROR;
     }
     CfgEdge *edges = (CfgEdge *)arena_alloc(
-        C->F->arena, ns * sizeof(CfgEdge));
+        C->F->scratch, ns * sizeof(CfgEdge));
     MLIR_BlockHandle *roots = (MLIR_BlockHandle *)arena_alloc(
-        C->F->arena, ns * sizeof(MLIR_BlockHandle));
+        C->F->scratch, ns * sizeof(MLIR_BlockHandle));
     for (size_t i = 0; i < ns; i++) {
         roots[i] = MLIR_GetOpSuccessor(sw, i);
         edges[i] = (CfgEdge){sw, i, roots[i]};
@@ -2767,11 +2769,11 @@ static CfgFlow cfg_try_switch_chain(CfgCtx *C, MLIR_BlockHandle parent,
     MLIR_BlockHandle cur = MLIR_GetOpSuccessor(entry_br, 0);
     MLIR_ValueHandle selector = MLIR_INVALID_HANDLE;
     int64_t *case_vals = (int64_t *)arena_alloc(
-        C->F->arena, C->n_blocks * sizeof(int64_t));
+        C->F->scratch, C->n_blocks * sizeof(int64_t));
     CfgEdge *case_edges = (CfgEdge *)arena_alloc(
-        C->F->arena, C->n_blocks * sizeof(CfgEdge));
+        C->F->scratch, C->n_blocks * sizeof(CfgEdge));
     MLIR_BlockHandle *chain = (MLIR_BlockHandle *)arena_alloc(
-        C->F->arena, C->n_blocks * sizeof(MLIR_BlockHandle));
+        C->F->scratch, C->n_blocks * sizeof(MLIR_BlockHandle));
     size_t n_cases = 0;
     CfgEdge default_edge = {0};
     while (n_cases < C->n_blocks) {
@@ -2804,9 +2806,9 @@ static CfgFlow cfg_try_switch_chain(CfgCtx *C, MLIR_BlockHandle parent,
     *matched = true;
     size_t n_arms = n_cases + 1;
     CfgEdge *edges = (CfgEdge *)arena_alloc(
-        C->F->arena, n_arms * sizeof(CfgEdge));
+        C->F->scratch, n_arms * sizeof(CfgEdge));
     MLIR_BlockHandle *roots = (MLIR_BlockHandle *)arena_alloc(
-        C->F->arena, n_arms * sizeof(MLIR_BlockHandle));
+        C->F->scratch, n_arms * sizeof(MLIR_BlockHandle));
     edges[0] = default_edge;
     roots[0] = default_edge.target;
     for (size_t i = 0; i < n_cases; i++) {
@@ -2889,7 +2891,7 @@ static CfgFlow cfg_lower_cond_br(CfgCtx *C, MLIR_BlockHandle parent,
                             &arm_stops, &else_wasm, &ef))
         return CFG_FLOW_ERROR;
     MLIR_ValueHandle *results = n_res ? (MLIR_ValueHandle *)arena_alloc(
-        C->F->arena, n_res * sizeof(MLIR_ValueHandle)) : NULL;
+        C->F->scratch, n_res * sizeof(MLIR_ValueHandle)) : NULL;
     if (!emit_wasmssa_if(C->F, cond, then_wasm, else_wasm, has_else,
                          res_vts, n_res, results) ||
         !cfg_map_results(C, merge, results, n_res))
@@ -2993,7 +2995,8 @@ static CfgFlow lower_block_cfg(CfgCtx *C, MLIR_BlockHandle blk,
 // module body. The function's signature attrs are passed in (param_types
 // includes the synthetic trailing i32 for vararg functions); the special
 // "__original_main" rename + exported flag are picked by the caller.
-static bool lower_function(MLIR_Context *ctx, Arena *arena, ModCtx *mod,
+static bool lower_function(MLIR_Context *ctx, Arena *arena, Arena *scratch,
+                           ModCtx *mod,
                            MLIR_BlockHandle mod_body,
                            string fn_name, bool exported,
                            MLIR_OpHandle fn,
@@ -3003,6 +3006,7 @@ static bool lower_function(MLIR_Context *ctx, Arena *arena, ModCtx *mod,
     memset(&F, 0, sizeof F);
     F.ctx = ctx;
     F.arena = arena;
+    F.scratch = scratch;
     F.mod = mod;
     F.fn_name = fn_name;
     F.n_params = n_params;
@@ -3539,6 +3543,9 @@ MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
     size_t nops = MLIR_GetBlockNumOps(mb);
 
     Arena            *arena = MLIR_GetArenaAllocator(ctx);
+    Arena *scratch = arena_create(1u * 1024u * 1024u);
+    if (!scratch) return MLIR_INVALID_HANDLE;
+    arena_pos_t scratch0 = arena_get_pos(scratch);
     MLIR_BlockHandle  body  = MLIR_CreateBlock(ctx);
     MLIR_RegionHandle region = MLIR_CreateRegion(ctx);
     MLIR_AppendRegionBlock(ctx, region, body);
@@ -3562,8 +3569,10 @@ MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
         bool has_body = MLIR_GetOpNumRegions(op) > 0 &&
                         MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 0)) > 0;
         if (has_body) continue;
+        arena_reset(scratch, scratch0);
         uint8_t *p, *r; size_t np, nr;
-        if (!sig_for_func(ctx, arena, op, &p, &np, &r, &nr)) {
+        if (!sig_for_func(ctx, scratch, op, &p, &np, &r, &nr)) {
+            arena_destroy(scratch);
             return MLIR_INVALID_HANDLE;
         }
         MLIR_AttributeHandle sa = find_attr(op, "sym_name");
@@ -3592,8 +3601,10 @@ MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
         bool has_body = MLIR_GetOpNumRegions(op) > 0 &&
                         MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 0)) > 0;
         if (!has_body) continue;
+        arena_reset(scratch, scratch0);
         uint8_t *p, *r; size_t np, nr;
-        if (!sig_for_func(ctx, arena, op, &p, &np, &r, &nr)) {
+        if (!sig_for_func(ctx, scratch, op, &p, &np, &r, &nr)) {
+            arena_destroy(scratch);
             return MLIR_INVALID_HANDLE;
         }
         MLIR_AttributeHandle sa = find_attr(op, "sym_name");
@@ -3601,8 +3612,9 @@ MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
         bool is_main = (sym.size == 4 && memcmp(sym.str, "main", 4) == 0);
         string nm = is_main ? str_lit("__original_main") : sym;
 
-        if (!lower_function(ctx, arena, &mod, body, nm, is_main,
+        if (!lower_function(ctx, arena, scratch, &mod, body, nm, is_main,
                             op, p, np, r, nr)) {
+            arena_destroy(scratch);
             return MLIR_INVALID_HANDLE;
         }
     }
@@ -3614,9 +3626,11 @@ MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
         if (!name_eq(MLIR_GetOpName(op), "llvm.mlir.global")) continue;
         if (!lower_global(ctx, arena, body, op)) {
             fprintf(stderr, "wasmssa-lower: failed to lower global\n");
+            arena_destroy(scratch);
             return MLIR_INVALID_HANDLE;
         }
     }
 
+    arena_destroy(scratch);
     return out_module;
 }
