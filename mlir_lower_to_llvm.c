@@ -1,9 +1,9 @@
 // Native lowering pass: rewrites a `builtin.module` from the high-level
 // dialects (func, arith, cf, scf, vector, memref) down to the `llvm`
 // dialect. Structured control flow (`scf.if`, `scf.while`,
-// `scf.index_switch`) becomes flat `llvm.br` / `llvm.cond_br` CFG here for
-// every backend. The wasm pipeline reconstructs the same structured control
-// flow from these LLVM terminators in `mlir_llvm_to_wasmssa.c`.
+// `scf.index_switch`) becomes flat `llvm.br` / `llvm.cond_br` / `llvm.switch`
+// CFG here. Default lowering emits `llvm.switch`; the wasm lift path keeps
+// the compare-chain shape because wasmssa recognizes it more efficiently.
 // Uses ONLY the public mlir_api.h surface — no upstream MLIR types — so
 // this same translation unit is linked into both the upstream-backed and
 // the native-backed builds.
@@ -84,6 +84,7 @@ typedef struct LowerState {
     MLIR_Context *ctx;
     MLIR_OpHandle module;
     MLIR_BlockHandle module_body;
+    bool use_llvm_switch;  // true: llvm.switch; false: icmp compare chain
 } LowerState;
 
 // -----------------------------------------------------------------------------
@@ -826,6 +827,48 @@ static void emit_cond_br_at(LowerState *st, MLIR_BlockHandle parent, size_t *pos
     (*pos)++;
 }
 
+static void emit_switch_at(LowerState *st, MLIR_BlockHandle parent, size_t *pos,
+                           MLIR_ValueHandle selector,
+                           MLIR_BlockHandle default_dst,
+                           const int64_t *case_values,
+                           MLIR_BlockHandle *case_dsts, size_t n_cases,
+                           MLIR_LocationHandle loc) {
+    Arena *alloc = MLIR_GetArenaAllocator(st->ctx);
+    size_t n_succ = 1 + n_cases;
+    MLIR_BlockHandle *succs = (MLIR_BlockHandle *)arena_alloc(
+        alloc, n_succ * sizeof(MLIR_BlockHandle));
+    MLIR_ValueHandle **sops = (MLIR_ValueHandle **)arena_alloc(
+        alloc, n_succ * sizeof(MLIR_ValueHandle *));
+    size_t *snums = (size_t *)arena_alloc(alloc, n_succ * sizeof(size_t));
+    succs[0] = default_dst;
+    sops[0] = NULL;
+    snums[0] = 0;
+    for (size_t i = 0; i < n_cases; i++) {
+        succs[1 + i] = case_dsts[i];
+        sops[1 + i] = NULL;
+        snums[1 + i] = 0;
+    }
+    MLIR_ValueHandle ops[1] = { selector };
+    MLIR_AttributeHandle ca = MLIR_INVALID_HANDLE;
+    if (n_cases > 0) {
+        int32_t *cv32 = (int32_t *)arena_alloc(alloc, n_cases * sizeof(int32_t));
+        for (size_t i = 0; i < n_cases; i++) cv32[i] = (int32_t)case_values[i];
+        ca = MLIR_CreateAttributeDenseI32Array(
+            st->ctx, str_lit("case_values"), cv32, n_cases);
+    }
+    MLIR_AttributeHandle attrs[1];
+    size_t nattrs = 0;
+    if (ca != MLIR_INVALID_HANDLE) attrs[nattrs++] = ca;
+    MLIR_OpHandle sw = MLIR_CreateOpWithSuccessors(
+        st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.switch"),
+        nattrs ? attrs : NULL, nattrs, NULL, 0, NULL, 0,
+        ops, 1, NULL, 0,
+        succs, n_succ, sops, snums,
+        loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_InsertBlockOpAtIndex(st->ctx, parent, sw, *pos);
+    (*pos)++;
+}
+
 // Append `llvm.br ^target(ops...)` at the end of `blk`.
 static void emit_br_at_end(LowerState *st, MLIR_BlockHandle blk,
                            MLIR_BlockHandle target,
@@ -954,10 +997,11 @@ static bool lower_scf_while(LowerState *st, MLIR_OpHandle op,
     return true;
 }
 
-// Lower `scf.index_switch` to a compare chain plus case/default blocks that
-// merge at a phi block, then continue in a separate post-switch block (region
-// 0 = default, regions 1..N = cases). Empty regions become synthetic blocks
-// that branch to the merge with zero-filled result operands.
+// Lower `scf.index_switch` to case/default blocks that merge at a phi block
+// (region 0 = default, regions 1..N = cases). Empty regions become synthetic
+// blocks that branch to the merge with zero-filled result operands.
+// When `use_llvm_switch` is set, emit `llvm.switch`; otherwise emit the
+// icmp compare chain recognized by wasmssa.
 static bool lower_scf_index_switch(LowerState *st, MLIR_OpHandle op,
                                    MLIR_BlockHandle parent, size_t pos) {
     MLIR_LocationHandle loc = MLIR_GetOpLocation(op);
@@ -995,24 +1039,33 @@ static bool lower_scf_index_switch(LowerState *st, MLIR_OpHandle op,
 
     size_t nr = MLIR_GetOpNumResults(op);
     MLIR_BlockHandle merge_blk = MLIR_CreateBlock(st->ctx);
-    MLIR_BlockHandle cont_blk = MLIR_CreateBlock(st->ctx);
-    MLIR_ValueHandle *cont_args = nr ? (MLIR_ValueHandle *)arena_alloc(
-        alloc, nr * sizeof(MLIR_ValueHandle)) : NULL;
+    MLIR_BlockHandle cont_blk = MLIR_INVALID_HANDLE;
+    MLIR_ValueHandle *cont_args = NULL;
+    if (!st->use_llvm_switch) {
+        cont_blk = MLIR_CreateBlock(st->ctx);
+        cont_args = nr ? (MLIR_ValueHandle *)arena_alloc(
+            alloc, nr * sizeof(MLIR_ValueHandle)) : NULL;
+    }
     for (size_t i = 0; i < nr; i++) {
         MLIR_ValueHandle old = MLIR_GetOpResult(op, i);
         MLIR_TypeHandle ty = MLIR_GetValueType(old);
         MLIR_ValueHandle marg = MLIR_CreateValueBlockArg(
             st->ctx, str_lit(""), (uint32_t)i, ty, loc);
         MLIR_AppendBlockArg(st->ctx, merge_blk, marg);
-        cont_args[i] = MLIR_CreateValueBlockArg(
-            st->ctx, str_lit(""), (uint32_t)i, ty, loc);
-        MLIR_AppendBlockArg(st->ctx, cont_blk, cont_args[i]);
-        MLIR_ReplaceAllUsesOfValue(st->ctx, old, cont_args[i]);
+        MLIR_ValueHandle repl = marg;
+        if (!st->use_llvm_switch) {
+            cont_args[i] = MLIR_CreateValueBlockArg(
+                st->ctx, str_lit(""), (uint32_t)i, ty, loc);
+            MLIR_AppendBlockArg(st->ctx, cont_blk, cont_args[i]);
+            repl = cont_args[i];
+        }
+        MLIR_ReplaceAllUsesOfValue(st->ctx, old, repl);
     }
 
+    MLIR_BlockHandle tail_blk = st->use_llvm_switch ? merge_blk : cont_blk;
     while (MLIR_GetBlockNumOps(parent) > pos + 1) {
         MLIR_OpHandle tail = MLIR_GetBlockOp(parent, pos + 1);
-        MLIR_MoveOpToBlockEnd(st->ctx, tail, cont_blk);
+        MLIR_MoveOpToBlockEnd(st->ctx, tail, tail_blk);
     }
 
     MLIR_BlockHandle *arm_blks = (MLIR_BlockHandle *)arena_alloc(
@@ -1030,8 +1083,10 @@ static bool lower_scf_index_switch(LowerState *st, MLIR_OpHandle op,
         move_region_blocks(st, regs[ri], parent_region);
     }
     MLIR_MoveBlockToRegionEnd(st->ctx, merge_blk, parent_region);
-    MLIR_MoveBlockToRegionEnd(st->ctx, cont_blk, parent_region);
-    emit_join_to_cont(st, merge_blk, cont_blk, nr, loc);
+    if (!st->use_llvm_switch) {
+        MLIR_MoveBlockToRegionEnd(st->ctx, cont_blk, parent_region);
+        emit_join_to_cont(st, merge_blk, cont_blk, nr, loc);
+    }
 
     MLIR_BlockHandle default_blk = arm_blks[0];
     if (n_cases == 0) {
@@ -1043,6 +1098,12 @@ static bool lower_scf_index_switch(LowerState *st, MLIR_OpHandle op,
         alloc, n_cases * sizeof(MLIR_BlockHandle)) : NULL;
     for (size_t i = 0; i < n_cases; i++)
         case_blks[i] = arm_blks[i + 1];
+
+    if (st->use_llvm_switch) {
+        emit_switch_at(st, parent, &pos, selector, default_blk,
+                       case_vals, case_blks, n_cases, loc);
+        return true;
+    }
 
     MLIR_BlockHandle chain = MLIR_CreateBlock(st->ctx);
     MLIR_BlockHandle chain_cur = chain;
@@ -1153,6 +1214,7 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
     else if (name_eq(name, "arith.bitcast"))ok = lower_rename(st, op, parent, pos, str_lit("llvm.bitcast"),OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "cf.br"))      ok = lower_cf_branch(st, op, parent, pos, str_lit("llvm.br"));
     else if (name_eq(name, "cf.cond_br")) ok = lower_cf_branch(st, op, parent, pos, str_lit("llvm.cond_br"));
+    else if (name_eq(name, "cf.switch"))  ok = lower_cf_branch(st, op, parent, pos, str_lit("llvm.switch"));
 
     return ok ? LOWER_REPLACED : LOWER_NONE;
 }
@@ -1228,6 +1290,7 @@ bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module) {
     st.ctx = ctx;
     st.module = module;
     st.module_body = MLIR_GetRegionBlock(body_region, 0);
+    st.use_llvm_switch = true;
 
     walk_block(&st, st.module_body);
     return true;
@@ -1235,7 +1298,8 @@ bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module) {
 
 // Wasm-tailored lowering first normalizes cf CFG into the structured forms
 // understood by this pass, then lowers those forms back to the canonical LLVM
-// CFG shapes consumed by the WasmSSA reconstructor.
+// CFG shapes consumed by the WasmSSA reconstructor. Uses the icmp compare
+// chain for index switches because wasmssa recognizes that shape faster.
 bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx, MLIR_OpHandle module) {
     if (module == MLIR_INVALID_HANDLE) return false;
     if (!MLIR_LiftCfToScf(ctx, module)) return false;
@@ -1247,6 +1311,7 @@ bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx, MLIR_OpHandle module) {
     st.ctx = ctx;
     st.module = module;
     st.module_body = MLIR_GetRegionBlock(body_region, 0);
+    st.use_llvm_switch = false;
 
     walk_block(&st, st.module_body);
     return verify_llvm_only_block(st.module_body);
