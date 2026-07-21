@@ -1943,6 +1943,11 @@ typedef struct {
     MLIR_BlockHandle *blocks; // all blocks in llvm.func
     uint8_t *state;  // 0 unseen, 1 active, 2 consumed
     size_t n_blocks;
+    // Reused BFS workspace (allocated once per function in cfg_init).
+    size_t *bfs_dist;
+    size_t *bfs_queue;
+    size_t *merge_dist; // n_roots * n_blocks for cfg_find_common_forward
+    size_t merge_cap;   // merge_dist length in size_t elements
 } CfgCtx;
 
 typedef struct {
@@ -1964,8 +1969,24 @@ static bool cfg_init(CfgCtx *C, FnCtx *F, MLIR_RegionHandle region) {
         F->arena, C->n_blocks * sizeof(MLIR_BlockHandle));
     C->state = (uint8_t *)arena_alloc(F->arena, C->n_blocks);
     memset(C->state, 0, C->n_blocks);
+    C->bfs_dist = (size_t *)arena_alloc(
+        F->arena, C->n_blocks * sizeof(size_t));
+    C->bfs_queue = (size_t *)arena_alloc(
+        F->arena, C->n_blocks * sizeof(size_t));
+    if (!C->blocks || !C->state || !C->bfs_dist || !C->bfs_queue)
+        return false;
     for (size_t i = 0; i < C->n_blocks; i++)
         C->blocks[i] = MLIR_GetRegionBlock(region, i);
+    return true;
+}
+
+static bool cfg_ensure_merge_dist(CfgCtx *C, size_t n_roots) {
+    size_t need = n_roots * C->n_blocks;
+    if (need <= C->merge_cap) return true;
+    C->merge_dist = (size_t *)arena_alloc(
+        C->F->arena, need * sizeof(size_t));
+    if (!C->merge_dist) return false;
+    C->merge_cap = need;
     return true;
 }
 
@@ -2109,16 +2130,15 @@ static CfgFlow cfg_emit_stop_block(CfgCtx *C, MLIR_BlockHandle blk,
 
 static bool cfg_distances(CfgCtx *C, MLIR_BlockHandle start,
                           const CfgStops *bounds, size_t *dist) {
+    if (!dist) dist = C->bfs_dist;
     for (size_t i = 0; i < C->n_blocks; i++) dist[i] = SIZE_MAX;
     size_t si = cfg_block_index(C, start);
     if (si == SIZE_MAX) return false;
-    size_t *queue = (size_t *)arena_alloc(
-        C->F->arena, C->n_blocks * sizeof(size_t));
     size_t head = 0, tail = 0;
     dist[si] = 0;
-    queue[tail++] = si;
+    C->bfs_queue[tail++] = si;
     while (head < tail) {
-        size_t bi = queue[head++];
+        size_t bi = C->bfs_queue[head++];
         // A boundary remains reachable (and can itself be selected as a
         // merge), but paths belonging to an enclosing construct must not make
         // blocks beyond it appear to be local joins.
@@ -2129,7 +2149,7 @@ static bool cfg_distances(CfgCtx *C, MLIR_BlockHandle start,
             size_t ti = cfg_block_index(C, MLIR_GetOpSuccessor(term, s));
             if (ti == SIZE_MAX || dist[ti] != SIZE_MAX) continue;
             dist[ti] = dist[bi] + 1;
-            queue[tail++] = ti;
+            C->bfs_queue[tail++] = ti;
         }
     }
     return true;
@@ -2144,8 +2164,8 @@ static bool cfg_find_common_forward(CfgCtx *C, MLIR_BlockHandle parent,
     if (n_roots == 0) return false;
     size_t pi = cfg_block_index(C, parent);
     if (pi == SIZE_MAX) return false;
-    size_t *all = (size_t *)arena_alloc(
-        C->F->arena, n_roots * C->n_blocks * sizeof(size_t));
+    if (!cfg_ensure_merge_dist(C, n_roots)) return false;
+    size_t *all = C->merge_dist;
     for (size_t r = 0; r < n_roots; r++)
         if (!cfg_distances(C, roots[r], bounds,
                            all + r * C->n_blocks))
@@ -2285,11 +2305,9 @@ typedef struct {
 
 static bool cfg_has_edge_to(CfgCtx *C, MLIR_BlockHandle start,
                             MLIR_BlockHandle target) {
-    size_t *dist = (size_t *)arena_alloc(
-        C->F->arena, C->n_blocks * sizeof(size_t));
-    if (!cfg_distances(C, start, NULL, dist)) return false;
+    if (!cfg_distances(C, start, NULL, NULL)) return false;
     size_t ti = cfg_block_index(C, target);
-    return ti != SIZE_MAX && dist[ti] != SIZE_MAX;
+    return ti != SIZE_MAX && C->bfs_dist[ti] != SIZE_MAX;
 }
 
 static size_t cfg_distance_to_avoiding(CfgCtx *C, MLIR_BlockHandle start,
@@ -2300,16 +2318,13 @@ static size_t cfg_distance_to_avoiding(CfgCtx *C, MLIR_BlockHandle start,
     size_t ai = cfg_block_index(C, avoid);
     if (si == SIZE_MAX || ti == SIZE_MAX || ai == SIZE_MAX || si == ai)
         return SIZE_MAX;
-    size_t *dist = (size_t *)arena_alloc(
-        C->F->arena, C->n_blocks * sizeof(size_t));
+    size_t *dist = C->bfs_dist;
     for (size_t i = 0; i < C->n_blocks; i++) dist[i] = SIZE_MAX;
-    size_t *queue = (size_t *)arena_alloc(
-        C->F->arena, C->n_blocks * sizeof(size_t));
     size_t head = 0, tail = 0;
     dist[si] = 0;
-    queue[tail++] = si;
+    C->bfs_queue[tail++] = si;
     while (head < tail) {
-        size_t bi = queue[head++];
+        size_t bi = C->bfs_queue[head++];
         MLIR_OpHandle term = cfg_terminator(C->blocks[bi]);
         if (term == MLIR_INVALID_HANDLE) continue;
         for (size_t s = 0; s < MLIR_GetOpNumSuccessors(term); s++) {
@@ -2323,7 +2338,7 @@ static size_t cfg_distance_to_avoiding(CfgCtx *C, MLIR_BlockHandle start,
             }
             if (ni == SIZE_MAX || ni == ai || dist[ni] != SIZE_MAX) continue;
             dist[ni] = dist[bi] + 1;
-            queue[tail++] = ni;
+            C->bfs_queue[tail++] = ni;
         }
     }
     return SIZE_MAX;
