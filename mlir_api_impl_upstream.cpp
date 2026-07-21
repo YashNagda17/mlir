@@ -443,7 +443,8 @@ extern "C" MLIR_OpHandle MLIR_CreateOpWithSuccessors(
         // attribute type doesn't match, which then makes the
         // intermediate cf.switch fail to lift to scf.index_switch.
         // Convert here so the typed property storage accepts it.
-        if (nm == "cf.switch" && na->getName().strref() == "case_values") {
+        if ((nm == "cf.switch" || nm == "llvm.switch") &&
+            na->getName().strref() == "case_values") {
             if (auto arr = mlir::dyn_cast<mlir::DenseI32ArrayAttr>(val)) {
                 auto i32Ty = mlir::IntegerType::get(&ctx, 32);
                 auto shaped = mlir::RankedTensorType::get(
@@ -483,7 +484,7 @@ extern "C" MLIR_OpHandle MLIR_CreateOpWithSuccessors(
             }
             state.addAttribute("operandSegmentSizes",
                 mlir::DenseI32ArrayAttr::get(&ctx, seg));
-        } else if (nm == "cf.switch") {
+        } else if (nm == "cf.switch" || nm == "llvm.switch") {
             // cf.switch has 3 operand segments: flag (always 1), default
             // operands (successor 0), and case operands (sum across
             // successors 1..N-1). It also needs case_operand_segments —
@@ -687,7 +688,8 @@ extern "C" MLIR_AttributeHandle MLIR_GetOpAttributeByName(MLIR_OpHandle h,
     // currently supports); for wider integer types fall through and
     // return the underlying DenseIntElementsAttr unchanged so callers
     // see the full-width values instead of silently truncated i32s.
-    if (mlir::isa<mlir::cf::SwitchOp>(op) &&
+    if ((mlir::isa<mlir::cf::SwitchOp>(op) ||
+         (op->getName().getStringRef() == "llvm.switch")) &&
         llvm::StringRef(name) == "case_values") {
         if (auto sw = mlir::dyn_cast<mlir::cf::SwitchOp>(op)) {
             if (auto cv = sw.getCaseValuesAttr()) {
@@ -701,6 +703,17 @@ extern "C" MLIR_AttributeHandle MLIR_GetOpAttributeByName(MLIR_OpHandle h,
                 }
                 return stash(cv);
             }
+        }
+        if (auto cv = op->getAttrOfType<mlir::DenseIntElementsAttr>("case_values")) {
+            auto elemTy = cv.getElementType();
+            if (elemTy.isInteger(32)) {
+                llvm::SmallVector<int32_t, 8> vals;
+                vals.reserve(cv.getNumElements());
+                for (auto apv : cv.getValues<llvm::APInt>())
+                    vals.push_back((int32_t)apv.getSExtValue());
+                return stash(mlir::DenseI32ArrayAttr::get(&mctx, vals));
+            }
+            return stash(cv);
         }
     }
     if (auto a = op->getAttr(name)) return stash(a);
