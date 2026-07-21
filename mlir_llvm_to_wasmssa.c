@@ -3,8 +3,9 @@
 //
 // Each `llvm.func` / `llvm.mlir.global` is lowered directly to `wasmssa.*`
 // MLIR ops appended into the output module body. Function bodies are walked
-// as flat LLVM CFG (llvm.br / llvm.cond_br) and reconstructed into
-// wasmssa.if / wasmssa.loop / switch trees. Straight-line ops use
+// as flat LLVM CFG (llvm.br / llvm.cond_br / llvm.switch) and reconstructed
+// into wasmssa.if / wasmssa.loop / switch trees. Both `llvm.switch` and the
+// icmp compare-chain shape from the wasm lift path are recognized.
 // emit-helper / inline call sites that build a stack-local `wasmssa_op_t`
 // describing one op and hands it to `commit_op`, which materializes the
 // matching MLIR op into the function's body block and returns the
@@ -232,6 +233,7 @@ static unsigned type_align_bytes(MLIR_Context *ctx, MLIR_TypeHandle ty) {
 // =============================================================================
 typedef struct { uintptr_t key; MLIR_ValueHandle val; } VMapEntry;
 typedef struct { uintptr_t key; uint32_t off; } AMapEntry;
+typedef struct { uintptr_t key; uint32_t idx; } BMapEntry;
 
 DEFINE_VECTOR_FOR_TYPE(uint8_t,    VecU8)
 
@@ -1923,6 +1925,16 @@ typedef enum {
 } CfgFlow;
 
 typedef enum {
+    CFG_TERM_NONE = 0,
+    CFG_TERM_BR,
+    CFG_TERM_COND_BR,
+    CFG_TERM_SWITCH,
+    CFG_TERM_RETURN,
+    CFG_TERM_UNREACHABLE,
+    CFG_TERM_OTHER,
+} CfgTermKind;
+
+typedef enum {
     CFG_STOP_BLOCK_RETURN = 0, // arm ends -> wasmsssa.block_return (vals)
     CFG_STOP_BR, // arm ends -> wasmsssa.br (depth, vals)
     CFG_STOP_REACH, // arm ends -> bind phi / stop
@@ -1951,6 +1963,18 @@ typedef struct {
     size_t *bfs_queue;
     size_t *merge_dist; // n_roots * n_blocks for cfg_find_common_forward
     size_t merge_cap;   // merge_dist length in size_t elements
+    // Open-addressing MLIR_BlockHandle -> block index (built once in cfg_init).
+    BMapEntry *bmap;
+    size_t bmap_cap;
+    // Precomputed integer adjacency + terminator metadata (built in cfg_init).
+    uint32_t *succ_off;
+    uint32_t *succ;
+    uint32_t *pred_off;
+    uint32_t *pred;
+    CfgTermKind *term_kind;
+    MLIR_OpHandle *terms;
+    uint8_t *reach; // separate from bfs_dist for concurrent reachability queries
+    uint8_t *back_reach; // blocks that can reach a given header (pred walk)
 } CfgCtx;
 
 typedef struct {
@@ -1961,6 +1985,50 @@ typedef struct {
 
 static CfgFlow lower_block_cfg(CfgCtx *C, MLIR_BlockHandle blk,
                                const CfgStops *stops);
+
+static CfgTermKind cfg_term_kind_for(MLIR_OpHandle term) {
+    if (term == MLIR_INVALID_HANDLE) return CFG_TERM_NONE;
+    string name = MLIR_GetOpName(term);
+    if (name_eq(name, "llvm.br")) return CFG_TERM_BR;
+    if (name_eq(name, "llvm.cond_br")) return CFG_TERM_COND_BR;
+    if (name_eq(name, "llvm.switch")) return CFG_TERM_SWITCH;
+    if (name_eq(name, "llvm.return")) return CFG_TERM_RETURN;
+    if (name_eq(name, "llvm.unreachable")) return CFG_TERM_UNREACHABLE;
+    return CFG_TERM_OTHER;
+}
+
+static uint32_t cfg_succ_begin(const CfgCtx *C, size_t bi) {
+    return C->succ_off[bi];
+}
+
+static uint32_t cfg_succ_end(const CfgCtx *C, size_t bi) {
+    return C->succ_off[bi + 1];
+}
+
+static uint32_t cfg_pred_begin(const CfgCtx *C, size_t bi) {
+    return C->pred_off[bi];
+}
+
+static uint32_t cfg_pred_end(const CfgCtx *C, size_t bi) {
+    return C->pred_off[bi + 1];
+}
+
+static size_t cfg_block_index(CfgCtx *C, MLIR_BlockHandle blk) {
+    if (C->bmap_cap == 0 || blk == 0) return SIZE_MAX;
+    uintptr_t k = (uintptr_t)blk;
+    size_t mask = C->bmap_cap - 1;
+    size_t i = map_hash(k) & mask;
+    while (C->bmap[i].key != 0) {
+        if (C->bmap[i].key == k) return C->bmap[i].idx;
+        i = (i + 1) & mask;
+    }
+    return SIZE_MAX;
+}
+
+static MLIR_OpHandle cfg_terminator(MLIR_BlockHandle blk) {
+    size_t n = MLIR_GetBlockNumOps(blk);
+    return n ? MLIR_GetBlockOp(blk, n - 1) : MLIR_INVALID_HANDLE;
+}
 
 static bool cfg_init(CfgCtx *C, FnCtx *F, MLIR_RegionHandle region) {
     memset(C, 0, sizeof *C);
@@ -1976,10 +2044,97 @@ static bool cfg_init(CfgCtx *C, FnCtx *F, MLIR_RegionHandle region) {
         F->scratch, C->n_blocks * sizeof(size_t));
     C->bfs_queue = (size_t *)arena_alloc(
         F->scratch, C->n_blocks * sizeof(size_t));
-    if (!C->blocks || !C->state || !C->bfs_dist || !C->bfs_queue)
+    C->reach = (uint8_t *)arena_alloc(F->scratch, C->n_blocks);
+    C->back_reach = (uint8_t *)arena_alloc(F->scratch, C->n_blocks);
+    C->terms = (MLIR_OpHandle *)arena_alloc(
+        F->scratch, C->n_blocks * sizeof(MLIR_OpHandle));
+    C->term_kind = (CfgTermKind *)arena_alloc(
+        F->scratch, C->n_blocks * sizeof(CfgTermKind));
+    if (!C->blocks || !C->state || !C->bfs_dist || !C->bfs_queue ||
+        !C->reach || !C->back_reach || !C->terms || !C->term_kind)
         return false;
     for (size_t i = 0; i < C->n_blocks; i++)
         C->blocks[i] = MLIR_GetRegionBlock(region, i);
+    size_t bcap = 16;
+    while (bcap < C->n_blocks * 2) bcap *= 2;
+    C->bmap = (BMapEntry *)arena_alloc(F->scratch, bcap * sizeof(BMapEntry));
+    if (!C->bmap) return false;
+    memset(C->bmap, 0, bcap * sizeof(BMapEntry));
+    C->bmap_cap = bcap;
+    size_t mask = bcap - 1;
+    for (size_t i = 0; i < C->n_blocks; i++) {
+        uintptr_t k = (uintptr_t)C->blocks[i];
+        if (k == 0) continue;
+        size_t j = map_hash(k) & mask;
+        while (C->bmap[j].key != 0) j = (j + 1) & mask;
+        C->bmap[j].key = k;
+        C->bmap[j].idx = (uint32_t)i;
+    }
+
+    uint32_t *succ_count = (uint32_t *)arena_alloc(
+        F->scratch, C->n_blocks * sizeof(uint32_t));
+    uint32_t *pred_count = (uint32_t *)arena_alloc(
+        F->scratch, C->n_blocks * sizeof(uint32_t));
+    if (!succ_count || !pred_count) return false;
+    memset(succ_count, 0, C->n_blocks * sizeof(uint32_t));
+    memset(pred_count, 0, C->n_blocks * sizeof(uint32_t));
+
+    for (size_t i = 0; i < C->n_blocks; i++) {
+        MLIR_BlockHandle blk = C->blocks[i];
+        MLIR_OpHandle term = cfg_terminator(blk);
+        C->terms[i] = term;
+        C->term_kind[i] = cfg_term_kind_for(term);
+        if (term == MLIR_INVALID_HANDLE) continue;
+        size_t ns = MLIR_GetOpNumSuccessors(term);
+        for (size_t s = 0; s < ns; s++) {
+            size_t ti = cfg_block_index(C, MLIR_GetOpSuccessor(term, s));
+            if (ti == SIZE_MAX) continue;
+            succ_count[i]++;
+            pred_count[ti]++;
+        }
+    }
+
+    C->succ_off = (uint32_t *)arena_alloc(
+        F->scratch, (C->n_blocks + 1) * sizeof(uint32_t));
+    C->pred_off = (uint32_t *)arena_alloc(
+        F->scratch, (C->n_blocks + 1) * sizeof(uint32_t));
+    if (!C->succ_off || !C->pred_off) return false;
+    C->succ_off[0] = 0;
+    C->pred_off[0] = 0;
+    for (size_t i = 0; i < C->n_blocks; i++) {
+        C->succ_off[i + 1] = C->succ_off[i] + succ_count[i];
+        C->pred_off[i + 1] = C->pred_off[i] + pred_count[i];
+    }
+
+    uint32_t nsucc = C->succ_off[C->n_blocks];
+    uint32_t npred = C->pred_off[C->n_blocks];
+    C->succ = nsucc ? (uint32_t *)arena_alloc(
+        F->scratch, nsucc * sizeof(uint32_t)) : NULL;
+    C->pred = npred ? (uint32_t *)arena_alloc(
+        F->scratch, npred * sizeof(uint32_t)) : NULL;
+    if ((nsucc && !C->succ) || (npred && !C->pred)) return false;
+
+    uint32_t *succ_pos = (uint32_t *)arena_alloc(
+        F->scratch, C->n_blocks * sizeof(uint32_t));
+    uint32_t *pred_pos = (uint32_t *)arena_alloc(
+        F->scratch, C->n_blocks * sizeof(uint32_t));
+    if (!succ_pos || !pred_pos) return false;
+    for (size_t i = 0; i < C->n_blocks; i++) {
+        succ_pos[i] = C->succ_off[i];
+        pred_pos[i] = C->pred_off[i];
+    }
+
+    for (size_t i = 0; i < C->n_blocks; i++) {
+        MLIR_OpHandle term = C->terms[i];
+        if (term == MLIR_INVALID_HANDLE) continue;
+        size_t ns = MLIR_GetOpNumSuccessors(term);
+        for (size_t s = 0; s < ns; s++) {
+            size_t ti = cfg_block_index(C, MLIR_GetOpSuccessor(term, s));
+            if (ti == SIZE_MAX) continue;
+            C->succ[succ_pos[i]++] = (uint32_t)ti;
+            C->pred[pred_pos[ti]++] = (uint32_t)i;
+        }
+    }
     return true;
 }
 
@@ -1991,17 +2146,6 @@ static bool cfg_ensure_merge_dist(CfgCtx *C, size_t n_roots) {
     if (!C->merge_dist) return false;
     C->merge_cap = need;
     return true;
-}
-
-static size_t cfg_block_index(CfgCtx *C, MLIR_BlockHandle blk) {
-    for (size_t i = 0; i < C->n_blocks; i++)
-        if (C->blocks[i] == blk) return i;
-    return SIZE_MAX;
-}
-
-static MLIR_OpHandle cfg_terminator(MLIR_BlockHandle blk) {
-    size_t n = MLIR_GetBlockNumOps(blk);
-    return n ? MLIR_GetBlockOp(blk, n - 1) : MLIR_INVALID_HANDLE;
 }
 
 static void cfg_dump(CfgCtx *C) {
@@ -2018,10 +2162,11 @@ static void cfg_dump(CfgCtx *C) {
                 MLIR_GetBlockNumOps(blk),
                 (int)name.size, name.str);
         if (term != MLIR_INVALID_HANDLE) {
-            for (size_t s = 0; s < MLIR_GetOpNumSuccessors(term); s++) {
-                fprintf(stderr, " %s%zu(%zu)", s ? "," : "->",
-                        cfg_block_index(C, MLIR_GetOpSuccessor(term, s)),
-                        MLIR_GetOpNumSuccessorOperands(term, s));
+            for (uint32_t si = 0, e = cfg_succ_begin(C, i);
+                 e < cfg_succ_end(C, i); e++, si++) {
+                fprintf(stderr, " %s%u(%zu)", si ? "," : "->",
+                        C->succ[e],
+                        MLIR_GetOpNumSuccessorOperands(term, si));
             }
         }
         fputc('\n', stderr);
@@ -2131,28 +2276,66 @@ static CfgFlow cfg_emit_stop_block(CfgCtx *C, MLIR_BlockHandle blk,
     return CFG_FLOW_STOP;
 }
 
-static bool cfg_distances(CfgCtx *C, MLIR_BlockHandle start,
-                          const CfgStops *bounds, size_t *dist) {
+static bool cfg_distances_idx(CfgCtx *C, size_t si,
+                              const CfgStops *bounds, size_t *dist) {
     if (!dist) dist = C->bfs_dist;
     for (size_t i = 0; i < C->n_blocks; i++) dist[i] = SIZE_MAX;
-    size_t si = cfg_block_index(C, start);
-    if (si == SIZE_MAX) return false;
+    if (si >= C->n_blocks) return false;
     size_t head = 0, tail = 0;
     dist[si] = 0;
     C->bfs_queue[tail++] = si;
     while (head < tail) {
         size_t bi = C->bfs_queue[head++];
-        // A boundary remains reachable (and can itself be selected as a
-        // merge), but paths belonging to an enclosing construct must not make
-        // blocks beyond it appear to be local joins.
         if (cfg_find_stop(bounds, C->blocks[bi])) continue;
-        MLIR_OpHandle term = cfg_terminator(C->blocks[bi]);
-        if (term == MLIR_INVALID_HANDLE) continue;
-        for (size_t s = 0; s < MLIR_GetOpNumSuccessors(term); s++) {
-            size_t ti = cfg_block_index(C, MLIR_GetOpSuccessor(term, s));
-            if (ti == SIZE_MAX || dist[ti] != SIZE_MAX) continue;
+        for (uint32_t e = cfg_succ_begin(C, bi); e < cfg_succ_end(C, bi); e++) {
+            size_t ti = C->succ[e];
+            if (dist[ti] != SIZE_MAX) continue;
             dist[ti] = dist[bi] + 1;
             C->bfs_queue[tail++] = ti;
+        }
+    }
+    return true;
+}
+
+static bool cfg_distances(CfgCtx *C, MLIR_BlockHandle start,
+                          const CfgStops *bounds, size_t *dist) {
+    size_t si = cfg_block_index(C, start);
+    if (si == SIZE_MAX) return false;
+    return cfg_distances_idx(C, si, bounds, dist);
+}
+
+static bool cfg_fill_reach(CfgCtx *C, size_t si, const CfgStops *bounds) {
+    memset(C->reach, 0, C->n_blocks);
+    if (si >= C->n_blocks) return false;
+    size_t head = 0, tail = 0;
+    C->reach[si] = 1;
+    C->bfs_queue[tail++] = si;
+    while (head < tail) {
+        size_t bi = C->bfs_queue[head++];
+        if (cfg_find_stop(bounds, C->blocks[bi])) continue;
+        for (uint32_t e = cfg_succ_begin(C, bi); e < cfg_succ_end(C, bi); e++) {
+            size_t ti = C->succ[e];
+            if (C->reach[ti]) continue;
+            C->reach[ti] = 1;
+            C->bfs_queue[tail++] = ti;
+        }
+    }
+    return true;
+}
+
+static bool cfg_fill_back_reach(CfgCtx *C, size_t hi) {
+    memset(C->back_reach, 0, C->n_blocks);
+    if (hi >= C->n_blocks) return false;
+    size_t head = 0, tail = 0;
+    C->back_reach[hi] = 1;
+    C->bfs_queue[tail++] = hi;
+    while (head < tail) {
+        size_t bi = C->bfs_queue[head++];
+        for (uint32_t e = cfg_pred_begin(C, bi); e < cfg_pred_end(C, bi); e++) {
+            size_t pi = C->pred[e];
+            if (C->back_reach[pi]) continue;
+            C->back_reach[pi] = 1;
+            C->bfs_queue[tail++] = pi;
         }
     }
     return true;
@@ -2196,14 +2379,19 @@ static bool cfg_find_common_forward(CfgCtx *C, MLIR_BlockHandle parent,
     return true;
 }
 
-static bool cfg_block_ends_br(MLIR_BlockHandle blk,
-                              MLIR_BlockHandle *target) {
-    MLIR_OpHandle term = cfg_terminator(blk);
-    if (term == MLIR_INVALID_HANDLE ||
-        !name_eq(MLIR_GetOpName(term), "llvm.br") ||
-        MLIR_GetOpNumSuccessors(term) != 1)
-        return false;
-    *target = MLIR_GetOpSuccessor(term, 0);
+static bool cfg_block_ends_br_idx(CfgCtx *C, size_t bi, size_t *target) {
+    if (C->term_kind[bi] != CFG_TERM_BR) return false;
+    if (cfg_succ_end(C, bi) - cfg_succ_begin(C, bi) != 1) return false;
+    *target = C->succ[cfg_succ_begin(C, bi)];
+    return true;
+}
+
+static bool cfg_block_ends_br_ctx(CfgCtx *C, MLIR_BlockHandle blk,
+                                  MLIR_BlockHandle *target) {
+    size_t bi = cfg_block_index(C, blk);
+    size_t ti;
+    if (bi == SIZE_MAX || !cfg_block_ends_br_idx(C, bi, &ti)) return false;
+    *target = C->blocks[ti];
     return true;
 }
 
@@ -2219,7 +2407,7 @@ static bool cfg_find_arm_merge(CfgCtx *C, MLIR_BlockHandle parent,
     MLIR_BlockHandle candidate = MLIR_INVALID_HANDLE;
     for (size_t i = 0; i < n_roots; i++) {
         MLIR_BlockHandle target;
-        if (!cfg_block_ends_br(roots[i], &target)) continue;
+        if (!cfg_block_ends_br_ctx(C, roots[i], &target)) continue;
         if (candidate == MLIR_INVALID_HANDLE) candidate = target;
         else if (candidate != target) return false;
     }
@@ -2306,19 +2494,8 @@ typedef struct {
     MLIR_OpHandle header_cbr, exit_br;
 } CfgWhile;
 
-static bool cfg_has_edge_to(CfgCtx *C, MLIR_BlockHandle start,
-                            MLIR_BlockHandle target) {
-    if (!cfg_distances(C, start, NULL, NULL)) return false;
-    size_t ti = cfg_block_index(C, target);
-    return ti != SIZE_MAX && C->bfs_dist[ti] != SIZE_MAX;
-}
-
-static size_t cfg_distance_to_avoiding(CfgCtx *C, MLIR_BlockHandle start,
-                                       MLIR_BlockHandle target,
-                                       MLIR_BlockHandle avoid) {
-    size_t si = cfg_block_index(C, start);
-    size_t ti = cfg_block_index(C, target);
-    size_t ai = cfg_block_index(C, avoid);
+static size_t cfg_distance_to_avoiding_idx(CfgCtx *C, size_t si, size_t ti,
+                                           size_t ai) {
     if (si == SIZE_MAX || ti == SIZE_MAX || ai == SIZE_MAX || si == ai)
         return SIZE_MAX;
     size_t *dist = C->bfs_dist;
@@ -2328,18 +2505,13 @@ static size_t cfg_distance_to_avoiding(CfgCtx *C, MLIR_BlockHandle start,
     C->bfs_queue[tail++] = si;
     while (head < tail) {
         size_t bi = C->bfs_queue[head++];
-        MLIR_OpHandle term = cfg_terminator(C->blocks[bi]);
-        if (term == MLIR_INVALID_HANDLE) continue;
-        for (size_t s = 0; s < MLIR_GetOpNumSuccessors(term); s++) {
-            size_t ni = cfg_block_index(C, MLIR_GetOpSuccessor(term, s));
+        for (uint32_t e = cfg_succ_begin(C, bi); e < cfg_succ_end(C, bi); e++) {
+            size_t ni = C->succ[e];
             if (ni == ti) {
-                // The inverse lowering expects the yield/backedge emitted by
-                // the while back-edge, not a forward predecessor that happens
-                // to enter this block after traversing an enclosing cycle.
                 if (bi >= ti) return dist[bi] + 1;
                 continue;
             }
-            if (ni == SIZE_MAX || ni == ai || dist[ni] != SIZE_MAX) continue;
+            if (ni == ai || dist[ni] != SIZE_MAX) continue;
             dist[ni] = dist[bi] + 1;
             C->bfs_queue[tail++] = ni;
         }
@@ -2347,12 +2519,6 @@ static size_t cfg_distance_to_avoiding(CfgCtx *C, MLIR_BlockHandle start,
     return SIZE_MAX;
 }
 
-// Match the br/header/body/exit-stub/continuation shape emitted by
-// mlir_lower_to_llvm.c's lower_scf_while.  The header and body regions may
-// contain nested lowered ifs, so the loop condition need not be the
-// terminator of the entry target.  Identify it by the exact condition-edge
-// the true edge can reach the header, the false edge cannot, and the false
-// edge goes through the phi-forwarding exit stub.
 static bool cfg_match_while(CfgCtx *C, MLIR_OpHandle entry_br, CfgWhile *W,
                             const char **why) {
     if (why) *why = "not a single-successor entry";
@@ -2364,30 +2530,36 @@ static bool cfg_match_while(CfgCtx *C, MLIR_OpHandle entry_br, CfgWhile *W,
     size_t hi = cfg_block_index(C, header);
     if (hi == SIZE_MAX) return false;
 
+    if (!cfg_fill_reach(C, hi, NULL)) return false;
+    if (!cfg_fill_back_reach(C, hi)) return false;
+
     if (why) *why = "no reachable structured loop condition";
     size_t best_back_distance = SIZE_MAX;
     CfgWhile best = {0};
     for (size_t bi = hi; bi < C->n_blocks; bi++) {
-        MLIR_BlockHandle condition = C->blocks[bi];
-        if (!cfg_has_edge_to(C, header, condition)) continue;
-        MLIR_OpHandle cbr = cfg_terminator(condition);
+        if (!C->reach[bi]) continue;
+        if (C->term_kind[bi] != CFG_TERM_COND_BR) continue;
+        uint32_t sb = cfg_succ_begin(C, bi);
+        uint32_t se = cfg_succ_end(C, bi);
+        if (se - sb != 2) continue;
+        size_t body_i = C->succ[sb];
+        size_t exit_i = C->succ[sb + 1];
+        if (!C->back_reach[body_i]) continue;
+        MLIR_OpHandle cbr = C->terms[bi];
         if (cbr == MLIR_INVALID_HANDLE ||
-            !name_eq(MLIR_GetOpName(cbr), "llvm.cond_br") ||
-            MLIR_GetOpNumOperands(cbr) < 1 ||
-            MLIR_GetOpNumSuccessors(cbr) != 2)
+            MLIR_GetOpNumOperands(cbr) < 1)
             continue;
-        MLIR_BlockHandle body = MLIR_GetOpSuccessor(cbr, 0);
-        MLIR_BlockHandle exit = MLIR_GetOpSuccessor(cbr, 1);
-        size_t back_distance = cfg_distance_to_avoiding(
-            C, body, header, exit);
+        MLIR_BlockHandle body = C->blocks[body_i];
+        MLIR_BlockHandle exit = C->blocks[exit_i];
+        size_t back_distance = cfg_distance_to_avoiding_idx(
+            C, body_i, hi, exit_i);
         if (back_distance == SIZE_MAX) continue;
-        MLIR_OpHandle exit_br = cfg_terminator(exit);
-        if (exit_br == MLIR_INVALID_HANDLE ||
+        if (C->term_kind[exit_i] != CFG_TERM_BR ||
             MLIR_GetBlockNumOps(exit) != 1 ||
-            !name_eq(MLIR_GetOpName(exit_br), "llvm.br") ||
-            MLIR_GetOpNumSuccessors(exit_br) != 1)
+            cfg_succ_end(C, exit_i) - cfg_succ_begin(C, exit_i) != 1)
             continue;
-        MLIR_BlockHandle cont = MLIR_GetOpSuccessor(exit_br, 0);
+        MLIR_OpHandle exit_br = C->terms[exit_i];
+        MLIR_BlockHandle cont = C->blocks[C->succ[cfg_succ_begin(C, exit_i)]];
         size_t nt = MLIR_GetOpNumSuccessorOperands(cbr, 0);
         size_t nf = MLIR_GetOpNumSuccessorOperands(cbr, 1);
         size_t nx = MLIR_GetOpNumSuccessorOperands(exit_br, 0);
@@ -2408,7 +2580,7 @@ static bool cfg_match_while(CfgCtx *C, MLIR_OpHandle entry_br, CfgWhile *W,
         if (back_distance < best_back_distance) {
             best_back_distance = back_distance;
             best = (CfgWhile){
-                header, condition, body, exit, cont, cbr, exit_br};
+                header, C->blocks[bi], body, exit, cont, cbr, exit_br};
         }
     }
     if (best_back_distance == SIZE_MAX) return false;
@@ -2695,8 +2867,11 @@ static CfgFlow cfg_lower_llvm_switch(CfgCtx *C, MLIR_BlockHandle parent,
                                      MLIR_OpHandle sw,
                                      const CfgStops *outer_stops) {
     size_t ns = MLIR_GetOpNumSuccessors(sw);
-    if (MLIR_GetOpNumOperands(sw) != 1 || ns == 0)
-        return CFG_FLOW_ERROR;
+    if (ns == 0) return CFG_FLOW_ERROR;
+    size_t need_ops = 1;
+    for (size_t s = 0; s < ns; s++)
+        need_ops += MLIR_GetOpNumSuccessorOperands(sw, s);
+    if (MLIR_GetOpNumOperands(sw) != need_ops) return CFG_FLOW_ERROR;
     size_t n_cases = ns - 1;
     int64_t *case_vals = n_cases ? (int64_t *)arena_alloc(
         C->F->scratch, n_cases * sizeof(int64_t)) : NULL;
@@ -2720,8 +2895,7 @@ static CfgFlow cfg_lower_llvm_switch(CfgCtx *C, MLIR_BlockHandle parent,
         merge, outer_stops, merge);
 }
 
-// Recognize one compare-chain step emitted by mlir_lower_to_llvm.c's
-// lower_scf_index_switch:
+// Recognize one compare-chain step emitted by lower_scf_index_switch:
 // constant, icmp eq selector/constant, cond_br case/next.
 static bool cfg_match_switch_step(CfgCtx *C, MLIR_BlockHandle blk,
                                   MLIR_ValueHandle expected_selector,
