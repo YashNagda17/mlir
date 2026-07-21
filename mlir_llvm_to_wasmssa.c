@@ -13,9 +13,10 @@
 // them; subsequent lookups thread those handles through `o.operands` to
 // stitch up the wasmssa IR.
 //
-// No module-level scratch buffer is retained: ops flow straight from
-// lower_op into the MLIR module under construction. Per-function vmap and
-// CFG-walk temporaries use a scratch arena reset after each llvm.func.
+// Peak-memory strategy (mirrors mlir_llvm_to_macho): the LLVM input module
+// lives in the caller's arena; wasmssa output is built in a separate arena;
+// per-function vmap / CFG-walk temporaries use a scratch arena reset after
+// each llvm.func. The input arena is destroyed before this returns.
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -3530,22 +3531,103 @@ static void emit_import_func(MLIR_Context *ctx, Arena *arena,
     MLIR_AppendBlockOp(ctx, body, op);
 }
 
+// Match driver.c: one 64 MiB buddy block per arena chunk (see comment there).
+#define WASMSSA_OUT_CHUNK (64u * 1024u * 1024u - 64u * 1024u)
+
+static bool llvm_func_has_body(MLIR_OpHandle op) {
+    return MLIR_GetOpNumRegions(op) > 0 &&
+           MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 0)) > 0;
+}
+
+typedef struct {
+    MLIR_OpHandle *ops;
+    size_t n;
+} LlvmOpList;
+
+static void llvm_op_list_free(LlvmOpList *l) {
+    free(l->ops);
+    l->ops = NULL;
+    l->n = 0;
+}
+
+// Snapshot module-body ops before any erasures. Pass 2 erases llvm.func ops
+// from the module block, so later passes must not re-walk by index.
+static bool llvm_module_snapshot(MLIR_BlockHandle mb,
+                                 LlvmOpList *imports,
+                                 LlvmOpList *defs,
+                                 LlvmOpList *globals) {
+    memset(imports, 0, sizeof *imports);
+    memset(defs, 0, sizeof *defs);
+    memset(globals, 0, sizeof *globals);
+    size_t nops = MLIR_GetBlockNumOps(mb);
+    for (size_t i = 0; i < nops; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
+        string name = MLIR_GetOpName(op);
+        if (name_eq(name, "llvm.func")) {
+            if (llvm_func_has_body(op)) defs->n++;
+            else imports->n++;
+        } else if (name_eq(name, "llvm.mlir.global")) {
+            globals->n++;
+        }
+    }
+    if (imports->n) {
+        imports->ops = (MLIR_OpHandle *)calloc(imports->n, sizeof(MLIR_OpHandle));
+        if (!imports->ops) return false;
+    }
+    if (defs->n) {
+        defs->ops = (MLIR_OpHandle *)calloc(defs->n, sizeof(MLIR_OpHandle));
+        if (!defs->ops) return false;
+    }
+    if (globals->n) {
+        globals->ops = (MLIR_OpHandle *)calloc(globals->n, sizeof(MLIR_OpHandle));
+        if (!globals->ops) return false;
+    }
+    size_t ii = 0, di = 0, gi = 0;
+    for (size_t i = 0; i < nops; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
+        string name = MLIR_GetOpName(op);
+        if (name_eq(name, "llvm.func")) {
+            if (llvm_func_has_body(op)) defs->ops[di++] = op;
+            else imports->ops[ii++] = op;
+        } else if (name_eq(name, "llvm.mlir.global")) {
+            globals->ops[gi++] = op;
+        }
+    }
+    return true;
+}
+
 // =============================================================================
 // Public stage 1 entry point: walk the LLVM-dialect module and emit a
 // wasmssa-form `builtin.module` directly. Each function/global is emitted
 // straight into the output module body — no module-level intermediate is
 // retained. Output ordering (matches the prior two-pass implementation
 // byte-for-byte): import_funcs, then defined funcs, then import_globals.
+//
+// Peak memory: LLVM input stays in the caller's arena until the full wasm
+// pipeline finishes (type interning still references it); wasmssa output is
+// built in a fresh arena; per-function scratch (vmap, CFG BFS, sig buffers)
+// is reset after each llvm.func and the llvm.func is erased once lowered.
 // =============================================================================
 MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
+    if (module == MLIR_INVALID_HANDLE) return MLIR_INVALID_HANDLE;
+    if (!getenv("TINYC_NO_DEF_USE"))
+        ctx->no_def_use_tracking = true;
+
     MLIR_RegionHandle mr = MLIR_GetOpRegion(module, 0);
     MLIR_BlockHandle  mb = MLIR_GetRegionBlock(mr, 0);
-    size_t nops = MLIR_GetBlockNumOps(mb);
 
-    Arena            *arena = MLIR_GetArenaAllocator(ctx);
+    Arena *in_arena = MLIR_GetArenaAllocator(ctx);
+    Arena *out_arena = arena_create(WASMSSA_OUT_CHUNK);
+    if (!out_arena) return MLIR_INVALID_HANDLE;
     Arena *scratch = arena_create(1u * 1024u * 1024u);
-    if (!scratch) return MLIR_INVALID_HANDLE;
+    if (!scratch) {
+        arena_destroy(out_arena);
+        return MLIR_INVALID_HANDLE;
+    }
     arena_pos_t scratch0 = arena_get_pos(scratch);
+
+    MLIR_SetArenaAllocator(ctx, out_arena);
+
     MLIR_BlockHandle  body  = MLIR_CreateBlock(ctx);
     MLIR_RegionHandle region = MLIR_CreateRegion(ctx);
     MLIR_AppendRegionBlock(ctx, region, body);
@@ -3558,79 +3640,73 @@ MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
 
     ModCtx mod = {0};
     mod.ctx = ctx;
-    mod.arena = arena;
+    mod.arena = out_arena;
     mod.body = body;
+
+    LlvmOpList imports = {0}, defs = {0}, globals = {0};
+    if (!llvm_module_snapshot(mb, &imports, &defs, &globals)) goto fail;
 
     // Pass 1: imported (declared, body-less) funcs first so they take the
     // low function-index space in wasm.
-    for (size_t i = 0; i < nops; i++) {
-        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
-        if (!name_eq(MLIR_GetOpName(op), "llvm.func")) continue;
-        bool has_body = MLIR_GetOpNumRegions(op) > 0 &&
-                        MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 0)) > 0;
-        if (has_body) continue;
+    for (size_t i = 0; i < imports.n; i++) {
+        MLIR_OpHandle op = imports.ops[i];
         arena_reset(scratch, scratch0);
         uint8_t *p, *r; size_t np, nr;
-        if (!sig_for_func(ctx, scratch, op, &p, &np, &r, &nr)) {
-            arena_destroy(scratch);
-            return MLIR_INVALID_HANDLE;
-        }
+        if (!sig_for_func(ctx, scratch, op, &p, &np, &r, &nr)) goto fail;
         MLIR_AttributeHandle sa = find_attr(op, "sym_name");
         string nm = MLIR_GetAttributeString(sa);
 
-        // Forward `wasm.import_module` / `wasm.import_name` annotations
-        // (from `__attribute__((__import_module__("...")))`) so the
-        // binary emitter can place this import in the requested module
-        // (e.g. WASI's `wasi_snapshot_preview1`) instead of the default
-        // `env`.
         string imod = {0}, iname = {0};
         MLIR_AttributeHandle iam = find_attr(op, "wasm.import_module");
         if (iam != MLIR_INVALID_HANDLE) imod = MLIR_GetAttributeString(iam);
         MLIR_AttributeHandle ian = find_attr(op, "wasm.import_name");
         if (ian != MLIR_INVALID_HANDLE) iname = MLIR_GetAttributeString(ian);
 
-        emit_import_func(ctx, arena, body, nm, imod, iname, p, np, r, nr);
+        emit_import_func(ctx, out_arena, body, nm, imod, iname, p, np, r, nr);
     }
 
-    // Pass 2: defined funcs in source order. `is_function_symbol`
-    // discovers each func via its already-emitted wasmssa.func wrapper
-    // in `body`; refs between earlier defs therefore work naturally.
-    for (size_t i = 0; i < nops; i++) {
-        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
-        if (!name_eq(MLIR_GetOpName(op), "llvm.func")) continue;
-        bool has_body = MLIR_GetOpNumRegions(op) > 0 &&
-                        MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 0)) > 0;
-        if (!has_body) continue;
+    // Pass 2: defined funcs in source order.
+    for (size_t fi = 0; fi < defs.n; fi++) {
         arena_reset(scratch, scratch0);
+        MLIR_OpHandle op = defs.ops[fi];
         uint8_t *p, *r; size_t np, nr;
-        if (!sig_for_func(ctx, scratch, op, &p, &np, &r, &nr)) {
-            arena_destroy(scratch);
-            return MLIR_INVALID_HANDLE;
-        }
+        if (!sig_for_func(ctx, scratch, op, &p, &np, &r, &nr)) goto fail;
         MLIR_AttributeHandle sa = find_attr(op, "sym_name");
         string sym = MLIR_GetAttributeString(sa);
         bool is_main = (sym.size == 4 && memcmp(sym.str, "main", 4) == 0);
         string nm = is_main ? str_lit("__original_main") : sym;
 
-        if (!lower_function(ctx, arena, scratch, &mod, body, nm, is_main,
+        if (!lower_function(ctx, out_arena, scratch, &mod, body, nm, is_main,
                             op, p, np, r, nr)) {
-            arena_destroy(scratch);
-            return MLIR_INVALID_HANDLE;
+            goto fail;
         }
+        MLIR_EraseOp(ctx, op);
     }
 
     // Pass 3: globals last (matches the legacy emit ordering of
     // funcs-before-globals in the previously buffered module).
-    for (size_t i = 0; i < nops; i++) {
-        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
-        if (!name_eq(MLIR_GetOpName(op), "llvm.mlir.global")) continue;
-        if (!lower_global(ctx, arena, body, op)) {
+    for (size_t gi = 0; gi < globals.n; gi++) {
+        MLIR_OpHandle op = globals.ops[gi];
+        if (!lower_global(ctx, out_arena, body, op)) {
             fprintf(stderr, "wasmssa-lower: failed to lower global\n");
-            arena_destroy(scratch);
-            return MLIR_INVALID_HANDLE;
+            goto fail;
         }
     }
 
+    llvm_op_list_free(&imports);
+    llvm_op_list_free(&defs);
+    llvm_op_list_free(&globals);
+
     arena_destroy(scratch);
+    MLIR_SetArenaAllocator(ctx, out_arena);
     return out_module;
+
+fail:
+    llvm_op_list_free(&imports);
+    llvm_op_list_free(&defs);
+    llvm_op_list_free(&globals);
+    arena_destroy(scratch);
+    arena_destroy(out_arena);
+    MLIR_SetArenaAllocator(ctx, in_arena);
+    return MLIR_INVALID_HANDLE;
 }
