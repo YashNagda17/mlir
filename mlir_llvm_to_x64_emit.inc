@@ -711,6 +711,45 @@ static void lower_op(FnCtx *F, MLIR_OpHandle op, SymSet *refs) {
 
 // emit a terminator (also collects callee refs via lower_op for calls? no -
 // terminators here are br/cond_br/return/unreachable only)
+static bool parse_switch_case_values(MLIR_Context *ctx, MLIR_OpHandle sw,
+                                     size_t n, int64_t *out) {
+    if (n == 0) return true;
+    MLIR_AttributeHandle a = MLIR_GetOpAttributeByName(sw, "case_values");
+    if (a == MLIR_INVALID_HANDLE) return false;
+    string s = MLIR_GetAttributeAsString(ctx, a);
+    size_t begin = 0, end = s.size;
+    for (size_t i = 0; i + 6 <= s.size; i++) {
+        if (memcmp(s.str + i, "array<", 6) == 0) {
+            begin = i + 6;
+            while (begin < s.size && s.str[begin] != ':') begin++;
+            if (begin < s.size) begin++;
+            end = begin;
+            while (end < s.size && s.str[end] != '>') end++;
+            break;
+        }
+        if (memcmp(s.str + i, "dense<", 6) == 0) {
+            begin = i + 6;
+            end = begin;
+            while (end < s.size && s.str[end] != '>') end++;
+            break;
+        }
+    }
+    size_t p = begin, got = 0;
+    while (p < end && got < n) {
+        while (p < end && !((s.str[p] >= '0' && s.str[p] <= '9') ||
+                            s.str[p] == '-')) p++;
+        if (p == end) break;
+        int64_t sign = 1;
+        if (s.str[p] == '-') { sign = -1; p++; }
+        if (p == end || s.str[p] < '0' || s.str[p] > '9') return false;
+        int64_t v = 0;
+        while (p < end && s.str[p] >= '0' && s.str[p] <= '9')
+            v = v * 10 + (s.str[p++] - '0');
+        out[got++] = sign * v;
+    }
+    return got == n;
+}
+
 static void lower_term(FnCtx *F, MLIR_OpHandle op) {
     string nm = MLIR_GetOpName(op);
     MLIR_RegionHandle reg = MLIR_GetBlockParentRegion(MLIR_GetOpParentBlock(op));
@@ -766,6 +805,38 @@ static void lower_term(FnCtx *F, MLIR_OpHandle op) {
         } else {
             add_fix(F, block_index(reg, ft), f_jmp);
         }
+        return;
+    }
+    if (str_eqz(nm, "llvm.switch")) {
+        size_t ns = MLIR_GetOpNumSuccessors(op);
+        if (ns == 0) { fail(F, "llvm.switch has no destinations", nm); return; }
+        size_t n_cases = ns - 1;
+        int64_t case_vals[64];
+        int64_t *cv = case_vals;
+        if (n_cases > 64) {
+            cv = (int64_t *)malloc(n_cases * sizeof(int64_t));
+            if (!cv) { fail(F, "llvm.switch case alloc failed", nm); return; }
+        }
+        if (!parse_switch_case_values(F->ctx, op, n_cases, cv)) {
+            if (cv != case_vals) free(cv);
+            fail(F, "invalid llvm.switch case_values", nm);
+            return;
+        }
+        load_val(F, MLIR_GetOpOperand(op, 0), RAX);
+        for (size_t ci = 0; ci < n_cases; ci++) {
+            eb(F, 0x3D); e32(F, (uint32_t)cv[ci]);                 // cmp eax, imm32
+            eb(F, 0x0F); eb(F, 0x85); uint32_t jne = here(F); e32(F, 0); // jne next
+            MLIR_BlockHandle tgt = MLIR_GetOpSuccessor(op, ci + 1);
+            emit_edge(F, op, ci + 1, tgt);
+            eb(F, 0xE9); uint32_t jmp = here(F); e32(F, 0);
+            add_fix(F, block_index(reg, tgt), jmp);
+            patch_rel32_at(F, jne, here(F));
+        }
+        MLIR_BlockHandle def = MLIR_GetOpSuccessor(op, 0);
+        emit_edge(F, op, 0, def);
+        eb(F, 0xE9); uint32_t jmp = here(F); e32(F, 0);
+        add_fix(F, block_index(reg, def), jmp);
+        if (cv != case_vals) free(cv);
         return;
     }
     fail(F, "unsupported terminator", nm);

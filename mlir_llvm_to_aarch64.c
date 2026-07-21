@@ -705,6 +705,45 @@ static int icmp_pred_to_cond(int64_t p) {
     }
 }
 
+static bool parse_switch_case_values(MLIR_Context *ctx, MLIR_OpHandle sw,
+                                     size_t n, int64_t *out) {
+    if (n == 0) return true;
+    MLIR_AttributeHandle a = MLIR_GetOpAttributeByName(sw, "case_values");
+    if (a == MLIR_INVALID_HANDLE) return false;
+    string s = MLIR_GetAttributeAsString(ctx, a);
+    size_t begin = 0, end = s.size;
+    for (size_t i = 0; i + 6 <= s.size; i++) {
+        if (memcmp(s.str + i, "array<", 6) == 0) {
+            begin = i + 6;
+            while (begin < s.size && s.str[begin] != ':') begin++;
+            if (begin < s.size) begin++;
+            end = begin;
+            while (end < s.size && s.str[end] != '>') end++;
+            break;
+        }
+        if (memcmp(s.str + i, "dense<", 6) == 0) {
+            begin = i + 6;
+            end = begin;
+            while (end < s.size && s.str[end] != '>') end++;
+            break;
+        }
+    }
+    size_t p = begin, got = 0;
+    while (p < end && got < n) {
+        while (p < end && !((s.str[p] >= '0' && s.str[p] <= '9') ||
+                            s.str[p] == '-')) p++;
+        if (p == end) break;
+        int64_t sign = 1;
+        if (s.str[p] == '-') { sign = -1; p++; }
+        if (p == end || s.str[p] < '0' || s.str[p] > '9') return false;
+        int64_t v = 0;
+        while (p < end && s.str[p] >= '0' && s.str[p] <= '9')
+            v = v * 10 + (s.str[p++] - '0');
+        out[got++] = sign * v;
+    }
+    return got == n;
+}
+
 // ---------------------------------------------------------------------------
 // Value -> stack-slot map (open addressing keyed by the SSA value handle).
 // Step 2 uses a trivial "spill everything" allocator: each SSA value lives
@@ -3372,6 +3411,121 @@ static MLIR_OpHandle select_func_cfg(MLIR_Context *ctx, MLIR_OpHandle fn,
                 if (!L.ok) { free(src_blks); free(out_blks); return MLIR_INVALID_HANDLE; }
                 emit_b(ctx, br_f, real_f);
             }
+        } else if (name_eq(tn, "llvm.switch")) {
+            if (MLIR_GetOpNumOperands(term) < 1) {
+                fprintf(stderr, "llvm->aarch64: llvm.switch missing selector "
+                        "in '%.*s'\n", (int)sym.size, sym.str);
+                free(src_blks); free(out_blks);
+                return MLIR_INVALID_HANDLE;
+            }
+            if (!mat_into(&L, MLIR_GetOpOperand(term, 0), 9)) {
+                fprintf(stderr, "llvm->aarch64: undefined switch selector "
+                        "in '%.*s'\n", (int)sym.size, sym.str);
+                free(src_blks); free(out_blks);
+                return MLIR_INVALID_HANDLE;
+            }
+            size_t ns = MLIR_GetOpNumSuccessors(term);
+            if (ns == 0) {
+                fprintf(stderr, "llvm->aarch64: llvm.switch has no "
+                        "destinations in '%.*s'\n", (int)sym.size, sym.str);
+                free(src_blks); free(out_blks);
+                return MLIR_INVALID_HANDLE;
+            }
+            size_t n_cases = ns - 1;
+            int64_t case_vals[64];
+            int64_t *cv = case_vals;
+            if (n_cases > 64) {
+                cv = (int64_t *)malloc(n_cases * sizeof(int64_t));
+                if (!cv) {
+                    free(src_blks); free(out_blks);
+                    return MLIR_INVALID_HANDLE;
+                }
+            }
+            if (!parse_switch_case_values(ctx, term, n_cases, cv)) {
+                fprintf(stderr, "llvm->aarch64: invalid llvm.switch "
+                        "case_values in '%.*s'\n", (int)sym.size, sym.str);
+                if (cv != case_vals) free(cv);
+                free(src_blks); free(out_blks);
+                return MLIR_INVALID_HANDLE;
+            }
+            MLIR_BlockHandle cur = L.cur;
+            for (size_t ci = 0; ci < n_cases; ci++) {
+                MLIR_BlockHandle real_case = map_block(
+                    src_blks, out_blks, n_blocks,
+                    MLIR_GetOpSuccessor(term, ci + 1));
+                MLIR_BlockHandle br_case = real_case;
+                if (MLIR_GetOpNumSuccessorOperands(term, ci + 1)) {
+                    br_case = MLIR_CreateBlock(ctx);
+                    MLIR_AppendRegionBlock(ctx, out_reg, br_case);
+                }
+                int64_t cvv = cv[ci];
+                if (cvv >= 0 && cvv < 4096)
+                    emit_cmp_imm(ctx, cur, 9, (uint16_t)cvv, false);
+                else {
+                    emit_mov_imm32(ctx, cur, 10, (uint32_t)cvv);
+                    emit_cmp_reg(ctx, cur, 9, 10, false);
+                }
+                if (ci + 1 < n_cases) {
+                    MLIR_BlockHandle next = MLIR_CreateBlock(ctx);
+                    MLIR_AppendRegionBlock(ctx, out_reg, next);
+                    emit_bcond(ctx, cur, 0, br_case);
+                    emit_b(ctx, cur, next);
+                    if (br_case != real_case) {
+                        L.cur = br_case;
+                        emit_edge_copies(&L, term, ci + 1);
+                        if (!L.ok) break;
+                        emit_b(ctx, br_case, real_case);
+                    }
+                    cur = next;
+                    L.cur = cur;
+                } else {
+                    emit_bcond(ctx, cur, 0, br_case);
+                    MLIR_BlockHandle real_def = map_block(
+                        src_blks, out_blks, n_blocks,
+                        MLIR_GetOpSuccessor(term, 0));
+                    L.cur = cur;
+                    if (MLIR_GetOpNumSuccessorOperands(term, 0)) {
+                        MLIR_BlockHandle land = MLIR_CreateBlock(ctx);
+                        MLIR_AppendRegionBlock(ctx, out_reg, land);
+                        emit_b(ctx, L.cur, land);
+                        L.cur = land;
+                        emit_edge_copies(&L, term, 0);
+                        if (!L.ok) break;
+                        emit_b(ctx, land, real_def);
+                    } else {
+                        emit_b(ctx, L.cur, real_def);
+                    }
+                    if (br_case != real_case) {
+                        L.cur = br_case;
+                        emit_edge_copies(&L, term, ci + 1);
+                        if (!L.ok) break;
+                        emit_b(ctx, br_case, real_case);
+                    }
+                }
+            }
+            if (n_cases == 0) {
+                MLIR_BlockHandle real_def = map_block(
+                    src_blks, out_blks, n_blocks,
+                    MLIR_GetOpSuccessor(term, 0));
+                L.cur = cur;
+                if (MLIR_GetOpNumSuccessorOperands(term, 0)) {
+                    MLIR_BlockHandle land = MLIR_CreateBlock(ctx);
+                    MLIR_AppendRegionBlock(ctx, out_reg, land);
+                    emit_b(ctx, L.cur, land);
+                    L.cur = land;
+                    emit_edge_copies(&L, term, 0);
+                    if (!L.ok) {
+                        if (cv != case_vals) free(cv);
+                        free(src_blks); free(out_blks);
+                        return MLIR_INVALID_HANDLE;
+                    }
+                    emit_b(ctx, land, real_def);
+                } else {
+                    emit_b(ctx, L.cur, real_def);
+                }
+            }
+            if (cv != case_vals) free(cv);
+            if (!L.ok) { free(src_blks); free(out_blks); return MLIR_INVALID_HANDLE; }
         } else {
             fprintf(stderr, "llvm->aarch64: block in '%.*s' ends in "
                     "non-terminator '%.*s'\n",
