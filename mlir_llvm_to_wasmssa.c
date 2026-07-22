@@ -1943,6 +1943,10 @@ typedef struct {
     MLIR_BlockHandle *blocks; // all blocks in llvm.func
     uint8_t *state;  // 0 unseen, 1 active, 2 consumed
     size_t n_blocks;
+    // MLIR_BlockHandle (uintptr_t) -> block index; built once in cfg_init().
+    uintptr_t *blk_keys;
+    size_t    *blk_vals;
+    size_t     blk_cap;
 } CfgCtx;
 
 typedef struct {
@@ -1954,6 +1958,29 @@ typedef struct {
 static CfgFlow lower_block_cfg(CfgCtx *C, MLIR_BlockHandle blk,
                                const CfgStops *stops);
 
+// Open-addressing MLIR_BlockHandle -> index map (same pattern as load_cse
+// PMap / arith_gvn AgMap). Key 0 is reserved as empty.
+static size_t cfg_blkmap_slot(uintptr_t *keys, size_t cap, uintptr_t k) {
+    size_t i = (size_t)((k >> 4) * 11400714819323198485ull) & (cap - 1);
+    while (keys[i] && keys[i] != k) i = (i + 1) & (cap - 1);
+    return i;
+}
+
+static void cfg_blkmap_put(CfgCtx *C, uintptr_t k, size_t v) {
+    if (!k) return;
+    size_t s = cfg_blkmap_slot(C->blk_keys, C->blk_cap, k);
+    C->blk_keys[s] = k;
+    C->blk_vals[s] = v;
+}
+
+static bool cfg_blkmap_get(CfgCtx *C, uintptr_t k, size_t *out) {
+    if (!k || C->blk_cap == 0) return false;
+    size_t s = cfg_blkmap_slot(C->blk_keys, C->blk_cap, k);
+    if (!C->blk_keys[s]) return false;
+    *out = C->blk_vals[s];
+    return true;
+}
+
 static bool cfg_init(CfgCtx *C, FnCtx *F, MLIR_RegionHandle region) {
     memset(C, 0, sizeof *C);
     C->F = F;
@@ -1964,14 +1991,22 @@ static bool cfg_init(CfgCtx *C, FnCtx *F, MLIR_RegionHandle region) {
         F->arena, C->n_blocks * sizeof(MLIR_BlockHandle));
     C->state = (uint8_t *)arena_alloc(F->arena, C->n_blocks);
     memset(C->state, 0, C->n_blocks);
-    for (size_t i = 0; i < C->n_blocks; i++)
+    size_t cap = 16;
+    while (cap < C->n_blocks * 2 + 16) cap <<= 1;
+    C->blk_cap = cap;
+    C->blk_keys = (uintptr_t *)arena_alloc(F->arena, cap * sizeof(uintptr_t));
+    C->blk_vals = (size_t *)arena_alloc(F->arena, cap * sizeof(size_t));
+    memset(C->blk_keys, 0, cap * sizeof(uintptr_t));
+    for (size_t i = 0; i < C->n_blocks; i++) {
         C->blocks[i] = MLIR_GetRegionBlock(region, i);
+        cfg_blkmap_put(C, (uintptr_t)C->blocks[i], i);
+    }
     return true;
 }
 
 static size_t cfg_block_index(CfgCtx *C, MLIR_BlockHandle blk) {
-    for (size_t i = 0; i < C->n_blocks; i++)
-        if (C->blocks[i] == blk) return i;
+    size_t idx;
+    if (cfg_blkmap_get(C, (uintptr_t)blk, &idx)) return idx;
     return SIZE_MAX;
 }
 
