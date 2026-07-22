@@ -1,8 +1,12 @@
 // Native lowering pass: rewrites a `builtin.module` from the high-level
-// dialects (func, arith, cf, vector, memref, scf) down to the `llvm`
-// dialect. Uses ONLY the public mlir_api.h surface — no upstream MLIR
-// types — so this same translation unit is linked into both the
-// upstream-backed and the native-backed builds.
+// dialects (func, arith, cf, scf, vector, memref) down to the `llvm`
+// dialect. Structured control flow (`scf.if`, `scf.while`,
+// `scf.index_switch`) becomes flat `llvm.br` / `llvm.cond_br` CFG here for
+// every backend. The wasm pipeline reconstructs the same structured control
+// flow from these LLVM terminators in `mlir_llvm_to_wasmssa.c`.
+// Uses ONLY the public mlir_api.h surface — no upstream MLIR types — so
+// this same translation unit is linked into both the upstream-backed and
+// the native-backed builds.
 //
 // Strategy: walk every region top-down. For each op encountered, if it
 // has a known lowering, build the replacement LLVM-dialect op(s),
@@ -17,6 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <base/arena.h>
@@ -79,12 +84,6 @@ typedef struct LowerState {
     MLIR_Context *ctx;
     MLIR_OpHandle module;
     MLIR_BlockHandle module_body;
-
-    // When true, the walker preserves scf.* control-flow ops and skips
-    // any cf->llvm rewrites: the wasm pipeline expects the post-lift
-    // scf-form to survive into the wasmssa lowering. Set by
-    // MLIR_LowerToLLVMDialectForWasm.
-    bool keep_scf;
 } LowerState;
 
 // -----------------------------------------------------------------------------
@@ -342,6 +341,47 @@ static bool lower_rename(LowerState *st, MLIR_OpHandle op,
     return true;
 }
 
+// Return the bit width of an integer or index type, or 0 if unknown.
+static int type_bitwidth(MLIR_Context *ctx, MLIR_TypeHandle ty) {
+    if (MLIR_IsTypeIndex(ty)) return 64;
+    string s = MLIR_GetTypeString(ctx, ty);
+    if (s.size < 2 || s.str[0] != 'i') return 0;
+    int w = 0;
+    for (size_t i = 1; i < s.size; i++) {
+        if (s.str[i] < '0' || s.str[i] > '9') return 0;
+        w = w * 10 + (s.str[i] - '0');
+    }
+    return w;
+}
+
+// Lower `arith.index_cast` / `arith.index_castui` to llvm.sext, llvm.zext, or
+// llvm.trunc depending on source/destination width (index = 64 bits here).
+static bool lower_arith_index_cast(LowerState *st, MLIR_OpHandle op,
+                                   MLIR_BlockHandle parent, size_t pos,
+                                   bool is_unsigned) {
+    if (MLIR_GetOpNumOperands(op) != 1 || MLIR_GetOpNumResults(op) != 1)
+        return false;
+    MLIR_ValueHandle src = MLIR_GetOpOperand(op, 0);
+    MLIR_ValueHandle old_res = MLIR_GetOpResult(op, 0);
+    MLIR_TypeHandle src_ty = MLIR_GetValueType(src);
+    MLIR_TypeHandle dst_ty = MLIR_GetValueType(old_res);
+    int sw = type_bitwidth(st->ctx, src_ty);
+    int dw = type_bitwidth(st->ctx, dst_ty);
+    if (sw == 0 || dw == 0) return false;
+    if (sw == dw) {
+        MLIR_ReplaceAllUsesOfValue(st->ctx, old_res, src);
+        return true;
+    }
+    string cast_name;
+    if (dw > sw) {
+        cast_name = (sw < 32 || is_unsigned) ? str_lit("llvm.zext")
+                                            : str_lit("llvm.sext");
+    } else {
+        cast_name = str_lit("llvm.trunc");
+    }
+    return lower_rename(st, op, parent, pos, cast_name, OP_TYPE_UNREGISTERED);
+}
+
 // Lower `cf.br` / `cf.cond_br` to `llvm.br` / `llvm.cond_br`. These ops
 // carry block successors plus per-successor operand lists; we have to
 // use the successor-aware op constructor.
@@ -524,6 +564,29 @@ static void rewrite_yield_to_br(LowerState *st, MLIR_BlockHandle blk,
     MLIR_EraseOp(st->ctx, term);
 }
 
+// Detach `op`'s regions into `out[0..n-1]`. On failure, restores any
+// regions already taken.
+static bool take_op_regions(MLIR_Context *ctx, MLIR_OpHandle op,
+                            MLIR_RegionHandle *out, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        out[i] = MLIR_TakeOpRegion(ctx, op, i);
+        if (out[i] == MLIR_INVALID_HANDLE) {
+            for (size_t j = 0; j < i; j++)
+                MLIR_SetOpRegion(ctx, op, j, out[j]);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void restore_op_regions(MLIR_Context *ctx, MLIR_OpHandle op,
+                               const MLIR_RegionHandle *regs, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (regs[i] != MLIR_INVALID_HANDLE)
+            MLIR_SetOpRegion(ctx, op, i, regs[i]);
+    }
+}
+
 // Lower `scf.if %cond -> (Ts) { thenRegion } else { elseRegion }` to a
 // CFG: the parent block ends with `llvm.cond_br %cond, ^then, ^else`;
 // then/else regions are inlined into the parent region; their terminating
@@ -539,20 +602,22 @@ static bool lower_scf_if(LowerState *st, MLIR_OpHandle op,
     MLIR_RegionHandle parent_region = MLIR_GetBlockParentRegion(parent);
     if (parent_region == MLIR_INVALID_HANDLE) return false;
     if (MLIR_GetOpNumOperands(op) < 1) return false;
-    if (MLIR_GetOpNumRegions(op) < 1) return false;
 
     MLIR_ValueHandle cond = MLIR_GetOpOperand(op, 0);
     size_t nr = MLIR_GetOpNumResults(op);
+    size_t n_regs = MLIR_GetOpNumRegions(op);
 
-    MLIR_RegionHandle then_reg = MLIR_TakeOpRegion(st->ctx, op, 0);
-    MLIR_RegionHandle else_reg = MLIR_INVALID_HANDLE;
-    if (MLIR_GetOpNumRegions(op) >= 2) {
-        else_reg = MLIR_TakeOpRegion(st->ctx, op, 1);
+    MLIR_RegionHandle regs[2];
+    if (n_regs > 2 || !take_op_regions(st->ctx, op, regs, n_regs))
+        return false;
+    if (MLIR_GetRegionNumBlocks(regs[0]) < 1) {
+        restore_op_regions(st->ctx, op, regs, n_regs);
+        return false;
     }
-    if (then_reg == MLIR_INVALID_HANDLE) return false;
-    if (MLIR_GetRegionNumBlocks(then_reg) < 1) return false;
-    bool has_else = (else_reg != MLIR_INVALID_HANDLE) &&
-                    (MLIR_GetRegionNumBlocks(else_reg) >= 1);
+
+    MLIR_RegionHandle then_reg = regs[0];
+    MLIR_RegionHandle else_reg = n_regs >= 2 ? regs[1] : MLIR_INVALID_HANDLE;
+    bool has_else = n_regs >= 2 && MLIR_GetRegionNumBlocks(regs[1]) >= 1;
 
     // Entry blocks are first block of each region; the branch target.
     MLIR_BlockHandle then_blk = MLIR_GetRegionBlock(then_reg, 0);
@@ -624,6 +689,384 @@ static bool lower_scf_if(LowerState *st, MLIR_OpHandle op,
     return true;
 }
 
+// Parse a `cases` attribute that prints as "array<i64: 1, 2, 3>".
+static bool parse_cases(string cs, int64_t *out, size_t n) {
+    size_t p = 0;
+    while (p < cs.size && cs.str[p] != ':') p++;
+    if (p < cs.size) p++;
+    size_t got = 0;
+    while (p < cs.size && got < n) {
+        while (p < cs.size && (cs.str[p] == ' ' || cs.str[p] == ',')) p++;
+        if (p >= cs.size || cs.str[p] == '>') break;
+        int64_t sign = 1;
+        if (cs.str[p] == '-') { sign = -1; p++; }
+        int64_t v = 0;
+        while (p < cs.size && cs.str[p] >= '0' && cs.str[p] <= '9')
+            v = v * 10 + (cs.str[p++] - '0');
+        out[got++] = sign * v;
+    }
+    return got == n;
+}
+
+static void rewrite_region_yields(LowerState *st, MLIR_RegionHandle reg,
+                                  MLIR_BlockHandle target) {
+    size_t nb = MLIR_GetRegionNumBlocks(reg);
+    for (size_t bi = 0; bi < nb; bi++)
+        rewrite_yield_to_br(st, MLIR_GetRegionBlock(reg, bi), target);
+}
+
+static void move_region_blocks(LowerState *st, MLIR_RegionHandle reg,
+                               MLIR_RegionHandle parent_region) {
+    while (MLIR_GetRegionNumBlocks(reg) > 0) {
+        MLIR_MoveBlockToRegionEnd(st->ctx,
+            MLIR_GetRegionBlock(reg, 0), parent_region);
+    }
+}
+
+// Replace the trailing `scf.condition %cond, %fwd...` with
+// `llvm.cond_br %cond, ^after(%fwd), ^exit(%fwd)`.
+static void rewrite_condition_to_cbr(LowerState *st, MLIR_BlockHandle blk,
+                                     MLIR_BlockHandle body_blk,
+                                     MLIR_BlockHandle exit_blk) {
+    size_t n = MLIR_GetBlockNumOps(blk);
+    if (n == 0) return;
+    MLIR_OpHandle term = MLIR_GetBlockOp(blk, n - 1);
+    if (!name_eq(MLIR_GetOpName(term), "scf.condition")) return;
+    Arena *alloc = MLIR_GetArenaAllocator(st->ctx);
+    MLIR_ValueHandle cond = MLIR_GetOpOperand(term, 0);
+    size_t nf = MLIR_GetOpNumOperands(term) - 1;
+    MLIR_ValueHandle *fwd = nf ? (MLIR_ValueHandle *)arena_alloc(
+        alloc, nf * sizeof(MLIR_ValueHandle)) : NULL;
+    for (size_t i = 0; i < nf; i++) fwd[i] = MLIR_GetOpOperand(term, i + 1);
+    MLIR_BlockHandle succs[2] = { body_blk, exit_blk };
+    MLIR_ValueHandle *succ_ops_arr[2] = { fwd, fwd };
+    size_t n_succ_ops_arr[2] = { nf, nf };
+    MLIR_LocationHandle term_loc = MLIR_GetOpLocation(term);
+    MLIR_ValueHandle cond_arr[1] = { cond };
+    MLIR_OpHandle cbr = MLIR_CreateOpWithSuccessors(
+        st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.cond_br"),
+        NULL, 0, NULL, 0, NULL, 0,
+        cond_arr, 1, NULL, 0,
+        succs, 2, succ_ops_arr, n_succ_ops_arr,
+        term_loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_AppendBlockOp(st->ctx, blk, cbr);
+    MLIR_EraseOp(st->ctx, term);
+}
+
+static MLIR_ValueHandle emit_int_constant(LowerState *st, MLIR_BlockHandle parent,
+                                          size_t *pos, MLIR_TypeHandle ty,
+                                          int64_t val, MLIR_LocationHandle loc) {
+    MLIR_ValueHandle res = make_result_value(st->ctx, ty, loc);
+    MLIR_AttributeHandle val_attr = MLIR_CreateAttributeInteger(
+        st->ctx, str_lit("value"), val, ty);
+    MLIR_AttributeHandle attrs[1] = { val_attr };
+    MLIR_TypeHandle rts[1] = { ty };
+    MLIR_ValueHandle results[1] = { res };
+    MLIR_OpHandle nop = create_simple_op(
+        st->ctx, OP_TYPE_LLVM_MLIR_CONSTANT, str_lit("llvm.mlir.constant"),
+        attrs, 1, rts, 1, results, 1, NULL, 0, NULL, 0, loc);
+    MLIR_InsertBlockOpAtIndex(st->ctx, parent, nop, *pos);
+    (*pos)++;
+    return res;
+}
+
+static MLIR_ValueHandle emit_icmp_eq(LowerState *st, MLIR_BlockHandle parent,
+                                     size_t *pos, MLIR_ValueHandle a,
+                                     MLIR_ValueHandle b,
+                                     MLIR_LocationHandle loc) {
+    MLIR_TypeHandle i1 = MLIR_CreateTypeInteger(st->ctx, 1, false);
+    MLIR_ValueHandle res = make_result_value(st->ctx, i1, loc);
+    MLIR_AttributeHandle pred = MLIR_CreateAttributeInteger(
+        st->ctx, str_lit("predicate"), 0,
+        MLIR_CreateTypeInteger(st->ctx, 64, true));
+    MLIR_AttributeHandle attrs[1] = { pred };
+    MLIR_TypeHandle rts[1] = { i1 };
+    MLIR_ValueHandle results[1] = { res };
+    MLIR_ValueHandle ops[2] = { a, b };
+    MLIR_OpHandle nop = create_simple_op(
+        st->ctx, OP_TYPE_LLVM_ICMP, str_lit("llvm.icmp"),
+        attrs, 1, rts, 1, results, 1, ops, 2, NULL, 0, loc);
+    MLIR_InsertBlockOpAtIndex(st->ctx, parent, nop, *pos);
+    (*pos)++;
+    return res;
+}
+
+static void emit_br_at(LowerState *st, MLIR_BlockHandle parent, size_t *pos,
+                       MLIR_BlockHandle target,
+                       MLIR_ValueHandle *ops, size_t n_ops,
+                       MLIR_LocationHandle loc) {
+    MLIR_BlockHandle succs[1] = { target };
+    MLIR_ValueHandle *succ_ops_arr[1] = { ops };
+    size_t n_succ_ops_arr[1] = { n_ops };
+    MLIR_OpHandle br = MLIR_CreateOpWithSuccessors(
+        st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.br"),
+        NULL, 0, NULL, 0, NULL, 0,
+        NULL, 0, NULL, 0,
+        succs, 1, succ_ops_arr, n_succ_ops_arr,
+        loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_InsertBlockOpAtIndex(st->ctx, parent, br, *pos);
+    (*pos)++;
+}
+
+static void emit_cond_br_at(LowerState *st, MLIR_BlockHandle parent, size_t *pos,
+                            MLIR_ValueHandle cond,
+                            MLIR_BlockHandle true_tgt, MLIR_BlockHandle false_tgt,
+                            MLIR_LocationHandle loc) {
+    MLIR_BlockHandle succs[2] = { true_tgt, false_tgt };
+    MLIR_ValueHandle *empty_ops[2] = { NULL, NULL };
+    size_t n_empty_ops[2] = { 0, 0 };
+    MLIR_ValueHandle cond_arr[1] = { cond };
+    MLIR_OpHandle cbr = MLIR_CreateOpWithSuccessors(
+        st->ctx, OP_TYPE_UNREGISTERED, str_lit("llvm.cond_br"),
+        NULL, 0, NULL, 0, NULL, 0,
+        cond_arr, 1, NULL, 0,
+        succs, 2, empty_ops, n_empty_ops,
+        loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
+    MLIR_InsertBlockOpAtIndex(st->ctx, parent, cbr, *pos);
+    (*pos)++;
+}
+
+// Append `llvm.br ^target(ops...)` at the end of `blk`.
+static void emit_br_at_end(LowerState *st, MLIR_BlockHandle blk,
+                           MLIR_BlockHandle target,
+                           MLIR_ValueHandle *ops, size_t n_ops,
+                           MLIR_LocationHandle loc) {
+    size_t pos = MLIR_GetBlockNumOps(blk);
+    emit_br_at(st, blk, &pos, target, ops, n_ops, loc);
+}
+
+// Empty switch/while arm: branch to `merge` with zero constants when the
+// op carries results, else an operand-free branch.
+static void emit_br_to_merge(LowerState *st, MLIR_BlockHandle blk,
+                             MLIR_BlockHandle merge, MLIR_OpHandle owner) {
+    size_t nr = MLIR_GetOpNumResults(owner);
+    MLIR_LocationHandle loc = MLIR_GetOpLocation(owner);
+    if (nr == 0) {
+        emit_br_at_end(st, blk, merge, NULL, 0, loc);
+        return;
+    }
+    Arena *alloc = MLIR_GetArenaAllocator(st->ctx);
+    MLIR_ValueHandle *zeros = (MLIR_ValueHandle *)arena_alloc(
+        alloc, nr * sizeof(MLIR_ValueHandle));
+    for (size_t i = 0; i < nr; i++) {
+        MLIR_TypeHandle ty = MLIR_GetValueType(MLIR_GetOpResult(owner, i));
+        size_t pos = MLIR_GetBlockNumOps(blk);
+        zeros[i] = emit_int_constant(st, blk, &pos, ty, 0, loc);
+    }
+    emit_br_at_end(st, blk, merge, zeros, nr, loc);
+}
+
+// Phi join block `join` receives values on its block args; pass them on to
+// `cont` where post-op code lives (separate SSA names on `cont`).
+static void emit_join_to_cont(LowerState *st, MLIR_BlockHandle join,
+                              MLIR_BlockHandle cont, size_t nr,
+                              MLIR_LocationHandle loc) {
+    if (nr == 0) {
+        emit_br_at_end(st, join, cont, NULL, 0, loc);
+        return;
+    }
+    Arena *alloc = MLIR_GetArenaAllocator(st->ctx);
+    MLIR_ValueHandle *ops = (MLIR_ValueHandle *)arena_alloc(
+        alloc, nr * sizeof(MLIR_ValueHandle));
+    for (size_t i = 0; i < nr; i++)
+        ops[i] = MLIR_GetBlockArg(join, i);
+    emit_br_at_end(st, join, cont, ops, nr, loc);
+}
+
+// Lower `scf.while` to a header/body/exit CFG:
+//   llvm.br ^header(inits)
+// ^header(%iter...): ...; llvm.cond_br %cond, ^body(%fwd), ^exit(%fwd)
+// ^body(%res...): ...; llvm.br ^header(yielded)
+// ^exit(%results...): llvm.br ^cont(%results...)
+// ^cont: post-loop code (uses cont block args, not exit's)
+static bool lower_scf_while(LowerState *st, MLIR_OpHandle op,
+                            MLIR_BlockHandle parent, size_t pos) {
+    MLIR_LocationHandle loc = MLIR_GetOpLocation(op);
+    MLIR_RegionHandle parent_region = MLIR_GetBlockParentRegion(parent);
+    if (parent_region == MLIR_INVALID_HANDLE) return false;
+    if (MLIR_GetOpNumRegions(op) < 2) return false;
+
+    MLIR_RegionHandle regs[2];
+    if (!take_op_regions(st->ctx, op, regs, 2)) return false;
+    MLIR_RegionHandle condition_reg = regs[0];
+    MLIR_RegionHandle body_reg = regs[1];
+
+    if (MLIR_GetRegionNumBlocks(condition_reg) < 1 ||
+        MLIR_GetRegionNumBlocks(body_reg) < 1) {
+        restore_op_regions(st->ctx, op, regs, 2);
+        return false;
+    }
+
+    MLIR_BlockHandle header_blk = MLIR_GetRegionBlock(condition_reg, 0);
+    MLIR_BlockHandle body_blk = MLIR_GetRegionBlock(body_reg, 0);
+    size_t n_iter = MLIR_GetOpNumOperands(op);
+    size_t nr = MLIR_GetOpNumResults(op);
+    if (n_iter != MLIR_GetBlockNumArgs(header_blk) ||
+        nr != MLIR_GetBlockNumArgs(body_blk)) {
+        restore_op_regions(st->ctx, op, regs, 2);
+        return false;
+    }
+
+    Arena *alloc = MLIR_GetArenaAllocator(st->ctx);
+    MLIR_BlockHandle exit_blk = MLIR_CreateBlock(st->ctx);
+    MLIR_BlockHandle cont_blk = MLIR_CreateBlock(st->ctx);
+    MLIR_ValueHandle *exit_args = nr ? (MLIR_ValueHandle *)arena_alloc(
+        alloc, nr * sizeof(MLIR_ValueHandle)) : NULL;
+    MLIR_ValueHandle *cont_args = nr ? (MLIR_ValueHandle *)arena_alloc(
+        alloc, nr * sizeof(MLIR_ValueHandle)) : NULL;
+    for (size_t i = 0; i < nr; i++) {
+        MLIR_ValueHandle old = MLIR_GetOpResult(op, i);
+        MLIR_TypeHandle ty = MLIR_GetValueType(old);
+        exit_args[i] = MLIR_CreateValueBlockArg(
+            st->ctx, str_lit(""), (uint32_t)i, ty, loc);
+        MLIR_AppendBlockArg(st->ctx, exit_blk, exit_args[i]);
+        cont_args[i] = MLIR_CreateValueBlockArg(
+            st->ctx, str_lit(""), (uint32_t)i, ty, loc);
+        MLIR_AppendBlockArg(st->ctx, cont_blk, cont_args[i]);
+        MLIR_ReplaceAllUsesOfValue(st->ctx, old, cont_args[i]);
+    }
+
+    while (MLIR_GetBlockNumOps(parent) > pos + 1) {
+        MLIR_OpHandle tail = MLIR_GetBlockOp(parent, pos + 1);
+        MLIR_MoveOpToBlockEnd(st->ctx, tail, cont_blk);
+    }
+
+    size_t nbefore = MLIR_GetRegionNumBlocks(condition_reg);
+    for (size_t bi = 0; bi < nbefore; bi++) {
+        rewrite_condition_to_cbr(st, MLIR_GetRegionBlock(condition_reg, bi),
+                                 body_blk, exit_blk);
+    }
+    size_t nafter = MLIR_GetRegionNumBlocks(body_reg);
+    for (size_t bi = 0; bi < nafter; bi++) {
+        rewrite_yield_to_br(st, MLIR_GetRegionBlock(body_reg, bi), header_blk);
+    }
+
+    move_region_blocks(st, condition_reg, parent_region);
+    move_region_blocks(st, body_reg, parent_region);
+    MLIR_MoveBlockToRegionEnd(st->ctx, exit_blk, parent_region);
+    MLIR_MoveBlockToRegionEnd(st->ctx, cont_blk, parent_region);
+    emit_join_to_cont(st, exit_blk, cont_blk, nr, loc);
+
+    MLIR_ValueHandle *inits = n_iter ? (MLIR_ValueHandle *)arena_alloc(
+        alloc, n_iter * sizeof(MLIR_ValueHandle)) : NULL;
+    for (size_t i = 0; i < n_iter; i++) inits[i] = MLIR_GetOpOperand(op, i);
+    emit_br_at(st, parent, &pos, header_blk, inits, n_iter, loc);
+    return true;
+}
+
+// Lower `scf.index_switch` to a compare chain plus case/default blocks that
+// merge at a phi block, then continue in a separate post-switch block (region
+// 0 = default, regions 1..N = cases). Empty regions become synthetic blocks
+// that branch to the merge with zero-filled result operands.
+static bool lower_scf_index_switch(LowerState *st, MLIR_OpHandle op,
+                                   MLIR_BlockHandle parent, size_t pos) {
+    MLIR_LocationHandle loc = MLIR_GetOpLocation(op);
+    MLIR_RegionHandle parent_region = MLIR_GetBlockParentRegion(parent);
+    if (parent_region == MLIR_INVALID_HANDLE) return false;
+    if (MLIR_GetOpNumOperands(op) < 1) return false;
+
+    MLIR_ValueHandle selector = MLIR_GetOpOperand(op, 0);
+    MLIR_TypeHandle sel_ty = MLIR_GetValueType(selector);
+    size_t n_regions = MLIR_GetOpNumRegions(op);
+    if (n_regions < 1) return false;
+    size_t n_cases = n_regions - 1;
+
+    Arena *alloc = MLIR_GetArenaAllocator(st->ctx);
+    int64_t case_vals_stk[64];
+    int64_t *case_vals = case_vals_stk;
+    if (n_cases > 64) {
+        case_vals = (int64_t *)arena_alloc(alloc, n_cases * sizeof(int64_t));
+    }
+    if (n_cases > 0) {
+        MLIR_AttributeHandle ca = MLIR_GetOpAttributeByName(op, "cases");
+        if (ca == MLIR_INVALID_HANDLE ||
+            !parse_cases(MLIR_GetAttributeAsString(st->ctx, ca),
+                         case_vals, n_cases))
+            return false;
+    }
+
+    MLIR_RegionHandle regs_stk[16];
+    MLIR_RegionHandle *regs = regs_stk;
+    if (n_regions > 16) {
+        regs = (MLIR_RegionHandle *)arena_alloc(
+            alloc, n_regions * sizeof(MLIR_RegionHandle));
+    }
+    if (!take_op_regions(st->ctx, op, regs, n_regions)) return false;
+
+    size_t nr = MLIR_GetOpNumResults(op);
+    MLIR_BlockHandle merge_blk = MLIR_CreateBlock(st->ctx);
+    MLIR_BlockHandle cont_blk = MLIR_CreateBlock(st->ctx);
+    MLIR_ValueHandle *cont_args = nr ? (MLIR_ValueHandle *)arena_alloc(
+        alloc, nr * sizeof(MLIR_ValueHandle)) : NULL;
+    for (size_t i = 0; i < nr; i++) {
+        MLIR_ValueHandle old = MLIR_GetOpResult(op, i);
+        MLIR_TypeHandle ty = MLIR_GetValueType(old);
+        MLIR_ValueHandle marg = MLIR_CreateValueBlockArg(
+            st->ctx, str_lit(""), (uint32_t)i, ty, loc);
+        MLIR_AppendBlockArg(st->ctx, merge_blk, marg);
+        cont_args[i] = MLIR_CreateValueBlockArg(
+            st->ctx, str_lit(""), (uint32_t)i, ty, loc);
+        MLIR_AppendBlockArg(st->ctx, cont_blk, cont_args[i]);
+        MLIR_ReplaceAllUsesOfValue(st->ctx, old, cont_args[i]);
+    }
+
+    while (MLIR_GetBlockNumOps(parent) > pos + 1) {
+        MLIR_OpHandle tail = MLIR_GetBlockOp(parent, pos + 1);
+        MLIR_MoveOpToBlockEnd(st->ctx, tail, cont_blk);
+    }
+
+    MLIR_BlockHandle *arm_blks = (MLIR_BlockHandle *)arena_alloc(
+        alloc, n_regions * sizeof(MLIR_BlockHandle));
+    for (size_t ri = 0; ri < n_regions; ri++) {
+        if (MLIR_GetRegionNumBlocks(regs[ri]) == 0) {
+            MLIR_BlockHandle empty = MLIR_CreateBlock(st->ctx);
+            emit_br_to_merge(st, empty, merge_blk, op);
+            arm_blks[ri] = empty;
+            MLIR_MoveBlockToRegionEnd(st->ctx, empty, parent_region);
+            continue;
+        }
+        arm_blks[ri] = MLIR_GetRegionBlock(regs[ri], 0);
+        rewrite_region_yields(st, regs[ri], merge_blk);
+        move_region_blocks(st, regs[ri], parent_region);
+    }
+    MLIR_MoveBlockToRegionEnd(st->ctx, merge_blk, parent_region);
+    MLIR_MoveBlockToRegionEnd(st->ctx, cont_blk, parent_region);
+    emit_join_to_cont(st, merge_blk, cont_blk, nr, loc);
+
+    MLIR_BlockHandle default_blk = arm_blks[0];
+    if (n_cases == 0) {
+        emit_br_at(st, parent, &pos, default_blk, NULL, 0, loc);
+        return true;
+    }
+
+    MLIR_BlockHandle *case_blks = n_cases ? (MLIR_BlockHandle *)arena_alloc(
+        alloc, n_cases * sizeof(MLIR_BlockHandle)) : NULL;
+    for (size_t i = 0; i < n_cases; i++)
+        case_blks[i] = arm_blks[i + 1];
+
+    MLIR_BlockHandle chain = MLIR_CreateBlock(st->ctx);
+    MLIR_BlockHandle chain_cur = chain;
+    size_t cpos = 0;
+    for (size_t i = 0; i < n_cases; i++) {
+        MLIR_ValueHandle cv = emit_int_constant(st, chain_cur, &cpos, sel_ty,
+                                                case_vals[i], loc);
+        MLIR_ValueHandle eq = emit_icmp_eq(st, chain_cur, &cpos, selector, cv, loc);
+        if (i + 1 < n_cases) {
+            MLIR_BlockHandle next = MLIR_CreateBlock(st->ctx);
+            emit_cond_br_at(st, chain_cur, &cpos, eq, case_blks[i], next, loc);
+            MLIR_MoveBlockToRegionEnd(st->ctx, chain_cur, parent_region);
+            chain_cur = next;
+            cpos = 0;
+        } else {
+            emit_cond_br_at(st, chain_cur, &cpos, eq, case_blks[i],
+                            default_blk, loc);
+            MLIR_MoveBlockToRegionEnd(st->ctx, chain_cur, parent_region);
+        }
+    }
+    emit_br_at(st, parent, &pos, chain, NULL, 0, loc);
+    return true;
+}
+
 // Return values from try_lower_op:
 //   LOWER_NONE      — op not handled; walker should leave it in place.
 //   LOWER_REPLACED  — lowering inserted N replacement ops at position
@@ -645,13 +1088,21 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
                         MLIR_BlockHandle parent, size_t pos) {
     string name = MLIR_GetOpName(op);
     if (name_eq(name, "scf.if")) {
-        if (st->keep_scf) return LOWER_NONE;
-        // scf.if rewrites the parent block's tail: it erases its own
-        // original op (after taking its regions and uses) — actually it
-        // doesn't erase here; we handle that in the walker by checking
-        // whether the original is still in the block. Easier: have
-        // scf.if erase its own original and return DONE_BLOCK.
         if (lower_scf_if(st, op, parent, pos)) {
+            MLIR_EraseOp(st->ctx, op);
+            return LOWER_DONE_BLOCK;
+        }
+        return LOWER_NONE;
+    }
+    if (name_eq(name, "scf.while")) {
+        if (lower_scf_while(st, op, parent, pos)) {
+            MLIR_EraseOp(st->ctx, op);
+            return LOWER_DONE_BLOCK;
+        }
+        return LOWER_NONE;
+    }
+    if (name_eq(name, "scf.index_switch")) {
+        if (lower_scf_index_switch(st, op, parent, pos)) {
             MLIR_EraseOp(st->ctx, op);
             return LOWER_DONE_BLOCK;
         }
@@ -668,6 +1119,8 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
              name_eq(name, "unrealized_conversion_cast"))
                                          ok = lower_unrealized_cast(st, op, parent, pos);
     else if (name_eq(name, "arith.constant")) ok = lower_arith_constant(st, op, parent, pos);
+    else if (name_eq(name, "arith.index_cast")) ok = lower_arith_index_cast(st, op, parent, pos, false);
+    else if (name_eq(name, "arith.index_castui")) ok = lower_arith_index_cast(st, op, parent, pos, true);
     else if (name_eq(name, "arith.addi"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.add"),  OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.subi"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.sub"),  OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.muli"))  ok = lower_rename(st, op, parent, pos, str_lit("llvm.mul"),  OP_TYPE_UNREGISTERED);
@@ -698,8 +1151,8 @@ static int try_lower_op(LowerState *st, MLIR_OpHandle op,
     else if (name_eq(name, "arith.fptosi"))ok = lower_rename(st, op, parent, pos, str_lit("llvm.fptosi"), OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.fptoui"))ok = lower_rename(st, op, parent, pos, str_lit("llvm.fptoui"), OP_TYPE_UNREGISTERED);
     else if (name_eq(name, "arith.bitcast"))ok = lower_rename(st, op, parent, pos, str_lit("llvm.bitcast"),OP_TYPE_UNREGISTERED);
-    else if (name_eq(name, "cf.br"))      ok = st->keep_scf ? false : lower_cf_branch(st, op, parent, pos, str_lit("llvm.br"));
-    else if (name_eq(name, "cf.cond_br")) ok = st->keep_scf ? false : lower_cf_branch(st, op, parent, pos, str_lit("llvm.cond_br"));
+    else if (name_eq(name, "cf.br"))      ok = lower_cf_branch(st, op, parent, pos, str_lit("llvm.br"));
+    else if (name_eq(name, "cf.cond_br")) ok = lower_cf_branch(st, op, parent, pos, str_lit("llvm.cond_br"));
 
     return ok ? LOWER_REPLACED : LOWER_NONE;
 }
@@ -742,6 +1195,29 @@ static void walk_block(LowerState *st, MLIR_BlockHandle block) {
     }
 }
 
+static bool verify_llvm_only_block(MLIR_BlockHandle block) {
+    size_t n = MLIR_GetBlockNumOps(block);
+    for (size_t i = 0; i < n; i++) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(block, i);
+        string name = MLIR_GetOpName(op);
+        if (name.size < 5 || memcmp(name.str, "llvm.", 5) != 0) {
+            fprintf(stderr,
+                    "wasm-llvm-lower: non-LLVM operation remains: '%.*s'\n",
+                    (int)name.size, name.str);
+            return false;
+        }
+        for (size_t r = 0; r < MLIR_GetOpNumRegions(op); r++) {
+            MLIR_RegionHandle region = MLIR_GetOpRegion(op, r);
+            for (size_t b = 0; b < MLIR_GetRegionNumBlocks(region); b++) {
+                if (!verify_llvm_only_block(
+                        MLIR_GetRegionBlock(region, b)))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module) {
     if (module == MLIR_INVALID_HANDLE) return false;
     if (MLIR_GetOpNumRegions(module) == 0) return false;
@@ -757,12 +1233,9 @@ bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module) {
     return true;
 }
 
-// In-tree LLVM-dialect lowering tailored for the wasm pipeline. First
-// lifts cf.br / cf.cond_br into scf.if / scf.while via MLIR_LiftCfToScf,
-// then runs the regular lowering with `keep_scf = true` so the scf
-// operations survive into the wasmssa stage (which expects structured
-// control flow). cf->llvm.br rewrites are also skipped: any cf op
-// surviving the lift is a hard error caught later by wasmssa-lower.
+// Wasm-tailored lowering first normalizes cf CFG into the structured forms
+// understood by this pass, then lowers those forms back to the canonical LLVM
+// CFG shapes consumed by the WasmSSA reconstructor.
 bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx, MLIR_OpHandle module) {
     if (module == MLIR_INVALID_HANDLE) return false;
     if (!MLIR_LiftCfToScf(ctx, module)) return false;
@@ -774,8 +1247,7 @@ bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx, MLIR_OpHandle module) {
     st.ctx = ctx;
     st.module = module;
     st.module_body = MLIR_GetRegionBlock(body_region, 0);
-    st.keep_scf = true;
 
     walk_block(&st, st.module_body);
-    return true;
+    return verify_llvm_only_block(st.module_body);
 }

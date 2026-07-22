@@ -1352,3 +1352,10 @@ expected_stdout = "OK\n"
 name = "octal_literal"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "493\n8\n0\n511\n31\n100\n512\n"
+
+[[test]]
+name = "variadic_extern_probe"
+targets = ["native"]
+platforms = ["linux", "darwin"]
+host_sources = ["variadic_extern_probe_host.c"]
+expected_stdout = "ok\n"

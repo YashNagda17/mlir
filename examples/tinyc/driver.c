@@ -116,25 +116,19 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
 
     string defs[16]; size_t nd = 0;
     if (is_wasi_adapter) {
-        // The WASI adapter defines fd_write/path_open/... and calls the
-        // already-renamed __host_platform_* plus fchmod (Mach-O: _fchmod).
-        defs[nd++] = str_from_cstr_view((char *)"fchmod=_fchmod");
+        // wasi_adapter.c calls platform_*; PLATFORM_HOST_SHIM (platform.h) renames
+        // those to __host_platform_* so they reach the spliced host copies.
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_HOST_SHIM=1");
     } else {
-    defs[nd++] = str_from_cstr_view((char *)"PLATFORM_SKIP_ENTRY=1");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_write=__host_platform_fd_write");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_read=__host_platform_fd_read");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_close=__host_platform_fd_close");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_seek=__host_platform_fd_seek");
-    defs[nd++] = str_from_cstr_view((char *)"platform_fd_tell=__host_platform_fd_tell");
-    defs[nd++] = str_from_cstr_view((char *)"platform_path_open=__host_platform_path_open");
-    defs[nd++] = str_from_cstr_view((char *)"platform_exit=__host_platform_exit");
-    defs[nd++] = str_from_cstr_view((char *)"writev=_writev");
-    defs[nd++] = str_from_cstr_view((char *)"readv=_readv");
-    defs[nd++] = str_from_cstr_view((char *)"fcntl=_fcntl");
-    defs[nd++] = str_from_cstr_view((char *)"open=_open");
-    defs[nd++] = str_from_cstr_view((char *)"close=_close");
-    defs[nd++] = str_from_cstr_view((char *)"lseek=_lseek");
-    defs[nd++] = str_from_cstr_view((char *)"__error=___error");
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_SKIP_ENTRY=1");
+        defs[nd++] = str_from_cstr_view((char *)"PLATFORM_HOST_SHIM=1");
+        defs[nd++] = str_from_cstr_view((char *)"writev=_writev");
+        defs[nd++] = str_from_cstr_view((char *)"readv=_readv");
+        defs[nd++] = str_from_cstr_view((char *)"fcntl=_fcntl");
+        defs[nd++] = str_from_cstr_view((char *)"open=_open");
+        defs[nd++] = str_from_cstr_view((char *)"close=_close");
+        defs[nd++] = str_from_cstr_view((char *)"lseek=_lseek");
+        defs[nd++] = str_from_cstr_view((char *)"__error=___error");
     }
 
     string src = tinyc_preprocess(pmod_arena, str_from_cstr_view((char *)path),
@@ -175,9 +169,15 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
         string s = MLIR_GetAttributeString(sa);
         // The platform file also defines non-renamed platform_* that collide
         // with the wasm-side copies, so pick only the __host_platform_* entry
-        // points. The WASI adapter has no such collisions: pick every func.
-        if (!is_wasi_adapter &&
-            (s.size < 16 || memcmp(s.str, "__host_platform_", 16) != 0)) continue;
+        // points. Skip init only: it calls ensure_heap_initialized helpers the
+        // pick-based splice does not move (wasm crt0 handles init). Keep exit:
+        // mlir_wasmssa_to_llvm rewrites proc_exit -> __host_platform_exit.
+        // The WASI adapter has no such collisions: pick every func.
+        if (!is_wasi_adapter) {
+            if (s.size < 16 || memcmp(s.str, "__host_platform_", 16) != 0) continue;
+            if (s.size == 20 && memcmp(s.str, "__host_platform_init", 20) == 0)
+                continue;
+        }
         picks[np++] = op;
     }
     MLIR_SetArenaAllocator(ctx, saved_arena);
@@ -836,7 +836,12 @@ int app_main(void) {
         mlir_llvm_mem2reg(&ctx, module);
 
     if (emit_lowered || emit_llvm || emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho || emit_aarch64 || emit_elf) {
-        bool needs_wasm_lowering = emit_wasm || emit_wasmssa || emit_wasmstack || emit_wat || emit_macho || emit_aarch64;
+        // Wasm pipelines (emit wasm / wasmssa / wasmstack / wat, and the
+        // default wasm-link Mach-O path) need cf->scf + keep_scf for wasmssa.
+        // The native llvm -> aarch64 backend (--macho-backend=llvm,
+        // --emit=aarch64) needs flat llvm.br / llvm.cond_br instead.
+        bool needs_wasm_lowering = emit_wasm || emit_wasmssa || emit_wasmstack
+            || emit_wat || (emit_macho && !macho_backend_llvm);
         bool ok = needs_wasm_lowering
                       ? lower_for_wasm_fn(&ctx, module)
                       : lower_fn(&ctx, module);
