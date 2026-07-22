@@ -329,8 +329,9 @@ def unity_include_flags() -> list[str]:
     ]
 
 
-def link_native(obj_path: Path, exe_path: Path):
-    """Link the llc-produced single-TU object."""
+def link_native(obj_path: Path, exe_path: Path, host_sources: list[Path] | None = None):
+    """Link the llc-produced single-TU object, optionally with host .c files."""
+    extra = [str(p) for p in (host_sources or [])]
     if IS_WIN:
         # MSVC: cl /nologo /MD obj /Fe:exe.exe
         # The llc-produced object carries no /DEFAULTLIB directive, so name the
@@ -340,11 +341,12 @@ def link_native(obj_path: Path, exe_path: Path):
         return run([
             CC, "/nologo", "/MD",
             str(obj_path),
+            *extra,
             "msvcrt.lib", "ucrt.lib", "vcruntime.lib",
             "legacy_stdio_definitions.lib",
             f"/Fe:{exe_path}",
         ])
-    cmd = [CC, str(obj_path), "-o", str(exe_path)]
+    cmd = [CC, str(obj_path), *extra, "-o", str(exe_path)]
     # llc emits non-PIC by default; some Linux toolchains default to -pie which
     # rejects R_X86_64_32 relocations from .rodata. Force -no-pie on Linux.
     if sys.platform.startswith("linux"):
@@ -458,6 +460,12 @@ def main():
             print(f"SKIP {name} (targets={targets}, current={TARGET})")
             skipped += 1
             continue
+        macho_backends = t.get("macho_backends")
+        if (TARGET == "macho" and macho_backends is not None
+                and MACHO_BACKEND not in macho_backends):
+            print(f"SKIP {name} (macho_backends={macho_backends}, current={MACHO_BACKEND})")
+            skipped += 1
+            continue
         platforms = t.get("platforms")
         if platforms is not None and plat_key not in platforms:
             print(f"SKIP {name} (platforms={platforms}, current={plat_key})")
@@ -528,7 +536,7 @@ def main():
             continue
         # Multi-file tests pass `sources = [...]`; single-file tests
         # default to `<name>.tc` for backwards compatibility.
-        sources = t.get("sources", [f"{name}.tc"])
+        sources = list(t.get("sources", [f"{name}.tc"]))
         srcs = [HERE / "tests" / s for s in sources]
         unity_src = write_unity_source(name, srcs) if use_unity_source() else None
 
@@ -633,6 +641,10 @@ def main():
                     print(f"FAIL {name}: tinyc --from-wasm returned {r.returncode}\nstderr:\n{r.stderr}")
                     failures += 1
                     continue
+                created_file = t.get("created_file")
+                created_path = ROOT / created_file if created_file else None
+                if created_path is not None:
+                    created_path.unlink(missing_ok=True)
                 # Same retry-on-SIGKILL dance as the regular macho path.
                 r = run([str(exe)])
                 if r.returncode == -9:
@@ -645,6 +657,23 @@ def main():
                     print(f"FAIL {name}: stdout mismatch\n  expected: {expected!r}\n  got:      {r.stdout!r}")
                     failures += 1
                     continue
+                if created_path is not None:
+                    current_umask = os.umask(0)
+                    os.umask(current_umask)
+                    expected_mode = t["expected_file_mode"] & ~current_umask
+                    try:
+                        actual_mode = created_path.stat().st_mode & 0o777
+                    except FileNotFoundError:
+                        print(f"FAIL {name}: expected file was not created: {created_path}")
+                        failures += 1
+                        continue
+                    created_path.unlink()
+                    if actual_mode != expected_mode:
+                        print(f"FAIL {name}: file mode mismatch\n"
+                              f"  expected: {expected_mode:#05o}\n"
+                              f"  got:      {actual_mode:#05o}")
+                        failures += 1
+                        continue
                 print(f"PASS {name}")
                 continue
 
@@ -720,7 +749,8 @@ def main():
             print(f"FAIL {name}: llc failed\nstderr:\n{r.stderr}")
             failures += 1
             continue
-        r = link_native(obj, exe)
+        host_srcs = [HERE / "tests" / s for s in t.get("host_sources", [])]
+        r = link_native(obj, exe, host_srcs)
         if r.returncode != 0:
             print(f"FAIL {name}: link failed\nstderr:\n{r.stderr}\nstdout:\n{r.stdout}")
             failures += 1

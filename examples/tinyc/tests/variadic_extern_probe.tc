@@ -1,0 +1,23 @@
+// Regression: extern variadic callees lower as llvm.func/llvm.call and pass
+// varargs with the host ABI
+
+extern int echo_check(int n_extra, int a, int b, ...);
+extern int printf(const char *fmt, ...);
+
+int main(void) {
+    // Two fixed args (10, 20); n_extra optional ints after them (30, 40).
+    if (echo_check(0, 10, 20) != 0) {
+        printf("bad0\n");
+        return 1;
+    }
+    if (echo_check(1, 10, 20, 30) != 0) {
+        printf("bad1\n");
+        return 1;
+    }
+    if (echo_check(2, 10, 20, 30, 40) != 0) {
+        printf("bad2\n");
+        return 1;
+    }
+    printf("ok\n");
+    return 0;
+}
