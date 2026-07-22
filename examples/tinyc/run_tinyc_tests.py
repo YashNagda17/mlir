@@ -460,6 +460,12 @@ def main():
             print(f"SKIP {name} (targets={targets}, current={TARGET})")
             skipped += 1
             continue
+        macho_backends = t.get("macho_backends")
+        if (TARGET == "macho" and macho_backends is not None
+                and MACHO_BACKEND not in macho_backends):
+            print(f"SKIP {name} (macho_backends={macho_backends}, current={MACHO_BACKEND})")
+            skipped += 1
+            continue
         platforms = t.get("platforms")
         if platforms is not None and plat_key not in platforms:
             print(f"SKIP {name} (platforms={platforms}, current={plat_key})")
@@ -635,6 +641,10 @@ def main():
                     print(f"FAIL {name}: tinyc --from-wasm returned {r.returncode}\nstderr:\n{r.stderr}")
                     failures += 1
                     continue
+                created_file = t.get("created_file")
+                created_path = ROOT / created_file if created_file else None
+                if created_path is not None:
+                    created_path.unlink(missing_ok=True)
                 # Same retry-on-SIGKILL dance as the regular macho path.
                 r = run([str(exe)])
                 if r.returncode == -9:
@@ -647,6 +657,23 @@ def main():
                     print(f"FAIL {name}: stdout mismatch\n  expected: {expected!r}\n  got:      {r.stdout!r}")
                     failures += 1
                     continue
+                if created_path is not None:
+                    current_umask = os.umask(0)
+                    os.umask(current_umask)
+                    expected_mode = t["expected_file_mode"] & ~current_umask
+                    try:
+                        actual_mode = created_path.stat().st_mode & 0o777
+                    except FileNotFoundError:
+                        print(f"FAIL {name}: expected file was not created: {created_path}")
+                        failures += 1
+                        continue
+                    created_path.unlink()
+                    if actual_mode != expected_mode:
+                        print(f"FAIL {name}: file mode mismatch\n"
+                              f"  expected: {expected_mode:#05o}\n"
+                              f"  got:      {actual_mode:#05o}")
+                        failures += 1
+                        continue
                 print(f"PASS {name}")
                 continue
 

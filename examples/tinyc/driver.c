@@ -137,6 +137,9 @@ static bool tinyc_compile_host_platform(MLIR_Context *ctx, const char *path,
     VecTcTok toks = tinyc_lex(pmod_arena, src);
     Program *prog = arena_new(pmod_arena, Program);
     *prog = (Program){0};
+    // These sources run natively after the wasm module is lifted, so extern
+    // variadic calls such as open(path, flags, mode) must use the host ABI.
+    prog->host_varargs = true;
     if (tinyc_parse_into(pmod_arena, prog, toks, false) > 0) {
         fprintf(stderr, "tinyc: parse failed for host platform '%s'\n", path);
         MLIR_SetArenaAllocator(ctx, saved_arena);

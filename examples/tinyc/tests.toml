@@ -1359,3 +1359,11 @@ targets = ["native"]
 platforms = ["linux", "darwin"]
 host_sources = ["variadic_extern_probe_host.c"]
 expected_stdout = "ok\n"
+
+[[test]]
+name = "macho_created_file_mode"
+targets = ["macho"]
+platforms = ["darwin"]
+macho_backends = ["llvm_via_wasm"]
+created_file = "_tinyc_macho_mode.tmp"
+expected_file_mode = 0o644
