@@ -397,7 +397,7 @@ static MLIR_ValueHandle emit_fpext_f32_to_f64(E *e, MLIR_ValueHandle v) {
     MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = e->f64;
     MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = r;
     MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = v;
-    emit_op(e, OP_TYPE_UNREGISTERED, str_lit("arith.extf"),
+    emit_op(e, OP_TYPE_ARITH_EXTF, str_lit("arith.extf"),
             rts, 1, rs, 1, ops, 1, NULL, 0, NULL, 0);
     return r;
 }
@@ -409,7 +409,7 @@ static MLIR_ValueHandle emit_fptrunc_f64_to_f32(E *e, MLIR_ValueHandle v) {
     MLIR_TypeHandle *rts = arena_new_array(e->arena, MLIR_TypeHandle, 1); rts[0] = e->f32;
     MLIR_ValueHandle *rs = arena_new_array(e->arena, MLIR_ValueHandle, 1); rs[0] = r;
     MLIR_ValueHandle *ops = arena_new_array(e->arena, MLIR_ValueHandle, 1); ops[0] = v;
-    emit_op(e, OP_TYPE_UNREGISTERED, str_lit("arith.truncf"),
+    emit_op(e, OP_TYPE_ARITH_TRUNCF, str_lit("arith.truncf"),
             rts, 1, rs, 1, ops, 1, NULL, 0, NULL, 0);
     return r;
 }
@@ -1952,7 +1952,8 @@ static void emit_struct_copy_path(E *e, MLIR_ValueHandle dst, MLIR_ValueHandle s
             StructDef *inner = find_struct(e, ft.struct_name);
             emit_struct_copy_path(e, dst, src, source_elem, inner, path, n_path);
         } else if (ft.kind == TY_PTR_STRUCT || ft.kind == TY_PTR_I32 ||
-                   ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID) {
+                   ft.kind == TY_PTR_CHAR || ft.kind == TY_PTR_VOID ||
+                   ft.kind == TY_PTR_PTR || ft.kind == TY_FNPTR) {
             MLIR_ValueHandle sp = emit_gep(e, src, source_elem, path, n_path, NULL, 0);
             MLIR_ValueHandle val = emit_load_v(e, sp, e->ptr);
             MLIR_ValueHandle dp = emit_gep(e, dst, source_elem, path, n_path, NULL, 0);
@@ -2912,6 +2913,22 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                                 v.ptr_elem = ft.ptr_is_i64 ? e->i64 : e->i32;
                             } else if (ft.kind == TY_PTR_VOID) {
                                 v.is_void_ptr = true;
+                            } else if (ft.kind == TY_FNPTR) {
+                                Type *fnty = arena_new(e->arena, Type);
+                                *fnty = ft;
+                                v.fnptr_ty = fnty;
+                            } else if (ft.kind == TY_PTR_PTR) {
+                                v.ptr_elem = e->ptr;
+                                if (ft.pointee) {
+                                    Type *pe = ft.pointee;
+                                    if (pe->kind == TY_PTR_STRUCT) {
+                                        v.sdef = find_struct(e, pe->struct_name);
+                                    } else if (pe->kind == TY_FNPTR) {
+                                        Type *fnty = arena_new(e->arena, Type);
+                                        *fnty = *pe;
+                                        v.fnptr_ty = fnty;
+                                    }
+                                }
                             }
                         }
                     }
