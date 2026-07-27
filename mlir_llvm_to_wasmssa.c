@@ -2434,29 +2434,1876 @@ fail:
 }
 
 // =============================================================================
-// LLVM CFG structurization — discovery (ported from mlir_lift_cf_to_scf.c).
+// LLVM CFG structurization — discovery, snapshot, normalization, analysis.
 //
-// Walk every `builtin.module` (including nested modules), find each defined
-// `llvm.func`, and collect region-local CFGs that still contain llvm.br /
-// llvm.cond_br / llvm.switch. This mirrors the cf->scf driver's post-order
-// region walk; no IR mutation happens here.
+// Target pipeline (cf-lowering.md):
+//   LLVM MLIR  ->  CFGInfo (immutable snapshot)
+//             ->  NormalizedCFG (mutable graph for M5/M7/M8 rewrites)
+//             ->  StructuredPlan (future)
+//             ->  wasmssa.if / loop / block emission (future)
+//
+// Upstream reference: mlir/lib/Transforms/Utils/CFGToSCF.cpp and the
+// mlir_lift_cf_to_scf.c port. Phase mapping:
+//   M5 — return normalization (shared return block, unify exits)
+//   M7 — cycle normalization (SCC decomposition, loop latches)
+//   M8 — branch normalization (entry/exit muxes, edge multiplexing)
+//
+// LLVM MLIR is never mutated during normalization; only NormalizedCFG changes.
+// Discovery mirrors the cf->scf driver's post-order region walk.
 // =============================================================================
+
+// ---------------------------------------------------------------------------
+// CFGInfo — immutable per-region CFG snapshot taken once from LLVM MLIR.
+// Upstream: initial CFG view before CFGToSCF graph rewrites; successor_slot
+// preserves llvm.cond_br / llvm.switch operand identity for edge values.
+// ---------------------------------------------------------------------------
+
+// Classifies the terminator on a CFG block (llvm.br, llvm.cond_br, etc.).
+typedef enum {
+    CFG_TERM_NONE,
+    CFG_TERM_BR,
+    CFG_TERM_COND_BR,
+    CFG_TERM_SWITCH,
+    CFG_TERM_RETURN,
+    CFG_TERM_UNREACHABLE,
+} CFGTermKind;
+
+// Directed CFG edge in the immutable snapshot pool.
+typedef struct {
+    size_t from;            // dense source block index
+    size_t to;              // dense destination block index
+    size_t successor_slot;  // terminator successor slot on `from`
+} CFGEdge;
+
+// One basic block in the immutable snapshot with adjacency into the edge pool.
+typedef struct {
+    MLIR_BlockHandle block;
+    MLIR_OpHandle    terminator;
+    CFGTermKind      term_kind;
+    bool             reachable;
+    size_t          *edge_by_successor_slot;  // [n_successor_slots], SIZE_MAX if none
+    size_t           n_successor_slots;
+    size_t          *out_edges;   // [n_out_edges] compact valid edge pool ids
+    size_t           n_out_edges;
+    size_t          *in_edges;    // incoming pool indices
+    size_t           n_in_edges;
+} CFGBlock;
+
+// Open-addressing hash map: MLIR_BlockHandle -> dense block index for O(1) lookup.
+typedef struct {
+    uintptr_t *keys;   // MLIR_BlockHandle, 0 = empty slot
+    size_t    *vals;   // dense block index
+    size_t     cap;    // power of two
+    size_t     n;
+} BlockIndexMap;
+
+// Immutable CFG snapshot for one llvm.func region. Built once; never mutated.
+typedef struct {
+    MLIR_RegionHandle region;
+    MLIR_BlockHandle  entry_block;
+    CFGBlock         *blocks;
+    size_t            n_blocks;
+    CFGEdge          *edges;
+    size_t            n_edges;
+    BlockIndexMap     block_to_index;
+} CFGInfo;
+
+// ---------------------------------------------------------------------------
+// NormalizedCFG — mutable working graph for M5/M7/M8 (CFGToSCF-style rewrites).
+// Synthetic blocks, edge redirection, and mux operands live here; LLVM MLIR
+// stays frozen. generation + rewrite batching invalidate cached analyses.
+// ---------------------------------------------------------------------------
+
+// Growable per-block list of NormEdge pool indices (outgoing or incoming).
+typedef struct {
+    size_t *edge_ids;
+    size_t  n;
+    size_t  cap;
+} NormAdjacency;
+
+// Semantic role of a synthetic block (why it exists in the normalized graph).
+// Upstream: mux blocks, unified return, loop latch in CFGToSCF.cpp.
+typedef enum {
+    NORM_BLOCK_ORIGINAL,
+    NORM_BLOCK_SHARED_RETURN,
+    NORM_BLOCK_ENTRY_MUX,
+    NORM_BLOCK_EXIT_MUX,
+    NORM_BLOCK_LOOP_LATCH,
+    NORM_BLOCK_LOOP_EXIT_DISPATCH,
+} NormBlockKind;
+
+// ---------------------------------------------------------------------------
+// Value model — NormOperand (normalization) vs PlanValue (structured emission).
+// Upstream: CFGToSCF edge/block argument forwarding; discriminators and typed
+// undef padding for multiplexer edges (CFGToSCF.cpp edge multiplexing).
+// ---------------------------------------------------------------------------
+
+// Operand tag for values flowing on normalized CFG edges and terminators.
+typedef enum {
+    NORM_OPERAND_INVALID = 0,
+    NORM_OPERAND_MLIR,
+    NORM_OPERAND_BLOCK_ARG,
+    NORM_OPERAND_DISCRIMINATOR,
+    NORM_OPERAND_UNDEF,
+} NormOperandKind;
+
+// Tagged union for a value on a normalized edge or in a synthetic terminator.
+typedef struct {
+    NormOperandKind kind;
+    MLIR_TypeHandle type;
+    union {
+        MLIR_ValueHandle mlir_value;
+        struct {
+            size_t block_id;
+            size_t arg_index;
+        } block_arg;
+        int32_t discriminator;
+    } as;
+} NormOperand;
+
+// Values in the structured plan layer (after structurization). Not on edges.
+typedef enum {
+    PLAN_VALUE_OPERAND,
+    PLAN_VALUE_STRUCTURED_RESULT,
+} PlanValueKind;
+
+typedef struct {
+    PlanValueKind kind;
+    NormOperand   operand;
+    size_t        plan_node_id;
+    size_t        result_index;
+} PlanValue;
+
+// Role of a block argument in a synthetic block signature (not operand kind).
+typedef enum {
+    NORM_BLOCK_ARG_FORWARDED,
+    NORM_BLOCK_ARG_DISCRIMINATOR,
+    NORM_BLOCK_ARG_LOOP_FLAG,
+    NORM_BLOCK_ARG_EXTRA,
+} NormBlockArgRole;
+
+// Type + role for one formal argument on a synthetic (or snapshot) block.
+typedef struct {
+    MLIR_TypeHandle   type;
+    NormBlockArgRole  role;
+} NormBlockArg;
+
+// Maps one mux destination to its argument slice and discriminator constant.
+// Upstream: CFGToSCF multiplexer destination layout.
+typedef struct {
+    size_t  destination_block;
+    size_t  arg_offset;
+    size_t  n_args;
+    int32_t discriminator;
+} NormMuxEntry;
+
+// Synthetic terminator metadata (switch cases, return values, loop latch).
+// Upstream: private terminator state in CFGToSCF before scf emission.
+typedef struct {
+    CFGTermKind  kind;
+    NormOperand  selector;
+    int32_t     *case_values;
+    size_t      *case_edge_ids;
+    size_t       n_cases;
+    size_t       default_edge_id;
+    NormOperand *return_values;
+    size_t       n_return_values;
+    NormOperand  should_repeat;  // loop latch cond_br
+} NormTerminator;
+
+// One node in the mutable normalized graph (original LLVM block or synthetic).
+typedef struct {
+    NormBlockKind    kind;
+    MLIR_BlockHandle mlir_block;
+    MLIR_OpHandle    terminator;
+    NormTerminator   synth_term;
+    CFGTermKind      term_kind;
+    NormBlockArg    *args;
+    size_t           n_args;
+    NormMuxEntry    *mux_entries;
+    size_t           n_mux_entries;
+    NormAdjacency    outgoing;
+    NormAdjacency    incoming;
+    bool             active;
+    bool             finalized;
+} NormBlock;
+
+// Whether edge operands are lazy snapshot refs or owned synthetic copies.
+typedef enum {
+    NORM_EDGE_SNAPSHOT,
+    NORM_EDGE_SYNTHETIC,
+} NormEdgePayloadKind;
+
+// SSA values forwarded across a normalized edge (snapshot or synthetic).
+typedef struct {
+    NormEdgePayloadKind kind;
+    size_t              snapshot_edge_id;  // valid when NORM_EDGE_SNAPSHOT
+    NormOperand        *operands;
+    size_t              n_operands;
+} NormEdgePayload;
+
+// Mutable directed edge with adjacency positions for O(1) redirect/remove.
+typedef struct {
+    size_t from;
+    size_t to;
+    size_t successor_slot;
+    size_t out_position;
+    size_t in_position;
+    NormEdgePayload payload;
+    bool   active;
+} NormEdge;
+
+// ---------------------------------------------------------------------------
+// CFG analysis caches — lazy, generation-tracked graph analyses.
+// Upstream: Cooper-Harvey-Kennedy dominance (mlir_lift_cf_to_scf.c DomInfo),
+// reverse postorder for SCC (M7) and branch structuring (M8).
+// ---------------------------------------------------------------------------
+
+// Reverse postorder with block->position inverse map for dominance intersect.
+typedef struct {
+    size_t *order;
+    size_t *position;
+    size_t  n;
+} RPOInfo;
+
+// Immediate-dominator tree; post_dominance uses root/has_virtual_exit for exits.
+typedef struct {
+    size_t *idom;
+    size_t  n;
+    size_t  root;
+    bool    has_virtual_exit;
+} DominanceInfo;
+
+// Tarjan SCC result with component member ranges (M7 cycle normalization).
+typedef struct {
+    size_t *component_id;
+    size_t *component_offsets;
+    size_t *members;
+    size_t  n;
+    size_t  n_components;
+} SCCInfo;
+
+// Lazily computed analyses keyed by NormalizedCFG.generation.
+typedef struct {
+    size_t         generation;
+    RPOInfo        rpo;
+    DominanceInfo  dominance;
+    DominanceInfo  post_dominance;
+    SCCInfo        scc;
+    bool           has_rpo;
+    bool           has_dominance;
+    bool           has_post_dominance;
+    bool           has_scc;
+} CFGAnalysisCache;
+
+// Mutable normalized graph + arena pointers + analysis cache.
+typedef struct {
+    const CFGInfo *snapshot;
+
+    NormBlock *blocks;
+    size_t     n_blocks;
+    size_t     blocks_cap;
+
+    NormEdge *edges;
+    size_t    n_edges;
+    size_t    edges_cap;
+
+    size_t generation;
+    size_t entry_block;
+    size_t rewrite_depth;
+    bool   rewrite_dirty;
+
+    Arena      *graph_arena;
+    Arena      *analysis_arena;
+    arena_pos_t analysis_base_pos;
+
+    CFGAnalysisCache analysis;
+} NormalizedCFG;
+
+// Single-pass iterator over active outgoing/incoming edges of one block.
+typedef struct {
+    const NormalizedCFG *cfg;
+    const NormAdjacency *adj;
+    size_t               i;
+} NormEdgeIter;
+
+// DFS stack frame for iterative RPO computation.
+typedef struct {
+    size_t bid;
+    size_t edge_i;
+} NormRpoFrame;
+
+// One llvm.func region that still needs CFG->structured lowering.
 typedef struct {
     MLIR_OpHandle     fn_op;        // owning llvm.func
     MLIR_RegionHandle region;       // region whose CFG needs structurizing
     MLIR_BlockHandle  entry_block;  // first block of `region`
 } LiftRegionTarget;
 
+// Growable array of LiftRegionTarget discovered in a module walk.
 typedef struct {
     LiftRegionTarget *items;
     size_t            n;
     size_t            cap;
 } LiftRegionTargetList;
 
+// Graph and analysis use separate arena lifetimes:
+//   graph_arena    — CFGInfo snapshot + NormalizedCFG blocks/edges/payloads
+//   analysis_arena — cached RPO/dominance/SCC + temporary workspaces; reset
+//                    whenever the normalized CFG generation changes.
+typedef struct {
+    Arena      *graph_arena;
+    arena_pos_t graph_base_pos;
+    Arena      *analysis_arena;
+    arena_pos_t analysis_base_pos;
+} CFGAnalysisArena;
+
+// View of one target's CFG snapshot + normalized graph in a shared arena pool.
+typedef struct {
+    CFGAnalysisArena *pool;
+    CFGInfo           cfg;
+    NormalizedCFG     norm;
+} CFGInfoScratch;
+
+// ---------------------------------------------------------------------------
+// BlockIndexMap — O(1) MLIR_BlockHandle -> dense index.
+// Upstream: dense block numbering used throughout CFGToSCF analyses.
+// ---------------------------------------------------------------------------
+// Look up dense block index for an MLIR block handle; SIZE_MAX if absent.
+static size_t block_index_map_probe(const BlockIndexMap *map, MLIR_BlockHandle b) {
+    if (map->cap == 0) return SIZE_MAX;
+    uintptr_t key = (uintptr_t)b;
+    size_t mask = map->cap - 1;
+    size_t i = map_hash(key) & mask;
+    while (map->keys[i] != 0) {
+        if (map->keys[i] == key) return map->vals[i];
+        i = (i + 1) & mask;
+    }
+    return SIZE_MAX;
+}
+
+// Initialize an empty BlockIndexMap with at least `min_cap` slots.
+static void block_index_map_init(BlockIndexMap *map, Arena *arena, size_t min_cap) {
+    memset(map, 0, sizeof(*map));
+    size_t cap = 16;
+    while (cap < min_cap) cap *= 2;
+    map->cap = cap;
+    map->keys = arena_new_array(arena, uintptr_t, cap);
+    map->vals = arena_new_array(arena, size_t, cap);
+    memset(map->keys, 0, cap * sizeof(uintptr_t));
+}
+
+// Double BlockIndexMap capacity and rehash all entries into a new table.
+static void block_index_map_grow(BlockIndexMap *map, Arena *arena) {
+    size_t ocap = map->cap;
+    uintptr_t *okeys = map->keys;
+    size_t *ovals = map->vals;
+    size_t ncap = ocap ? ocap * 2 : 16;
+    map->cap = ncap;
+    map->keys = arena_new_array(arena, uintptr_t, ncap);
+    map->vals = arena_new_array(arena, size_t, ncap);
+    memset(map->keys, 0, ncap * sizeof(uintptr_t));
+    map->n = 0;
+    size_t mask = ncap - 1;
+    for (size_t i = 0; i < ocap; ++i) {
+        uintptr_t key = okeys[i];
+        if (key == 0) continue;
+        size_t j = map_hash(key) & mask;
+        while (map->keys[j] != 0) j = (j + 1) & mask;
+        map->keys[j] = key;
+        map->vals[j] = ovals[i];
+        map->n++;
+    }
+}
+
+// Insert block->index mapping; first insert wins on duplicate keys.
+static void block_index_map_put(BlockIndexMap *map, Arena *arena,
+                                MLIR_BlockHandle b, size_t index) {
+    uintptr_t key = (uintptr_t)b;
+    if ((map->n + 1) * 4 >= map->cap * 3) block_index_map_grow(map, arena);
+    size_t mask = map->cap - 1;
+    size_t i = map_hash(key) & mask;
+    while (map->keys[i] != 0) {
+        if (map->keys[i] == key) return;  // first insert wins
+        i = (i + 1) & mask;
+    }
+    map->keys[i] = key;
+    map->vals[i] = index;
+    map->n++;
+}
+
+// ---------------------------------------------------------------------------
+// CFGInfo query helpers.
+// ---------------------------------------------------------------------------
+// Map an LLVM terminator op to CFGTermKind for snapshot classification.
+static CFGTermKind cfg_term_kind_of(MLIR_OpHandle term) {
+    if (term == MLIR_INVALID_HANDLE) return CFG_TERM_NONE;
+    string n = MLIR_GetOpName(term);
+    if (name_eq(n, "llvm.br")) return CFG_TERM_BR;
+    if (name_eq(n, "llvm.cond_br")) return CFG_TERM_COND_BR;
+    if (name_eq(n, "llvm.switch")) return CFG_TERM_SWITCH;
+    if (name_eq(n, "llvm.return")) return CFG_TERM_RETURN;
+    if (name_eq(n, "llvm.unreachable")) return CFG_TERM_UNREACHABLE;
+    return CFG_TERM_NONE;
+}
+
+// Dense index of `block` in CFGInfo, or SIZE_MAX.
+static size_t cfg_info_block_index(const CFGInfo *cfg, MLIR_BlockHandle block) {
+    return block_index_map_probe(&cfg->block_to_index, block);
+}
+
+// MLIR block handle at dense index `idx`.
+static MLIR_BlockHandle cfg_info_block_at(const CFGInfo *cfg, size_t idx) {
+    if (idx >= cfg->n_blocks) return MLIR_INVALID_HANDLE;
+    return cfg->blocks[idx].block;
+}
+
+// Terminator op on block `idx` (llvm.br, llvm.cond_br, etc.).
+static MLIR_OpHandle cfg_info_block_terminator(const CFGInfo *cfg, size_t idx) {
+    if (idx >= cfg->n_blocks) return MLIR_INVALID_HANDLE;
+    return cfg->blocks[idx].terminator;
+}
+
+// Cached CFGTermKind for block `idx`.
+static CFGTermKind cfg_info_block_term_kind(const CFGInfo *cfg, size_t idx) {
+    if (idx >= cfg->n_blocks) return CFG_TERM_NONE;
+    return cfg->blocks[idx].term_kind;
+}
+
+static const CFGEdge *cfg_info_edge_at(const CFGInfo *cfg, size_t edge_id) {
+    if (edge_id >= cfg->n_edges) return NULL;
+    return &cfg->edges[edge_id];
+}
+
+// Edge pool id for successor slot `succ_slot` on block `block_idx`.
+static size_t cfg_info_edge_id_for_slot(const CFGInfo *cfg, size_t block_idx,
+                                        size_t succ_slot) {
+    if (block_idx >= cfg->n_blocks) return SIZE_MAX;
+    CFGBlock *b = &cfg->blocks[block_idx];
+    if (succ_slot >= b->n_successor_slots) return SIZE_MAX;
+    return b->edge_by_successor_slot[succ_slot];
+}
+
+// Incoming edge pool id at predecessor index `pred_i`.
+static size_t cfg_info_in_edge_id(const CFGInfo *cfg, size_t block_idx,
+                                  size_t pred_i) {
+    if (block_idx >= cfg->n_blocks) return SIZE_MAX;
+    CFGBlock *b = &cfg->blocks[block_idx];
+    if (pred_i >= b->n_in_edges) return SIZE_MAX;
+    return b->in_edges[pred_i];
+}
+
+// Number of terminator successor slots on block `idx`.
+static size_t cfg_info_num_successor_slots(const CFGInfo *cfg, size_t idx) {
+    if (idx >= cfg->n_blocks) return 0;
+    return cfg->blocks[idx].n_successor_slots;
+}
+
+// Count of valid outgoing edges in the snapshot pool.
+static size_t cfg_info_num_out_edges(const CFGInfo *cfg, size_t idx) {
+    if (idx >= cfg->n_blocks) return 0;
+    return cfg->blocks[idx].n_out_edges;
+}
+
+// Outgoing edge pool id at compact out-edge index `out_i`.
+static size_t cfg_info_out_edge_id_at(const CFGInfo *cfg, size_t block_idx,
+                                      size_t out_i) {
+    if (block_idx >= cfg->n_blocks) return SIZE_MAX;
+    CFGBlock *b = &cfg->blocks[block_idx];
+    if (out_i >= b->n_out_edges) return SIZE_MAX;
+    return b->out_edges[out_i];
+}
+
+// Dense destination block index for successor slot `succ_slot`.
+static size_t cfg_info_successor_index(const CFGInfo *cfg, size_t idx,
+                                       size_t succ_slot) {
+    size_t eid = cfg_info_edge_id_for_slot(cfg, idx, succ_slot);
+    const CFGEdge *e = cfg_info_edge_at(cfg, eid);
+    return e ? e->to : SIZE_MAX;
+}
+
+// MLIR block handle for successor slot `succ_slot` on block `idx`.
+static MLIR_BlockHandle cfg_info_successor_block(const CFGInfo *cfg, size_t idx,
+                                                 size_t succ_slot) {
+    size_t si = cfg_info_successor_index(cfg, idx, succ_slot);
+    return cfg_info_block_at(cfg, si);
+}
+
+// Number of incoming edges to block `idx`.
+static size_t cfg_info_num_predecessors(const CFGInfo *cfg, size_t idx) {
+    if (idx >= cfg->n_blocks) return 0;
+    return cfg->blocks[idx].n_in_edges;
+}
+
+// Dense source block index of predecessor `pred_i`.
+static size_t cfg_info_predecessor_index(const CFGInfo *cfg, size_t idx,
+                                         size_t pred_i) {
+    size_t eid = cfg_info_in_edge_id(cfg, idx, pred_i);
+    const CFGEdge *e = cfg_info_edge_at(cfg, eid);
+    return e ? e->from : SIZE_MAX;
+}
+
+// Successor slot on the predecessor's terminator for `pred_i`.
+static size_t cfg_info_predecessor_succ_slot(const CFGInfo *cfg, size_t idx,
+                                             size_t pred_i) {
+    size_t eid = cfg_info_in_edge_id(cfg, idx, pred_i);
+    const CFGEdge *e = cfg_info_edge_at(cfg, eid);
+    return e ? e->successor_slot : SIZE_MAX;
+}
+
+// Full CFGEdge record for predecessor `pred_i` of block `idx`.
+static CFGEdge cfg_info_incoming_edge(const CFGInfo *cfg, size_t idx,
+                                      size_t pred_i) {
+    CFGEdge e;
+    e.from = SIZE_MAX;
+    e.to = SIZE_MAX;
+    e.successor_slot = SIZE_MAX;
+    size_t eid = cfg_info_in_edge_id(cfg, idx, pred_i);
+    const CFGEdge *ep = cfg_info_edge_at(cfg, eid);
+    if (ep) e = *ep;
+    return e;
+}
+
+// MLIR block handle of predecessor `pred_i` of block `idx`.
+static MLIR_BlockHandle cfg_info_predecessor_block(const CFGInfo *cfg, size_t idx,
+                                                   size_t pred_i) {
+    size_t pi = cfg_info_predecessor_index(cfg, idx, pred_i);
+    return cfg_info_block_at(cfg, pi);
+}
+
+// Count of MLIR successor operands on snapshot edge `edge_id`.
+static size_t cfg_info_edge_num_operands(const CFGInfo *cfg, size_t edge_id) {
+    const CFGEdge *e = cfg_info_edge_at(cfg, edge_id);
+    if (!e || e->from >= cfg->n_blocks) return 0;
+    MLIR_OpHandle term = cfg->blocks[e->from].terminator;
+    if (term == MLIR_INVALID_HANDLE) return 0;
+    return MLIR_GetOpNumSuccessorOperands(term, e->successor_slot);
+}
+
+// MLIR successor operand at `op_idx` on snapshot edge `edge_id`.
+static MLIR_ValueHandle cfg_info_edge_operand(const CFGInfo *cfg, size_t edge_id,
+                                              size_t op_idx) {
+    const CFGEdge *e = cfg_info_edge_at(cfg, edge_id);
+    if (!e || e->from >= cfg->n_blocks) return MLIR_INVALID_HANDLE;
+    MLIR_OpHandle term = cfg->blocks[e->from].terminator;
+    if (term == MLIR_INVALID_HANDLE) return MLIR_INVALID_HANDLE;
+    return MLIR_GetOpSuccessorOperand(term, e->successor_slot, op_idx);
+}
+
+// Dense index of the region entry block.
+static size_t cfg_info_entry_index(const CFGInfo *cfg) {
+    size_t ei = cfg_info_block_index(cfg, cfg->entry_block);
+    return ei;
+}
+
+// True when BFS from entry reached every indexed block.
+static bool cfg_info_all_region_blocks_reachable(const CFGInfo *cfg) {
+    for (size_t i = 0; i < cfg->n_blocks; ++i) {
+        if (!cfg->blocks[i].reachable) return false;
+    }
+    return true;
+}
+
+// Resolve in-region successor to dense index; filters unreachable blocks.
+static bool cfg_edge_dest_index(const CFGInfo *cfg, MLIR_RegionHandle region,
+                                MLIR_BlockHandle succ, size_t *out_dest) {
+    if (succ == MLIR_INVALID_HANDLE) return false;
+    if (MLIR_GetBlockParentRegion(succ) != region) return false;
+    size_t di = cfg_info_block_index(cfg, succ);
+    if (di == SIZE_MAX || di >= cfg->n_blocks) return false;
+    if (!cfg->blocks[di].reachable) return false;
+    if (out_dest) *out_dest = di;
+    return true;
+}
+
+// Build immutable CFGInfo: index blocks, BFS reachability, edge pool.
+// Upstream: initial CFG snapshot before CFGToSCF rewrites.
+static bool cfg_info_build(Arena *arena, MLIR_RegionHandle region,
+                           CFGInfo *out) {
+    memset(out, 0, sizeof(*out));
+    out->region = region;
+    size_t n = MLIR_GetRegionNumBlocks(region);
+    if (n == 0) return false;
+    out->entry_block = MLIR_GetRegionBlock(region, 0);
+
+    out->n_blocks = n;
+    out->blocks = arena_new_array(arena, CFGBlock, n);
+    memset(out->blocks, 0, n * sizeof(CFGBlock));
+    block_index_map_init(&out->block_to_index, arena, n * 2);
+
+    for (size_t i = 0; i < n; ++i) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, i);
+        out->blocks[i].block = b;
+        out->blocks[i].terminator = MLIR_GetBlockTerminator(b);
+        out->blocks[i].term_kind = cfg_term_kind_of(out->blocks[i].terminator);
+        block_index_map_put(&out->block_to_index, arena, b, i);
+    }
+
+    bool *visited = arena_new_array(arena, bool, n);
+    memset(visited, 0, n * sizeof(bool));
+    size_t *queue = arena_new_array(arena, size_t, n);
+    size_t head = 0, tail = 0;
+    visited[0] = true;
+    out->blocks[0].reachable = true;
+    queue[tail++] = 0;
+    while (head < tail) {
+        size_t bi = queue[head++];
+        MLIR_OpHandle term = out->blocks[bi].terminator;
+        if (term == MLIR_INVALID_HANDLE) continue;
+        size_t ns = MLIR_GetOpNumSuccessors(term);
+        for (size_t i = 0; i < ns; ++i) {
+            MLIR_BlockHandle s = MLIR_GetOpSuccessor(term, i);
+            if (s == MLIR_INVALID_HANDLE) continue;
+            if (MLIR_GetBlockParentRegion(s) != region) continue;
+            size_t si = block_index_map_probe(&out->block_to_index, s);
+            if (si == SIZE_MAX || visited[si]) continue;
+            visited[si] = true;
+            out->blocks[si].reachable = true;
+            queue[tail++] = si;
+        }
+    }
+
+    // Edge pass 1: classify terminators and count edges on reachable blocks.
+    size_t total_edges = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!out->blocks[i].reachable) continue;
+        CFGBlock *b = &out->blocks[i];
+        MLIR_OpHandle term = b->terminator;
+        size_t ns = (term == MLIR_INVALID_HANDLE) ? 0
+                                                  : MLIR_GetOpNumSuccessors(term);
+        b->n_successor_slots = ns;
+        if (ns == 0) continue;
+        for (size_t s = 0; s < ns; ++s) {
+            size_t di;
+            if (!cfg_edge_dest_index(out, region,
+                                     MLIR_GetOpSuccessor(term, s), &di)) {
+                continue;
+            }
+            total_edges++;
+            b->n_out_edges++;
+            out->blocks[di].n_in_edges++;
+        }
+    }
+
+    out->n_edges = total_edges;
+    out->edges = total_edges ? arena_new_array(arena, CFGEdge, total_edges) : NULL;
+    for (size_t i = 0; i < n; ++i) {
+        CFGBlock *b = &out->blocks[i];
+        if (!b->reachable) continue;
+        if (b->n_successor_slots > 0) {
+            b->edge_by_successor_slot =
+                arena_new_array(arena, size_t, b->n_successor_slots);
+            for (size_t s = 0; s < b->n_successor_slots; ++s) {
+                b->edge_by_successor_slot[s] = SIZE_MAX;
+            }
+        }
+        if (b->n_out_edges > 0) {
+            b->out_edges = arena_new_array(arena, size_t, b->n_out_edges);
+        }
+        if (b->n_in_edges > 0) {
+            b->in_edges = arena_new_array(arena, size_t, b->n_in_edges);
+        }
+    }
+
+    // Edge pass 2: populate the edge pool and per-block edge-id lists.
+    size_t *in_cursor = arena_new_array(arena, size_t, n);
+    memset(in_cursor, 0, n * sizeof(size_t));
+    size_t edge_id = 0;
+    for (size_t i = 0; i < n; ++i) {
+        CFGBlock *src = &out->blocks[i];
+        if (!src->reachable) continue;
+        MLIR_OpHandle term = src->terminator;
+        if (term == MLIR_INVALID_HANDLE) continue;
+        size_t out_cursor = 0;
+        for (size_t s = 0; s < src->n_successor_slots; ++s) {
+            size_t di;
+            if (!cfg_edge_dest_index(out, region,
+                                     MLIR_GetOpSuccessor(term, s), &di)) {
+                continue;
+            }
+            out->edges[edge_id].from = i;
+            out->edges[edge_id].to = di;
+            out->edges[edge_id].successor_slot = s;
+            src->edge_by_successor_slot[s] = edge_id;
+            src->out_edges[out_cursor++] = edge_id;
+            out->blocks[di].in_edges[in_cursor[di]++] = edge_id;
+            edge_id++;
+        }
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// NormalizedCFG — mutable graph layered on an immutable CFGInfo snapshot.
+// Upstream: CFGToSCF graph mutation layer (mux insertion, edge redirect).
+// ---------------------------------------------------------------------------
+
+// --- Generation tracking and rewrite transactions ---
+static void normalized_cfg_reset_analysis_storage(NormalizedCFG *n) {
+    if (n->analysis_arena) {
+        arena_reset(n->analysis_arena, n->analysis_base_pos);
+    }
+    n->analysis.has_rpo = false;
+    n->analysis.has_dominance = false;
+    n->analysis.has_post_dominance = false;
+    n->analysis.has_scc = false;
+    memset(&n->analysis.rpo, 0, sizeof(n->analysis.rpo));
+    memset(&n->analysis.dominance, 0, sizeof(n->analysis.dominance));
+    memset(&n->analysis.post_dominance, 0, sizeof(n->analysis.post_dominance));
+    memset(&n->analysis.scc, 0, sizeof(n->analysis.scc));
+}
+
+// Alias for reset_analysis_storage.
+static void normalized_cfg_invalidate_analysis(NormalizedCFG *n) {
+    normalized_cfg_reset_analysis_storage(n);
+}
+
+// Increment graph generation and discard stale analysis storage.
+static void normalized_cfg_bump_generation(NormalizedCFG *n) {
+    n->generation++;
+    normalized_cfg_reset_analysis_storage(n);
+    n->analysis.generation = n->generation;
+}
+
+// Record a graph change; defer generation bump inside rewrite batches.
+static void normalized_cfg_note_mutation(NormalizedCFG *n) {
+    if (n->rewrite_depth > 0) {
+        n->rewrite_dirty = true;
+    } else {
+        normalized_cfg_bump_generation(n);
+    }
+}
+
+// Invalidate analysis cache when generation lags the graph.
+static void cfg_analysis_cache_sync(NormalizedCFG *n) {
+    if (n->analysis.generation != n->generation) {
+        normalized_cfg_reset_analysis_storage(n);
+        n->analysis.generation = n->generation;
+    }
+}
+
+// Open a logical rewrite transaction; forbid analysis queries.
+static void normalized_cfg_begin_rewrite(NormalizedCFG *n) {
+    if (n->rewrite_depth == 0) {
+        n->rewrite_dirty = false;
+        normalized_cfg_invalidate_analysis(n);
+    }
+    n->rewrite_depth++;
+}
+
+// False while inside begin_rewrite/end_rewrite (stale analyses).
+static bool normalized_cfg_analysis_available(const NormalizedCFG *n) {
+    return n->rewrite_depth == 0;
+}
+
+// Close rewrite batch; bump generation once if dirty.
+static void normalized_cfg_end_rewrite(NormalizedCFG *n) {
+    if (n->rewrite_depth == 0) return;
+    n->rewrite_depth--;
+    if (n->rewrite_depth == 0 && n->rewrite_dirty) {
+        normalized_cfg_bump_generation(n);
+        n->rewrite_dirty = false;
+    }
+}
+
+// --- Adjacency lists, operands, and block/terminator helpers ---
+
+// True when edge and both endpoint blocks are active.
+static bool norm_edge_is_active(const NormalizedCFG *n, size_t edge_id);
+// True when `edge_id` is an active outgoing edge of `block_id` (O(1)).
+static bool norm_edge_is_outgoing_from(const NormalizedCFG *n, size_t edge_id,
+                                       size_t block_id);
+
+// Begin single-pass iteration over active outgoing edges of `block_id`.
+static NormEdgeIter norm_out_edges(const NormalizedCFG *n, size_t block_id) {
+    NormEdgeIter it;
+    it.cfg = n;
+    it.i = 0;
+    if (block_id >= n->n_blocks || !n->blocks[block_id].active) {
+        it.adj = NULL;
+        return it;
+    }
+    it.adj = &n->blocks[block_id].outgoing;
+    return it;
+}
+
+// Begin single-pass iteration over active incoming edges of `block_id`.
+static NormEdgeIter norm_in_edges(const NormalizedCFG *n, size_t block_id) {
+    NormEdgeIter it;
+    it.cfg = n;
+    it.i = 0;
+    if (block_id >= n->n_blocks || !n->blocks[block_id].active) {
+        it.adj = NULL;
+        return it;
+    }
+    it.adj = &n->blocks[block_id].incoming;
+    return it;
+}
+
+// Advance edge iterator; returns next active edge id or false.
+static bool norm_edge_iter_next(NormEdgeIter *it, size_t *out_edge_id) {
+    if (!it->adj) return false;
+    while (it->i < it->adj->n) {
+        size_t eid = it->adj->edge_ids[it->i++];
+        if (!norm_edge_is_active(it->cfg, eid)) continue;
+        if (out_edge_id) *out_edge_id = eid;
+        return true;
+    }
+    return false;
+}
+
+// Allocate exact-capacity adjacency list (snapshot build path).
+static void norm_adj_prealloc(Arena *arena, NormAdjacency *adj, size_t cap) {
+    adj->n = 0;
+    adj->cap = 0;
+    adj->edge_ids = NULL;
+    if (cap == 0) return;
+    adj->edge_ids = arena_new_array(arena, size_t, cap);
+    adj->cap = cap;
+}
+
+// Append edge id assuming adjacency has spare capacity.
+static void norm_adj_append(NormAdjacency *adj, size_t edge_id) {
+    adj->edge_ids[adj->n++] = edge_id;
+}
+
+// Append edge id, growing adjacency geometrically when needed.
+static void norm_adj_push(Arena *arena, NormAdjacency *adj, size_t edge_id) {
+    if (adj->cap > 0 && adj->n < adj->cap) {
+        norm_adj_append(adj, edge_id);
+        return;
+    }
+    if (adj->n >= adj->cap) {
+        size_t ncap = adj->cap ? adj->cap * 2 : 4;
+        size_t *next = arena_new_array(arena, size_t, ncap);
+        if (adj->n > 0) memcpy(next, adj->edge_ids, adj->n * sizeof(size_t));
+        adj->edge_ids = next;
+        adj->cap = ncap;
+    }
+    adj->edge_ids[adj->n++] = edge_id;
+}
+
+// O(1) swap-remove at `pos`; updates moved edge's position field.
+static void norm_adj_remove_swap(NormAdjacency *adj, size_t pos,
+                                 NormEdge *edges, bool is_outgoing) {
+    if (pos >= adj->n) return;
+    size_t last = adj->n - 1;
+    if (pos != last) {
+        size_t moved_eid = adj->edge_ids[last];
+        adj->edge_ids[pos] = moved_eid;
+        if (is_outgoing) {
+            edges[moved_eid].out_position = pos;
+        } else {
+            edges[moved_eid].in_position = pos;
+        }
+    }
+    adj->n--;
+}
+
+// Zero-init NormTerminator; default_edge_id = SIZE_MAX.
+static void norm_terminator_init(NormTerminator *t) {
+    memset(t, 0, sizeof(*t));
+    t->default_edge_id = SIZE_MAX;
+}
+
+// Zero-init NormOperand (NORM_OPERAND_INVALID).
+static void norm_operand_init(NormOperand *o) {
+    memset(o, 0, sizeof(*o));
+}
+
+// Construct NORM_OPERAND_MLIR with type and MLIR value.
+static NormOperand norm_operand_mlir(MLIR_TypeHandle ty, MLIR_ValueHandle v) {
+    NormOperand o;
+    norm_operand_init(&o);
+    o.kind = NORM_OPERAND_MLIR;
+    o.type = ty;
+    o.as.mlir_value = v;
+    return o;
+}
+
+// Construct NORM_OPERAND_BLOCK_ARG referencing a block formal.
+static NormOperand norm_operand_block_arg(MLIR_TypeHandle ty, size_t block_id,
+                                          size_t arg_index) {
+    NormOperand o;
+    norm_operand_init(&o);
+    o.kind = NORM_OPERAND_BLOCK_ARG;
+    o.type = ty;
+    o.as.block_arg.block_id = block_id;
+    o.as.block_arg.arg_index = arg_index;
+    return o;
+}
+
+// Construct NORM_OPERAND_DISCRIMINATOR mux constant.
+static NormOperand norm_operand_discriminator(MLIR_TypeHandle ty, int32_t disc) {
+    NormOperand o;
+    norm_operand_init(&o);
+    o.kind = NORM_OPERAND_DISCRIMINATOR;
+    o.type = ty;
+    o.as.discriminator = disc;
+    return o;
+}
+
+// Construct typed NORM_OPERAND_UNDEF padding value.
+static NormOperand norm_operand_undef(MLIR_TypeHandle ty) {
+    NormOperand o;
+    norm_operand_init(&o);
+    o.kind = NORM_OPERAND_UNDEF;
+    o.type = ty;
+    return o;
+}
+
+// False for zero-initialized / NORM_OPERAND_INVALID operands.
+static bool norm_operand_is_valid(const NormOperand *o) {
+    return o && o->kind != NORM_OPERAND_INVALID;
+}
+
+// Copy MLIR block argument types into NormBlockArg signature.
+static void norm_block_init_original_signature(Arena *arena, NormBlock *nb,
+                                               MLIR_BlockHandle b) {
+    size_t nargs = MLIR_GetBlockNumArgs(b);
+    if (nargs == 0) return;
+    nb->args = arena_new_array(arena, NormBlockArg, nargs);
+    nb->n_args = nargs;
+    for (size_t i = 0; i < nargs; ++i) {
+        MLIR_ValueHandle arg = MLIR_GetBlockArg(b, i);
+        nb->args[i].type = MLIR_GetValueType(arg);
+        nb->args[i].role = NORM_BLOCK_ARG_FORWARDED;
+    }
+}
+
+// Attach NormMuxEntry destination layout table to a block.
+static bool norm_block_set_mux_entries(NormBlock *nb, Arena *arena,
+                                       const NormMuxEntry *entries, size_t n) {
+    nb->mux_entries = NULL;
+    nb->n_mux_entries = 0;
+    if (n == 0) return true;
+    nb->mux_entries = arena_new_array(arena, NormMuxEntry, n);
+    if (!nb->mux_entries) return false;
+    nb->n_mux_entries = n;
+    memcpy(nb->mux_entries, entries, n * sizeof(NormMuxEntry));
+    return true;
+}
+
+// False after synthetic block finalization.
+static bool norm_synthetic_block_allows_outgoing_mutation(const NormBlock *b) {
+    if (b->kind == NORM_BLOCK_ORIGINAL) return true;
+    return !b->finalized;
+}
+
+// True when an active edge may be removed (source block still allows outgoing edits).
+static bool norm_edge_deactivation_allowed(const NormalizedCFG *n, size_t edge_id) {
+    if (edge_id >= n->n_edges) return false;
+    const NormEdge *e = &n->edges[edge_id];
+    if (!e->active) return false;
+    if (e->from < n->n_blocks &&
+        !norm_synthetic_block_allows_outgoing_mutation(&n->blocks[e->from])) {
+        return false;
+    }
+    return true;
+}
+
+// Arena-copy variable-length NormTerminator arrays.
+static bool norm_terminator_deep_copy(Arena *arena, const NormTerminator *src,
+                                      NormTerminator *dst) {
+    norm_terminator_init(dst);
+    if (!src) return true;
+    dst->kind = src->kind;
+    dst->selector = src->selector;
+    dst->should_repeat = src->should_repeat;
+    dst->default_edge_id = src->default_edge_id;
+    dst->n_cases = src->n_cases;
+    if (src->n_cases > 0) {
+        if (!src->case_values || !src->case_edge_ids) return false;
+        dst->case_values = arena_new_array(arena, int32_t, src->n_cases);
+        dst->case_edge_ids = arena_new_array(arena, size_t, src->n_cases);
+        if (!dst->case_values || !dst->case_edge_ids) return false;
+        memcpy(dst->case_values, src->case_values, src->n_cases * sizeof(int32_t));
+        memcpy(dst->case_edge_ids, src->case_edge_ids, src->n_cases * sizeof(size_t));
+    }
+    dst->n_return_values = src->n_return_values;
+    if (src->n_return_values > 0) {
+        if (!src->return_values) return false;
+        dst->return_values = arena_new_array(arena, NormOperand, src->n_return_values);
+        if (!dst->return_values) return false;
+        memcpy(dst->return_values, src->return_values,
+               src->n_return_values * sizeof(NormOperand));
+    }
+    return true;
+}
+
+// Arena-copy NormBlockArg formal signature onto a block.
+static bool norm_block_set_signature(NormBlock *nb, Arena *arena,
+                                     const NormBlockArg *args, size_t n_args) {
+    nb->args = NULL;
+    nb->n_args = 0;
+    if (n_args == 0) return true;
+    nb->args = arena_new_array(arena, NormBlockArg, n_args);
+    if (!nb->args) return false;
+    nb->n_args = n_args;
+    memcpy(nb->args, args, n_args * sizeof(NormBlockArg));
+    return true;
+}
+
+// Zero-init NormBlock including synthetic terminator defaults.
+static void norm_block_init(NormBlock *b) {
+    memset(b, 0, sizeof(*b));
+    norm_terminator_init(&b->synth_term);
+}
+
+// Grow NormalizedCFG blocks array, initializing new NormBlock slots.
+static void norm_ensure_block_slots(NormalizedCFG *n, Arena *arena, size_t need) {
+    while (n->blocks_cap < need) {
+        size_t ocap = n->blocks_cap;
+        size_t ncap = ocap ? ocap * 2 : 8;
+        NormBlock *nb = arena_new_array(arena, NormBlock, ncap);
+        if (ocap > 0) {
+            memcpy(nb, n->blocks, ocap * sizeof(NormBlock));
+        }
+        for (size_t i = ocap; i < ncap; ++i) {
+            norm_block_init(&nb[i]);
+        }
+        n->blocks = nb;
+        n->blocks_cap = ncap;
+    }
+}
+
+// Replace edge payload with owned synthetic NormOperand array.
+static bool norm_edge_payload_set_operands(Arena *arena, NormEdgePayload *payload,
+                                           const NormOperand *operands,
+                                           size_t n_operands) {
+    payload->kind = NORM_EDGE_SYNTHETIC;
+    payload->snapshot_edge_id = SIZE_MAX;
+    payload->operands = NULL;
+    payload->n_operands = 0;
+    if (n_operands == 0) return true;
+    payload->operands = arena_new_array(arena, NormOperand, n_operands);
+    if (!payload->operands) return false;
+    payload->n_operands = n_operands;
+    memcpy(payload->operands, operands, n_operands * sizeof(NormOperand));
+    return true;
+}
+
+// Mark payload as lazy snapshot reference (no operand copy).
+static void norm_edge_payload_init_snapshot(NormEdgePayload *out,
+                                            size_t snapshot_edge_id) {
+    memset(out, 0, sizeof(*out));
+    out->kind = NORM_EDGE_SNAPSHOT;
+    out->snapshot_edge_id = snapshot_edge_id;
+}
+
+// Initialize synthetic edge payload from operand array.
+static bool norm_edge_payload_init_synthetic_operands(
+        Arena *arena, const NormOperand *operands, size_t n_operands,
+        NormEdgePayload *out) {
+    memset(out, 0, sizeof(*out));
+    return norm_edge_payload_set_operands(arena, out, operands, n_operands);
+}
+
+// Operand count; lazy-resolve snapshot edges via CFGInfo.
+static size_t norm_edge_payload_num_operands(const NormalizedCFG *n,
+                                             const NormEdgePayload *payload) {
+    if (!payload) return 0;
+    if (payload->kind == NORM_EDGE_SNAPSHOT && n->snapshot) {
+        return cfg_info_edge_num_operands(n->snapshot, payload->snapshot_edge_id);
+    }
+    return payload->n_operands;
+}
+
+// Resolve one edge operand into caller-owned NormOperand.
+static bool norm_edge_payload_operand(const NormalizedCFG *n,
+                                      const NormEdgePayload *payload,
+                                      size_t op_idx, NormOperand *out) {
+    if (!payload || !out) return false;
+    if (payload->kind == NORM_EDGE_SNAPSHOT && n->snapshot) {
+        size_t sid = payload->snapshot_edge_id;
+        if (op_idx >= cfg_info_edge_num_operands(n->snapshot, sid)) return false;
+        MLIR_ValueHandle v = cfg_info_edge_operand(n->snapshot, sid, op_idx);
+        *out = norm_operand_mlir(MLIR_GetValueType(v), v);
+        return true;
+    }
+    if (op_idx >= payload->n_operands) return false;
+    *out = payload->operands[op_idx];
+    return true;
+}
+
+// Append edge to normalized graph; internal builder primitive.
+static size_t normalized_cfg_add_edge(NormalizedCFG *n, Arena *arena,
+                                      size_t from, size_t to,
+                                      size_t succ_slot, size_t snapshot_edge_id) {
+    if (n->n_edges >= n->edges_cap) {
+        size_t ncap = n->edges_cap ? n->edges_cap * 2 : 16;
+        NormEdge *ne = arena_new_array(arena, NormEdge, ncap);
+        if (n->n_edges > 0) {
+            memcpy(ne, n->edges, n->n_edges * sizeof(NormEdge));
+        }
+        n->edges = ne;
+        n->edges_cap = ncap;
+    }
+    size_t eid = n->n_edges++;
+    NormEdge *e = &n->edges[eid];
+    memset(e, 0, sizeof(*e));
+    e->from = from;
+    e->to = to;
+    e->successor_slot = succ_slot;
+    e->active = true;
+    if (snapshot_edge_id != SIZE_MAX && n->snapshot) {
+        norm_edge_payload_init_snapshot(&e->payload, snapshot_edge_id);
+    } else {
+        if (!norm_edge_payload_set_operands(arena, &e->payload, NULL, 0)) {
+            n->n_edges--;
+            return SIZE_MAX;
+        }
+    }
+    norm_ensure_block_slots(n, arena, from + 1);
+    norm_ensure_block_slots(n, arena, to + 1);
+    norm_adj_push(arena, &n->blocks[from].outgoing, eid);
+    e->out_position = n->blocks[from].outgoing.n - 1;
+    norm_adj_push(arena, &n->blocks[to].incoming, eid);
+    e->in_position = n->blocks[to].incoming.n - 1;
+    normalized_cfg_note_mutation(n);
+    return eid;
+}
+
+// --- Graph construction and mutation (M5/M7/M8 rewrite primitives) ---
+
+// Copy reachable CFGInfo into NormalizedCFG with exact adjacency.
+// Upstream: graph copy before CFGToSCF mux/latch insertion.
+static bool normalized_cfg_build_from_snapshot(CFGAnalysisArena *pool,
+                                               const CFGInfo *cfg,
+                                               NormalizedCFG *out) {
+    memset(out, 0, sizeof(*out));
+    if (!pool || !pool->graph_arena || !pool->analysis_arena) return false;
+    if (!cfg || cfg->n_blocks == 0) return false;
+    out->snapshot = cfg;
+    out->graph_arena = pool->graph_arena;
+    out->analysis_arena = pool->analysis_arena;
+    out->analysis_base_pos = pool->analysis_base_pos;
+    arena_reset(out->analysis_arena, out->analysis_base_pos);
+    out->entry_block = cfg_info_entry_index(cfg);
+    if (out->entry_block == SIZE_MAX) return false;
+
+    Arena *arena = pool->graph_arena;
+    out->n_blocks = cfg->n_blocks;
+    norm_ensure_block_slots(out, arena, cfg->n_blocks);
+    for (size_t i = 0; i < cfg->n_blocks; ++i) {
+        const CFGBlock *sb = &cfg->blocks[i];
+        NormBlock *nb = &out->blocks[i];
+        norm_block_init(nb);
+        nb->kind = NORM_BLOCK_ORIGINAL;
+        nb->term_kind = sb->term_kind;
+        nb->mlir_block = sb->block;
+        nb->terminator = sb->terminator;
+        nb->active = sb->reachable;
+        norm_block_init_original_signature(arena, nb, sb->block);
+        if (!sb->reachable) continue;
+        norm_adj_prealloc(arena, &nb->outgoing, sb->n_out_edges);
+        norm_adj_prealloc(arena, &nb->incoming, sb->n_in_edges);
+    }
+
+    normalized_cfg_begin_rewrite(out);
+    for (size_t eid = 0; eid < cfg->n_edges; ++eid) {
+        const CFGEdge *se = &cfg->edges[eid];
+        if (!out->blocks[se->from].active || !out->blocks[se->to].active) {
+            continue;
+        }
+        normalized_cfg_add_edge(out, arena, se->from, se->to, se->successor_slot,
+                                eid);
+    }
+    normalized_cfg_end_rewrite(out);
+    if (out->generation == 0) out->generation = 1;
+    out->analysis.generation = out->generation;
+    return true;
+}
+
+// Append synthetic block (mux, latch, shared return, etc.).
+static size_t normalized_cfg_add_synthetic_block(NormalizedCFG *n, Arena *arena,
+                                                 NormBlockKind kind,
+                                                 CFGTermKind term_kind,
+                                                 const NormBlockArg *args,
+                                                 size_t n_args) {
+    size_t id = n->n_blocks++;
+    norm_ensure_block_slots(n, arena, n->n_blocks);
+    NormBlock *b = &n->blocks[id];
+    norm_block_init(b);
+    b->kind = kind;
+    b->term_kind = term_kind;
+    b->synth_term.kind = term_kind;
+    b->mlir_block = MLIR_INVALID_HANDLE;
+    b->terminator = MLIR_INVALID_HANDLE;
+    b->active = true;
+    if (!norm_block_set_signature(b, arena, args, n_args)) {
+        n->n_blocks--;
+        return SIZE_MAX;
+    }
+    normalized_cfg_note_mutation(n);
+    return id;
+}
+
+// Deep-copy synthetic terminator onto a non-finalized block.
+static bool normalized_cfg_set_synthetic_terminator(NormalizedCFG *n, Arena *arena,
+                                                    size_t block_id,
+                                                    const NormTerminator *term) {
+    if (!term) return false;
+    if (block_id >= n->n_blocks) return false;
+    NormBlock *b = &n->blocks[block_id];
+    if (b->kind == NORM_BLOCK_ORIGINAL) return false;
+    if (!b->active || b->finalized) return false;
+    if (!norm_terminator_deep_copy(arena, term, &b->synth_term)) return false;
+    b->term_kind = term->kind;
+    normalized_cfg_note_mutation(n);
+    return true;
+}
+
+// Install mux destination->argument layout on a synthetic block.
+static bool normalized_cfg_set_mux_entries(NormalizedCFG *n, Arena *arena,
+                                           size_t block_id,
+                                           const NormMuxEntry *entries,
+                                           size_t n_entries) {
+    if (block_id >= n->n_blocks) return false;
+    NormBlock *b = &n->blocks[block_id];
+    if (b->kind == NORM_BLOCK_ORIGINAL) return false;
+    if (!b->active || b->finalized) return false;
+    if (!norm_block_set_mux_entries(b, arena, entries, n_entries)) return false;
+    normalized_cfg_note_mutation(n);
+    return true;
+}
+
+// True when every forwarded operand on `edge_id` matches the destination signature.
+static bool norm_edge_operands_match_destination(const NormalizedCFG *n,
+                                                 size_t edge_id) {
+    if (!norm_edge_is_active(n, edge_id)) return false;
+    const NormEdge *e = &n->edges[edge_id];
+    const NormBlock *dest = &n->blocks[e->to];
+    size_t n_ops = norm_edge_payload_num_operands(n, &e->payload);
+    if (n_ops != dest->n_args) return false;
+    if (n_ops > 0 && !dest->args) return false;
+    for (size_t i = 0; i < n_ops; ++i) {
+        NormOperand op;
+        if (!norm_edge_payload_operand(n, &e->payload, i, &op)) return false;
+        if (!norm_operand_is_valid(&op)) return false;
+        if (op.type != dest->args[i].type) return false;
+    }
+    return true;
+}
+
+// Validate operand counts/types for every active outgoing edge of `block_id`.
+static bool norm_validate_block_outgoing_edges(const NormalizedCFG *n,
+                                               size_t block_id) {
+    NormEdgeIter it = norm_out_edges(n, block_id);
+    size_t eid;
+    while (norm_edge_iter_next(&it, &eid)) {
+        if (!norm_edge_operands_match_destination(n, eid)) return false;
+    }
+    return true;
+}
+
+// SWITCH terminator: unique cases/default and bijection with outgoing edges.
+static bool norm_switch_covers_all_outgoing(const NormalizedCFG *n,
+                                            size_t block_id,
+                                            const NormTerminator *t) {
+    if (!norm_edge_is_outgoing_from(n, t->default_edge_id, block_id)) {
+        return false;
+    }
+    if (!t->case_values || !t->case_edge_ids) return false;
+
+    size_t n_out = 0;
+    NormEdgeIter it = norm_out_edges(n, block_id);
+    size_t eid;
+    while (norm_edge_iter_next(&it, &eid)) {
+        n_out++;
+        if (eid == t->default_edge_id) continue;
+        bool found = false;
+        for (size_t i = 0; i < t->n_cases; ++i) {
+            if (t->case_edge_ids[i] == eid) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    if (n_out != t->n_cases + 1) return false;
+
+    for (size_t i = 0; i < t->n_cases; ++i) {
+        if (!norm_edge_is_outgoing_from(n, t->case_edge_ids[i], block_id)) {
+            return false;
+        }
+        if (t->case_edge_ids[i] == t->default_edge_id) return false;
+        for (size_t j = 0; j < i; ++j) {
+            if (t->case_edge_ids[i] == t->case_edge_ids[j]) return false;
+            if (t->case_values[i] == t->case_values[j]) return false;
+        }
+    }
+    return true;
+}
+
+// Validate synthetic terminator metadata against outgoing-edge topology.
+static bool norm_validate_synthetic_terminator(const NormalizedCFG *n,
+                                               size_t block_id,
+                                               const NormBlock *b) {
+    const NormTerminator *t = &b->synth_term;
+    if (b->term_kind != t->kind) return false;
+
+    size_t n_out = 0;
+    NormEdgeIter it = norm_out_edges(n, block_id);
+    size_t eid;
+    while (norm_edge_iter_next(&it, &eid)) n_out++;
+
+    switch (t->kind) {
+    case CFG_TERM_BR:
+        return n_out == 1;
+    case CFG_TERM_COND_BR:
+        if (!norm_operand_is_valid(&t->selector)) return false;
+        return n_out == 2;
+    case CFG_TERM_SWITCH:
+        if (!norm_operand_is_valid(&t->selector)) return false;
+        if (t->default_edge_id == SIZE_MAX) return false;
+        return norm_switch_covers_all_outgoing(n, block_id, t);
+    case CFG_TERM_RETURN:
+        if (n_out != 0) return false;
+        if (t->n_return_values > 0 && !t->return_values) return false;
+        for (size_t i = 0; i < t->n_return_values; ++i) {
+            if (!norm_operand_is_valid(&t->return_values[i])) return false;
+        }
+        return true;
+    case CFG_TERM_UNREACHABLE:
+        return n_out == 0;
+    default:
+        return false;
+    }
+}
+
+// Validate mux destination layout: bounds, active targets, unique discriminators.
+static bool norm_validate_mux_entries(const NormalizedCFG *n,
+                                      const NormBlock *mux_block) {
+    if (mux_block->n_mux_entries == 0) return true;
+    if (!mux_block->mux_entries) return false;
+
+    for (size_t i = 0; i < mux_block->n_mux_entries; ++i) {
+        const NormMuxEntry *me = &mux_block->mux_entries[i];
+        if (me->arg_offset + me->n_args > mux_block->n_args) return false;
+        if (me->n_args > 0 && !mux_block->args) return false;
+        if (me->destination_block >= n->n_blocks) return false;
+        const NormBlock *dest = &n->blocks[me->destination_block];
+        if (!dest->active) return false;
+        if (me->n_args > dest->n_args) return false;
+        if (me->n_args > 0 && !dest->args) return false;
+        for (size_t j = 0; j < me->n_args; ++j) {
+            if (mux_block->args[me->arg_offset + j].type != dest->args[j].type) {
+                return false;
+            }
+        }
+        for (size_t k = 0; k < i; ++k) {
+            if (mux_block->mux_entries[k].discriminator == me->discriminator) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Lock block after terminator edges validated; M8 builder final step.
+static bool normalized_cfg_finalize_synthetic_block(NormalizedCFG *n,
+                                                    size_t block_id) {
+    if (block_id >= n->n_blocks) return false;
+    NormBlock *b = &n->blocks[block_id];
+    if (b->kind == NORM_BLOCK_ORIGINAL) return false;
+    if (!b->active || b->finalized) return false;
+    if (!norm_validate_block_outgoing_edges(n, block_id)) return false;
+    if (!norm_validate_synthetic_terminator(n, block_id, b)) return false;
+    if (!norm_validate_mux_entries(n, b)) return false;
+    b->finalized = true;
+    normalized_cfg_note_mutation(n);
+    return true;
+}
+
+// Add edge with owned synthetic operand payload.
+static bool normalized_cfg_add_synthetic_edge(NormalizedCFG *n, Arena *arena,
+                                              size_t from, size_t to,
+                                              size_t succ_slot,
+                                              const NormOperand *operands,
+                                              size_t n_operands,
+                                              size_t *out_edge_id) {
+    if (out_edge_id) *out_edge_id = SIZE_MAX;
+    if (from >= n->n_blocks || to >= n->n_blocks) return false;
+    if (!n->blocks[from].active || !n->blocks[to].active) return false;
+    if (!norm_synthetic_block_allows_outgoing_mutation(&n->blocks[from])) {
+        return false;
+    }
+    if (n->n_edges >= n->edges_cap) {
+        size_t ncap = n->edges_cap ? n->edges_cap * 2 : 16;
+        NormEdge *ne = arena_new_array(arena, NormEdge, ncap);
+        if (n->n_edges > 0) {
+            memcpy(ne, n->edges, n->n_edges * sizeof(NormEdge));
+        }
+        n->edges = ne;
+        n->edges_cap = ncap;
+    }
+    size_t eid = n->n_edges++;
+    NormEdge *e = &n->edges[eid];
+    memset(e, 0, sizeof(*e));
+    e->from = from;
+    e->to = to;
+    e->successor_slot = succ_slot;
+    e->active = true;
+    if (!norm_edge_payload_init_synthetic_operands(arena, operands, n_operands,
+                                                   &e->payload)) {
+        n->n_edges--;
+        return false;
+    }
+    norm_ensure_block_slots(n, arena, from + 1);
+    norm_ensure_block_slots(n, arena, to + 1);
+    norm_adj_push(arena, &n->blocks[from].outgoing, eid);
+    e->out_position = n->blocks[from].outgoing.n - 1;
+    norm_adj_push(arena, &n->blocks[to].incoming, eid);
+    e->in_position = n->blocks[to].incoming.n - 1;
+    normalized_cfg_note_mutation(n);
+    if (out_edge_id) *out_edge_id = eid;
+    return true;
+}
+
+// Replace only the operand payload of an active edge.
+static bool normalized_cfg_replace_edge_payload(NormalizedCFG *n, Arena *arena,
+                                              size_t edge_id,
+                                              const NormOperand *operands,
+                                              size_t n_operands) {
+    if (edge_id >= n->n_edges) return false;
+    NormEdge *e = &n->edges[edge_id];
+    if (!e->active) return false;
+    if (!norm_edge_payload_set_operands(arena, &e->payload, operands, n_operands)) {
+        return false;
+    }
+    normalized_cfg_note_mutation(n);
+    return true;
+}
+
+// Soft-delete edge and remove from both adjacency lists.
+static bool normalized_cfg_deactivate_edge(NormalizedCFG *n, size_t edge_id) {
+    if (!norm_edge_deactivation_allowed(n, edge_id)) return false;
+    NormEdge *e = &n->edges[edge_id];
+    if (e->from < n->n_blocks) {
+        norm_adj_remove_swap(&n->blocks[e->from].outgoing, e->out_position,
+                             n->edges, true);
+    }
+    if (e->to < n->n_blocks) {
+        norm_adj_remove_swap(&n->blocks[e->to].incoming, e->in_position,
+                             n->edges, false);
+    }
+    e->active = false;
+    normalized_cfg_note_mutation(n);
+    return true;
+}
+
+// Change edge destination only; keep snapshot/synthetic operands.
+static bool normalized_cfg_retarget_edge_preserving_payload(NormalizedCFG *n,
+                                                            Arena *arena,
+                                                            size_t edge_id,
+                                                            size_t new_target) {
+    if (edge_id >= n->n_edges) return false;
+    NormEdge *e = &n->edges[edge_id];
+    if (!e->active) return false;
+    if (new_target >= n->n_blocks || !n->blocks[new_target].active) return false;
+    size_t old_to = e->to;
+    if (old_to == new_target) return true;
+    norm_ensure_block_slots(n, arena, new_target + 1);
+    if (old_to < n->n_blocks) {
+        norm_adj_remove_swap(&n->blocks[old_to].incoming, e->in_position,
+                             n->edges, false);
+    }
+    e->to = new_target;
+    norm_adj_push(arena, &n->blocks[new_target].incoming, edge_id);
+    e->in_position = n->blocks[new_target].incoming.n - 1;
+    normalized_cfg_note_mutation(n);
+    return true;
+}
+
+// Atomically retarget edge and replace payload (NULL,0 = empty). Upstream: CFGToSCF mux edge rewrite.
+static bool normalized_cfg_redirect_edge_with_payload(NormalizedCFG *n, Arena *arena,
+                                                    size_t edge_id,
+                                                    size_t new_target,
+                                                    const NormOperand *operands,
+                                                    size_t n_operands) {
+    if (edge_id >= n->n_edges) return false;
+    NormEdge *e = &n->edges[edge_id];
+    if (!e->active) return false;
+    if (new_target >= n->n_blocks || !n->blocks[new_target].active) return false;
+    if (!norm_edge_payload_set_operands(arena, &e->payload, operands, n_operands)) {
+        return false;
+    }
+    size_t old_to = e->to;
+    bool changed = true;
+    if (old_to != new_target) {
+        norm_ensure_block_slots(n, arena, new_target + 1);
+        if (old_to < n->n_blocks) {
+            norm_adj_remove_swap(&n->blocks[old_to].incoming, e->in_position,
+                                 n->edges, false);
+        }
+        e->to = new_target;
+        norm_adj_push(arena, &n->blocks[new_target].incoming, edge_id);
+        e->in_position = n->blocks[new_target].incoming.n - 1;
+    }
+    normalized_cfg_note_mutation(n);
+    return changed;
+}
+
+// Deactivate all incident edges then mark block inactive.
+// Returns false without mutating when any incident edge originates from a
+// finalized synthetic block (outgoing mutation is locked).
+static bool normalized_cfg_deactivate_block(NormalizedCFG *n, size_t block_id) {
+    if (block_id >= n->n_blocks) return false;
+    if (!n->blocks[block_id].active) return true;
+
+    NormBlock *block = &n->blocks[block_id];
+    for (size_t i = 0; i < block->outgoing.n; ++i) {
+        if (!norm_edge_deactivation_allowed(n, block->outgoing.edge_ids[i])) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < block->incoming.n; ++i) {
+        if (!norm_edge_deactivation_allowed(n, block->incoming.edge_ids[i])) {
+            return false;
+        }
+    }
+
+    normalized_cfg_begin_rewrite(n);
+    while (block->outgoing.n > 0) {
+        size_t eid = block->outgoing.edge_ids[block->outgoing.n - 1];
+        if (!normalized_cfg_deactivate_edge(n, eid)) {
+            normalized_cfg_end_rewrite(n);
+            return false;
+        }
+    }
+    while (block->incoming.n > 0) {
+        size_t eid = block->incoming.edge_ids[block->incoming.n - 1];
+        if (!normalized_cfg_deactivate_edge(n, eid)) {
+            normalized_cfg_end_rewrite(n);
+            return false;
+        }
+    }
+    block->active = false;
+    normalized_cfg_note_mutation(n);
+    normalized_cfg_end_rewrite(n);
+    return true;
+}
+
+// True when edge and both endpoint blocks are active.
+static bool norm_edge_is_active(const NormalizedCFG *n, size_t edge_id) {
+    if (edge_id >= n->n_edges) return false;
+    const NormEdge *e = &n->edges[edge_id];
+    if (!e->active) return false;
+    if (e->from >= n->n_blocks || e->to >= n->n_blocks) return false;
+    if (!n->blocks[e->from].active || !n->blocks[e->to].active) return false;
+    return true;
+}
+
+// True when `edge_id` is an active outgoing edge of `block_id` (O(1)).
+static bool norm_edge_is_outgoing_from(const NormalizedCFG *n, size_t edge_id,
+                                       size_t block_id) {
+    return norm_edge_is_active(n, edge_id) && n->edges[edge_id].from == block_id;
+}
+
+// Count active outgoing edges (O(degree); prefer norm_out_edges loop).
+static size_t normalized_cfg_num_active_out_edges(const NormalizedCFG *n,
+                                                  size_t block_id) {
+    NormEdgeIter it = norm_out_edges(n, block_id);
+    size_t count = 0, eid;
+    while (norm_edge_iter_next(&it, &eid)) count++;
+    return count;
+}
+
+// Nth active outgoing edge id (O(degree); prefer iterator).
+static size_t normalized_cfg_active_out_edge_at(const NormalizedCFG *n,
+                                                size_t block_id, size_t out_i) {
+    NormEdgeIter it = norm_out_edges(n, block_id);
+    size_t eid, seen = 0;
+    while (norm_edge_iter_next(&it, &eid)) {
+        if (seen++ == out_i) return eid;
+    }
+    return SIZE_MAX;
+}
+
+// Count active incoming edges.
+static size_t normalized_cfg_num_active_in_edges(const NormalizedCFG *n,
+                                                 size_t block_id) {
+    NormEdgeIter it = norm_in_edges(n, block_id);
+    size_t count = 0, eid;
+    while (norm_edge_iter_next(&it, &eid)) count++;
+    return count;
+}
+
+// Nth active incoming edge id.
+static size_t normalized_cfg_active_in_edge_at(const NormalizedCFG *n,
+                                             size_t block_id, size_t in_i) {
+    NormEdgeIter it = norm_in_edges(n, block_id);
+    size_t eid, seen = 0;
+    while (norm_edge_iter_next(&it, &eid)) {
+        if (seen++ == in_i) return eid;
+    }
+    return SIZE_MAX;
+}
+
+// --- NormalizedCFG read-only queries ---
+
+// Const pointer to edge pool entry `edge_id`.
+static const NormEdge *normalized_cfg_edge_at(const NormalizedCFG *n,
+                                              size_t edge_id) {
+    if (edge_id >= n->n_edges) return NULL;
+    return &n->edges[edge_id];
+}
+
+// Operand count on normalized edge (lazy for snapshot).
+static size_t normalized_cfg_edge_num_operands(const NormalizedCFG *n,
+                                               size_t edge_id) {
+    const NormEdge *e = normalized_cfg_edge_at(n, edge_id);
+    return norm_edge_payload_num_operands(n, e ? &e->payload : NULL);
+}
+
+// Resolve edge operand into caller-owned NormOperand (reentrant).
+static bool normalized_cfg_edge_operand_resolve(const NormalizedCFG *n,
+                                                size_t edge_id, size_t op_idx,
+                                                NormOperand *out) {
+    const NormEdge *e = normalized_cfg_edge_at(n, edge_id);
+    if (!e) return false;
+    return norm_edge_payload_operand(n, &e->payload, op_idx, out);
+}
+
+// Formal block argument metadata for synthetic or original blocks.
+static const NormBlockArg *normalized_cfg_block_arg(const NormalizedCFG *n,
+                                                    size_t block_id,
+                                                    size_t arg_idx) {
+    if (block_id >= n->n_blocks) return NULL;
+    const NormBlock *b = &n->blocks[block_id];
+    if (arg_idx >= b->n_args) return NULL;
+    return &b->args[arg_idx];
+}
+
+// Synthetic terminator metadata for non-ORIGINAL blocks (NULL for LLVM blocks).
+static const NormTerminator *normalized_cfg_synthetic_terminator(
+        const NormalizedCFG *n, size_t block_id) {
+    if (block_id >= n->n_blocks) return NULL;
+    const NormBlock *b = &n->blocks[block_id];
+    if (b->kind == NORM_BLOCK_ORIGINAL) return NULL;
+    return &b->synth_term;
+}
+
+// --- Analysis cache (lazy, generation-tracked) ---
+
+// Compute reverse postorder + position inverse map.
+// Upstream: DFS postorder input for dominance and SCC (CFGToSCF DomInfo).
+static bool norm_compute_rpo(const NormalizedCFG *n, RPOInfo *out) {
+    memset(out, 0, sizeof(*out));
+    if (!n->analysis_arena || n->n_blocks == 0) return true;
+    if (n->entry_block >= n->n_blocks || !n->blocks[n->entry_block].active) {
+        return true;
+    }
+
+    Arena *arena = n->analysis_arena;
+    bool *visited = arena_new_array(arena, bool, n->n_blocks);
+    memset(visited, 0, n->n_blocks * sizeof(bool));
+    size_t *order = arena_new_array(arena, size_t, n->n_blocks);
+    size_t post_n = 0;
+
+    NormRpoFrame *stack = arena_new_array(arena, NormRpoFrame, n->n_blocks);
+    size_t sp = 0;
+
+    visited[n->entry_block] = true;
+    stack[sp].bid = n->entry_block;
+    stack[sp].edge_i = 0;
+    sp++;
+
+    while (sp > 0) {
+        NormRpoFrame *f = &stack[sp - 1];
+        const NormAdjacency *out_adj = &n->blocks[f->bid].outgoing;
+        bool pushed = false;
+        while (f->edge_i < out_adj->n) {
+            size_t eid = out_adj->edge_ids[f->edge_i++];
+            if (!norm_edge_is_active(n, eid)) continue;
+            size_t succ = n->edges[eid].to;
+            if (succ >= n->n_blocks || visited[succ]) continue;
+            visited[succ] = true;
+            stack[sp].bid = succ;
+            stack[sp].edge_i = 0;
+            sp++;
+            pushed = true;
+            break;
+        }
+        if (!pushed) {
+            order[post_n++] = stack[--sp].bid;
+        }
+    }
+
+    out->n = post_n;
+    if (post_n == 0) return true;
+
+    for (size_t i = 0, j = post_n - 1; i < j; ++i, --j) {
+        size_t tmp = order[i];
+        order[i] = order[j];
+        order[j] = tmp;
+    }
+
+    out->order = order;
+    out->position = arena_new_array(arena, size_t, n->n_blocks);
+    for (size_t i = 0; i < n->n_blocks; ++i) out->position[i] = SIZE_MAX;
+    for (size_t i = 0; i < post_n; ++i) {
+        out->position[out->order[i]] = i;
+    }
+    return true;
+}
+
+// Lazy RPO cache; computes on first use after generation sync.
+static const RPOInfo *normalized_cfg_try_get_cached_rpo(NormalizedCFG *n) {
+    if (!normalized_cfg_analysis_available(n)) return NULL;
+    cfg_analysis_cache_sync(n);
+    if (!n->analysis.has_rpo) {
+        if (!norm_compute_rpo(n, &n->analysis.rpo)) return NULL;
+        n->analysis.has_rpo = true;
+    }
+    return &n->analysis.rpo;
+}
+
+// Lazy dominance cache (NULL until Cooper-Harvey-Kennedy is ported).
+static const DominanceInfo *normalized_cfg_try_get_cached_dominance(
+        NormalizedCFG *n) {
+    if (!normalized_cfg_analysis_available(n)) return NULL;
+    cfg_analysis_cache_sync(n);
+    if (!n->analysis.has_dominance) return NULL;
+    return &n->analysis.dominance;
+}
+
+// Lazy post-dominance cache (NULL until compute is ported).
+static const DominanceInfo *normalized_cfg_try_get_cached_post_dominance(
+        NormalizedCFG *n) {
+    if (!normalized_cfg_analysis_available(n)) return NULL;
+    cfg_analysis_cache_sync(n);
+    if (!n->analysis.has_post_dominance) return NULL;
+    return &n->analysis.post_dominance;
+}
+
+// Lazy Tarjan SCC cache (NULL until M7 cycle detection is ported).
+static const SCCInfo *normalized_cfg_try_get_cached_scc(NormalizedCFG *n) {
+    if (!normalized_cfg_analysis_available(n)) return NULL;
+    cfg_analysis_cache_sync(n);
+    if (!n->analysis.has_scc) return NULL;
+    return &n->analysis.scc;
+}
+
+// Explicitly drop all cached analyses at a phase boundary.
+static void normalized_cfg_refresh_analysis(NormalizedCFG *n) {
+    normalized_cfg_invalidate_analysis(n);
+    n->analysis.generation = n->generation;
+}
+
+// --- Arena pool and per-target scratch ---
+
+// Create separate graph and analysis bump allocators.
+static bool cfg_analysis_arena_init(CFGAnalysisArena *pool) {
+    memset(pool, 0, sizeof(*pool));
+    pool->graph_arena = arena_create(64 * 1024);
+    pool->analysis_arena = arena_create(16 * 1024);
+    if (!pool->graph_arena || !pool->analysis_arena) {
+        if (pool->graph_arena) arena_destroy(pool->graph_arena);
+        if (pool->analysis_arena) arena_destroy(pool->analysis_arena);
+        memset(pool, 0, sizeof(*pool));
+        return false;
+    }
+    pool->graph_base_pos = arena_get_pos(pool->graph_arena);
+    pool->analysis_base_pos = arena_get_pos(pool->analysis_arena);
+    return true;
+}
+
+// Reset graph arena to snapshot+norm graph base position.
+static void cfg_graph_arena_reset(CFGAnalysisArena *pool) {
+    if (pool->graph_arena) arena_reset(pool->graph_arena, pool->graph_base_pos);
+}
+
+// Reset both graph and analysis arenas (new target build).
+static void cfg_analysis_arena_reset(CFGAnalysisArena *pool) {
+    cfg_graph_arena_reset(pool);
+    if (pool->analysis_arena) {
+        arena_reset(pool->analysis_arena, pool->analysis_base_pos);
+    }
+}
+
+// Destroy both arenas in a CFGAnalysisArena pool.
+static void cfg_analysis_arena_destroy(CFGAnalysisArena *pool) {
+    if (pool->graph_arena) arena_destroy(pool->graph_arena);
+    if (pool->analysis_arena) arena_destroy(pool->analysis_arena);
+    memset(pool, 0, sizeof(*pool));
+}
+
+// Zero-init CFGInfoScratch view.
+static void cfg_info_scratch_init(CFGInfoScratch *scratch) {
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+// Clear scratch view without freeing pool arenas.
+static void cfg_info_scratch_clear(CFGInfoScratch *scratch) {
+    memset(&scratch->cfg, 0, sizeof(scratch->cfg));
+    memset(&scratch->norm, 0, sizeof(scratch->norm));
+    scratch->pool = NULL;
+}
+
+// Build CFGInfo + NormalizedCFG for one region in the shared pool.
+static bool cfg_info_scratch_build(CFGInfoScratch *scratch,
+                                   CFGAnalysisArena *pool,
+                                   MLIR_RegionHandle region) {
+    cfg_info_scratch_clear(scratch);
+    if (!pool || !pool->graph_arena || !pool->analysis_arena) return false;
+    cfg_analysis_arena_reset(pool);
+    scratch->pool = pool;
+    if (!cfg_info_build(pool->graph_arena, region, &scratch->cfg)) {
+        cfg_analysis_arena_reset(pool);
+        cfg_info_scratch_clear(scratch);
+        return false;
+    }
+    if (cfg_info_entry_index(&scratch->cfg) != 0) {
+        cfg_analysis_arena_reset(pool);
+        cfg_info_scratch_clear(scratch);
+        return false;
+    }
+    if (!cfg_info_all_region_blocks_reachable(&scratch->cfg)) {
+        fprintf(stderr,
+                "wasmssa-cfg: unreachable blocks in llvm.func region\n");
+        cfg_analysis_arena_reset(pool);
+        cfg_info_scratch_clear(scratch);
+        return false;
+    }
+    if (!normalized_cfg_build_from_snapshot(pool, &scratch->cfg,
+                                            &scratch->norm)) {
+        cfg_analysis_arena_reset(pool);
+        cfg_info_scratch_clear(scratch);
+        return false;
+    }
+    return true;
+}
+
+// --- Lift-target discovery and preflight ---
+
+// Preflight all lift targets: build snapshot+norm per region.
+static bool lift_targets_validate_cfg_scratch(LiftRegionTarget *targets,
+                                              size_t n) {
+    CFGAnalysisArena pool;
+    if (!cfg_analysis_arena_init(&pool)) return false;
+    for (size_t i = 0; i < n; ++i) {
+        CFGInfoScratch scratch;
+        cfg_info_scratch_init(&scratch);
+        if (!cfg_info_scratch_build(&scratch, &pool, targets[i].region)) {
+            cfg_analysis_arena_destroy(&pool);
+            return false;
+        }
+        cfg_analysis_arena_reset(&pool);
+        cfg_info_scratch_clear(&scratch);
+    }
+    cfg_analysis_arena_destroy(&pool);
+    return true;
+}
+
+// True when op is llvm.func.
 static bool op_is_llvm_func(MLIR_OpHandle op) {
     return MLIR_GetOpType(op) == OP_TYPE_LLVM_FUNC;
 }
 
+// True when op is builtin.module.
 static bool op_is_builtin_module(MLIR_OpHandle op) {
     return MLIR_GetOpType(op) == OP_TYPE_MODULE;
 }
@@ -2468,26 +4315,20 @@ static bool op_is_llvm_cfg_branch(MLIR_OpHandle op) {
            name_eq(n, "llvm.switch");
 }
 
-// True iff `region` contains any llvm CFG branch op, including inside nested
-// op regions (mirrors region_has_cf_branch in mlir_lift_cf_to_scf.c).
-static bool region_has_llvm_cfg_branch(MLIR_RegionHandle region) {
+// True when region blocks contain a direct LLVM CFG branch.
+static bool region_has_direct_llvm_cfg_branch(MLIR_RegionHandle region) {
     size_t nb = MLIR_GetRegionNumBlocks(region);
     for (size_t bi = 0; bi < nb; ++bi) {
         MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
         size_t no = MLIR_GetBlockNumOps(b);
         for (size_t oi = 0; oi < no; ++oi) {
-            MLIR_OpHandle o = MLIR_GetBlockOp(b, oi);
-            if (op_is_llvm_cfg_branch(o)) return true;
-            size_t nr = MLIR_GetOpNumRegions(o);
-            for (size_t ri = 0; ri < nr; ++ri) {
-                if (region_has_llvm_cfg_branch(MLIR_GetOpRegion(o, ri)))
-                    return true;
-            }
+            if (op_is_llvm_cfg_branch(MLIR_GetBlockOp(b, oi))) return true;
         }
     }
     return false;
 }
 
+// Append one LiftRegionTarget to the discovery list.
 static void lift_target_list_push(LiftRegionTargetList *list, Arena *arena,
                                   MLIR_OpHandle fn_op, MLIR_RegionHandle region,
                                   MLIR_BlockHandle entry_block) {
@@ -2502,15 +4343,14 @@ static void lift_target_list_push(LiftRegionTargetList *list, Arena *arena,
         list->cap = new_cap;
     }
     LiftRegionTarget t;
+    memset(&t, 0, sizeof t);
     t.fn_op = fn_op;
     t.region = region;
     t.entry_block = entry_block;
     list->items[list->n++] = t;
 }
 
-// Post-order walk over every op-region inside `fn_op`, recording regions
-// that still contain llvm CFG branches. Matches walk_and_transform_regions
-// in mlir_lift_cf_to_scf.c without mutating IR.
+// Post-order record nested regions with direct LLVM CFG branches.
 static void collect_llvm_cfg_lift_regions(LiftRegionTargetList *out,
                                           Arena *arena, MLIR_OpHandle fn_op,
                                           MLIR_RegionHandle region) {
@@ -2527,21 +4367,20 @@ static void collect_llvm_cfg_lift_regions(LiftRegionTargetList *out,
             }
         }
     }
-    if (!region_has_llvm_cfg_branch(region)) return;
+    if (!region_has_direct_llvm_cfg_branch(region)) return;
     if (nb == 0) return;
     lift_target_list_push(out, arena, fn_op, region,
                           MLIR_GetRegionBlock(region, 0));
 }
 
+// True when llvm.func has a non-empty entry block body.
 static bool llvm_func_has_defined_body(MLIR_OpHandle fn) {
     if (!op_is_llvm_func(fn)) return false;
     if (MLIR_GetOpNumRegions(fn) == 0) return false;
     return MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(fn, 0)) > 0;
 }
 
-// Walk one module body's top-level region, recursing into nested
-// `builtin.module` ops and collecting lift targets from each defined
-// `llvm.func`.
+// Recurse into nested modules; collect lift targets from defined llvm.func.
 static void collect_llvm_cfg_lift_targets_in_region(LiftRegionTargetList *out,
                                                     Arena *arena,
                                                     MLIR_RegionHandle region) {
@@ -2565,9 +4404,7 @@ static void collect_llvm_cfg_lift_targets_in_region(LiftRegionTargetList *out,
     }
 }
 
-// Discover every region-local LLVM CFG that needs structurization under
-// `module` (including nested modules). Returns the number of targets
-// collected; when `out_items` is non-NULL it receives the arena-backed list.
+// Entry: discover all lift targets in a module tree.
 static size_t collect_llvm_cfg_lift_targets_in_module(
     Arena *arena, MLIR_OpHandle module, LiftRegionTarget **out_items) {
     LiftRegionTargetList list = {0};
@@ -2986,26 +4823,136 @@ static void emit_import_func(MLIR_Context *ctx, Arena *arena,
     MLIR_AppendBlockOp(ctx, body, op);
 }
 
+// Recursively emit body-less llvm.func ops as wasmssa.import_func into
+// `body`, including those under nested builtin.module ops.
+static bool emit_import_funcs_in_region(MLIR_Context *ctx, Arena *arena,
+                                        MLIR_BlockHandle body,
+                                        MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(b, oi);
+            if (op_is_builtin_module(op)) {
+                if (MLIR_GetOpNumRegions(op) > 0) {
+                    if (!emit_import_funcs_in_region(
+                            ctx, arena, body, MLIR_GetOpRegion(op, 0))) {
+                        return false;
+                    }
+                }
+                continue;
+            }
+            if (!op_is_llvm_func(op)) continue;
+            if (llvm_func_has_defined_body(op)) continue;
+            uint8_t *p, *r;
+            size_t np, nr;
+            if (!sig_for_func(ctx, arena, op, &p, &np, &r, &nr)) return false;
+            MLIR_AttributeHandle sa = find_attr(op, "sym_name");
+            string nm = MLIR_GetAttributeString(sa);
+            string imod = {0}, iname = {0};
+            MLIR_AttributeHandle iam = find_attr(op, "wasm.import_module");
+            if (iam != MLIR_INVALID_HANDLE) imod = MLIR_GetAttributeString(iam);
+            MLIR_AttributeHandle ian = find_attr(op, "wasm.import_name");
+            if (ian != MLIR_INVALID_HANDLE) iname = MLIR_GetAttributeString(ian);
+            emit_import_func(ctx, arena, body, nm, imod, iname, p, np, r, nr);
+        }
+    }
+    return true;
+}
+
+// Recursively lower defined llvm.func ops into wasmssa.func ops appended to
+// `body`, including those under nested builtin.module ops.
+static bool emit_defined_funcs_in_region(MLIR_Context *ctx, Arena *arena,
+                                         ModCtx *mod, MLIR_BlockHandle body,
+                                         MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(b, oi);
+            if (op_is_builtin_module(op)) {
+                if (MLIR_GetOpNumRegions(op) > 0) {
+                    if (!emit_defined_funcs_in_region(
+                            ctx, arena, mod, body,
+                            MLIR_GetOpRegion(op, 0))) {
+                        return false;
+                    }
+                }
+                continue;
+            }
+            if (!llvm_func_has_defined_body(op)) continue;
+            uint8_t *p, *r;
+            size_t np, nr;
+            if (!sig_for_func(ctx, arena, op, &p, &np, &r, &nr)) return false;
+            MLIR_AttributeHandle sa = find_attr(op, "sym_name");
+            string sym = MLIR_GetAttributeString(sa);
+            bool is_main = (sym.size == 4 && memcmp(sym.str, "main", 4) == 0);
+            string nm = is_main ? str_lit("__original_main") : sym;
+            if (!lower_function(ctx, arena, mod, body, nm, is_main,
+                                op, p, np, r, nr)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Recursively lower llvm.mlir.global ops into wasmssa.import_global ops
+// appended to `body`, including those under nested builtin.module ops.
+static bool emit_globals_in_region(MLIR_Context *ctx, Arena *arena,
+                                   MLIR_BlockHandle body,
+                                   MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(b, oi);
+            if (op_is_builtin_module(op)) {
+                if (MLIR_GetOpNumRegions(op) > 0) {
+                    if (!emit_globals_in_region(
+                            ctx, arena, body, MLIR_GetOpRegion(op, 0))) {
+                        return false;
+                    }
+                }
+                continue;
+            }
+            if (!name_eq(MLIR_GetOpName(op), "llvm.mlir.global")) continue;
+            if (!lower_global(ctx, arena, body, op)) {
+                fprintf(stderr, "wasmssa-lower: failed to lower global\n");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // =============================================================================
 // Public stage 1 entry point: walk the LLVM-dialect module and emit a
 // wasmssa-form `builtin.module` directly. Each function/global is emitted
 // straight into the output module body — no module-level intermediate is
-// retained. Output ordering (matches the prior two-pass implementation
-// byte-for-byte): import_funcs, then defined funcs, then import_globals.
+// retained. Walks nested builtin.module ops recursively so every llvm.func
+// and llvm.mlir.global is lowered. Output ordering per scope: import_funcs,
+// then defined funcs, then import_globals.
 // =============================================================================
 MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
     MLIR_RegionHandle mr = MLIR_GetOpRegion(module, 0);
-    MLIR_BlockHandle  mb = MLIR_GetRegionBlock(mr, 0);
-    size_t nops = MLIR_GetBlockNumOps(mb);
 
     Arena            *arena = MLIR_GetArenaAllocator(ctx);
 
-    // Discovery only for now: find llvm.func regions that still carry llvm.br /
-    // llvm.cond_br / llvm.switch (including under nested builtin.module ops).
-    // Structurization will consume this list in a later stage.
+    // Discover llvm.func regions that still carry llvm.br / llvm.cond_br /
+    // llvm.switch (including under nested builtin.module ops). CFG analysis
+    // uses a reusable scratch arena (CFGAnalysisArena) reset per target.
     LiftRegionTarget *lift_targets = NULL;
     size_t n_lift_targets =
         collect_llvm_cfg_lift_targets_in_module(arena, module, &lift_targets);
+    if (n_lift_targets > 0) {
+        if (!lift_targets_validate_cfg_scratch(lift_targets, n_lift_targets)) {
+            return MLIR_INVALID_HANDLE;
+        }
+    }
     (void)lift_targets;
     (void)n_lift_targets;
     MLIR_BlockHandle  body  = MLIR_CreateBlock(ctx);
@@ -3023,68 +4970,19 @@ MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
     mod.arena = arena;
     mod.body = body;
 
-    // Pass 1: imported (declared, body-less) funcs first so they take the
-    // low function-index space in wasm.
-    for (size_t i = 0; i < nops; i++) {
-        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
-        if (!name_eq(MLIR_GetOpName(op), "llvm.func")) continue;
-        bool has_body = MLIR_GetOpNumRegions(op) > 0 &&
-                        MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 0)) > 0;
-        if (has_body) continue;
-        uint8_t *p, *r; size_t np, nr;
-        if (!sig_for_func(ctx, arena, op, &p, &np, &r, &nr)) {
-            return MLIR_INVALID_HANDLE;
-        }
-        MLIR_AttributeHandle sa = find_attr(op, "sym_name");
-        string nm = MLIR_GetAttributeString(sa);
-
-        // Forward `wasm.import_module` / `wasm.import_name` annotations
-        // (from `__attribute__((__import_module__("...")))`) so the
-        // binary emitter can place this import in the requested module
-        // (e.g. WASI's `wasi_snapshot_preview1`) instead of the default
-        // `env`.
-        string imod = {0}, iname = {0};
-        MLIR_AttributeHandle iam = find_attr(op, "wasm.import_module");
-        if (iam != MLIR_INVALID_HANDLE) imod = MLIR_GetAttributeString(iam);
-        MLIR_AttributeHandle ian = find_attr(op, "wasm.import_name");
-        if (ian != MLIR_INVALID_HANDLE) iname = MLIR_GetAttributeString(ian);
-
-        emit_import_func(ctx, arena, body, nm, imod, iname, p, np, r, nr);
+    // Pass 1: imported funcs (including nested builtin.module bodies).
+    if (!emit_import_funcs_in_region(ctx, arena, body, mr)) {
+        return MLIR_INVALID_HANDLE;
     }
 
-    // Pass 2: defined funcs in source order. `is_function_symbol`
-    // discovers each func via its already-emitted wasmssa.func wrapper
-    // in `body`; refs between earlier defs therefore work naturally.
-    for (size_t i = 0; i < nops; i++) {
-        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
-        if (!name_eq(MLIR_GetOpName(op), "llvm.func")) continue;
-        bool has_body = MLIR_GetOpNumRegions(op) > 0 &&
-                        MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(op, 0)) > 0;
-        if (!has_body) continue;
-        uint8_t *p, *r; size_t np, nr;
-        if (!sig_for_func(ctx, arena, op, &p, &np, &r, &nr)) {
-            return MLIR_INVALID_HANDLE;
-        }
-        MLIR_AttributeHandle sa = find_attr(op, "sym_name");
-        string sym = MLIR_GetAttributeString(sa);
-        bool is_main = (sym.size == 4 && memcmp(sym.str, "main", 4) == 0);
-        string nm = is_main ? str_lit("__original_main") : sym;
-
-        if (!lower_function(ctx, arena, &mod, body, nm, is_main,
-                            op, p, np, r, nr)) {
-            return MLIR_INVALID_HANDLE;
-        }
+    // Pass 2: defined funcs in source order, recursing into nested modules.
+    if (!emit_defined_funcs_in_region(ctx, arena, &mod, body, mr)) {
+        return MLIR_INVALID_HANDLE;
     }
 
-    // Pass 3: globals last (matches the legacy emit ordering of
-    // funcs-before-globals in the previously buffered module).
-    for (size_t i = 0; i < nops; i++) {
-        MLIR_OpHandle op = MLIR_GetBlockOp(mb, i);
-        if (!name_eq(MLIR_GetOpName(op), "llvm.mlir.global")) continue;
-        if (!lower_global(ctx, arena, body, op)) {
-            fprintf(stderr, "wasmssa-lower: failed to lower global\n");
-            return MLIR_INVALID_HANDLE;
-        }
+    // Pass 3: globals last, recursing into nested modules.
+    if (!emit_globals_in_region(ctx, arena, body, mr)) {
+        return MLIR_INVALID_HANDLE;
     }
 
     return out_module;
