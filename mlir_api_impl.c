@@ -470,6 +470,8 @@ static bool type_eq(const IR_Type *a, const IR_Type *b) {
             // We don't intern LLVM struct types through this path; the
             // dedicated intern_llvm_struct keeps name->handle identity.
             return false;
+        default:
+            return false;
     }
     return false;
 }
@@ -1546,7 +1548,12 @@ MLIR_LLVM_TypeKind MLIR_GetTypeKind(MLIR_TypeHandle th) {
 
 bool MLIR_GetIntegerTypeInfo(MLIR_TypeHandle th, MLIR_LLVM_IntegerTypeInfo *out) {
     IR_Type *t = resolve_type(th);
-    if (!t || t->kind != MLIR_LLVM_TYPE_INTEGER) return false;
+    if (!t) return false;
+    if (t->kind == MLIR_LLVM_TYPE_INDEX) {
+        if (out) *out = (MLIR_LLVM_IntegerTypeInfo){ 64 };
+        return true;
+    }
+    if (t->kind != MLIR_LLVM_TYPE_INTEGER) return false;
     if (out) *out = (MLIR_LLVM_IntegerTypeInfo){ t->data.integer.width };
     return true;
 }
