@@ -2434,6 +2434,152 @@ fail:
 }
 
 // =============================================================================
+// LLVM CFG structurization — discovery (ported from mlir_lift_cf_to_scf.c).
+//
+// Walk every `builtin.module` (including nested modules), find each defined
+// `llvm.func`, and collect region-local CFGs that still contain llvm.br /
+// llvm.cond_br / llvm.switch. This mirrors the cf->scf driver's post-order
+// region walk; no IR mutation happens here.
+// =============================================================================
+typedef struct {
+    MLIR_OpHandle     fn_op;        // owning llvm.func
+    MLIR_RegionHandle region;       // region whose CFG needs structurizing
+    MLIR_BlockHandle  entry_block;  // first block of `region`
+} LiftRegionTarget;
+
+typedef struct {
+    LiftRegionTarget *items;
+    size_t            n;
+    size_t            cap;
+} LiftRegionTargetList;
+
+static bool op_is_llvm_func(MLIR_OpHandle op) {
+    return MLIR_GetOpType(op) == OP_TYPE_LLVM_FUNC;
+}
+
+static bool op_is_builtin_module(MLIR_OpHandle op) {
+    return MLIR_GetOpType(op) == OP_TYPE_MODULE;
+}
+
+// llvm.br / llvm.cond_br / llvm.switch — the LLVM CFG terminators we lift.
+static bool op_is_llvm_cfg_branch(MLIR_OpHandle op) {
+    string n = MLIR_GetOpName(op);
+    return name_eq(n, "llvm.br") || name_eq(n, "llvm.cond_br") ||
+           name_eq(n, "llvm.switch");
+}
+
+// True iff `region` contains any llvm CFG branch op, including inside nested
+// op regions (mirrors region_has_cf_branch in mlir_lift_cf_to_scf.c).
+static bool region_has_llvm_cfg_branch(MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            MLIR_OpHandle o = MLIR_GetBlockOp(b, oi);
+            if (op_is_llvm_cfg_branch(o)) return true;
+            size_t nr = MLIR_GetOpNumRegions(o);
+            for (size_t ri = 0; ri < nr; ++ri) {
+                if (region_has_llvm_cfg_branch(MLIR_GetOpRegion(o, ri)))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void lift_target_list_push(LiftRegionTargetList *list, Arena *arena,
+                                  MLIR_OpHandle fn_op, MLIR_RegionHandle region,
+                                  MLIR_BlockHandle entry_block) {
+    if (list->n >= list->cap) {
+        size_t new_cap = list->cap ? list->cap * 2 : 8;
+        LiftRegionTarget *items =
+            arena_new_array(arena, LiftRegionTarget, new_cap);
+        if (list->n > 0) {
+            memcpy(items, list->items, list->n * sizeof(LiftRegionTarget));
+        }
+        list->items = items;
+        list->cap = new_cap;
+    }
+    LiftRegionTarget t;
+    t.fn_op = fn_op;
+    t.region = region;
+    t.entry_block = entry_block;
+    list->items[list->n++] = t;
+}
+
+// Post-order walk over every op-region inside `fn_op`, recording regions
+// that still contain llvm CFG branches. Matches walk_and_transform_regions
+// in mlir_lift_cf_to_scf.c without mutating IR.
+static void collect_llvm_cfg_lift_regions(LiftRegionTargetList *out,
+                                          Arena *arena, MLIR_OpHandle fn_op,
+                                          MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(b, oi);
+            size_t nr = MLIR_GetOpNumRegions(op);
+            for (size_t ri = 0; ri < nr; ++ri) {
+                collect_llvm_cfg_lift_regions(out, arena, fn_op,
+                                              MLIR_GetOpRegion(op, ri));
+            }
+        }
+    }
+    if (!region_has_llvm_cfg_branch(region)) return;
+    if (nb == 0) return;
+    lift_target_list_push(out, arena, fn_op, region,
+                          MLIR_GetRegionBlock(region, 0));
+}
+
+static bool llvm_func_has_defined_body(MLIR_OpHandle fn) {
+    if (!op_is_llvm_func(fn)) return false;
+    if (MLIR_GetOpNumRegions(fn) == 0) return false;
+    return MLIR_GetRegionNumBlocks(MLIR_GetOpRegion(fn, 0)) > 0;
+}
+
+// Walk one module body's top-level region, recursing into nested
+// `builtin.module` ops and collecting lift targets from each defined
+// `llvm.func`.
+static void collect_llvm_cfg_lift_targets_in_region(LiftRegionTargetList *out,
+                                                    Arena *arena,
+                                                    MLIR_RegionHandle region) {
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(b, oi);
+            if (op_is_builtin_module(op)) {
+                if (MLIR_GetOpNumRegions(op) > 0) {
+                    collect_llvm_cfg_lift_targets_in_region(
+                        out, arena, MLIR_GetOpRegion(op, 0));
+                }
+                continue;
+            }
+            if (!llvm_func_has_defined_body(op)) continue;
+            collect_llvm_cfg_lift_regions(out, arena, op,
+                                          MLIR_GetOpRegion(op, 0));
+        }
+    }
+}
+
+// Discover every region-local LLVM CFG that needs structurization under
+// `module` (including nested modules). Returns the number of targets
+// collected; when `out_items` is non-NULL it receives the arena-backed list.
+static size_t collect_llvm_cfg_lift_targets_in_module(
+    Arena *arena, MLIR_OpHandle module, LiftRegionTarget **out_items) {
+    LiftRegionTargetList list = {0};
+    if (module != MLIR_INVALID_HANDLE && MLIR_GetOpNumRegions(module) > 0) {
+        collect_llvm_cfg_lift_targets_in_region(
+            &list, arena, MLIR_GetOpRegion(module, 0));
+    }
+    if (out_items) *out_items = list.items;
+    return list.n;
+}
+
+// =============================================================================
 // Module walker.
 // =============================================================================
 static bool sig_for_func(MLIR_Context *ctx, Arena *arena, MLIR_OpHandle fn,
@@ -2853,6 +2999,15 @@ MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
     size_t nops = MLIR_GetBlockNumOps(mb);
 
     Arena            *arena = MLIR_GetArenaAllocator(ctx);
+
+    // Discovery only for now: find llvm.func regions that still carry llvm.br /
+    // llvm.cond_br / llvm.switch (including under nested builtin.module ops).
+    // Structurization will consume this list in a later stage.
+    LiftRegionTarget *lift_targets = NULL;
+    size_t n_lift_targets =
+        collect_llvm_cfg_lift_targets_in_module(arena, module, &lift_targets);
+    (void)lift_targets;
+    (void)n_lift_targets;
     MLIR_BlockHandle  body  = MLIR_CreateBlock(ctx);
     MLIR_RegionHandle region = MLIR_CreateRegion(ctx);
     MLIR_AppendRegionBlock(ctx, region, body);
