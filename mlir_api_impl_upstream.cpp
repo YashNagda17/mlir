@@ -237,11 +237,11 @@ struct OpTypeOperationNameCache {
         auto rit = canonicalRefs.find(type);
         if (rit == canonicalRefs.end()) {
             mlir::OperationName unknown("unknown", &ctx);
-            cachedNames[type] = unknown;
+            cachedNames.insert({type, unknown});
             return unknown;
         }
         mlir::OperationName on(rit->second, &ctx);
-        cachedNames[type] = on;
+        cachedNames.insert({type, on});
         return on;
     }
 };
@@ -1284,12 +1284,12 @@ static llvm::APInt integerLiteralToAPInt(const MLIR_IntegerLiteral &literal,
     if (MLIR_IntegerLiteral_uses_larger_bits(&literal)) {
         uint32_t wc = 0;
         if (!MLIR_IntegerLiteral_get_larger_bits(&literal, nullptr, 0, &wc) || wc == 0)
-            return {};
+            return llvm::APInt();
         return llvm::APInt(width, llvm::ArrayRef(literal.value_larger_bits, wc));
     }
     int64_t v = 0;
     if (!MLIR_IntegerLiteral_get_value(&literal, &v))
-        return {};
+        return llvm::APInt();
     return llvm::APInt(width, v, true);
 }
 
@@ -1316,7 +1316,7 @@ static llvm::APFloat floatLiteralToAPFloat(const MLIR_FloatLiteral &literal,
                                            MLIR_LLVM_FloatEncoding encoding) {
     const llvm::fltSemantics *sem = floatSemanticsFor(encoding, width);
     if (!sem)
-        return llvm::APFloat(llvm::APFloat::IEEEsingle(), 0.0);
+        return llvm::APFloat::getZero(llvm::APFloat::IEEEsingle());
     if (MLIR_FloatLiteral_uses_larger_bits(&literal)) {
         uint32_t wc = 0;
         if (!MLIR_FloatLiteral_get_larger_bits(&literal, nullptr, 0, &wc) || wc == 0)
@@ -1327,10 +1327,12 @@ static llvm::APFloat floatLiteralToAPFloat(const MLIR_FloatLiteral &literal,
     double v = 0.0;
     if (!MLIR_FloatLiteral_get_value(&literal, &v))
         return llvm::APFloat(*sem, llvm::APInt::getZero(width));
-    llvm::APFloat apf(*sem);
-    bool losesInfo = false;
-    apf.convertFromDouble(v, llvm::APFloat::rmNearestTiesToEven, &losesInfo);
-    (void)losesInfo;
+    llvm::APFloat apf(v);
+    if (sem != &llvm::APFloat::IEEEdouble()) {
+        bool losesInfo = false;
+        apf.convert(*sem, llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+        (void)losesInfo;
+    }
     return apf;
 }
 
@@ -1661,10 +1663,10 @@ extern "C" bool MLIR_GetAttributeIntegerLiteral(MLIR_AttributeHandle h,
             if (!MLIR_IntegerLiteral_set_value(out, info.width, apint.getSExtValue()))
                 return false;
         } else {
-            auto raw = apint.getRawData();
-            if (raw.size() > MLIR_LITERAL_LARGER_BITS_WORDS) return false;
-            if (!MLIR_IntegerLiteral_set_larger_bits(out, info.width, raw.data(),
-                                                     (uint32_t)raw.size()))
+            const uint64_t *raw = apint.getRawData();
+            uint32_t wc = (uint32_t)apint.getNumWords();
+            if (wc > MLIR_LITERAL_LARGER_BITS_WORDS) return false;
+            if (!MLIR_IntegerLiteral_set_larger_bits(out, info.width, raw, wc))
                 return false;
         }
     }
@@ -1686,10 +1688,11 @@ extern "C" bool MLIR_GetAttributeFloatLiteral(MLIR_AttributeHandle h,
                 return false;
         } else {
             llvm::APInt bits = attr.getValue().bitcastToAPInt();
-            auto raw = bits.getRawData();
-            if (raw.size() > MLIR_LITERAL_LARGER_BITS_WORDS) return false;
+            const uint64_t *raw = bits.getRawData();
+            uint32_t wc = (uint32_t)bits.getNumWords();
+            if (wc > MLIR_LITERAL_LARGER_BITS_WORDS) return false;
             if (!MLIR_FloatLiteral_set_larger_bits(out, info.width, info.encoding,
-                                                   raw.data(), (uint32_t)raw.size()))
+                                                   raw, wc))
                 return false;
         }
     }
