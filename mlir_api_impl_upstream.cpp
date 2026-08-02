@@ -1060,29 +1060,60 @@ extern "C" void MLIR_SetTypeTensorProperties(MLIR_TypeHandle, const int64_t *, s
 extern "C" void MLIR_SetTypeMemrefProperties(MLIR_TypeHandle, const int64_t *, size_t, MLIR_TypeHandle) {}
 extern "C" void MLIR_SetTypePointerProperties(MLIR_TypeHandle, MLIR_TypeHandle, bool, uint32_t) {}
 
-extern "C" MLIR_LLVM_TypeKind MLIR_GetTypeKind(MLIR_TypeHandle h) {
+extern "C" MLIR_TypeKind MLIR_GetTypeKind(MLIR_TypeHandle h) {
     auto t = typeF(h);
-    if (!t) return MLIR_LLVM_TYPE_INVALID;
-    if (llvm::isa<mlir::IntegerType>(t)) return MLIR_LLVM_TYPE_INTEGER;
-    if (llvm::isa<mlir::FloatType>(t)) return MLIR_LLVM_TYPE_FLOAT;
-    if (llvm::isa<mlir::IndexType>(t)) return MLIR_LLVM_TYPE_INDEX;
-    if (llvm::isa<mlir::TensorType>(t)) return MLIR_LLVM_TYPE_TENSOR;
-    if (llvm::isa<mlir::BaseMemRefType>(t)) return MLIR_LLVM_TYPE_MEMREF;
-    if (llvm::isa<mlir::VectorType>(t)) return MLIR_LLVM_TYPE_VECTOR;
-    if (llvm::isa<mlir::FunctionType>(t)) return MLIR_LLVM_TYPE_FUNCTION;
-    if (llvm::isa<mlir::NoneType>(t)) return MLIR_LLVM_TYPE_UNKNOWN;
-    if (llvm::isa<mlir::LLVM::LLVMPointerType>(t)) return MLIR_LLVM_TYPE_LLVM_POINTER;
-    if (llvm::isa<mlir::LLVM::LLVMVoidType>(t)) return MLIR_LLVM_TYPE_LLVM_VOID;
-    if (llvm::isa<mlir::LLVM::LLVMArrayType>(t)) return MLIR_LLVM_TYPE_LLVM_ARRAY;
-    if (llvm::isa<mlir::LLVM::LLVMStructType>(t)) return MLIR_LLVM_TYPE_LLVM_STRUCT;
-    if (llvm::isa<mlir::LLVM::LLVMFunctionType>(t)) return MLIR_LLVM_TYPE_LLVM_FUNCTION;
+    if (!t) return MLIR_TYPE_INVALID;
+    if (llvm::isa<mlir::IntegerType>(t)) return MLIR_TYPE_INTEGER;
+    if (llvm::isa<mlir::FloatType>(t)) return MLIR_TYPE_FLOAT;
+    if (llvm::isa<mlir::IndexType>(t)) return MLIR_TYPE_INDEX;
+    if (llvm::isa<mlir::TensorType>(t)) return MLIR_TYPE_TENSOR;
+    if (llvm::isa<mlir::BaseMemRefType>(t)) return MLIR_TYPE_MEMREF;
+    if (llvm::isa<mlir::VectorType>(t)) return MLIR_TYPE_VECTOR;
+    if (llvm::isa<mlir::FunctionType>(t)) return MLIR_TYPE_FUNCTION;
+    if (llvm::isa<mlir::NoneType>(t)) return MLIR_TYPE_UNKNOWN;
+    if (llvm::isa<mlir::LLVM::LLVMPointerType>(t)) return MLIR_TYPE_POINTER;
+    if (llvm::isa<mlir::LLVM::LLVMVoidType>(t)) return MLIR_TYPE_VOID;
+    if (llvm::isa<mlir::LLVM::LLVMArrayType>(t)) return MLIR_TYPE_ARRAY;
+    if (llvm::isa<mlir::LLVM::LLVMStructType>(t)) return MLIR_TYPE_STRUCT;
+    if (llvm::isa<mlir::LLVM::LLVMFunctionType>(t)) return MLIR_TYPE_FUNCTION;
     if (auto o = llvm::dyn_cast<mlir::OpaqueType>(t))
-        return o.getDialectNamespace() == "tt" ? MLIR_LLVM_TYPE_POINTER : MLIR_LLVM_TYPE_OPAQUE;
-    return MLIR_LLVM_TYPE_INVALID;
+        return o.getDialectNamespace() == "tt" ? MLIR_TYPE_POINTER : MLIR_TYPE_OPAQUE;
+    return MLIR_TYPE_INVALID;
+}
+
+extern "C" MLIR_Dialect MLIR_GetTypeDialect(MLIR_TypeHandle h) {
+    auto t = typeF(h);
+    if (!t) return MLIR_DIALECT_NONE;
+    if (llvm::isa<mlir::IntegerType>(t) ||
+        llvm::isa<mlir::FloatType>(t) ||
+        llvm::isa<mlir::IndexType>(t) ||
+        llvm::isa<mlir::TensorType>(t) ||
+        llvm::isa<mlir::BaseMemRefType>(t) ||
+        llvm::isa<mlir::VectorType>(t) ||
+        llvm::isa<mlir::FunctionType>(t) ||
+        llvm::isa<mlir::NoneType>(t))
+        return MLIR_DIALECT_BUILTIN;
+    if (llvm::isa<mlir::LLVM::LLVMPointerType>(t) ||
+        llvm::isa<mlir::LLVM::LLVMVoidType>(t) ||
+        llvm::isa<mlir::LLVM::LLVMArrayType>(t) ||
+        llvm::isa<mlir::LLVM::LLVMStructType>(t) ||
+        llvm::isa<mlir::LLVM::LLVMFunctionType>(t))
+        return MLIR_DIALECT_LLVM;
+    if (auto o = llvm::dyn_cast<mlir::OpaqueType>(t))
+        return o.getDialectNamespace() == "tt" ? MLIR_DIALECT_NONE : MLIR_DIALECT_NONE;
+    return MLIR_DIALECT_NONE;
+}
+
+extern "C" bool MLIR_TypeHasDialect(MLIR_TypeHandle h, MLIR_Dialect dialect) {
+    return MLIR_GetTypeDialect(h) == dialect;
+}
+
+extern "C" bool MLIR_TypeIs(MLIR_TypeHandle h, MLIR_TypeKind kind, MLIR_Dialect dialect) {
+    return MLIR_GetTypeKind(h) == kind && MLIR_GetTypeDialect(h) == dialect;
 }
 
 extern "C" bool MLIR_GetIntegerTypeInfo(MLIR_TypeHandle h,
-                                         MLIR_LLVM_IntegerTypeInfo *out) {
+                                         MLIR_IntegerTypeInfo *out) {
     auto t = llvm::dyn_cast<mlir::IntegerType>(typeF(h));
     if (!t) return false;
     if (out) *out = { t.getWidth() };
@@ -1090,12 +1121,12 @@ extern "C" bool MLIR_GetIntegerTypeInfo(MLIR_TypeHandle h,
 }
 
 extern "C" bool MLIR_GetFloatTypeInfo(MLIR_TypeHandle h,
-                                       MLIR_LLVM_FloatTypeInfo *out) {
+                                       MLIR_FloatTypeInfo *out) {
     auto t = llvm::dyn_cast<mlir::FloatType>(typeF(h));
     if (!t) return false;
-    MLIR_LLVM_FloatEncoding encoding = MLIR_LLVM_FLOAT_ENCODING_IEEE_BINARY;
-    if (llvm::isa<mlir::BFloat16Type>(t)) encoding = MLIR_LLVM_FLOAT_ENCODING_BFLOAT;
-    else if (llvm::isa<mlir::Float80Type>(t)) encoding = MLIR_LLVM_FLOAT_ENCODING_X87_EXTENDED;
+    MLIR_FloatEncoding encoding = MLIR_FLOAT_ENCODING_IEEE_BINARY;
+    if (llvm::isa<mlir::BFloat16Type>(t)) encoding = MLIR_FLOAT_ENCODING_BFLOAT;
+    else if (llvm::isa<mlir::Float80Type>(t)) encoding = MLIR_FLOAT_ENCODING_X87_EXTENDED;
     if (out) *out = { t.getWidth(), encoding };
     return true;
 }
@@ -1114,7 +1145,11 @@ extern "C" bool MLIR_IsTypeOpaque(MLIR_TypeHandle h)  {
     auto opaq = llvm::dyn_cast<mlir::OpaqueType>(typeF(h));
     return opaq && opaq.getDialectNamespace() != "tt";
 }
-extern "C" bool MLIR_IsTypeFunction(MLIR_TypeHandle h) { return llvm::isa<mlir::FunctionType>(typeF(h)); }
+extern "C" bool MLIR_IsTypeFunction(MLIR_TypeHandle h) {
+    auto t = typeF(h);
+    return llvm::isa<mlir::FunctionType>(t) ||
+           llvm::isa<mlir::LLVM::LLVMFunctionType>(t);
+}
 extern "C" size_t MLIR_GetTypeFunctionNumInputs(MLIR_TypeHandle h) {
     auto t = typeF(h);
     if (auto ft = llvm::dyn_cast<mlir::FunctionType>(t)) return ft.getNumInputs();
@@ -1174,34 +1209,36 @@ extern "C" MLIR_TypeHandle MLIR_GetTypeShapedElement(MLIR_TypeHandle h) {
     return MLIR_INVALID_HANDLE;
 }
 
-extern "C" bool MLIR_IsTypeLLVMStruct(MLIR_TypeHandle h) {
+extern "C" bool MLIR_TypeIsStruct(MLIR_TypeHandle h, MLIR_Dialect dialect) {
+    if (dialect != MLIR_DIALECT_LLVM) return false;
     return llvm::isa<mlir::LLVM::LLVMStructType>(typeF(h));
 }
-extern "C" size_t MLIR_GetTypeLLVMStructNumFields(MLIR_TypeHandle h) {
+extern "C" size_t MLIR_GetTypeStructNumFields(MLIR_TypeHandle h) {
     auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(typeF(h));
     if (!st) return 0;
     return st.getBody().size();
 }
-extern "C" MLIR_TypeHandle MLIR_GetTypeLLVMStructField(MLIR_TypeHandle h, size_t idx) {
+extern "C" MLIR_TypeHandle MLIR_GetTypeStructField(MLIR_TypeHandle h, size_t idx) {
     auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(typeF(h));
     if (!st || idx >= st.getBody().size()) return MLIR_INVALID_HANDLE;
     return typeH(st.getBody()[idx]);
 }
-extern "C" bool MLIR_IsTypeLLVMArray(MLIR_TypeHandle h) {
+extern "C" bool MLIR_TypeIsArray(MLIR_TypeHandle h, MLIR_Dialect dialect) {
+    if (dialect != MLIR_DIALECT_LLVM) return false;
     return llvm::isa<mlir::LLVM::LLVMArrayType>(typeF(h));
 }
-extern "C" MLIR_TypeHandle MLIR_GetTypeLLVMArrayElement(MLIR_TypeHandle h) {
+extern "C" MLIR_TypeHandle MLIR_GetTypeArrayElement(MLIR_TypeHandle h) {
     auto at = llvm::dyn_cast<mlir::LLVM::LLVMArrayType>(typeF(h));
     if (!at) return MLIR_INVALID_HANDLE;
     return typeH(at.getElementType());
 }
-extern "C" uint64_t MLIR_GetTypeLLVMArrayNumElements(MLIR_TypeHandle h) {
+extern "C" uint64_t MLIR_GetTypeArrayNumElements(MLIR_TypeHandle h) {
     auto at = llvm::dyn_cast<mlir::LLVM::LLVMArrayType>(typeF(h));
     if (!at) return 0;
     return at.getNumElements();
 }
 
-extern "C" uint32_t MLIR_GetTypeLLVMPointerAddressSpace(MLIR_TypeHandle h) {
+extern "C" uint32_t MLIR_GetTypePointerAddressSpace(MLIR_TypeHandle h) {
     auto p = llvm::dyn_cast<mlir::LLVM::LLVMPointerType>(typeF(h));
     return p ? p.getAddressSpace() : 0;
 }
@@ -1293,18 +1330,18 @@ static llvm::APInt integerLiteralToAPInt(const MLIR_IntegerLiteral &literal,
     return llvm::APInt(width, v, true);
 }
 
-static const llvm::fltSemantics *floatSemanticsFor(MLIR_LLVM_FloatEncoding enc,
+static const llvm::fltSemantics *floatSemanticsFor(MLIR_FloatEncoding enc,
                                                    uint32_t width) {
     switch (enc) {
-    case MLIR_LLVM_FLOAT_ENCODING_IEEE_BINARY:
+    case MLIR_FLOAT_ENCODING_IEEE_BINARY:
         if (width == 16) return &llvm::APFloat::IEEEhalf();
         if (width == 32) return &llvm::APFloat::IEEEsingle();
         if (width == 64) return &llvm::APFloat::IEEEdouble();
         if (width == 128) return &llvm::APFloat::IEEEquad();
         return nullptr;
-    case MLIR_LLVM_FLOAT_ENCODING_BFLOAT:
+    case MLIR_FLOAT_ENCODING_BFLOAT:
         return width == 16 ? &llvm::APFloat::BFloat() : nullptr;
-    case MLIR_LLVM_FLOAT_ENCODING_X87_EXTENDED:
+    case MLIR_FLOAT_ENCODING_X87_EXTENDED:
         return width == 80 ? &llvm::APFloat::x87DoubleExtended() : nullptr;
     default:
         return nullptr;
@@ -1313,7 +1350,7 @@ static const llvm::fltSemantics *floatSemanticsFor(MLIR_LLVM_FloatEncoding enc,
 
 static llvm::APFloat floatLiteralToAPFloat(const MLIR_FloatLiteral &literal,
                                            uint32_t width,
-                                           MLIR_LLVM_FloatEncoding encoding) {
+                                           MLIR_FloatEncoding encoding) {
     const llvm::fltSemantics *sem = floatSemanticsFor(encoding, width);
     if (!sem)
         return llvm::APFloat::getZero(llvm::APFloat::IEEEsingle());
@@ -1342,7 +1379,7 @@ extern "C" MLIR_AttributeHandle MLIR_CreateAttributeInteger(MLIR_Context *, stri
 }
 extern "C" MLIR_AttributeHandle MLIR_CreateAttributeIntegerLiteral(
     MLIR_Context *, string name, MLIR_TypeHandle type, MLIR_IntegerLiteral literal) {
-    MLIR_LLVM_IntegerTypeInfo info;
+    MLIR_IntegerTypeInfo info;
     if (literal.kind != MLIR_LITERAL_INTEGER ||
         !MLIR_GetIntegerTypeInfo(type, &info) || literal.width != info.width ||
         !literal_width_supported(info.width))
@@ -1359,7 +1396,7 @@ extern "C" MLIR_AttributeHandle MLIR_CreateAttributeFloat(MLIR_Context *, string
 }
 extern "C" MLIR_AttributeHandle MLIR_CreateAttributeFloatLiteral(
     MLIR_Context *, string name, MLIR_TypeHandle type, MLIR_FloatLiteral literal) {
-    MLIR_LLVM_FloatTypeInfo info;
+    MLIR_FloatTypeInfo info;
     auto ft = llvm::dyn_cast<mlir::FloatType>(typeF(type));
     if (literal.kind != MLIR_LITERAL_FLOAT || !ft ||
         !MLIR_GetFloatTypeInfo(type, &info) || literal.width != info.width ||
@@ -1445,55 +1482,59 @@ extern "C" MLIR_AttributeHandle MLIR_CreateAttributeDenseI64Array(MLIR_Context *
                          mlir::DenseI64ArrayAttr::get(&ctx, v));
 }
 
-extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMPointer(MLIR_Context *) {
-    return MLIR_CreateTypeLLVMPointerInAddressSpace(nullptr, 0);
-}
-
-// Adds address space to the pointer type, e.g. !llvm.ptr<3> for address space 3.
-extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMPointerInAddressSpace(
-    MLIR_Context *, uint32_t address_space) {
+extern "C" MLIR_TypeHandle MLIR_CreateTypePointerInAddressSpace(
+    MLIR_Context *, MLIR_Dialect dialect, uint32_t address_space) {
+    if (dialect != MLIR_DIALECT_LLVM) return MLIR_INVALID_HANDLE;
     auto &ctx = globalCtx().mctx;
     return typeH(mlir::LLVM::LLVMPointerType::get(&ctx, address_space));
 }
 
-extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMStructIdentified(MLIR_Context *, string name) {
+extern "C" MLIR_TypeHandle MLIR_CreateTypeStructIdentified(MLIR_Context *,
+                                                           MLIR_Dialect dialect,
+                                                           string name) {
+    if (dialect != MLIR_DIALECT_LLVM) return MLIR_INVALID_HANDLE;
     auto &ctx = globalCtx().mctx;
     return typeH(mlir::LLVM::LLVMStructType::getIdentified(&ctx,
                      llvm::StringRef(name.str, name.size)));
 }
 
-extern "C" void MLIR_SetTypeLLVMStructBody(MLIR_Context *, MLIR_TypeHandle struct_ty,
-                                            const MLIR_TypeHandle *fields, size_t n_fields) {
+extern "C" void MLIR_SetTypeStructBody(MLIR_Context *, MLIR_TypeHandle struct_ty,
+                                       const MLIR_TypeHandle *fields, size_t n_fields) {
     auto t = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(typeF(struct_ty));
     if (!t) {
-        std::fprintf(stderr, "MLIR_SetTypeLLVMStructBody: not an LLVM struct type\n");
+        std::fprintf(stderr, "MLIR_SetTypeStructBody: not a dialect struct type\n");
         return;
     }
     llvm::SmallVector<mlir::Type, 8> body;
     body.reserve(n_fields);
     for (size_t i = 0; i < n_fields; i++) body.push_back(typeF(fields[i]));
     if (llvm::failed(t.setBody(body, /*isPacked=*/false))) {
-        std::fprintf(stderr, "MLIR_SetTypeLLVMStructBody: setBody failed (already set?)\n");
+        std::fprintf(stderr, "MLIR_SetTypeStructBody: setBody failed (already set?)\n");
     }
 }
 
-extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMArray(MLIR_Context *, MLIR_TypeHandle elem,
-                                                     uint64_t count) {
+extern "C" MLIR_TypeHandle MLIR_CreateTypeArray(MLIR_Context *, MLIR_Dialect dialect,
+                                                MLIR_TypeHandle elem,
+                                                uint64_t count) {
+    if (dialect != MLIR_DIALECT_LLVM) return MLIR_INVALID_HANDLE;
     return typeH(mlir::LLVM::LLVMArrayType::get(typeF(elem), count));
 }
 
-extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMFunction(MLIR_Context *,
-                                                       MLIR_TypeHandle result,
-                                                       const MLIR_TypeHandle *inputs,
-                                                       size_t n_inputs,
-                                                       bool is_var_arg) {
+extern "C" MLIR_TypeHandle MLIR_CreateTypeDialectFunction(MLIR_Context *,
+                                                          MLIR_Dialect dialect,
+                                                          MLIR_TypeHandle result,
+                                                          const MLIR_TypeHandle *inputs,
+                                                          size_t n_inputs,
+                                                          bool is_var_arg) {
+    if (dialect != MLIR_DIALECT_LLVM) return MLIR_INVALID_HANDLE;
     llvm::SmallVector<mlir::Type, 8> in;
     in.reserve(n_inputs);
     for (size_t i = 0; i < n_inputs; i++) in.push_back(typeF(inputs[i]));
     return typeH(mlir::LLVM::LLVMFunctionType::get(typeF(result), in, is_var_arg));
 }
 
-extern "C" MLIR_TypeHandle MLIR_CreateTypeLLVMVoid(MLIR_Context *) {
+extern "C" MLIR_TypeHandle MLIR_CreateTypeVoid(MLIR_Context *, MLIR_Dialect dialect) {
+    if (dialect != MLIR_DIALECT_LLVM) return MLIR_INVALID_HANDLE;
     auto &ctx = globalCtx().mctx;
     return typeH(mlir::LLVM::LLVMVoidType::get(&ctx));
 }
@@ -1652,7 +1693,7 @@ extern "C" bool MLIR_GetAttributeIntegerLiteral(MLIR_AttributeHandle h,
                                                   MLIR_IntegerLiteral *out) {
     auto attr = llvm::dyn_cast<mlir::IntegerAttr>(F<mlir::NamedAttribute>(h)->getValue());
     if (!attr) return false;
-    MLIR_LLVM_IntegerTypeInfo info;
+    MLIR_IntegerTypeInfo info;
     if (!MLIR_GetIntegerTypeInfo(typeH(attr.getType()), &info) ||
         !literal_width_supported(info.width))
         return false;
@@ -1676,7 +1717,7 @@ extern "C" bool MLIR_GetAttributeFloatLiteral(MLIR_AttributeHandle h,
                                                 MLIR_FloatLiteral *out) {
     auto attr = llvm::dyn_cast<mlir::FloatAttr>(F<mlir::NamedAttribute>(h)->getValue());
     if (!attr) return false;
-    MLIR_LLVM_FloatTypeInfo info;
+    MLIR_FloatTypeInfo info;
     if (!MLIR_GetFloatTypeInfo(typeH(attr.getType()), &info) ||
         !literal_width_supported(info.width))
         return false;

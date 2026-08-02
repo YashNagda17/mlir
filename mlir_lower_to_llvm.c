@@ -35,11 +35,55 @@ static bool name_eq(string s, const char *cstr) {
     return s.size == n && memcmp(s.str, cstr, n) == 0;
 }
 
-static MLIR_TypeHandle ty_i64(MLIR_Context *ctx) {
-    return MLIR_CreateTypeInteger(ctx, 64, false);
+// Target dialect for this lowering pass. Only MLIR_DIALECT_LLVM is lowered
+// today; other dialects are left in place by the walker.
+#define LOWER_DIALECT MLIR_DIALECT_LLVM
+
+static bool type_has_dialect(MLIR_TypeHandle ty, MLIR_Dialect dialect) {
+    return MLIR_TypeHasDialect(ty, dialect);
 }
-static MLIR_TypeHandle ty_llvm_void(MLIR_Context *ctx) {
-    return MLIR_CreateTypeLLVMVoid(ctx);
+
+static bool type_is(MLIR_TypeHandle ty, MLIR_TypeKind kind, MLIR_Dialect dialect) {
+    return MLIR_TypeIs(ty, kind, dialect);
+}
+
+static MLIR_TypeHandle ty_void(MLIR_Context *ctx) {
+    return MLIR_CreateTypeVoid(ctx, LOWER_DIALECT);
+}
+
+static MLIR_TypeHandle ty_ptr(MLIR_Context *ctx) {
+    return MLIR_CreateTypePointerInAddressSpace(ctx, LOWER_DIALECT, 0);
+}
+
+static MLIR_TypeHandle convert_function_type(MLIR_Context *ctx,
+                                             MLIR_TypeHandle ft,
+                                             bool is_var_arg) {
+    // Dialect-first: already a target-dialect function type needs no conversion.
+    if (type_has_dialect(ft, LOWER_DIALECT)) {
+        return type_is(ft, MLIR_TYPE_FUNCTION, LOWER_DIALECT) ? ft : MLIR_INVALID_HANDLE;
+    }
+    if (!MLIR_IsTypeFunction(ft)) return MLIR_INVALID_HANDLE;
+    size_t ni = MLIR_GetTypeFunctionNumInputs(ft);
+    size_t nr = MLIR_GetTypeFunctionNumResults(ft);
+    MLIR_TypeHandle ins_stk[16];
+    MLIR_TypeHandle *ins = ins_stk;
+    if (ni > 16) {
+        ins = (MLIR_TypeHandle *)arena_alloc(
+            MLIR_GetArenaAllocator(ctx), ni * sizeof(MLIR_TypeHandle));
+    }
+    for (size_t k = 0; k < ni; k++) ins[k] = MLIR_GetTypeFunctionInput(ft, k);
+    MLIR_TypeHandle ret_ty = (nr == 0)
+        ? ty_void(ctx)
+        : MLIR_GetTypeFunctionResult(ft, 0);
+    return MLIR_CreateTypeDialectFunction(ctx, LOWER_DIALECT, ret_ty,
+                                          ins, ni, is_var_arg);
+}
+
+static int integer_type_width(MLIR_TypeHandle ty) {
+    if (MLIR_IsTypeIndex(ty)) return 64;
+    MLIR_IntegerTypeInfo info;
+    if (MLIR_GetIntegerTypeInfo(ty, &info)) return (int)info.width;
+    return 0;
 }
 
 // Allocate a fresh value handle (op-result) that becomes the result of
@@ -193,24 +237,12 @@ static bool lower_func_func(LowerState *st, MLIR_OpHandle op,
             attrs_buf[n_attrs++] = a;
             exp_name = MLIR_GetAttributeString(a);
         } else if (name_eq(an, "function_type")) {
-            // Convert FunctionType -> LLVMFunctionType (which carries
-            // is_var_arg and uses LLVM void instead of zero-results).
+            // Convert builtin FunctionType -> dialect function type.
             MLIR_TypeHandle ft = MLIR_GetAttributeTypeValue(a);
-            size_t ni = MLIR_GetTypeFunctionNumInputs(ft);
-            size_t nr_ = MLIR_GetTypeFunctionNumResults(ft);
-            MLIR_TypeHandle ins_stk[16];
-            MLIR_TypeHandle *ins = ins_stk;
-            if (ni > 16) ins = (MLIR_TypeHandle *)arena_alloc(
-                MLIR_GetArenaAllocator(st->ctx),
-                ni * sizeof(MLIR_TypeHandle));
-            for (size_t k = 0; k < ni; k++) ins[k] = MLIR_GetTypeFunctionInput(ft, k);
-            MLIR_TypeHandle ret_ty = (nr_ == 0)
-                ? ty_llvm_void(st->ctx)
-                : MLIR_GetTypeFunctionResult(ft, 0);
-            MLIR_TypeHandle llvmft = MLIR_CreateTypeLLVMFunction(
-                st->ctx, ret_ty, ins, ni, false);
+            MLIR_TypeHandle dialect_ft = convert_function_type(st->ctx, ft, false);
+            if (dialect_ft == MLIR_INVALID_HANDLE) return false;
             attrs_buf[n_attrs++] = MLIR_CreateAttributeType(
-                st->ctx, str_lit("function_type"), llvmft);
+                st->ctx, str_lit("function_type"), dialect_ft);
         }
     }
 
@@ -417,7 +449,7 @@ static bool lower_func_constant(LowerState *st, MLIR_OpHandle op,
     }
     if (sym_name.size == 0) return false;
 
-    MLIR_TypeHandle ptr_ty = MLIR_CreateTypeLLVMPointer(st->ctx);
+    MLIR_TypeHandle ptr_ty = ty_ptr(st->ctx);
     MLIR_ValueHandle new_res = make_result_value(st->ctx, ptr_ty, loc);
     MLIR_TypeHandle rts[1] = { ptr_ty };
     MLIR_ValueHandle results[1] = { new_res };
@@ -474,20 +506,20 @@ static bool lower_func_call_indirect(LowerState *st, MLIR_OpHandle op,
         results[i] = make_result_value(st->ctx, rts[i], loc);
     }
 
-    // Build a `var_callee_type` LLVMFunctionType attribute describing
+    // Build a `var_callee_type` dialect function attribute describing
     // the indirect call's signature (return + arg types).
-    MLIR_TypeHandle ret_ty = (nr == 0) ? ty_llvm_void(st->ctx) : rts[0];
+    MLIR_TypeHandle ret_ty = (nr == 0) ? ty_void(st->ctx) : rts[0];
     size_t n_args = no - 1;
     MLIR_TypeHandle *arg_tys = n_args ? (MLIR_TypeHandle *)arena_alloc(
         alloc, n_args * sizeof(MLIR_TypeHandle)) : NULL;
     for (size_t i = 0; i < n_args; i++) {
         arg_tys[i] = MLIR_GetValueType(operands[i + 1]);
     }
-    MLIR_TypeHandle llvmft = MLIR_CreateTypeLLVMFunction(
-        st->ctx, ret_ty, arg_tys, n_args, false);
+    MLIR_TypeHandle callee_ty = MLIR_CreateTypeDialectFunction(
+        st->ctx, LOWER_DIALECT, ret_ty, arg_tys, n_args, false);
     MLIR_AttributeHandle attrs[1];
     attrs[0] = MLIR_CreateAttributeType(
-        st->ctx, str_lit("var_callee_type"), llvmft);
+        st->ctx, str_lit("var_callee_type"), callee_ty);
 
     MLIR_OpHandle nop = create_simple_op(
         st->ctx, OP_TYPE_LLVM_CALL,
@@ -624,18 +656,6 @@ static bool lower_scf_if(LowerState *st, MLIR_OpHandle op,
         loc, MLIR_INVALID_HANDLE, str_lit(""), -1);
     MLIR_InsertBlockOpAtIndex(st->ctx, parent, cbr, pos);
     return true;
-}
-
-static int string_to_int(MLIR_Context *ctx, MLIR_TypeHandle ty) {
-    if (MLIR_IsTypeIndex(ty)) return 64;
-    string s = MLIR_GetTypeString(ctx, ty);
-    if (s.size < 2 || s.str[0] != 'i') return 0;
-    int w = 0;
-    for (size_t i = 1; i < s.size; i++) {
-        if (s.str[i] < '0' || s.str[i] > '9') return 0;
-        w = w * 10 + (s.str[i] - '0');
-    }
-    return w;
 }
 
 static void move_region_blocks_to_parent(LowerState *st, MLIR_RegionHandle reg,
@@ -957,8 +977,8 @@ static bool lower_arith_index_cast(LowerState *st, MLIR_OpHandle op,
     MLIR_ValueHandle old_res = MLIR_GetOpResult(op, 0);
     MLIR_TypeHandle src_ty = MLIR_GetValueType(src);
     MLIR_TypeHandle dst_ty = MLIR_GetValueType(old_res);
-    int sw = string_to_int(st->ctx, src_ty);
-    int dw = string_to_int(st->ctx, dst_ty);
+    int sw = integer_type_width(src_ty);
+    int dw = integer_type_width(dst_ty);
     if (sw == 0 || dw == 0) return false;
     if (sw == dw) {
         MLIR_ReplaceAllUsesOfValue(st->ctx, old_res, src);

@@ -507,46 +507,64 @@ string MLIR_MLIR_OpTypeToString(MLIR_OpType type);
 
 // These enums are used to capture the type of a variable, which is different from
 // MLIR_OpType, which is used to capture the type of an operation.
+//
+// A type is identified by the pair (kind, dialect). The kind is a general,
+// dialect-independent family (integer, float, pointer, struct, ...); the
+// dialect distinguishes owners when two dialects have a type in the same
+// family: `!llvm.ptr` is (MLIR_TYPE_POINTER, MLIR_DIALECT_LLVM) while
+// `!tt.ptr` is (MLIR_TYPE_POINTER, MLIR_DIALECT_NONE). Builtin types (iN,
+// fN, index, tensor, memref, vector) are MLIR_DIALECT_BUILTIN and shared by
+// every dialect that uses them — there is no "LLVM integer"; LLVM
+// compatibility of an integer is a constraint checked at the LLVM
+// conversion boundary, not a separate type.
+//
 // Type identity is deliberately family-based. Widths such as i7/i32/i128 or
 // f32/f64 are fields of the corresponding type-info struct, not enum members.
-typedef enum MLIR_LLVM_TypeKind {
-    MLIR_LLVM_TYPE_INVALID = 0,
-    MLIR_LLVM_TYPE_UNKNOWN,
-    MLIR_LLVM_TYPE_OPAQUE,
-    MLIR_LLVM_TYPE_INTEGER,
-    MLIR_LLVM_TYPE_FLOAT,
-    MLIR_LLVM_TYPE_MEMREF,
-    MLIR_LLVM_TYPE_TENSOR,
-    MLIR_LLVM_TYPE_FUNCTION,
-    MLIR_LLVM_TYPE_INDEX,
-    MLIR_LLVM_TYPE_POINTER,
-    MLIR_LLVM_TYPE_LLVM_POINTER,
-    MLIR_LLVM_TYPE_LLVM_VOID,
-    MLIR_LLVM_TYPE_LLVM_ARRAY,
-    MLIR_LLVM_TYPE_LLVM_STRUCT,
-    MLIR_LLVM_TYPE_LLVM_FUNCTION,
-    MLIR_LLVM_TYPE_VECTOR,
-    MLIR_LLVM_TYPE_TOKEN,
-    MLIR_LLVM_TYPE_LLVM_METADATA,
-    MLIR_LLVM_TYPE_LLVM_PPC_FP128,
-    MLIR_LLVM_TYPE_KIND_COUNT
-} MLIR_LLVM_TypeKind;
+typedef enum MLIR_Dialect {
+    // Dialect not modeled by this API yet. Types owned by dialects the API
+    // does not describe structurally (e.g. !tt.ptr) carry this value for now.
+    MLIR_DIALECT_NONE = 0,
+    MLIR_DIALECT_BUILTIN,
+    MLIR_DIALECT_LLVM,
+    MLIR_DIALECT_COUNT
+} MLIR_Dialect;
 
-typedef enum MLIR_LLVM_FloatEncoding {
-    MLIR_LLVM_FLOAT_ENCODING_IEEE_BINARY = 0,
-    MLIR_LLVM_FLOAT_ENCODING_BFLOAT,
-    MLIR_LLVM_FLOAT_ENCODING_X87_EXTENDED,
-    MLIR_LLVM_FLOAT_ENCODING_PPC_DOUBLE_DOUBLE
-} MLIR_LLVM_FloatEncoding;
+typedef enum MLIR_TypeKind {
+    MLIR_TYPE_INVALID = 0,
+    MLIR_TYPE_UNKNOWN,
+    MLIR_TYPE_OPAQUE,
+    MLIR_TYPE_INTEGER,
+    MLIR_TYPE_FLOAT,
+    MLIR_TYPE_MEMREF,
+    MLIR_TYPE_TENSOR,
+    MLIR_TYPE_FUNCTION,
+    MLIR_TYPE_INDEX,
+    MLIR_TYPE_POINTER,
+    MLIR_TYPE_VOID,
+    MLIR_TYPE_ARRAY,
+    MLIR_TYPE_STRUCT,
+    MLIR_TYPE_VECTOR,
+    MLIR_TYPE_TOKEN,
+    MLIR_TYPE_METADATA,
+    MLIR_TYPE_PPC_FP128,
+    MLIR_TYPE_KIND_COUNT
+} MLIR_TypeKind;
 
-typedef struct MLIR_LLVM_IntegerTypeInfo {
+typedef enum MLIR_FloatEncoding {
+    MLIR_FLOAT_ENCODING_IEEE_BINARY = 0,
+    MLIR_FLOAT_ENCODING_BFLOAT,
+    MLIR_FLOAT_ENCODING_X87_EXTENDED,
+    MLIR_FLOAT_ENCODING_PPC_DOUBLE_DOUBLE
+} MLIR_FloatEncoding;
+
+typedef struct MLIR_IntegerTypeInfo {
     uint32_t width; /* bit width of the integer type (e.g. 32 for i32) */
-} MLIR_LLVM_IntegerTypeInfo;
+} MLIR_IntegerTypeInfo;
 
-typedef struct MLIR_LLVM_FloatTypeInfo {
-    uint32_t width;                   /* bit width of the floating-point type (e.g. 32 for f32) */
-    MLIR_LLVM_FloatEncoding encoding; /* IEEE binary, bfloat, x87 extended, or PPC double-double */
-} MLIR_LLVM_FloatTypeInfo;
+typedef struct MLIR_FloatTypeInfo {
+    uint32_t width;              /* bit width of the floating-point type (e.g. 32 for f32) */
+    MLIR_FloatEncoding encoding; /* IEEE binary, bfloat, x87 extended, or PPC double-double */
+} MLIR_FloatTypeInfo;
 
 // -----------------------------------------------------------------------------
 // API lifecycle
@@ -767,18 +785,45 @@ MLIR_TypeHandle MLIR_CreateTypeTensor(MLIR_Context *ctx, const int64_t *shape, s
 MLIR_TypeHandle MLIR_CreateTypeMemref(MLIR_Context *ctx, const int64_t *shape, size_t rank, MLIR_TypeHandle element_type);
 MLIR_TypeHandle MLIR_CreateTypePointer(MLIR_Context *ctx, MLIR_TypeHandle element_type, bool has_address_space, uint32_t address_space);
 
-// LLVM dialect types — used by frontends that emit `!llvm.ptr`,
-// `!llvm.struct`, and `!llvm.array`. Identified structs are mutable: create
-// with MLIR_CreateTypeLLVMStructIdentified, then call
-// MLIR_SetTypeLLVMStructBody once. Recursion through `!llvm.ptr` (which is
-// opaque) is fully supported because the body never mentions the recursive
-// struct's body type.
-MLIR_TypeHandle MLIR_CreateTypeLLVMPointer(MLIR_Context *ctx);
-MLIR_TypeHandle MLIR_CreateTypeLLVMPointerInAddressSpace(MLIR_Context *ctx, uint32_t address_space);
-MLIR_TypeHandle MLIR_CreateTypeLLVMStructIdentified(MLIR_Context *ctx, string name);
-void            MLIR_SetTypeLLVMStructBody(MLIR_Context *ctx, MLIR_TypeHandle struct_ty,
-                                           const MLIR_TypeHandle *fields, size_t n_fields);
-MLIR_TypeHandle MLIR_CreateTypeLLVMArray(MLIR_Context *ctx, MLIR_TypeHandle elem, uint64_t count);
+// Dialect-owned types. Only MLIR_DIALECT_LLVM is fully modeled today; other
+// dialects return MLIR_INVALID_HANDLE until their payload layout is added.
+MLIR_TypeHandle MLIR_CreateTypeVoid(MLIR_Context *ctx, MLIR_Dialect dialect);
+MLIR_TypeHandle MLIR_CreateTypePointerInAddressSpace(MLIR_Context *ctx,
+                                                     MLIR_Dialect dialect,
+                                                     uint32_t address_space);
+MLIR_TypeHandle MLIR_CreateTypeArray(MLIR_Context *ctx, MLIR_Dialect dialect,
+                                     MLIR_TypeHandle elem, uint64_t count);
+MLIR_TypeHandle MLIR_CreateTypeStructIdentified(MLIR_Context *ctx,
+                                                MLIR_Dialect dialect,
+                                                string name);
+void MLIR_SetTypeStructBody(MLIR_Context *ctx, MLIR_TypeHandle struct_ty,
+                            const MLIR_TypeHandle *fields, size_t n_fields);
+// Dialect function type: one result (use MLIR_CreateTypeVoid for no result),
+// N parameter types, optional varargs. Differs from MLIR_CreateTypeFunction
+// which models the builtin multi-result FunctionType.
+MLIR_TypeHandle MLIR_CreateTypeDialectFunction(MLIR_Context *ctx,
+                                               MLIR_Dialect dialect,
+                                               MLIR_TypeHandle result,
+                                               const MLIR_TypeHandle *inputs,
+                                               size_t n_inputs,
+                                               bool is_var_arg);
+
+// Backward-compatible LLVM dialect aliases (call the general API above).
+#define MLIR_CreateTypeLLVMPointer(ctx) \
+    MLIR_CreateTypePointerInAddressSpace((ctx), MLIR_DIALECT_LLVM, 0)
+#define MLIR_CreateTypeLLVMPointerInAddressSpace(ctx, as) \
+    MLIR_CreateTypePointerInAddressSpace((ctx), MLIR_DIALECT_LLVM, (as))
+#define MLIR_CreateTypeLLVMVoid(ctx) \
+    MLIR_CreateTypeVoid((ctx), MLIR_DIALECT_LLVM)
+#define MLIR_CreateTypeLLVMArray(ctx, elem, count) \
+    MLIR_CreateTypeArray((ctx), MLIR_DIALECT_LLVM, (elem), (count))
+#define MLIR_CreateTypeLLVMStructIdentified(ctx, name) \
+    MLIR_CreateTypeStructIdentified((ctx), MLIR_DIALECT_LLVM, (name))
+#define MLIR_SetTypeLLVMStructBody(ctx, ty, fields, n) \
+    MLIR_SetTypeStructBody((ctx), (ty), (fields), (n))
+#define MLIR_CreateTypeLLVMFunction(ctx, result, inputs, n, vararg) \
+    MLIR_CreateTypeDialectFunction((ctx), MLIR_DIALECT_LLVM, (result), \
+                                   (inputs), (n), (vararg))
 
 // LLVM-dialect global helpers. Each returns a freshly-created (unattached)
 // op; the caller appends it to the module body. Implemented by the
@@ -828,20 +873,6 @@ MLIR_TypeHandle MLIR_CreateTypeFunction(MLIR_Context *ctx,
                                          const MLIR_TypeHandle *inputs, size_t n_inputs,
                                          const MLIR_TypeHandle *results, size_t n_results);
 
-// LLVM-dialect function type (LLVMFunctionType). Differs from the standard
-// FunctionType in two ways: it has at most one result (use the LLVM `void`
-// type for "no result"), and it has an `is_var_arg` flag used to model C
-// variadic functions like `int printf(const char *, ...)`. The result type
-// must be either an LLVM-compatible scalar/pointer type or the LLVM void
-// type (see MLIR_CreateTypeLLVMVoid).
-MLIR_TypeHandle MLIR_CreateTypeLLVMFunction(MLIR_Context *ctx,
-                                             MLIR_TypeHandle result,
-                                             const MLIR_TypeHandle *inputs,
-                                             size_t n_inputs,
-                                             bool is_var_arg);
-// LLVM `void` type — only valid as the result of an LLVMFunctionType.
-MLIR_TypeHandle MLIR_CreateTypeLLVMVoid(MLIR_Context *ctx);
-
 // Deprecated compatibility entrypoints. Interned types are immutable; these
 // functions are no-ops in both native and upstream implementations. Construct
 // a new canonical type instead. Identified LLVM struct body initialization is
@@ -853,9 +884,17 @@ void MLIR_SetTypeMemrefProperties(MLIR_TypeHandle type, const int64_t *shape, si
 void MLIR_SetTypePointerProperties(MLIR_TypeHandle type, MLIR_TypeHandle element_type, bool has_address_space, uint32_t address_space);
 
 // Introspection & formatting
-MLIR_LLVM_TypeKind MLIR_GetTypeKind(MLIR_TypeHandle type);
-bool MLIR_GetIntegerTypeInfo(MLIR_TypeHandle type, MLIR_LLVM_IntegerTypeInfo *out);
-bool MLIR_GetFloatTypeInfo(MLIR_TypeHandle type, MLIR_LLVM_FloatTypeInfo *out);
+MLIR_TypeKind MLIR_GetTypeKind(MLIR_TypeHandle type);
+// Dialect that owns the type. Distinguishes types in the same family, e.g.
+// !llvm.ptr (MLIR_DIALECT_LLVM) from another dialect's pointer
+// (MLIR_DIALECT_NONE until that dialect is modeled).
+MLIR_Dialect MLIR_GetTypeDialect(MLIR_TypeHandle type);
+// Dialect-first classification helpers. Prefer checking dialect before kind
+// when dispatching on dialect-owned types (pointer, void, array, struct).
+bool MLIR_TypeHasDialect(MLIR_TypeHandle type, MLIR_Dialect dialect);
+bool MLIR_TypeIs(MLIR_TypeHandle type, MLIR_TypeKind kind, MLIR_Dialect dialect);
+bool MLIR_GetIntegerTypeInfo(MLIR_TypeHandle type, MLIR_IntegerTypeInfo *out);
+bool MLIR_GetFloatTypeInfo(MLIR_TypeHandle type, MLIR_FloatTypeInfo *out);
 bool MLIR_IsTypeInteger(MLIR_TypeHandle type);
 bool MLIR_IsTypeFloat(MLIR_TypeHandle type);
 bool MLIR_IsTypeTensor(MLIR_TypeHandle type);
@@ -875,15 +914,29 @@ bool MLIR_GetTypeFunctionIsVarArg(MLIR_TypeHandle type);
 // Element type of a tensor/memref/vector type, or invalid if the type is
 // not a shaped type.
 MLIR_TypeHandle MLIR_GetTypeShapedElement(MLIR_TypeHandle type);
-// LLVM struct/array type introspection. Used by lowering passes that
-// need to compute byte offsets and sizes (e.g. native LLVM->WASM).
-bool            MLIR_IsTypeLLVMStruct(MLIR_TypeHandle type);
-size_t          MLIR_GetTypeLLVMStructNumFields(MLIR_TypeHandle type);
-MLIR_TypeHandle MLIR_GetTypeLLVMStructField(MLIR_TypeHandle type, size_t idx);
-bool            MLIR_IsTypeLLVMArray(MLIR_TypeHandle type);
-MLIR_TypeHandle MLIR_GetTypeLLVMArrayElement(MLIR_TypeHandle type);
-uint64_t        MLIR_GetTypeLLVMArrayNumElements(MLIR_TypeHandle type);
-uint32_t        MLIR_GetTypeLLVMPointerAddressSpace(MLIR_TypeHandle type);
+// Dialect-owned aggregate/pointer introspection. Requires matching dialect
+// (e.g. MLIR_DIALECT_LLVM for !llvm.struct / !llvm.array / !llvm.ptr).
+bool            MLIR_TypeIsStruct(MLIR_TypeHandle type, MLIR_Dialect dialect);
+size_t          MLIR_GetTypeStructNumFields(MLIR_TypeHandle type);
+MLIR_TypeHandle MLIR_GetTypeStructField(MLIR_TypeHandle type, size_t idx);
+bool            MLIR_TypeIsArray(MLIR_TypeHandle type, MLIR_Dialect dialect);
+MLIR_TypeHandle MLIR_GetTypeArrayElement(MLIR_TypeHandle type);
+uint64_t        MLIR_GetTypeArrayNumElements(MLIR_TypeHandle type);
+uint32_t        MLIR_GetTypePointerAddressSpace(MLIR_TypeHandle type);
+#define MLIR_IsTypeLLVMStruct(type) \
+    MLIR_TypeIsStruct((type), MLIR_DIALECT_LLVM)
+#define MLIR_GetTypeLLVMStructNumFields(type) \
+    MLIR_GetTypeStructNumFields(type)
+#define MLIR_GetTypeLLVMStructField(type, idx) \
+    MLIR_GetTypeStructField((type), (idx))
+#define MLIR_IsTypeLLVMArray(type) \
+    MLIR_TypeIsArray((type), MLIR_DIALECT_LLVM)
+#define MLIR_GetTypeLLVMArrayElement(type) \
+    MLIR_GetTypeArrayElement(type)
+#define MLIR_GetTypeLLVMArrayNumElements(type) \
+    MLIR_GetTypeArrayNumElements(type)
+#define MLIR_GetTypeLLVMPointerAddressSpace(type) \
+    MLIR_GetTypePointerAddressSpace(type)
 string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle type);
 
 // -----------------------------------------------------------------------------
@@ -909,7 +962,7 @@ typedef struct MLIR_IntegerLiteral {
 typedef struct MLIR_FloatLiteral {
     MLIR_LiteralKind kind;
     uint32_t width;
-    MLIR_LLVM_FloatEncoding encoding;
+    MLIR_FloatEncoding encoding;
     double value; /* used when is_larger_bits is false (width <= 64) */
     bool is_larger_bits;
     uint32_t larger_word_count;
@@ -936,10 +989,10 @@ bool MLIR_IntegerLiteral_get_larger_bits(const MLIR_IntegerLiteral *lit,
                                          uint32_t *out_word_count);
 bool MLIR_FloatLiteral_uses_larger_bits(const MLIR_FloatLiteral *lit);
 bool MLIR_FloatLiteral_set_value(MLIR_FloatLiteral *lit, uint32_t width,
-                                 MLIR_LLVM_FloatEncoding encoding,
+                                 MLIR_FloatEncoding encoding,
                                  double value);
 bool MLIR_FloatLiteral_set_larger_bits(MLIR_FloatLiteral *lit, uint32_t width,
-                                       MLIR_LLVM_FloatEncoding encoding,
+                                       MLIR_FloatEncoding encoding,
                                        const uint64_t *words,
                                        uint32_t word_count);
 bool MLIR_FloatLiteral_get_value(const MLIR_FloatLiteral *lit, double *out);
