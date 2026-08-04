@@ -230,6 +230,7 @@ typedef struct { uintptr_t key; MLIR_ValueHandle val; } VMapEntry;
 typedef struct { uintptr_t key; uint32_t off; } AMapEntry;
 
 typedef struct M8EmissionMetadata M8EmissionMetadata;
+typedef struct M8EmitCtx M8EmitCtx;
 typedef struct CFGInfoScratch CFGInfoScratch;
 
 DEFINE_VECTOR_FOR_TYPE(uint8_t,    VecU8)
@@ -263,6 +264,7 @@ typedef struct {
     uint32_t  va_buf_offset;      // offset within shadow frame for the variadic buffer
 
     const M8EmissionMetadata *m8_plan;     // optional M8 emission metadata
+    M8EmitCtx                 *m8_emit;     // active direct-CFG emission state
     MLIR_BlockHandle          current_block; // LLVM block being lowered
 } FnCtx;
 
@@ -2237,8 +2239,9 @@ static bool va_call_layout(FnCtx *F, MLIR_OpHandle op, uint32_t *total_size,
 
 static bool prewalk_op(FnCtx *F, MLIR_OpHandle op) {
     string n = MLIR_GetOpName(op);
-    if (name_eq(n, "llvm.br") || name_eq(n, "llvm.cond_br") ||
-        name_eq(n, "llvm.switch") ||
+    if ((!F->m8_plan &&
+         (name_eq(n, "llvm.br") || name_eq(n, "llvm.cond_br") ||
+          name_eq(n, "llvm.switch"))) ||
         name_eq(n, "cf.br") || name_eq(n, "cf.cond_br") ||
         name_eq(n, "cf.switch")) {
         fprintf(stderr,
@@ -2348,6 +2351,7 @@ static bool lower_function_from_plan(MLIR_Context *ctx, Arena *arena,
                                      const uint8_t *result_types,
                                      size_t n_results,
                                      CFGInfoScratch *scratch);
+static bool m8_emit_function_body(FnCtx *F);
 
 // =============================================================================
 // LLVM CFG structurization — discovery, snapshot, normalization, analysis.
@@ -2355,14 +2359,15 @@ static bool lower_function_from_plan(MLIR_Context *ctx, Arena *arena,
 // Target pipeline (cf-lowering.md):
 //   LLVM MLIR  ->  CFGInfo (immutable snapshot)
 //             ->  NormalizedCFG (mutable graph for M5/M7/M8 rewrites)
-//             ->  StructuredPlan (future)
-//             ->  wasmssa.if / loop / block emission (future)
+//             ->  M8PlanNode tree (strict structured plan)
+//             ->  wasmssa.if / loop / block emission (M9)
 //
 // Upstream reference: mlir/lib/Transforms/Utils/CFGToSCF.cpp and the
 // mlir_lift_cf_to_scf.c port. Phase mapping:
 //   M5 — return normalization (shared return block, unify exits)  [implemented]
-//   M7 — cycle normalization (SCC decomposition, loop latches)    [in progress]
-//   M8 — branch normalization (entry/exit muxes, edge multiplexing)
+//   M7 — cycle normalization (SCC decomposition, loop latches)    [implemented]
+//   M8 — branch planning (post-dominance, explicit transfers)      [implemented]
+//   M9 — direct structured WasmSSA emission                        [implemented]
 //
 // LLVM MLIR is never mutated during normalization; only NormalizedCFG changes.
 // Discovery mirrors the cf->scf driver's post-order region walk.
@@ -2442,6 +2447,7 @@ typedef struct {
 typedef enum {
     NORM_BLOCK_ORIGINAL,
     NORM_BLOCK_SHARED_RETURN,
+    NORM_BLOCK_SHARED_UNREACHABLE,
     NORM_BLOCK_ENTRY_MUX,
     NORM_BLOCK_EXIT_MUX,
     NORM_BLOCK_LOOP_LATCH,
@@ -2722,7 +2728,7 @@ typedef struct {
 // M5 — return normalization (shared exit blocks for llvm.return sites).
 typedef enum {
     M5_EXIT_LLVM_RETURN,
-    // Later: M5_EXIT_LLVM_UNREACHABLE,
+    M5_EXIT_LLVM_UNREACHABLE,
 } M5ExitFlavor;
 
 typedef struct {
@@ -2983,6 +2989,7 @@ typedef struct {
     size_t        loop_id;
     size_t        loop_depth;
     NormOperand   replacement;
+    size_t        next_same_mlir;
 } M8ReplacementSlot;
 
 typedef struct {
@@ -2990,6 +2997,68 @@ typedef struct {
     size_t arg_index;
     MLIR_ValueHandle value;
 } M8NormArgBinding;
+
+typedef enum {
+    M8_PLAN_SEQUENCE,
+    M8_PLAN_IF,
+    M8_PLAN_SWITCH,
+    M8_PLAN_LOOP,
+    M8_PLAN_TRANSFER,
+    M8_PLAN_RETURN,
+    M8_PLAN_UNREACHABLE,
+} M8PlanKind;
+
+typedef struct {
+    size_t edge_id;
+    size_t target_block;
+    size_t target_node;
+} M8TransferPlan;
+
+typedef struct {
+    size_t next_node;
+} M8SequencePlan;
+
+typedef struct {
+    NormOperand condition;
+    size_t then_node;
+    size_t else_node;
+    size_t continuation_block;
+    size_t continuation_node;
+    MLIR_TypeHandle *result_types;
+    size_t n_results;
+} M8IfPlan;
+
+typedef struct {
+    NormOperand selector;
+    int64_t *case_values;
+    size_t *case_nodes;
+    size_t n_cases;
+    size_t default_node;
+    size_t continuation_block;
+    size_t continuation_node;
+    MLIR_TypeHandle *result_types;
+    size_t n_results;
+} M8SwitchPlan;
+
+typedef struct {
+    size_t loop_id;
+    size_t body_node;
+    size_t continuation_node;
+} M8LoopPlan;
+
+typedef struct {
+    size_t id;
+    M8PlanKind kind;
+    size_t source_block;
+    size_t owner_loop;
+    union {
+        M8SequencePlan sequence;
+        M8IfPlan if_plan;
+        M8SwitchPlan switch_plan;
+        M8LoopPlan loop_plan;
+        M8TransferPlan transfer;
+    } as;
+} M8PlanNode;
 
 typedef struct M8EmissionMetadata {
     CFGInfoScratch *scratch;
@@ -3001,12 +3070,19 @@ typedef struct M8EmissionMetadata {
     ValueIndexMap      replacement_by_mlir;
     M8NormArgBinding  *norm_arg_bindings;
     size_t             n_norm_arg_bindings;
+    M8PlanNode        *nodes;
+    size_t             n_nodes;
+    size_t             nodes_cap;
+    size_t             root_node;
+    size_t            *block_owner_node;
     bool               built;
+    bool               plan_built;
 } M8EmissionMetadata;
 
 // View of one target's CFG snapshot + normalized graph in a shared arena pool.
 typedef struct CFGInfoScratch {
     CFGAnalysisArena *pool;
+    MLIR_Context     *ctx;
     CFGInfo           cfg;
     NormalizedCFG     norm;
     CFGValueIndex     values;
@@ -3071,10 +3147,14 @@ static bool lower_function_impl(MLIR_Context *ctx, Arena *arena, ModCtx *mod,
         F.sp_value = sp_new;
     }
 
-    size_t nops = MLIR_GetBlockNumOps(entry);
-    F.current_block = entry;
-    for (size_t i = 0; i < nops; i++) {
-        if (!lower_op(&F, MLIR_GetBlockOp(entry, i))) goto fail;
+    if (scratch) {
+        if (!scratch->m8.plan_built || !m8_emit_function_body(&F)) goto fail;
+    } else {
+        size_t nops = MLIR_GetBlockNumOps(entry);
+        F.current_block = entry;
+        for (size_t i = 0; i < nops; i++) {
+            if (!lower_op(&F, MLIR_GetBlockOp(entry, i))) goto fail;
+        }
     }
 
     {
@@ -5662,7 +5742,7 @@ static bool m5_plan_add_site_from_return(M5Plan *plan, Arena *phase, Arena *grap
     return true;
 }
 
-// Discover llvm.return sites; no NormalizedCFG mutation.
+// Discover return-like sites; no NormalizedCFG mutation.
 static bool m5_prepare(NormalizedCFG *cfg, M5Plan *plan) {
     memset(plan, 0, sizeof(*plan));
 
@@ -5677,8 +5757,16 @@ static bool m5_prepare(NormalizedCFG *cfg, M5Plan *plan) {
 
         if (!block->active ||
             block->kind != NORM_BLOCK_ORIGINAL ||
-            block->term_source != NORM_TERM_SNAPSHOT ||
-            block->effective_term_kind != CFG_TERM_RETURN) {
+            block->term_source != NORM_TERM_SNAPSHOT) {
+            continue;
+        }
+
+        M5ExitFlavor flavor;
+        if (block->effective_term_kind == CFG_TERM_RETURN) {
+            flavor = M5_EXIT_LLVM_RETURN;
+        } else if (block->effective_term_kind == CFG_TERM_UNREACHABLE) {
+            flavor = M5_EXIT_LLVM_UNREACHABLE;
+        } else {
             continue;
         }
 
@@ -5688,11 +5776,11 @@ static bool m5_prepare(NormalizedCFG *cfg, M5Plan *plan) {
         if (ret == MLIR_INVALID_HANDLE) return false;
 
         size_t class_id = m5_plan_find_class_from_return(
-            plan, M5_EXIT_LLVM_RETURN, ret);
+            plan, flavor, ret);
 
         if (class_id == SIZE_MAX) {
             if (!m5_plan_add_class_from_return(plan, phase, graph,
-                                               M5_EXIT_LLVM_RETURN, ret,
+                                               flavor, ret,
                                                &class_id)) {
                 return false;
             }
@@ -5721,7 +5809,7 @@ static bool m5_reserve_commit_capacity(NormalizedCFG *cfg, const M5Plan *plan) {
     return true;
 }
 
-// Create NORM_BLOCK_SHARED_RETURN with a virtual return on block arguments.
+// Create one synthetic shared exit with a virtual terminal operation.
 static bool m5_create_shared_exit_block(NormalizedCFG *cfg, M5ExitFlavor flavor,
                                         const MLIR_TypeHandle *types,
                                         size_t n_types, size_t n_incoming_sites,
@@ -5730,8 +5818,12 @@ static bool m5_create_shared_exit_block(NormalizedCFG *cfg, M5ExitFlavor flavor,
     Arena *arena = cfg->graph_arena;
     if (!arena) return false;
 
+    CFGTermKind term_kind = flavor == M5_EXIT_LLVM_RETURN
+        ? CFG_TERM_RETURN : CFG_TERM_UNREACHABLE;
+    NormBlockKind block_kind = flavor == M5_EXIT_LLVM_RETURN
+        ? NORM_BLOCK_SHARED_RETURN : NORM_BLOCK_SHARED_UNREACHABLE;
     size_t shared_id = normalized_cfg_add_synthetic_block(
-        cfg, arena, NORM_BLOCK_SHARED_RETURN, CFG_TERM_RETURN, NULL, 0);
+        cfg, arena, block_kind, term_kind, NULL, 0);
     if (shared_id == SIZE_MAX) return false;
 
     NormBlock *nb = &cfg->blocks[shared_id];
@@ -5742,9 +5834,10 @@ static bool m5_create_shared_exit_block(NormalizedCFG *cfg, M5ExitFlavor flavor,
     norm_adj_prealloc(arena, &nb->incoming, n_incoming_sites);
 
     norm_terminator_init(&nb->normalized_term);
-    nb->normalized_term.kind = CFG_TERM_RETURN;
-    nb->normalized_term.n_return_values = n_types;
-    if (n_types > 0) {
+    nb->normalized_term.kind = term_kind;
+    nb->normalized_term.n_return_values =
+        term_kind == CFG_TERM_RETURN ? n_types : 0;
+    if (term_kind == CFG_TERM_RETURN && n_types > 0) {
         nb->normalized_term.return_values =
             arena_new_array(arena, NormOperand, n_types);
         if (!nb->normalized_term.return_values) return false;
@@ -5754,12 +5847,11 @@ static bool m5_create_shared_exit_block(NormalizedCFG *cfg, M5ExitFlavor flavor,
         }
     }
     nb->term_source = NORM_TERM_OWNED;
-    nb->effective_term_kind = CFG_TERM_RETURN;
+    nb->effective_term_kind = term_kind;
 
     if (!normalized_cfg_finalize_outgoing(cfg, shared_id)) {
         return false;
     }
-    (void)flavor;
     if (out_block_id) *out_block_id = shared_id;
     return true;
 }
@@ -7817,6 +7909,114 @@ static bool m8_lookup_norm_arg(const M8EmissionMetadata *meta, size_t block_id,
     return false;
 }
 
+typedef struct {
+    size_t slot;
+    MLIR_ValueHandle old_value;
+    bool old_bound;
+} M8BindingChange;
+
+typedef enum {
+    M8_LABEL_IF,
+    M8_LABEL_BLOCK,
+    M8_LABEL_LOOP,
+} M8LabelKind;
+
+typedef struct {
+    M8LabelKind kind;
+    size_t target_block;
+    size_t loop_id;
+} M8Label;
+
+struct M8EmitCtx {
+    FnCtx *F;
+    const M8EmissionMetadata *meta;
+    const NormalizedCFG *cfg;
+    size_t *arg_offsets;
+    MLIR_ValueHandle *arg_values;
+    bool *arg_bound;
+    size_t n_arg_slots;
+    ValueIndexMap arg_slot_by_mlir;
+    M8BindingChange *changes;
+    size_t n_changes;
+    size_t changes_cap;
+    M8Label *labels;
+    size_t n_labels;
+    size_t labels_cap;
+};
+
+static bool m8_emit_lookup_arg(const M8EmitCtx *ec, size_t block_id,
+                               size_t arg_index, MLIR_ValueHandle *out);
+
+static bool m8_emit_lookup_current_mlir_arg(const M8EmitCtx *ec,
+                                            MLIR_ValueHandle value,
+                                            MLIR_ValueHandle *out) {
+    if (!ec) return false;
+    size_t slot = value_index_map_probe(&ec->arg_slot_by_mlir, value);
+    if (slot == SIZE_MAX || slot >= ec->n_arg_slots ||
+        !ec->arg_bound[slot]) {
+        return false;
+    }
+    *out = ec->arg_values[slot];
+    return *out != MLIR_INVALID_HANDLE;
+}
+
+static bool m8_emit_grow_changes(M8EmitCtx *ec) {
+    size_t new_cap = ec->changes_cap ? ec->changes_cap * 2 : 32;
+    M8BindingChange *next = (M8BindingChange *)arena_alloc(
+        ec->F->arena, new_cap * sizeof(M8BindingChange));
+    if (!next) return false;
+    if (ec->n_changes) {
+        memcpy(next, ec->changes,
+               ec->n_changes * sizeof(M8BindingChange));
+    }
+    ec->changes = next;
+    ec->changes_cap = new_cap;
+    return true;
+}
+
+static size_t m8_emit_arg_slot(const M8EmitCtx *ec, size_t block_id,
+                               size_t arg_index) {
+    if (!ec || block_id >= ec->meta->n_blocks) return SIZE_MAX;
+    size_t begin = ec->arg_offsets[block_id];
+    size_t end = ec->arg_offsets[block_id + 1];
+    if (arg_index >= end - begin) return SIZE_MAX;
+    return begin + arg_index;
+}
+
+static bool m8_emit_lookup_arg(const M8EmitCtx *ec, size_t block_id,
+                               size_t arg_index, MLIR_ValueHandle *out) {
+    size_t slot = m8_emit_arg_slot(ec, block_id, arg_index);
+    if (slot == SIZE_MAX || !ec->arg_bound[slot]) return false;
+    *out = ec->arg_values[slot];
+    return *out != MLIR_INVALID_HANDLE;
+}
+
+static bool m8_emit_bind_arg(M8EmitCtx *ec, size_t block_id, size_t arg_index,
+                             MLIR_ValueHandle value) {
+    size_t slot = m8_emit_arg_slot(ec, block_id, arg_index);
+    if (slot == SIZE_MAX || value == MLIR_INVALID_HANDLE) {
+        return false;
+    }
+    if (ec->n_changes >= ec->changes_cap && !m8_emit_grow_changes(ec)) {
+        return false;
+    }
+    M8BindingChange *change = &ec->changes[ec->n_changes++];
+    change->slot = slot;
+    change->old_value = ec->arg_values[slot];
+    change->old_bound = ec->arg_bound[slot];
+    ec->arg_values[slot] = value;
+    ec->arg_bound[slot] = true;
+    return true;
+}
+
+static void m8_emit_restore_bindings(M8EmitCtx *ec, size_t checkpoint) {
+    while (ec->n_changes > checkpoint) {
+        M8BindingChange *change = &ec->changes[--ec->n_changes];
+        ec->arg_values[change->slot] = change->old_value;
+        ec->arg_bound[change->slot] = change->old_bound;
+    }
+}
+
 static bool m8_resolve_live_out(const M8EmissionMetadata *meta,
                                 size_t consumer_block,
                                 const NormValueKey *source,
@@ -7828,16 +8028,19 @@ static bool m8_resolve_live_out(const M8EmissionMetadata *meta,
 
     size_t begin = 0;
     size_t end = meta->n_replacement_slots;
+    bool use_chain = false;
     if (source->kind == NORM_OPERAND_MLIR) {
         size_t hint =
             value_index_map_probe(&meta->replacement_by_mlir, source->mlir_value);
         if (hint == SIZE_MAX) return false;
         begin = hint;
+        use_chain = true;
     }
 
     size_t best_depth = SIZE_MAX;
     bool found = false;
-    for (size_t i = begin; i < end; ++i) {
+    for (size_t i = begin; i < end;
+         i = use_chain ? meta->replacement_slots[i].next_same_mlir : i + 1) {
         const M8ReplacementSlot *s = &meta->replacement_slots[i];
         if (!norm_value_key_equal(&s->key, source)) continue;
         if (m8_block_in_loop_body(meta, s->loop_id, consumer_block)) continue;
@@ -7850,13 +8053,37 @@ static bool m8_resolve_live_out(const M8EmissionMetadata *meta,
     return found && norm_operand_is_valid(out);
 }
 
+static void m8_replacement_map_set(ValueIndexMap *map, Arena *arena,
+                                   MLIR_ValueHandle value, size_t index) {
+    size_t old = value_index_map_probe(map, value);
+    if (old == SIZE_MAX) {
+        value_index_map_put(map, arena, value, index);
+        return;
+    }
+    uintptr_t key = (uintptr_t)value;
+    size_t mask = map->cap - 1;
+    size_t slot = map_hash(key) & mask;
+    while (map->keys[slot] != key) slot = (slot + 1) & mask;
+    map->vals[slot] = index;
+}
+
 static bool fn_emit_norm_operand(FnCtx *F, const NormOperand *op,
                                  MLIR_ValueHandle *out) {
     if (!F || !op || !out || !norm_operand_is_valid(op)) return false;
     switch (op->kind) {
     case NORM_OPERAND_MLIR:
+        if (F->m8_emit &&
+            m8_emit_lookup_current_mlir_arg(F->m8_emit,
+                                            op->as.mlir_value, out)) {
+            return true;
+        }
         return vmap_get(F, op->as.mlir_value, out);
     case NORM_OPERAND_BLOCK_ARG:
+        if (F->m8_emit) {
+            return m8_emit_lookup_arg(F->m8_emit,
+                                      op->as.block_arg.block_id,
+                                      op->as.block_arg.arg_index, out);
+        }
         if (F->m8_plan) {
             return m8_lookup_norm_arg(F->m8_plan, op->as.block_arg.block_id,
                                       op->as.block_arg.arg_index, out);
@@ -7872,6 +8099,8 @@ static bool fn_emit_norm_operand(FnCtx *F, const NormOperand *op,
         return false;
     }
 }
+
+static bool m8_build_structured_plan(CFGInfoScratch *scratch);
 
 static bool m8_build_emission_metadata(CFGInfoScratch *scratch) {
     if (!scratch) return false;
@@ -7926,16 +8155,17 @@ static bool m8_build_emission_metadata(CFGInfoScratch *scratch) {
         s->loop_id = r->loop_id;
         s->loop_depth = m7_loop_depth(m7, r->loop_id);
         s->replacement = r->replacement;
-        if (s->key.kind == NORM_OPERAND_MLIR &&
-            value_index_map_probe(&meta->replacement_by_mlir,
-                                  s->key.mlir_value) == SIZE_MAX) {
-            value_index_map_put(&meta->replacement_by_mlir, arena,
-                                s->key.mlir_value, ri);
+        s->next_same_mlir = SIZE_MAX;
+        if (s->key.kind == NORM_OPERAND_MLIR) {
+            s->next_same_mlir = value_index_map_probe(
+                &meta->replacement_by_mlir, s->key.mlir_value);
+            m8_replacement_map_set(&meta->replacement_by_mlir, arena,
+                                   s->key.mlir_value, ri);
         }
     }
 
     meta->built = true;
-    return true;
+    return m8_build_structured_plan(scratch);
 }
 
 static int fn_vmap_get(FnCtx *F, MLIR_ValueHandle k, MLIR_ValueHandle *out) {
@@ -7951,6 +8181,10 @@ static int fn_vmap_get(FnCtx *F, MLIR_ValueHandle k, MLIR_ValueHandle *out) {
                 return 1;
             }
         }
+    }
+    if (F->m8_emit &&
+        m8_emit_lookup_current_mlir_arg(F->m8_emit, k, out)) {
+        return 1;
     }
     return vmap_get(F, k, out);
 }
@@ -8241,6 +8475,1359 @@ static bool m7_normalize_cycles(NormalizedCFG *cfg,
     return m7_verify_all(cfg, out);
 }
 
+// ---------------------------------------------------------------------------
+// M8 -- acyclic CFG to a strict structured plan.
+//
+// M7 has made every cycle explicit as one latch -> header backedge.  Hiding
+// those edges leaves a DAG.  M8 computes post-dominance on that DAG and builds
+// a tree: continuations occur once, while every incoming CFG edge remains an
+// explicit TRANSFER node carrying its normalized block arguments.  The plan
+// deliberately never guesses a branch label and never shares recursive plan
+// subtrees; shapes which still require an upstream-style edge multiplexer are
+// rejected instead of being silently miscompiled.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    M8EmissionMetadata *meta;
+    NormalizedCFG      *cfg;
+    M7Result           *m7;
+    MLIR_Context       *ctx;
+    Arena              *graph;
+    Arena              *phase;
+    bool               *hidden_edges;
+    size_t             *post_idom;
+    size_t             *post_position;
+    bool               *post_terminal;
+    size_t             *post_exits;
+    size_t              n_post_exits;
+    size_t              post_root;
+    size_t              post_n;
+    size_t             *reach_epoch;
+    size_t             *reach_stack;
+    size_t              current_reach_epoch;
+    size_t              reach_cached_target;
+} M8BuildCtx;
+
+typedef struct {
+    size_t node;
+    size_t next_index;
+} M8PostFrame;
+
+static bool m8_edge_hidden(const M8BuildCtx *bc, size_t edge_id) {
+    return edge_id < bc->cfg->n_edges && bc->hidden_edges[edge_id];
+}
+
+static bool m8_edge_visible(const M8BuildCtx *bc, size_t edge_id) {
+    return norm_edge_is_active(bc->cfg, edge_id) &&
+           !m8_edge_hidden(bc, edge_id);
+}
+
+static bool m8_post_terminal(const M8BuildCtx *bc, size_t block_id) {
+    if (bc->post_terminal) return bc->post_terminal[block_id];
+    NormEdgeIter it = norm_out_edges(bc->cfg, block_id);
+    size_t edge_id;
+    while (norm_edge_iter_next(&it, &edge_id)) {
+        if (m8_edge_visible(bc, edge_id)) return false;
+    }
+    return true;
+}
+
+// Return the Nth successor in the reverse graph.  The virtual root reaches all
+// DAG exits; a real block reaches its original predecessors.
+static size_t m8_post_successor(const M8BuildCtx *bc, size_t node,
+                                size_t *cursor) {
+    if (node == bc->post_root) {
+        if (*cursor >= bc->n_post_exits) return SIZE_MAX;
+        return bc->post_exits[(*cursor)++];
+    }
+
+    const NormAdjacency *incoming = &bc->cfg->blocks[node].incoming;
+    while (*cursor < incoming->n) {
+        size_t edge_id = incoming->edge_ids[(*cursor)++];
+        if (m8_edge_visible(bc, edge_id)) {
+            return bc->cfg->edges[edge_id].from;
+        }
+    }
+    return SIZE_MAX;
+}
+
+static size_t m8_post_intersect(const M8BuildCtx *bc, size_t lhs,
+                                size_t rhs) {
+    while (lhs != rhs) {
+        while (bc->post_position[lhs] > bc->post_position[rhs]) {
+            lhs = bc->post_idom[lhs];
+            if (lhs == SIZE_MAX) return SIZE_MAX;
+        }
+        while (bc->post_position[rhs] > bc->post_position[lhs]) {
+            rhs = bc->post_idom[rhs];
+            if (rhs == SIZE_MAX) return SIZE_MAX;
+        }
+    }
+    return lhs;
+}
+
+// Cooper-Harvey-Kennedy dominance on the reversed acyclic normalized graph.
+static bool m8_compute_post_dominance(M8BuildCtx *bc) {
+    size_t n_nodes = bc->cfg->n_blocks + 1;
+    bc->post_root = bc->cfg->n_blocks;
+    bc->post_n = n_nodes;
+
+    bool *visited = arena_new_array(bc->phase, bool, n_nodes);
+    size_t *postorder = arena_new_array(bc->phase, size_t, n_nodes);
+    M8PostFrame *stack = arena_new_array(bc->phase, M8PostFrame, n_nodes);
+    bc->post_position = arena_new_array(bc->phase, size_t, n_nodes);
+    bc->post_idom = arena_new_array(bc->phase, size_t, n_nodes);
+    bc->post_terminal = arena_new_array(bc->phase, bool, bc->cfg->n_blocks);
+    bc->post_exits = arena_new_array(bc->phase, size_t, bc->cfg->n_blocks);
+    if (!visited || !postorder || !stack || !bc->post_position ||
+        !bc->post_idom || !bc->post_terminal || !bc->post_exits) {
+        return false;
+    }
+    bc->n_post_exits = 0;
+    for (size_t bid = 0; bid < bc->cfg->n_blocks; ++bid) {
+        bool terminal = false;
+        if (bc->cfg->blocks[bid].active) {
+            terminal = true;
+            NormEdgeIter it = norm_out_edges(bc->cfg, bid);
+            size_t edge_id;
+            while (norm_edge_iter_next(&it, &edge_id)) {
+                if (m8_edge_visible(bc, edge_id)) {
+                    terminal = false;
+                    break;
+                }
+            }
+        }
+        bc->post_terminal[bid] = terminal;
+        if (terminal) bc->post_exits[bc->n_post_exits++] = bid;
+    }
+    if (bc->n_post_exits == 0) return false;
+    memset(visited, 0, n_nodes * sizeof(bool));
+    for (size_t i = 0; i < n_nodes; ++i) {
+        bc->post_position[i] = SIZE_MAX;
+        bc->post_idom[i] = SIZE_MAX;
+    }
+
+    size_t sp = 0, post_n = 0;
+    visited[bc->post_root] = true;
+    stack[sp++] = (M8PostFrame){bc->post_root, 0};
+    while (sp > 0) {
+        M8PostFrame *frame = &stack[sp - 1];
+        size_t succ = m8_post_successor(bc, frame->node,
+                                        &frame->next_index);
+        if (succ != SIZE_MAX) {
+            if (!visited[succ]) {
+                visited[succ] = true;
+                stack[sp++] = (M8PostFrame){succ, 0};
+            }
+            continue;
+        }
+        postorder[post_n++] = frame->node;
+        --sp;
+    }
+    if (post_n == 0) return false;
+
+    size_t *rpo = arena_new_array(bc->phase, size_t, post_n);
+    if (!rpo) return false;
+    for (size_t i = 0; i < post_n; ++i) {
+        rpo[i] = postorder[post_n - i - 1];
+        bc->post_position[rpo[i]] = i;
+    }
+    bc->post_idom[bc->post_root] = bc->post_root;
+
+    // The M7 backedge-hidden graph is a DAG, so reverse RPO is topological:
+    // every reverse predecessor already has an idom and one CHK pass suffices.
+    for (size_t ri = 1; ri < post_n; ++ri) {
+        size_t bid = rpo[ri];
+        size_t new_idom = SIZE_MAX;
+
+        // Predecessors in the reverse graph are visible forward successors.
+        NormEdgeIter it = norm_out_edges(bc->cfg, bid);
+        size_t edge_id;
+        while (norm_edge_iter_next(&it, &edge_id)) {
+            if (!m8_edge_visible(bc, edge_id)) continue;
+            size_t succ = bc->cfg->edges[edge_id].to;
+            if (succ >= n_nodes || bc->post_idom[succ] == SIZE_MAX) continue;
+            new_idom = new_idom == SIZE_MAX
+                ? succ : m8_post_intersect(bc, new_idom, succ);
+        }
+        if (m8_post_terminal(bc, bid)) new_idom = bc->post_root;
+        if (new_idom == SIZE_MAX) return false;
+        bc->post_idom[bid] = new_idom;
+    }
+
+    // Every active block must reach an exit after loop backedges are hidden.
+    for (size_t bid = 0; bid < bc->cfg->n_blocks; ++bid) {
+        if (bc->cfg->blocks[bid].active && bc->post_idom[bid] == SIZE_MAX) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool m8_plan_grow_nodes(M8BuildCtx *bc) {
+    M8EmissionMetadata *meta = bc->meta;
+    size_t new_cap = meta->nodes_cap ? meta->nodes_cap * 2 : 32;
+    M8PlanNode *next = arena_new_array(bc->graph, M8PlanNode, new_cap);
+    if (!next) return false;
+    if (meta->n_nodes > 0) {
+        memcpy(next, meta->nodes, meta->n_nodes * sizeof(M8PlanNode));
+    }
+    meta->nodes = next;
+    meta->nodes_cap = new_cap;
+    return true;
+}
+
+static bool m8_plan_new_node(M8BuildCtx *bc, M8PlanKind kind,
+                             size_t source_block, size_t owner_loop,
+                             size_t *out_node) {
+    M8EmissionMetadata *meta = bc->meta;
+    if (meta->n_nodes >= meta->nodes_cap && !m8_plan_grow_nodes(bc)) {
+        return false;
+    }
+    size_t id = meta->n_nodes++;
+    M8PlanNode *node = &meta->nodes[id];
+    memset(node, 0, sizeof(*node));
+    node->id = id;
+    node->kind = kind;
+    node->source_block = source_block;
+    node->owner_loop = owner_loop;
+    node->as.sequence.next_node = SIZE_MAX;
+    if (out_node) *out_node = id;
+    return true;
+}
+
+static bool m8_plan_claim_block(M8BuildCtx *bc, size_t block_id,
+                                size_t node_id) {
+    if (block_id >= bc->meta->n_blocks ||
+        bc->meta->block_owner_node[block_id] != SIZE_MAX) {
+        return false;
+    }
+    bc->meta->block_owner_node[block_id] = node_id;
+    return true;
+}
+
+static size_t m8_edge_for_successor_slot(const M8BuildCtx *bc,
+                                         size_t block_id, size_t slot) {
+    NormEdgeIter it = norm_out_edges(bc->cfg, block_id);
+    size_t edge_id;
+    while (norm_edge_iter_next(&it, &edge_id)) {
+        if (!m8_edge_visible(bc, edge_id)) continue;
+        if (bc->cfg->edges[edge_id].successor_slot == slot) return edge_id;
+    }
+    return SIZE_MAX;
+}
+
+static bool m8_block_selector(const M8BuildCtx *bc, size_t block_id,
+                              NormOperand *out) {
+    norm_operand_init(out);
+    const NormBlock *block = &bc->cfg->blocks[block_id];
+    const NormTerminator *owned =
+        normalized_cfg_block_owned_terminator(bc->cfg, block_id);
+    if (owned && norm_operand_is_valid(&owned->selector)) {
+        *out = owned->selector;
+        return true;
+    }
+    if (block->source_terminator == MLIR_INVALID_HANDLE ||
+        MLIR_GetOpNumOperands(block->source_terminator) == 0) {
+        return false;
+    }
+    MLIR_ValueHandle value = MLIR_GetOpOperand(block->source_terminator, 0);
+    *out = norm_operand_mlir(MLIR_GetValueType(value), value);
+    return true;
+}
+
+static bool m8_copy_block_result_types(M8BuildCtx *bc, size_t block_id,
+                                       MLIR_TypeHandle **out_types,
+                                       size_t *out_n) {
+    *out_types = NULL;
+    *out_n = 0;
+    if (block_id == SIZE_MAX || block_id >= bc->cfg->n_blocks) return true;
+    const NormBlock *block = &bc->cfg->blocks[block_id];
+    if (block->n_args == 0) return true;
+    MLIR_TypeHandle *types =
+        arena_new_array(bc->graph, MLIR_TypeHandle, block->n_args);
+    if (!types) return false;
+    for (size_t i = 0; i < block->n_args; ++i) types[i] = block->args[i].type;
+    *out_types = types;
+    *out_n = block->n_args;
+    return true;
+}
+
+static bool m8_parse_snapshot_switch_cases(M8BuildCtx *bc, size_t block_id,
+                                           int64_t **out_values,
+                                           size_t *out_n) {
+    *out_values = NULL;
+    *out_n = 0;
+    const NormBlock *block = &bc->cfg->blocks[block_id];
+    size_t n_out = normalized_cfg_num_active_out_edges(bc->cfg, block_id);
+    if (n_out == 0) return false;
+    size_t n_cases = n_out - 1;
+    if (n_cases == 0) return true;
+
+    int64_t *values = arena_new_array(bc->graph, int64_t, n_cases);
+    if (!values) return false;
+    MLIR_AttributeHandle attr = MLIR_GetOpAttributeByName(
+        block->source_terminator, "case_values");
+    if (attr == MLIR_INVALID_HANDLE) return false;
+    string text = MLIR_GetAttributeAsString(bc->ctx, attr);
+    size_t p = 0;
+    while (p < text.size && text.str[p] != ':') ++p;
+    if (p < text.size) ++p;
+    size_t parsed = 0;
+    while (p < text.size && parsed < n_cases) {
+        while (p < text.size && (text.str[p] == ' ' || text.str[p] == ',')) ++p;
+        if (p >= text.size || text.str[p] == '>') break;
+        bool negative = false;
+        if (text.str[p] == '-') { negative = true; ++p; }
+        uint64_t magnitude = 0;
+        bool digit = false;
+        while (p < text.size && text.str[p] >= '0' && text.str[p] <= '9') {
+            uint64_t next_digit = (uint64_t)(text.str[p++] - '0');
+            uint64_t limit = negative
+                ? (uint64_t)INT64_MAX + 1u : (uint64_t)INT64_MAX;
+            if (magnitude > (limit - next_digit) / 10u) return false;
+            magnitude = magnitude * 10u + next_digit;
+            digit = true;
+        }
+        if (!digit) return false;
+        if (negative && magnitude == (uint64_t)INT64_MAX + 1u) {
+            values[parsed++] = INT64_MIN;
+        } else {
+            int64_t value = (int64_t)magnitude;
+            values[parsed++] = negative ? -value : value;
+        }
+    }
+    if (parsed != n_cases) return false;
+    *out_values = values;
+    *out_n = n_cases;
+    return true;
+}
+
+static bool m8_plan_from(M8BuildCtx *bc, size_t entry, size_t stop,
+                         size_t owner_loop, size_t *out_node);
+
+static bool m8_reaches_block(M8BuildCtx *bc, size_t from, size_t target) {
+    if (from == target) return true;
+    if (from >= bc->cfg->n_blocks || target >= bc->cfg->n_blocks) return false;
+    if (bc->reach_cached_target != target) {
+        if (++bc->current_reach_epoch == SIZE_MAX) {
+            memset(bc->reach_epoch, 0,
+                   bc->cfg->n_blocks * sizeof(size_t));
+            bc->current_reach_epoch = 1;
+        }
+        size_t epoch = bc->current_reach_epoch;
+        size_t sp = 0;
+        bc->reach_epoch[target] = epoch;
+        bc->reach_stack[sp++] = target;
+        while (sp > 0) {
+            size_t block_id = bc->reach_stack[--sp];
+            NormEdgeIter it = norm_in_edges(bc->cfg, block_id);
+            size_t edge_id;
+            while (norm_edge_iter_next(&it, &edge_id)) {
+                if (!m8_edge_visible(bc, edge_id)) continue;
+                size_t pred = bc->cfg->edges[edge_id].from;
+                if (bc->reach_epoch[pred] == epoch) continue;
+                bc->reach_epoch[pred] = epoch;
+                bc->reach_stack[sp++] = pred;
+            }
+        }
+        bc->reach_cached_target = target;
+    }
+    return bc->reach_epoch[from] == bc->current_reach_epoch;
+}
+
+// Global post-dominance intentionally uses a virtual exit.  Inside an outer
+// branch region, however, a mixed return/continue child must use the caller's
+// stop block as its local continuation when any child path reaches that stop.
+static size_t m8_select_continuation(M8BuildCtx *bc, size_t block_id,
+                                     size_t stop) {
+    size_t continuation = bc->post_idom[block_id];
+    if (continuation != bc->post_root) return continuation;
+    if (stop == SIZE_MAX || stop >= bc->cfg->n_blocks) return SIZE_MAX;
+    NormEdgeIter it = norm_out_edges(bc->cfg, block_id);
+    size_t edge_id;
+    while (norm_edge_iter_next(&it, &edge_id)) {
+        if (!m8_edge_visible(bc, edge_id)) continue;
+        if (m8_reaches_block(bc, bc->cfg->edges[edge_id].to, stop)) {
+            return stop;
+        }
+    }
+    return SIZE_MAX;
+}
+
+static bool m8_plan_transfer(M8BuildCtx *bc, size_t edge_id, size_t stop,
+                             size_t owner_loop, size_t *out_node) {
+    if (!m8_edge_visible(bc, edge_id)) return false;
+    const NormEdge *edge = &bc->cfg->edges[edge_id];
+    size_t node_id;
+    if (!m8_plan_new_node(bc, M8_PLAN_TRANSFER, edge->from, owner_loop,
+                          &node_id)) {
+        return false;
+    }
+    size_t target_node = SIZE_MAX;
+    if (edge->to != stop &&
+        !m8_plan_from(bc, edge->to, stop, owner_loop, &target_node)) {
+        return false;
+    }
+    M8PlanNode *node = &bc->meta->nodes[node_id];
+    node->as.transfer.edge_id = edge_id;
+    node->as.transfer.target_block = edge->to;
+    node->as.transfer.target_node = target_node;
+    *out_node = node_id;
+    return true;
+}
+
+static bool m8_plan_loop(M8BuildCtx *bc, size_t loop_id, size_t stop,
+                         size_t owner_loop, size_t *out_node) {
+    if (loop_id >= bc->m7->n_loops) return false;
+    const M7Loop *loop = &bc->m7->loops[loop_id];
+    size_t node_id;
+    if (!m8_plan_new_node(bc, M8_PLAN_LOOP, SIZE_MAX, owner_loop, &node_id)) {
+        return false;
+    }
+    if (!m8_plan_claim_block(bc, loop->latch, node_id)) return false;
+
+    size_t body_node = SIZE_MAX;
+    if (!m8_plan_from(bc, loop->header, loop->latch, loop_id, &body_node)) {
+        return false;
+    }
+    size_t continuation_node = SIZE_MAX;
+    if (loop->exit_dispatch != stop &&
+        !m8_plan_from(bc, loop->exit_dispatch, stop, owner_loop,
+                      &continuation_node)) {
+        return false;
+    }
+    M8PlanNode *node = &bc->meta->nodes[node_id];
+    node->as.loop_plan.loop_id = loop_id;
+    node->as.loop_plan.body_node = body_node;
+    node->as.loop_plan.continuation_node = continuation_node;
+    *out_node = node_id;
+    return true;
+}
+
+static bool m8_plan_if(M8BuildCtx *bc, size_t block_id, size_t stop,
+                       size_t owner_loop, size_t node_id) {
+    size_t continuation = m8_select_continuation(bc, block_id, stop);
+    if (continuation != SIZE_MAX && continuation == block_id) return false;
+
+    size_t then_edge = m8_edge_for_successor_slot(bc, block_id, 0);
+    size_t else_edge = m8_edge_for_successor_slot(bc, block_id, 1);
+    if (then_edge == SIZE_MAX || else_edge == SIZE_MAX) return false;
+
+    NormOperand condition;
+    if (!m8_block_selector(bc, block_id, &condition)) return false;
+    MLIR_TypeHandle *result_types = NULL;
+    size_t n_results = 0;
+    if (!m8_copy_block_result_types(bc, continuation, &result_types,
+                                    &n_results)) {
+        return false;
+    }
+
+    size_t then_node = SIZE_MAX, else_node = SIZE_MAX;
+    if (!m8_plan_transfer(bc, then_edge, continuation, owner_loop,
+                          &then_node) ||
+        !m8_plan_transfer(bc, else_edge, continuation, owner_loop,
+                          &else_node)) {
+        return false;
+    }
+    size_t continuation_node = SIZE_MAX;
+    if (continuation != SIZE_MAX && continuation != stop &&
+        !m8_plan_from(bc, continuation, stop, owner_loop,
+                      &continuation_node)) {
+        return false;
+    }
+
+    M8PlanNode *node = &bc->meta->nodes[node_id];
+    node->as.if_plan.condition = condition;
+    node->as.if_plan.then_node = then_node;
+    node->as.if_plan.else_node = else_node;
+    node->as.if_plan.continuation_block = continuation;
+    node->as.if_plan.continuation_node = continuation_node;
+    node->as.if_plan.result_types = result_types;
+    node->as.if_plan.n_results = n_results;
+    return true;
+}
+
+static bool m8_plan_switch(M8BuildCtx *bc, size_t block_id, size_t stop,
+                           size_t owner_loop, size_t node_id) {
+    size_t continuation = m8_select_continuation(bc, block_id, stop);
+    if (continuation != SIZE_MAX && continuation == block_id) return false;
+
+    NormOperand selector;
+    if (!m8_block_selector(bc, block_id, &selector)) return false;
+
+    const NormTerminator *owned =
+        normalized_cfg_block_owned_terminator(bc->cfg, block_id);
+    int64_t *case_values = NULL;
+    size_t n_cases = 0;
+    size_t default_edge = SIZE_MAX;
+    size_t *case_edges = NULL;
+    if (owned) {
+        n_cases = owned->n_cases;
+        default_edge = owned->default_edge_id;
+        if (n_cases > 0) {
+            case_values = arena_new_array(bc->graph, int64_t, n_cases);
+            case_edges = arena_new_array(bc->phase, size_t, n_cases);
+            if (!case_values || !case_edges) return false;
+            for (size_t i = 0; i < n_cases; ++i) {
+                case_values[i] = owned->case_values[i];
+            }
+            memcpy(case_edges, owned->case_edge_ids,
+                   n_cases * sizeof(size_t));
+        }
+    } else {
+        if (!m8_parse_snapshot_switch_cases(bc, block_id, &case_values,
+                                            &n_cases)) {
+            return false;
+        }
+        size_t *slot_edges = arena_new_array(
+            bc->phase, size_t, n_cases + 1);
+        if (!slot_edges) return false;
+        for (size_t i = 0; i <= n_cases; ++i) slot_edges[i] = SIZE_MAX;
+        NormEdgeIter edge_it = norm_out_edges(bc->cfg, block_id);
+        size_t edge_id;
+        while (norm_edge_iter_next(&edge_it, &edge_id)) {
+            if (!m8_edge_visible(bc, edge_id)) continue;
+            size_t slot = bc->cfg->edges[edge_id].successor_slot;
+            if (slot > n_cases || slot_edges[slot] != SIZE_MAX) return false;
+            slot_edges[slot] = edge_id;
+        }
+        default_edge = slot_edges[0];
+        if (n_cases > 0) {
+            case_edges = arena_new_array(bc->phase, size_t, n_cases);
+            if (!case_edges) return false;
+            for (size_t i = 0; i < n_cases; ++i) {
+                case_edges[i] = slot_edges[i + 1];
+            }
+        }
+    }
+    if (default_edge == SIZE_MAX) return false;
+
+    size_t *case_nodes = n_cases
+        ? arena_new_array(bc->graph, size_t, n_cases) : NULL;
+    if (n_cases > 0 && !case_nodes) return false;
+    for (size_t i = 0; i < n_cases; ++i) {
+        if (case_edges[i] == SIZE_MAX ||
+            !m8_plan_transfer(bc, case_edges[i], continuation, owner_loop,
+                              &case_nodes[i])) {
+            return false;
+        }
+    }
+    size_t default_node = SIZE_MAX;
+    if (!m8_plan_transfer(bc, default_edge, continuation, owner_loop,
+                          &default_node)) {
+        return false;
+    }
+
+    size_t continuation_node = SIZE_MAX;
+    if (continuation != SIZE_MAX && continuation != stop &&
+        !m8_plan_from(bc, continuation, stop, owner_loop,
+                      &continuation_node)) {
+        return false;
+    }
+    MLIR_TypeHandle *result_types = NULL;
+    size_t n_results = 0;
+    if (!m8_copy_block_result_types(bc, continuation, &result_types,
+                                    &n_results)) {
+        return false;
+    }
+
+    M8PlanNode *node = &bc->meta->nodes[node_id];
+    node->as.switch_plan.selector = selector;
+    node->as.switch_plan.case_values = case_values;
+    node->as.switch_plan.case_nodes = case_nodes;
+    node->as.switch_plan.n_cases = n_cases;
+    node->as.switch_plan.default_node = default_node;
+    node->as.switch_plan.continuation_block = continuation;
+    node->as.switch_plan.continuation_node = continuation_node;
+    node->as.switch_plan.result_types = result_types;
+    node->as.switch_plan.n_results = n_results;
+    return true;
+}
+
+static bool m8_plan_from(M8BuildCtx *bc, size_t entry, size_t stop,
+                         size_t owner_loop, size_t *out_node) {
+    *out_node = SIZE_MAX;
+    if (entry == stop) return true;
+    if (entry >= bc->cfg->n_blocks || !bc->cfg->blocks[entry].active) {
+        return false;
+    }
+
+    size_t nested_loop = entry < bc->cfg->n_blocks
+        ? bc->m7->header_to_loop[entry] : SIZE_MAX;
+    if (nested_loop != SIZE_MAX && nested_loop != owner_loop) {
+        return m8_plan_loop(bc, nested_loop, stop, owner_loop, out_node);
+    }
+
+    CFGTermKind term_kind = normalized_cfg_block_term_kind(bc->cfg, entry);
+    M8PlanKind kind;
+    switch (term_kind) {
+    case CFG_TERM_BR:          kind = M8_PLAN_SEQUENCE; break;
+    case CFG_TERM_COND_BR:     kind = M8_PLAN_IF; break;
+    case CFG_TERM_SWITCH:      kind = M8_PLAN_SWITCH; break;
+    case CFG_TERM_RETURN:      kind = M8_PLAN_RETURN; break;
+    case CFG_TERM_UNREACHABLE: kind = M8_PLAN_UNREACHABLE; break;
+    default: return false;
+    }
+
+    size_t node_id;
+    if (!m8_plan_new_node(bc, kind, entry, owner_loop, &node_id) ||
+        !m8_plan_claim_block(bc, entry, node_id)) {
+        return false;
+    }
+
+    if (kind == M8_PLAN_SEQUENCE) {
+        size_t edge_id = m8_edge_for_successor_slot(bc, entry, 0);
+        if (edge_id == SIZE_MAX) return false;
+        size_t next_node = SIZE_MAX;
+        if (!m8_plan_transfer(bc, edge_id, stop, owner_loop, &next_node)) {
+            return false;
+        }
+        bc->meta->nodes[node_id].as.sequence.next_node = next_node;
+    } else if (kind == M8_PLAN_IF) {
+        if (!m8_plan_if(bc, entry, stop, owner_loop, node_id)) return false;
+    } else if (kind == M8_PLAN_SWITCH) {
+        if (!m8_plan_switch(bc, entry, stop, owner_loop, node_id)) return false;
+    }
+
+    *out_node = node_id;
+    return true;
+}
+
+static bool m8_build_structured_plan(CFGInfoScratch *scratch) {
+    if (!scratch || !scratch->m8.built) return false;
+    M8EmissionMetadata *meta = &scratch->m8;
+    NormalizedCFG *cfg = &scratch->norm;
+    Arena *graph = cfg->graph_arena;
+    Arena *phase = cfg->phase_arena;
+    if (!graph || !phase || cfg->n_blocks == 0) return false;
+
+    M8BuildCtx bc;
+    memset(&bc, 0, sizeof(bc));
+    bc.meta = meta;
+    bc.cfg = cfg;
+    bc.m7 = &scratch->m7;
+    bc.ctx = scratch->ctx;
+    bc.graph = graph;
+    bc.phase = phase;
+    bc.reach_cached_target = SIZE_MAX;
+
+    meta->root_node = SIZE_MAX;
+    meta->block_owner_node = arena_new_array(graph, size_t, cfg->n_blocks);
+    bc.hidden_edges = arena_new_array(phase, bool, cfg->n_edges);
+    bc.reach_epoch = arena_new_array(phase, size_t, cfg->n_blocks);
+    bc.reach_stack = arena_new_array(phase, size_t, cfg->n_blocks);
+    if (!meta->block_owner_node || (cfg->n_edges > 0 && !bc.hidden_edges)) {
+        return false;
+    }
+    if (!bc.reach_epoch || !bc.reach_stack) return false;
+    memset(bc.reach_epoch, 0, cfg->n_blocks * sizeof(size_t));
+    for (size_t i = 0; i < cfg->n_blocks; ++i) {
+        meta->block_owner_node[i] = SIZE_MAX;
+    }
+    if (cfg->n_edges > 0) {
+        memset(bc.hidden_edges, 0, cfg->n_edges * sizeof(bool));
+    }
+    for (size_t i = 0; i < bc.m7->n_loops; ++i) {
+        size_t back_edge = bc.m7->loops[i].back_edge;
+        if (back_edge >= cfg->n_edges) return false;
+        bc.hidden_edges[back_edge] = true;
+    }
+
+    if (!m8_compute_post_dominance(&bc)) return false;
+    if (!m8_plan_from(&bc, cfg->entry_block, SIZE_MAX, SIZE_MAX,
+                      &meta->root_node)) {
+        return false;
+    }
+    meta->plan_built = meta->root_node != SIZE_MAX;
+    normalized_cfg_reset_phase_storage(cfg);
+    return meta->plan_built;
+}
+
+// ---------------------------------------------------------------------------
+// M9 -- emit the strict M8 tree directly as structured WasmSSA.
+// ---------------------------------------------------------------------------
+
+static bool m8_emit_plan_node(M8EmitCtx *ec, size_t node_id);
+static bool m8_emit_loop_latch(M8EmitCtx *ec, size_t loop_id);
+
+static bool m8_emit_push_label(M8EmitCtx *ec, M8LabelKind kind,
+                               size_t target_block, size_t loop_id) {
+    if (ec->n_labels >= ec->labels_cap) {
+        size_t new_cap = ec->labels_cap ? ec->labels_cap * 2 : 16;
+        M8Label *next = (M8Label *)arena_alloc(
+            ec->F->arena, new_cap * sizeof(M8Label));
+        if (!next) return false;
+        if (ec->n_labels) {
+            memcpy(next, ec->labels, ec->n_labels * sizeof(M8Label));
+        }
+        ec->labels = next;
+        ec->labels_cap = new_cap;
+    }
+    ec->labels[ec->n_labels++] = (M8Label){kind, target_block, loop_id};
+    return true;
+}
+
+static void m8_emit_pop_label(M8EmitCtx *ec) {
+    if (ec->n_labels > 0) --ec->n_labels;
+}
+
+static bool m8_emit_find_label(const M8EmitCtx *ec, size_t target_block,
+                               uint32_t *out_depth, M8LabelKind *out_kind) {
+    for (size_t i = ec->n_labels; i > 0; --i) {
+        const M8Label *label = &ec->labels[i - 1];
+        if (label->target_block != target_block) continue;
+        *out_depth = (uint32_t)(ec->n_labels - i);
+        if (out_kind) *out_kind = label->kind;
+        return true;
+    }
+    return false;
+}
+
+static MLIR_ValueHandle m8_emit_zero(FnCtx *F, MLIR_TypeHandle type) {
+    uint8_t vt = wasm_vt(F->ctx, type);
+    if (vt == 0) return MLIR_INVALID_HANDLE;
+    wasmssa_op_t op = {0};
+    op.type = OP_TYPE_WASMSSA_CONST;
+    op.valtype = vt;
+    op.i_const = 0;
+    op.has_result = true;
+    return commit_op(F, &op);
+}
+
+static bool m8_emit_operand(M8EmitCtx *ec, const NormOperand *operand,
+                            MLIR_ValueHandle *out) {
+    if (operand->kind == NORM_OPERAND_UNDEF) {
+        *out = m8_emit_zero(ec->F, operand->type);
+        return *out != MLIR_INVALID_HANDLE;
+    }
+    return fn_emit_norm_operand(ec->F, operand, out);
+}
+
+static bool m8_emit_result_vts(FnCtx *F, MLIR_TypeHandle *types, size_t n,
+                               uint8_t **out) {
+    *out = NULL;
+    if (n == 0) return true;
+    uint8_t *vts = (uint8_t *)arena_alloc(F->arena, n);
+    if (!vts) return false;
+    for (size_t i = 0; i < n; ++i) {
+        vts[i] = wasm_vt(F->ctx, types[i]);
+        if (vts[i] == 0) return false;
+    }
+    *out = vts;
+    return true;
+}
+
+static bool m8_emit_edge_values(M8EmitCtx *ec, size_t edge_id,
+                                MLIR_ValueHandle **out_values,
+                                size_t *out_n) {
+    *out_values = NULL;
+    *out_n = 0;
+    size_t n = normalized_cfg_edge_num_operands(ec->cfg, edge_id);
+    if (n == 0) return true;
+    MLIR_ValueHandle *values = (MLIR_ValueHandle *)arena_alloc(
+        ec->F->arena, n * sizeof(MLIR_ValueHandle));
+    if (!values) return false;
+    for (size_t i = 0; i < n; ++i) {
+        NormOperand operand;
+        if (!normalized_cfg_edge_operand_resolve(ec->cfg, edge_id, i,
+                                                  &operand) ||
+            !m8_emit_operand(ec, &operand, &values[i])) {
+            return false;
+        }
+    }
+    *out_values = values;
+    *out_n = n;
+    return true;
+}
+
+static bool m8_emit_bind_values(M8EmitCtx *ec, size_t block_id,
+                                MLIR_ValueHandle *values, size_t n) {
+    if (block_id >= ec->cfg->n_blocks ||
+        ec->cfg->blocks[block_id].n_args != n) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (!m8_emit_bind_arg(ec, block_id, i, values[i])) return false;
+    }
+    return true;
+}
+
+static bool m8_emit_block_data(M8EmitCtx *ec, size_t block_id) {
+    if (block_id >= ec->cfg->n_blocks) return false;
+    const NormBlock *block = &ec->cfg->blocks[block_id];
+    if (block->kind != NORM_BLOCK_ORIGINAL) return true;
+    if (block->mlir_block == MLIR_INVALID_HANDLE) return false;
+
+    ec->F->current_block = block->mlir_block;
+    size_t n_ops = MLIR_GetBlockNumOps(block->mlir_block);
+    for (size_t i = 0; i < n_ops; ++i) {
+        MLIR_OpHandle op = MLIR_GetBlockOp(block->mlir_block, i);
+        if (op == block->source_terminator) continue;
+        if (!lower_op(ec->F, op)) return false;
+    }
+    return true;
+}
+
+static bool m8_emit_transfer(M8EmitCtx *ec, const M8TransferPlan *transfer,
+                             size_t *out_next_node) {
+    *out_next_node = SIZE_MAX;
+    MLIR_ValueHandle *values = NULL;
+    size_t n_values = 0;
+    if (!m8_emit_edge_values(ec, transfer->edge_id, &values, &n_values)) {
+        return false;
+    }
+
+    // Reaching the active loop latch performs the loop's exit/backedge split.
+    for (size_t i = ec->n_labels; i > 0; --i) {
+        const M8Label *label = &ec->labels[i - 1];
+        if (label->kind != M8_LABEL_LOOP ||
+            label->loop_id >= ec->meta->scratch->m7.n_loops) {
+            continue;
+        }
+        const M7Loop *loop = &ec->meta->scratch->m7.loops[label->loop_id];
+        if (loop->latch == transfer->target_block) {
+            if (!m8_emit_bind_values(ec, transfer->target_block,
+                                     values, n_values)) {
+                return false;
+            }
+            return m8_emit_loop_latch(ec, label->loop_id);
+        }
+    }
+
+    uint32_t depth;
+    M8LabelKind kind;
+    if (m8_emit_find_label(ec, transfer->target_block, &depth, &kind)) {
+        if (kind == M8_LABEL_IF && depth == 0) {
+            emit_block_return(ec->F, values, n_values);
+        } else {
+            emit_br_args(ec->F, depth, values, n_values);
+        }
+        return true;
+    }
+
+    if (!m8_emit_bind_values(ec, transfer->target_block, values, n_values)) {
+        return false;
+    }
+    if (transfer->target_node == SIZE_MAX) return false;
+    *out_next_node = transfer->target_node;
+    return true;
+}
+
+static bool m8_emit_if_node(M8EmitCtx *ec, const M8IfPlan *plan) {
+    FnCtx *F = ec->F;
+    MLIR_ValueHandle condition;
+    if (!m8_emit_operand(ec, &plan->condition, &condition)) return false;
+
+    uint8_t *result_vts = NULL;
+    if (!m8_emit_result_vts(F, plan->result_types, plan->n_results,
+                            &result_vts)) {
+        return false;
+    }
+    MLIR_BlockHandle saved = F->body_block;
+    size_t checkpoint = ec->n_changes;
+
+    MLIR_BlockHandle then_block = MLIR_CreateBlock(F->ctx);
+    F->body_block = then_block;
+    if (!m8_emit_push_label(ec, M8_LABEL_IF, plan->continuation_block,
+                            SIZE_MAX) ||
+        !m8_emit_plan_node(ec, plan->then_node)) {
+        F->body_block = saved;
+        return false;
+    }
+    m8_emit_pop_label(ec);
+    m8_emit_restore_bindings(ec, checkpoint);
+
+    MLIR_BlockHandle else_block = MLIR_CreateBlock(F->ctx);
+    F->body_block = else_block;
+    if (!m8_emit_push_label(ec, M8_LABEL_IF, plan->continuation_block,
+                            SIZE_MAX) ||
+        !m8_emit_plan_node(ec, plan->else_node)) {
+        F->body_block = saved;
+        return false;
+    }
+    m8_emit_pop_label(ec);
+    m8_emit_restore_bindings(ec, checkpoint);
+    F->body_block = saved;
+
+    MLIR_RegionHandle then_region = MLIR_CreateRegion(F->ctx);
+    MLIR_AppendRegionBlock(F->ctx, then_region, then_block);
+    MLIR_RegionHandle else_region = MLIR_CreateRegion(F->ctx);
+    MLIR_AppendRegionBlock(F->ctx, else_region, else_block);
+    MLIR_RegionHandle regions[2] = {then_region, else_region};
+    MLIR_ValueHandle cond_ops[1] = {condition};
+    MLIR_ValueHandle *results = plan->n_results
+        ? (MLIR_ValueHandle *)arena_alloc(
+              F->arena, plan->n_results * sizeof(MLIR_ValueHandle))
+        : NULL;
+    MLIR_AttributeHandle attrs[1];
+    size_t n_attrs = 0;
+    if (plan->n_results) {
+        attrs[n_attrs++] = attr_s_hex(F->ctx, F->arena, "result_types",
+                                      result_vts, plan->n_results);
+    }
+    MLIR_OpHandle if_op = make_op_n(
+        F->ctx, OP_TYPE_WASMSSA_IF, attrs, n_attrs, cond_ops, 1, regions, 2,
+        result_vts, plan->n_results, results);
+    MLIR_AppendBlockOp(F->ctx, F->body_block, if_op);
+
+    if (plan->continuation_block != SIZE_MAX) {
+        if (!m8_emit_bind_values(ec, plan->continuation_block,
+                                 results, plan->n_results)) {
+            return false;
+        }
+        if (plan->continuation_node != SIZE_MAX) {
+            return m8_emit_plan_node(ec, plan->continuation_node);
+        }
+    }
+    return true;
+}
+
+static MLIR_ValueHandle m8_emit_integer_constant(FnCtx *F, uint8_t vt,
+                                                  int64_t value) {
+    if (vt != WT_I32 && vt != WT_I64) return MLIR_INVALID_HANDLE;
+    wasmssa_op_t op = {0};
+    op.type = OP_TYPE_WASMSSA_CONST;
+    op.valtype = vt;
+    op.i_const = vt == WT_I32 ? (int64_t)(int32_t)value : value;
+    op.has_result = true;
+    return commit_op(F, &op);
+}
+
+static MLIR_ValueHandle m8_emit_integer_eq(FnCtx *F, uint8_t vt,
+                                            MLIR_ValueHandle lhs,
+                                            MLIR_ValueHandle rhs) {
+    if (vt != WT_I32 && vt != WT_I64) return MLIR_INVALID_HANDLE;
+    MLIR_ValueHandle operands[2] = {lhs, rhs};
+    wasmssa_op_t op = {0};
+    op.type = OP_TYPE_WASMSSA_BINOP;
+    op.valtype = WT_I32;
+    op.wasm_opcode = vt == WT_I32 ? 0x46 : 0x51;
+    op.n_operands = 2;
+    op.operands = operands;
+    op.has_result = true;
+    return commit_op(F, &op);
+}
+
+static bool m8_emit_switch_chain(M8EmitCtx *ec, const M8SwitchPlan *plan,
+                                 size_t case_index,
+                                 MLIR_ValueHandle selector,
+                                 const uint8_t *result_vts,
+                                 MLIR_ValueHandle *out_results) {
+    if (case_index != 0 || plan->n_cases == 0) return false;
+    FnCtx *F = ec->F;
+    uint8_t selector_vt = wasm_vt(F->ctx, plan->selector.type);
+    MLIR_BlockHandle saved = F->body_block;
+    size_t base_checkpoint = ec->n_changes;
+
+    // Materialize the default arm first. At runtime it is nested inside all
+    // case tests, so account for every enclosing if label when computing br.
+    MLIR_BlockHandle else_block = MLIR_CreateBlock(F->ctx);
+    F->body_block = else_block;
+    for (size_t i = 0; i < plan->n_cases; ++i) {
+        if (!m8_emit_push_label(ec, M8_LABEL_IF,
+                                plan->continuation_block, SIZE_MAX)) {
+            F->body_block = saved;
+            return false;
+        }
+    }
+    if (!m8_emit_plan_node(ec, plan->default_node)) {
+        F->body_block = saved;
+        return false;
+    }
+    for (size_t i = 0; i < plan->n_cases; ++i) m8_emit_pop_label(ec);
+    m8_emit_restore_bindings(ec, base_checkpoint);
+
+    // Wrap from the last case to the first. This keeps C-stack use constant
+    // even for switches with thousands of cases.
+    for (size_t rev = plan->n_cases; rev > 0; --rev) {
+        size_t i = rev - 1;
+        MLIR_BlockHandle then_block = MLIR_CreateBlock(F->ctx);
+        F->body_block = then_block;
+        for (size_t depth = 0; depth <= i; ++depth) {
+            if (!m8_emit_push_label(ec, M8_LABEL_IF,
+                                    plan->continuation_block, SIZE_MAX)) {
+                F->body_block = saved;
+                return false;
+            }
+        }
+        if (!m8_emit_plan_node(ec, plan->case_nodes[i])) {
+            F->body_block = saved;
+            return false;
+        }
+        for (size_t depth = 0; depth <= i; ++depth) m8_emit_pop_label(ec);
+        m8_emit_restore_bindings(ec, base_checkpoint);
+
+        MLIR_BlockHandle container = i == 0 ? saved : MLIR_CreateBlock(F->ctx);
+        F->body_block = container;
+        MLIR_ValueHandle constant = m8_emit_integer_constant(
+            F, selector_vt, plan->case_values[i]);
+        if (constant == MLIR_INVALID_HANDLE) return false;
+        MLIR_ValueHandle compare = m8_emit_integer_eq(
+            F, selector_vt, selector, constant);
+        if (compare == MLIR_INVALID_HANDLE) return false;
+
+        MLIR_RegionHandle then_region = MLIR_CreateRegion(F->ctx);
+        MLIR_AppendRegionBlock(F->ctx, then_region, then_block);
+        MLIR_RegionHandle else_region = MLIR_CreateRegion(F->ctx);
+        MLIR_AppendRegionBlock(F->ctx, else_region, else_block);
+        MLIR_RegionHandle regions[2] = {then_region, else_region};
+        MLIR_ValueHandle cond_ops[1] = {compare};
+        MLIR_AttributeHandle attrs[1];
+        size_t n_attrs = 0;
+        if (plan->n_results) {
+            attrs[n_attrs++] = attr_s_hex(
+                F->ctx, F->arena, "result_types",
+                result_vts, plan->n_results);
+        }
+        MLIR_ValueHandle *level_results = i == 0
+            ? out_results
+            : (plan->n_results
+                ? (MLIR_ValueHandle *)arena_alloc(
+                      F->arena,
+                      plan->n_results * sizeof(MLIR_ValueHandle))
+                : NULL);
+        MLIR_OpHandle if_op = make_op_n(
+            F->ctx, OP_TYPE_WASMSSA_IF, attrs, n_attrs, cond_ops, 1,
+            regions, 2, result_vts, plan->n_results, level_results);
+        MLIR_AppendBlockOp(F->ctx, container, if_op);
+        if (i > 0) {
+            emit_block_return(F, level_results, plan->n_results);
+            else_block = container;
+        }
+    }
+    F->body_block = saved;
+    return true;
+}
+
+static bool m8_emit_switch_node(M8EmitCtx *ec, const M8SwitchPlan *plan) {
+    if (plan->n_cases == 0) {
+        const M8PlanNode *transfer =
+            &ec->meta->nodes[plan->default_node];
+        if (transfer->kind != M8_PLAN_TRANSFER) return false;
+        MLIR_ValueHandle *values = NULL;
+        size_t n_values = 0;
+        if (!m8_emit_edge_values(ec, transfer->as.transfer.edge_id,
+                                 &values, &n_values) ||
+            !m8_emit_bind_values(ec, transfer->as.transfer.target_block,
+                                 values, n_values)) {
+            return false;
+        }
+        if (transfer->as.transfer.target_node != SIZE_MAX &&
+            !m8_emit_plan_node(ec, transfer->as.transfer.target_node)) {
+            return false;
+        }
+        if (plan->continuation_node != SIZE_MAX) {
+            return m8_emit_plan_node(ec, plan->continuation_node);
+        }
+        return true;
+    }
+
+    MLIR_ValueHandle selector;
+    if (!m8_emit_operand(ec, &plan->selector, &selector)) return false;
+    uint8_t selector_vt = wasm_vt(ec->F->ctx, plan->selector.type);
+    if (selector_vt != WT_I32 && selector_vt != WT_I64) return false;
+    uint8_t *result_vts = NULL;
+    if (!m8_emit_result_vts(ec->F, plan->result_types, plan->n_results,
+                            &result_vts)) {
+        return false;
+    }
+    MLIR_ValueHandle *results = plan->n_results
+        ? (MLIR_ValueHandle *)arena_alloc(
+              ec->F->arena, plan->n_results * sizeof(MLIR_ValueHandle))
+        : NULL;
+    if (!m8_emit_switch_chain(ec, plan, 0, selector, result_vts, results)) {
+        return false;
+    }
+    if (plan->continuation_block != SIZE_MAX &&
+        !m8_emit_bind_values(ec, plan->continuation_block,
+                             results, plan->n_results)) {
+        return false;
+    }
+    if (plan->continuation_node != SIZE_MAX) {
+        return m8_emit_plan_node(ec, plan->continuation_node);
+    }
+    return true;
+}
+
+static bool m8_emit_loop_latch(M8EmitCtx *ec, size_t loop_id) {
+    const M7Loop *loop = &ec->meta->scratch->m7.loops[loop_id];
+    MLIR_ValueHandle condition;
+    if (!m8_emit_operand(ec, &loop->condition, &condition)) return false;
+    MLIR_ValueHandle exit_condition = emit_eqz(ec->F, condition);
+
+    MLIR_ValueHandle *exit_values = NULL, *back_values = NULL;
+    size_t n_exit = 0, n_back = 0;
+    if (!m8_emit_edge_values(ec, loop->exit_edge, &exit_values, &n_exit) ||
+        !m8_emit_edge_values(ec, loop->back_edge, &back_values, &n_back)) {
+        return false;
+    }
+
+    FnCtx *F = ec->F;
+    MLIR_BlockHandle loop_body = F->body_block;
+    MLIR_BlockHandle exit_block = MLIR_CreateBlock(F->ctx);
+    F->body_block = exit_block;
+    if (!m8_emit_push_label(ec, M8_LABEL_IF, SIZE_MAX, SIZE_MAX)) return false;
+    uint32_t exit_depth;
+    if (!m8_emit_find_label(ec, loop->exit_dispatch, &exit_depth, NULL)) {
+        return false;
+    }
+    emit_br_args(F, exit_depth, exit_values, n_exit);
+    m8_emit_pop_label(ec);
+    F->body_block = loop_body;
+
+    MLIR_RegionHandle exit_region = MLIR_CreateRegion(F->ctx);
+    MLIR_AppendRegionBlock(F->ctx, exit_region, exit_block);
+    MLIR_RegionHandle regions[1] = {exit_region};
+    MLIR_ValueHandle cond_ops[1] = {exit_condition};
+    MLIR_OpHandle exit_if = make_op_n(
+        F->ctx, OP_TYPE_WASMSSA_IF, NULL, 0, cond_ops, 1, regions, 1,
+        NULL, 0, NULL);
+    MLIR_AppendBlockOp(F->ctx, F->body_block, exit_if);
+
+    uint32_t back_depth;
+    if (!m8_emit_find_label(ec, loop->header, &back_depth, NULL)) return false;
+    emit_br_args(F, back_depth, back_values, n_back);
+    return true;
+}
+
+static bool m8_emit_loop_node(M8EmitCtx *ec, const M8LoopPlan *plan) {
+    if (plan->loop_id >= ec->meta->scratch->m7.n_loops) return false;
+    const M7Loop *loop = &ec->meta->scratch->m7.loops[plan->loop_id];
+    const NormBlock *header = &ec->cfg->blocks[loop->header];
+    const NormBlock *dispatch = &ec->cfg->blocks[loop->exit_dispatch];
+    FnCtx *F = ec->F;
+
+    size_t n_iter = header->n_args;
+    MLIR_ValueHandle *init_values = n_iter
+        ? (MLIR_ValueHandle *)arena_alloc(
+              F->arena, n_iter * sizeof(MLIR_ValueHandle))
+        : NULL;
+    uint8_t *iter_vts = n_iter ? (uint8_t *)arena_alloc(F->arena, n_iter) : NULL;
+    for (size_t i = 0; i < n_iter; ++i) {
+        if (!m8_emit_lookup_arg(ec, loop->header, i, &init_values[i])) {
+            return false;
+        }
+        iter_vts[i] = wasm_vt(F->ctx, header->args[i].type);
+        if (iter_vts[i] == 0) return false;
+    }
+
+    MLIR_ValueHandle *loop_args = n_iter
+        ? (MLIR_ValueHandle *)arena_alloc(
+              F->arena, n_iter * sizeof(MLIR_ValueHandle))
+        : NULL;
+    MLIR_BlockHandle loop_body =
+        make_block_with_args(F->ctx, iter_vts, n_iter, loop_args);
+    MLIR_BlockHandle saved = F->body_block;
+    size_t checkpoint = ec->n_changes;
+    F->body_block = loop_body;
+    for (size_t i = 0; i < n_iter; ++i) {
+        if (!m8_emit_bind_arg(ec, loop->header, i, loop_args[i])) {
+            F->body_block = saved;
+            return false;
+        }
+    }
+    if (!m8_emit_push_label(ec, M8_LABEL_BLOCK, loop->exit_dispatch,
+                            plan->loop_id) ||
+        !m8_emit_push_label(ec, M8_LABEL_LOOP, loop->header,
+                            plan->loop_id) ||
+        !m8_emit_plan_node(ec, plan->body_node)) {
+        F->body_block = saved;
+        return false;
+    }
+    m8_emit_pop_label(ec);
+    m8_emit_pop_label(ec);
+    m8_emit_restore_bindings(ec, checkpoint);
+    F->body_block = saved;
+
+    MLIR_RegionHandle loop_region = MLIR_CreateRegion(F->ctx);
+    MLIR_AppendRegionBlock(F->ctx, loop_region, loop_body);
+    MLIR_OpHandle loop_op = make_op_n(
+        F->ctx, OP_TYPE_WASMSSA_LOOP, NULL, 0, init_values, n_iter,
+        &loop_region, 1, NULL, 0, NULL);
+
+    MLIR_BlockHandle outer_body = MLIR_CreateBlock(F->ctx);
+    MLIR_AppendBlockOp(F->ctx, outer_body, loop_op);
+    MLIR_OpHandle unreachable = make_op_n(
+        F->ctx, OP_TYPE_WASMSSA_UNREACHABLE, NULL, 0, NULL, 0,
+        NULL, 0, NULL, 0, NULL);
+    MLIR_AppendBlockOp(F->ctx, outer_body, unreachable);
+    MLIR_RegionHandle outer_region = MLIR_CreateRegion(F->ctx);
+    MLIR_AppendRegionBlock(F->ctx, outer_region, outer_body);
+
+    uint8_t *exit_vts = NULL;
+    MLIR_TypeHandle *exit_types = dispatch->n_args
+        ? (MLIR_TypeHandle *)arena_alloc(
+              F->arena, dispatch->n_args * sizeof(MLIR_TypeHandle))
+        : NULL;
+    for (size_t i = 0; i < dispatch->n_args; ++i) {
+        exit_types[i] = dispatch->args[i].type;
+    }
+    if (!m8_emit_result_vts(F, exit_types, dispatch->n_args, &exit_vts)) {
+        return false;
+    }
+    MLIR_ValueHandle *results = dispatch->n_args
+        ? (MLIR_ValueHandle *)arena_alloc(
+              F->arena, dispatch->n_args * sizeof(MLIR_ValueHandle))
+        : NULL;
+    MLIR_OpHandle block_op = make_op_n(
+        F->ctx, OP_TYPE_WASMSSA_BLOCK, NULL, 0, NULL, 0, &outer_region, 1,
+        exit_vts, dispatch->n_args, results);
+    MLIR_AppendBlockOp(F->ctx, F->body_block, block_op);
+
+    if (!m8_emit_bind_values(ec, loop->exit_dispatch,
+                             results, dispatch->n_args)) {
+        return false;
+    }
+    if (plan->continuation_node != SIZE_MAX) {
+        return m8_emit_plan_node(ec, plan->continuation_node);
+    }
+    return true;
+}
+
+static bool m8_emit_return_node(M8EmitCtx *ec, size_t block_id) {
+    const NormTerminator *term =
+        normalized_cfg_block_owned_terminator(ec->cfg, block_id);
+    if (!term || term->kind != CFG_TERM_RETURN) return false;
+    MLIR_ValueHandle *values = term->n_return_values
+        ? (MLIR_ValueHandle *)arena_alloc(
+              ec->F->arena,
+              term->n_return_values * sizeof(MLIR_ValueHandle))
+        : NULL;
+    for (size_t i = 0; i < term->n_return_values; ++i) {
+        if (!m8_emit_operand(ec, &term->return_values[i], &values[i])) {
+            return false;
+        }
+    }
+    if (ec->F->frame_size > 0 &&
+        ec->F->sp_value != MLIR_INVALID_HANDLE) {
+        MLIR_ValueHandle frame =
+            emit_const_i32(ec->F, (int32_t)ec->F->frame_size);
+        MLIR_ValueHandle restored =
+            emit_add_i32(ec->F, ec->F->sp_value, frame);
+        emit_global_set(ec->F, 0, restored);
+    }
+    MLIR_OpHandle ret = make_op_n(
+        ec->F->ctx, OP_TYPE_WASMSSA_RETURN, NULL, 0,
+        values, term->n_return_values, NULL, 0, NULL, 0, NULL);
+    MLIR_AppendBlockOp(ec->F->ctx, ec->F->body_block, ret);
+    return true;
+}
+
+static bool m8_emit_plan_node(M8EmitCtx *ec, size_t node_id) {
+    while (node_id != SIZE_MAX) {
+        if (node_id >= ec->meta->n_nodes) return false;
+        const M8PlanNode *node = &ec->meta->nodes[node_id];
+        if (node->source_block != SIZE_MAX &&
+            node->kind != M8_PLAN_TRANSFER &&
+            !m8_emit_block_data(ec, node->source_block)) {
+            return false;
+        }
+        switch (node->kind) {
+        case M8_PLAN_SEQUENCE:
+            node_id = node->as.sequence.next_node;
+            continue;
+        case M8_PLAN_TRANSFER: {
+            size_t next_node = SIZE_MAX;
+            if (!m8_emit_transfer(ec, &node->as.transfer, &next_node)) {
+                return false;
+            }
+            if (next_node == SIZE_MAX) return true;
+            node_id = next_node;
+            continue;
+        }
+        case M8_PLAN_IF:
+            return m8_emit_if_node(ec, &node->as.if_plan);
+        case M8_PLAN_SWITCH:
+            return m8_emit_switch_node(ec, &node->as.switch_plan);
+        case M8_PLAN_LOOP:
+            return m8_emit_loop_node(ec, &node->as.loop_plan);
+        case M8_PLAN_RETURN:
+            return m8_emit_return_node(ec, node->source_block);
+        case M8_PLAN_UNREACHABLE:
+            emit_unreachable(ec->F);
+            return true;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool m8_emit_function_body(FnCtx *F) {
+    if (!F || !F->m8_plan || !F->m8_plan->plan_built) return false;
+    const M8EmissionMetadata *meta = F->m8_plan;
+    const NormalizedCFG *cfg = &meta->scratch->norm;
+    M8EmitCtx ec;
+    memset(&ec, 0, sizeof(ec));
+    ec.F = F;
+    ec.meta = meta;
+    ec.cfg = cfg;
+    ec.arg_offsets = (size_t *)arena_alloc(
+        F->arena, (cfg->n_blocks + 1) * sizeof(size_t));
+    if (!ec.arg_offsets) return false;
+    size_t total_args = 0;
+    for (size_t i = 0; i < cfg->n_blocks; ++i) {
+        ec.arg_offsets[i] = total_args;
+        total_args += cfg->blocks[i].n_args;
+    }
+    ec.arg_offsets[cfg->n_blocks] = total_args;
+    ec.n_arg_slots = total_args;
+    ec.arg_values = total_args
+        ? (MLIR_ValueHandle *)arena_alloc(
+              F->arena, total_args * sizeof(MLIR_ValueHandle))
+        : NULL;
+    ec.arg_bound = total_args
+        ? (bool *)arena_alloc(F->arena, total_args * sizeof(bool)) : NULL;
+    if (total_args && (!ec.arg_values || !ec.arg_bound)) return false;
+    if (total_args) {
+        memset(ec.arg_values, 0, total_args * sizeof(MLIR_ValueHandle));
+        memset(ec.arg_bound, 0, total_args * sizeof(bool));
+    }
+    value_index_map_init(&ec.arg_slot_by_mlir, F->arena,
+                         total_args ? total_args * 2 : 16);
+    for (size_t bid = 0; bid < cfg->n_blocks; ++bid) {
+        const NormBlock *block = &cfg->blocks[bid];
+        if (block->kind != NORM_BLOCK_ORIGINAL ||
+            block->mlir_block == MLIR_INVALID_HANDLE) {
+            continue;
+        }
+        size_t n_args = MLIR_GetBlockNumArgs(block->mlir_block);
+        for (size_t i = 0; i < n_args; ++i) {
+            value_index_map_put(&ec.arg_slot_by_mlir, F->arena,
+                                MLIR_GetBlockArg(block->mlir_block, i),
+                                ec.arg_offsets[bid] + i);
+        }
+    }
+    ec.changes_cap = total_args * 2 + meta->n_nodes * 2 + 16;
+    ec.changes = (M8BindingChange *)arena_alloc(
+        F->arena, ec.changes_cap * sizeof(M8BindingChange));
+    ec.labels_cap = meta->n_nodes + meta->scratch->m7.n_loops * 2 + 8;
+    ec.labels = (M8Label *)arena_alloc(
+        F->arena, ec.labels_cap * sizeof(M8Label));
+    if (!ec.changes || !ec.labels) return false;
+
+    size_t entry = cfg->entry_block;
+    const NormBlock *entry_block = &cfg->blocks[entry];
+    for (size_t i = 0; i < entry_block->n_args; ++i) {
+        if (entry_block->mlir_block == MLIR_INVALID_HANDLE ||
+            i >= MLIR_GetBlockNumArgs(entry_block->mlir_block)) {
+            return false;
+        }
+        MLIR_ValueHandle mapped;
+        if (!vmap_get(F, MLIR_GetBlockArg(entry_block->mlir_block, i),
+                      &mapped) ||
+            !m8_emit_bind_arg(&ec, entry, i, mapped)) {
+            return false;
+        }
+    }
+
+    F->m8_emit = &ec;
+    bool ok = m8_emit_plan_node(&ec, meta->root_node);
+    F->m8_emit = NULL;
+    return ok;
+}
+
 // --- Arena pool and per-target scratch ---
 
 // Create separate graph, analysis, and phase bump allocators.
@@ -8306,6 +9893,7 @@ static void cfg_info_scratch_init(CFGInfoScratch *scratch) {
 
 // Clear scratch view without freeing pool arenas.
 static void cfg_info_scratch_clear(CFGInfoScratch *scratch) {
+    scratch->ctx = NULL;
     memset(&scratch->cfg, 0, sizeof(scratch->cfg));
     memset(&scratch->norm, 0, sizeof(scratch->norm));
     memset(&scratch->values, 0, sizeof(scratch->values));
@@ -8328,6 +9916,7 @@ static bool cfg_info_scratch_build(CFGInfoScratch *scratch,
     }
     cfg_analysis_arena_reset(pool);
     scratch->pool = pool;
+    scratch->ctx = ctx;
     if (!cfg_info_build(pool->graph_arena, region, &scratch->cfg)) {
         cfg_analysis_arena_reset(pool);
         cfg_info_scratch_clear(scratch);
