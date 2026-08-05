@@ -829,15 +829,11 @@ bool MLIR_LowerToLLVMDialect(MLIR_Context *ctx, MLIR_OpHandle module) {
     return true;
 }
 
-// In-tree LLVM-dialect lowering tailored for the wasm pipeline. First
-// lifts cf.br / cf.cond_br into scf.if / scf.while via MLIR_LiftCfToScf,
-// then runs the regular lowering with `keep_scf = true` so the scf
-// operations survive into the wasmssa stage (which expects structured
-// control flow). cf->llvm.br rewrites are also skipped: any cf op
-// surviving the lift is a hard error caught later by wasmssa-lower.
+// In-tree LLVM-dialect lowering tailored for the direct LLVM-CFG to WasmSSA
+// pipeline. Lower func, arith, and cf operations directly to LLVM dialect;
+// M5/M7/M8/M9 perform CFG normalization and structured WasmSSA emission.
 bool MLIR_LowerToLLVMDialectForWasm(MLIR_Context *ctx, MLIR_OpHandle module) {
     if (module == MLIR_INVALID_HANDLE) return false;
-    if (!MLIR_LiftCfToScf(ctx, module)) return false;
     if (MLIR_GetOpNumRegions(module) == 0) return false;
     MLIR_RegionHandle body_region = MLIR_GetOpRegion(module, 0);
     if (MLIR_GetRegionNumBlocks(body_region) == 0) return false;
