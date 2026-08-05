@@ -4519,9 +4519,9 @@ static bool normalized_cfg_add_synthetic_edge_adopt(NormalizedCFG *n,
     norm_edge_payload_adopt_operands(&e->payload, operands, n_operands);
     norm_ensure_block_slots(n, arena, from + 1);
     norm_ensure_block_slots(n, arena, to + 1);
-    norm_adj_append(&n->blocks[from].outgoing, eid);
+    norm_adj_push(arena, &n->blocks[from].outgoing, eid);
     e->out_position = n->blocks[from].outgoing.n - 1;
-    norm_adj_append(&n->blocks[to].incoming, eid);
+    norm_adj_push(arena, &n->blocks[to].incoming, eid);
     e->in_position = n->blocks[to].incoming.n - 1;
     normalized_cfg_note_mutation(n);
     if (out_edge_id) *out_edge_id = eid;
@@ -5020,6 +5020,7 @@ static bool m7_view_workspace_init(M7ViewWorkspace *ws, Arena *arena,
     memset(ws, 0, sizeof(*ws));
     if (!arena) return true;
     ws->persistent_arena = arena;
+    ws->dense_map_view_id = SIZE_MAX;
     if (n_blocks == 0) return true;
     if (!m7_workspace_ensure_graph_capacity(ws, n_blocks, n_edges)) return false;
     ws->target_mark_epoch = 1;
