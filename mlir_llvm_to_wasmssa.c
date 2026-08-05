@@ -9420,6 +9420,9 @@ static MLIR_ValueHandle m8_emit_zero(FnCtx *F, MLIR_TypeHandle type) {
 
 static bool m8_emit_operand(M8EmitCtx *ec, const NormOperand *operand,
                             MLIR_ValueHandle *out) {
+    if (operand->kind == NORM_OPERAND_MLIR) {
+        return fn_vmap_get(ec->F, operand->as.mlir_value, out);
+    }
     if (operand->kind == NORM_OPERAND_UNDEF) {
         *out = m8_emit_zero(ec->F, operand->type);
         return *out != MLIR_INVALID_HANDLE;
@@ -9599,6 +9602,17 @@ static bool m8_emit_if_node(M8EmitCtx *ec, const M8IfPlan *plan) {
                                  results, plan->n_results)) {
             return false;
         }
+        uint32_t depth;
+        M8LabelKind kind;
+        if (m8_emit_find_label(ec, plan->continuation_block,
+                               &depth, &kind)) {
+            if (kind == M8_LABEL_IF && depth == 0) {
+                emit_block_return(F, results, plan->n_results);
+            } else {
+                emit_br_args(F, depth, results, plan->n_results);
+            }
+            return true;
+        }
         if (plan->continuation_node != SIZE_MAX) {
             return m8_emit_plan_node(ec, plan->continuation_node);
         }
@@ -9766,6 +9780,19 @@ static bool m8_emit_switch_node(M8EmitCtx *ec, const M8SwitchPlan *plan) {
         !m8_emit_bind_values(ec, plan->continuation_block,
                              results, plan->n_results)) {
         return false;
+    }
+    if (plan->continuation_block != SIZE_MAX) {
+        uint32_t depth;
+        M8LabelKind kind;
+        if (m8_emit_find_label(ec, plan->continuation_block,
+                               &depth, &kind)) {
+            if (kind == M8_LABEL_IF && depth == 0) {
+                emit_block_return(ec->F, results, plan->n_results);
+            } else {
+                emit_br_args(ec->F, depth, results, plan->n_results);
+            }
+            return true;
+        }
     }
     if (plan->continuation_node != SIZE_MAX) {
         return m8_emit_plan_node(ec, plan->continuation_node);
@@ -9960,13 +9987,33 @@ static bool m8_emit_plan_node(M8EmitCtx *ec, size_t node_id) {
             continue;
         }
         case M8_PLAN_IF:
-            return m8_emit_if_node(ec, &node->as.if_plan);
+            if (!m8_emit_if_node(ec, &node->as.if_plan)) {
+                fprintf(stderr, "wasmssa-lower: failed to emit M8 if node %zu (block %zu)\n",
+                        node_id, node->source_block);
+                return false;
+            }
+            return true;
         case M8_PLAN_SWITCH:
-            return m8_emit_switch_node(ec, &node->as.switch_plan);
+            if (!m8_emit_switch_node(ec, &node->as.switch_plan)) {
+                fprintf(stderr, "wasmssa-lower: failed to emit M8 switch node %zu (block %zu)\n",
+                        node_id, node->source_block);
+                return false;
+            }
+            return true;
         case M8_PLAN_LOOP:
-            return m8_emit_loop_node(ec, &node->as.loop_plan);
+            if (!m8_emit_loop_node(ec, &node->as.loop_plan)) {
+                fprintf(stderr, "wasmssa-lower: failed to emit M8 loop node %zu\n",
+                        node_id);
+                return false;
+            }
+            return true;
         case M8_PLAN_RETURN:
-            return m8_emit_return_node(ec, node->source_block);
+            if (!m8_emit_return_node(ec, node->source_block)) {
+                fprintf(stderr, "wasmssa-lower: failed to emit M8 return node %zu (block %zu)\n",
+                        node_id, node->source_block);
+                return false;
+            }
+            return true;
         case M8_PLAN_UNREACHABLE:
             emit_unreachable(ec->F);
             return true;
