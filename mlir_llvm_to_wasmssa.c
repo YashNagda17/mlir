@@ -7053,6 +7053,13 @@ static bool m8_edge_hidden(const M8BuildCtx *bc, size_t edge_id) {
     return edge_id < bc->cfg->n_edges && bc->hidden_edges[edge_id];
 }
 
+static bool m8_is_loop_back_edge(const M8BuildCtx *bc, size_t edge_id) {
+    for (size_t i = 0; i < bc->m7->n_loops; ++i) {
+        if (bc->m7->loops[i].back_edge == edge_id) return true;
+    }
+    return false;
+}
+
 static bool m8_edge_visible(const M8BuildCtx *bc, size_t edge_id) {
     return norm_edge_is_active(bc->cfg, edge_id) &&
            !m8_edge_hidden(bc, edge_id);
@@ -7230,13 +7237,16 @@ static bool m8_plan_new_node(M8BuildCtx *bc, M8PlanKind kind,
 
 static size_t m8_edge_for_successor_slot(const M8BuildCtx *bc,
                                          size_t block_id, size_t slot) {
+    size_t hidden_fallback = SIZE_MAX;
     NormEdgeIter it = norm_out_edges(bc->cfg, block_id);
     size_t edge_id;
     while (norm_edge_iter_next(&it, &edge_id)) {
-        if (!m8_edge_visible(bc, edge_id)) continue;
-        if (bc->cfg->edges[edge_id].successor_slot == slot) return edge_id;
+        if (!norm_edge_is_active(bc->cfg, edge_id)) continue;
+        if (bc->cfg->edges[edge_id].successor_slot != slot) continue;
+        if (m8_edge_visible(bc, edge_id)) return edge_id;
+        hidden_fallback = edge_id;
     }
-    return SIZE_MAX;
+    return hidden_fallback;
 }
 
 static bool m8_block_selector(const M8BuildCtx *bc, size_t block_id,
@@ -7440,20 +7450,25 @@ static size_t m8_select_continuation(M8BuildCtx *bc, size_t block_id,
 static bool m8_plan_transfer(M8BuildCtx *bc, size_t edge_id, size_t stop,
                              size_t owner_loop, bool emit_source_block,
                              size_t *out_node) {
-    if (!m8_edge_visible(bc, edge_id)) return false;
+    if (!norm_edge_is_active(bc->cfg, edge_id)) return false;
     const NormEdge *edge = &bc->cfg->edges[edge_id];
+    bool is_back_edge = m8_is_loop_back_edge(bc, edge_id);
+    bool targets_owner_latch =
+        owner_loop < bc->m7->n_loops &&
+        edge->to == bc->m7->loops[owner_loop].latch;
+    if (m8_edge_hidden(bc, edge_id) &&
+        !is_back_edge && edge->to != stop && !targets_owner_latch) {
+        return false;
+    }
     size_t node_id;
     if (!m8_plan_new_node(bc, M8_PLAN_TRANSFER, edge->from, &node_id)) {
         return false;
     }
     size_t target_node = SIZE_MAX;
-    bool targets_owner_latch =
-        owner_loop < bc->m7->n_loops &&
-        edge->to == bc->m7->loops[owner_loop].latch;
     bool targets_active_continuation =
         edge->to < bc->cfg->n_blocks &&
         bc->active_continuations[edge->to] > 0;
-    if (edge->to != stop && !targets_owner_latch &&
+    if (edge->to != stop && !targets_owner_latch && !is_back_edge &&
         !targets_active_continuation &&
         !m8_plan_from(bc, edge->to, stop, owner_loop, &target_node)) {
         return false;
