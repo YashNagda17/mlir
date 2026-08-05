@@ -301,7 +301,10 @@ static void vmap_set(FnCtx *F, MLIR_ValueHandle k, MLIR_ValueHandle v) {
     size_t mask = F->vmap_cap - 1;
     size_t i = map_hash((uintptr_t)k) & mask;
     while (F->vmap[i].key != 0) {
-        if (F->vmap[i].key == (uintptr_t)k) return;  // first insert wins
+        if (F->vmap[i].key == (uintptr_t)k) {
+            F->vmap[i].val = v;
+            return;
+        }
         i = (i + 1) & mask;
     }
     F->vmap[i].key = (uintptr_t)k;
