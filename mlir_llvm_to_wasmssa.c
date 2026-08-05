@@ -6444,8 +6444,8 @@ static bool norm_edge_mux_create_dispatch(NormalizedCFG *cfg,
                                           size_t excluded_destination) {
     if (!cfg || !mux) return false;
     Arena *arena = cfg->graph_arena;
-    NormBlock *mux_b = &cfg->blocks[mux->mux_block];
     if (dispatch_block >= cfg->n_blocks) return false;
+    NormBlock *dispatch_b = &cfg->blocks[dispatch_block];
 
     size_t n_pick = 0;
     for (size_t i = 0; i < mux->n_entries; ++i) {
@@ -6466,11 +6466,11 @@ static bool norm_edge_mux_create_dispatch(NormalizedCFG *cfg,
             }
         }
         const NormMuxEntry *me = &mux->entries[pick_idx];
-        NormOperand *ops = arena_new_array(arena, NormOperand, me->n_args);
+        NormOperand *ops = me->n_args ? arena_new_array(arena, NormOperand, me->n_args) : NULL;
         for (size_t j = 0; j < me->n_args; ++j) {
             ops[j] = norm_operand_block_arg(
-                mux_b->args[me->arg_offset + j].type,
-                mux->mux_block, me->arg_offset + j);
+                dispatch_b->args[me->arg_offset + j].type,
+                dispatch_block, me->arg_offset + j);
         }
         size_t eid = SIZE_MAX;
         if (!normalized_cfg_add_synthetic_edge_adopt(
@@ -6490,11 +6490,11 @@ static bool norm_edge_mux_create_dispatch(NormalizedCFG *cfg,
     term.kind = CFG_TERM_SWITCH;
     if (mux->discriminator_arg != SIZE_MAX) {
         term.selector = norm_operand_block_arg(
-            mux_b->args[mux->discriminator_arg].type,
-            mux->mux_block, mux->discriminator_arg);
+            dispatch_b->args[mux->discriminator_arg].type,
+            dispatch_block, mux->discriminator_arg);
     } else {
         term.selector = norm_operand_discriminator(
-            mux_b->args[0].type, 0);
+            dispatch_b->args[0].type, 0);
     }
 
     term.n_cases = n_pick - 1;
@@ -6511,12 +6511,12 @@ static bool norm_edge_mux_create_dispatch(NormalizedCFG *cfg,
 
     size_t default_idx = pick_indices[pick_n - 1];
     const NormMuxEntry *default_me = &mux->entries[default_idx];
-    NormOperand *default_ops =
-        arena_new_array(arena, NormOperand, default_me->n_args);
+    NormOperand *default_ops = default_me->n_args
+        ? arena_new_array(arena, NormOperand, default_me->n_args) : NULL;
     for (size_t j = 0; j < default_me->n_args; ++j) {
         default_ops[j] = norm_operand_block_arg(
-            mux_b->args[default_me->arg_offset + j].type,
-            mux->mux_block, default_me->arg_offset + j);
+            dispatch_b->args[default_me->arg_offset + j].type,
+            dispatch_block, default_me->arg_offset + j);
     }
     size_t default_eid = SIZE_MAX;
     if (!normalized_cfg_add_synthetic_edge_adopt(
@@ -6529,11 +6529,11 @@ static bool norm_edge_mux_create_dispatch(NormalizedCFG *cfg,
 
     for (size_t ci = 0; ci < term.n_cases; ++ci) {
         const NormMuxEntry *me = &mux->entries[pick_indices[ci]];
-        NormOperand *ops = arena_new_array(arena, NormOperand, me->n_args);
+        NormOperand *ops = me->n_args ? arena_new_array(arena, NormOperand, me->n_args) : NULL;
         for (size_t j = 0; j < me->n_args; ++j) {
             ops[j] = norm_operand_block_arg(
-                mux_b->args[me->arg_offset + j].type,
-                mux->mux_block, me->arg_offset + j);
+                dispatch_b->args[me->arg_offset + j].type,
+                dispatch_block, me->arg_offset + j);
         }
         size_t eid = SIZE_MAX;
         if (!normalized_cfg_add_synthetic_edge_adopt(
