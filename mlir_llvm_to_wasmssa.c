@@ -3459,14 +3459,6 @@ static size_t cfg_info_entry_index(const CFGInfo *cfg) {
     return ei;
 }
 
-// True when BFS from entry reached every indexed block.
-static bool cfg_info_all_region_blocks_reachable(const CFGInfo *cfg) {
-    for (size_t i = 0; i < cfg->n_blocks; ++i) {
-        if (!cfg->blocks[i].reachable) return false;
-    }
-    return true;
-}
-
 // Resolve in-region successor to dense index; filters unreachable blocks.
 static bool cfg_edge_dest_index(const CFGInfo *cfg, MLIR_RegionHandle region,
                                 MLIR_BlockHandle succ, size_t *out_dest) {
@@ -9115,13 +9107,13 @@ static bool m8_plan_if(M8BuildCtx *bc, size_t block_id, size_t stop,
         return false;
     }
 
-    size_t then_node = SIZE_MAX, else_node = SIZE_MAX;
     bool continuation_was_active =
         continuation != SIZE_MAX &&
         bc->active_continuations[continuation] > 0;
     if (continuation != SIZE_MAX) {
         bc->active_continuations[continuation]++;
     }
+    size_t then_node = SIZE_MAX, else_node = SIZE_MAX;
     bool branches_ok =
         m8_plan_transfer(bc, then_edge, continuation, owner_loop,
                          &then_node) &&
@@ -10197,13 +10189,8 @@ static bool cfg_info_scratch_build(CFGInfoScratch *scratch,
         cfg_info_scratch_clear(scratch);
         return false;
     }
-    if (!cfg_info_all_region_blocks_reachable(&scratch->cfg)) {
-        fprintf(stderr,
-                "wasmssa-cfg: unreachable blocks in llvm.func region\n");
-        cfg_analysis_arena_reset(pool);
-        cfg_info_scratch_clear(scratch);
-        return false;
-    }
+    // Direct CF lowering can leave dead blocks after terminal paths.  The
+    // snapshot marks them unreachable and NormalizedCFG keeps them inactive.
     if (!normalized_cfg_build_from_snapshot(pool, &scratch->cfg,
                                             &scratch->norm)) {
         cfg_analysis_arena_reset(pool);
@@ -10248,7 +10235,8 @@ static bool cfg_info_scratch_build(CFGInfoScratch *scratch,
 
 // True when op is llvm.func.
 static bool op_is_llvm_func(MLIR_OpHandle op) {
-    return MLIR_GetOpType(op) == OP_TYPE_LLVM_FUNC;
+    if (MLIR_GetOpType(op) == OP_TYPE_LLVM_FUNC) return true;
+    return name_eq(MLIR_GetOpName(op), "llvm.func");
 }
 
 // True when op is builtin.module.
@@ -10762,9 +10750,13 @@ static bool emit_defined_funcs_in_region(MLIR_Context *ctx, Arena *arena,
             if (!llvm_func_has_defined_body(op)) continue;
             uint8_t *p, *r;
             size_t np, nr;
-            if (!sig_for_func(ctx, arena, op, &p, &np, &r, &nr)) return false;
             MLIR_AttributeHandle sa = find_attr(op, "sym_name");
             string sym = MLIR_GetAttributeString(sa);
+            if (!sig_for_func(ctx, arena, op, &p, &np, &r, &nr)) {
+                fprintf(stderr, "wasmssa-lower: unsupported signature for '%.*s'\n",
+                        (int)sym.size, sym.str);
+                return false;
+            }
             bool is_main = (sym.size == 4 && memcmp(sym.str, "main", 4) == 0);
             string nm = is_main ? str_lit("__original_main") : sym;
             MLIR_RegionHandle fn_region = MLIR_GetOpRegion(op, 0);
@@ -10773,10 +10765,14 @@ static bool emit_defined_funcs_in_region(MLIR_Context *ctx, Arena *arena,
                 CFGInfoScratch scratch;
                 cfg_info_scratch_init(&scratch);
                 if (!cfg_info_scratch_build(&scratch, cfg_pool, ctx, fn_region)) {
+                    fprintf(stderr, "wasmssa-lower: CFG analysis failed for '%.*s'\n",
+                            (int)sym.size, sym.str);
                     cfg_info_scratch_clear(&scratch);
                     return false;
                 }
                 if (!m8_build_emission_metadata(&scratch)) {
+                    fprintf(stderr, "wasmssa-lower: M8 planning failed for '%.*s'\n",
+                            (int)sym.size, sym.str);
                     cfg_analysis_arena_reset(cfg_pool);
                     cfg_info_scratch_clear(&scratch);
                     return false;
@@ -10790,7 +10786,11 @@ static bool emit_defined_funcs_in_region(MLIR_Context *ctx, Arena *arena,
                 lowered = lower_function(ctx, arena, mod, body, nm, is_main,
                                          op, p, np, r, nr);
             }
-            if (!lowered) return false;
+            if (!lowered) {
+                fprintf(stderr, "wasmssa-lower: emission failed for '%.*s'\n",
+                        (int)sym.size, sym.str);
+                return false;
+            }
         }
     }
     return true;
