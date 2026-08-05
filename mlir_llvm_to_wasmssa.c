@@ -8605,11 +8605,10 @@ static bool m7_normalize_cycles(NormalizedCFG *cfg,
 //
 // M7 has made every cycle explicit as one latch -> header backedge.  Hiding
 // those edges leaves a DAG.  M8 computes post-dominance on that DAG and builds
-// a tree: continuations occur once, while every incoming CFG edge remains an
-// explicit TRANSFER node carrying its normalized block arguments.  The plan
-// deliberately never guesses a branch label and never shares recursive plan
-// subtrees; shapes which still require an upstream-style edge multiplexer are
-// rejected instead of being silently miscompiled.
+// a tree: every incoming CFG edge remains an explicit TRANSFER node carrying
+// its normalized block arguments.  Acyclic paths, including complete M7 loop
+// subplans, may be split when a non-tree join cannot be represented by a single
+// enclosing continuation; hidden backedges still terminate at the owning latch.
 // ---------------------------------------------------------------------------
 
 typedef struct {
@@ -8629,6 +8628,7 @@ typedef struct {
     size_t              post_n;
     size_t             *reach_epoch;
     size_t             *reach_stack;
+    size_t             *active_continuations;
     size_t              current_reach_epoch;
     size_t              reach_cached_target;
 } M8BuildCtx;
@@ -8823,9 +8823,9 @@ static bool m8_plan_new_node(M8BuildCtx *bc, M8PlanKind kind,
 
 static bool m8_plan_claim_block(M8BuildCtx *bc, size_t block_id,
                                 size_t node_id) {
-    if (block_id >= bc->meta->n_blocks ||
-        bc->meta->block_owner_node[block_id] != SIZE_MAX) {
-        return false;
+    if (block_id >= bc->meta->n_blocks) return false;
+    if (bc->meta->block_owner_node[block_id] != SIZE_MAX) {
+        return true;
     }
     bc->meta->block_owner_node[block_id] = node_id;
     return true;
@@ -8964,20 +8964,80 @@ static bool m8_reaches_block(M8BuildCtx *bc, size_t from, size_t target) {
 // Global post-dominance intentionally uses a virtual exit.  Inside an outer
 // branch region, however, a mixed return/continue child must use the caller's
 // stop block as its local continuation when any child path reaches that stop.
-static size_t m8_select_continuation(M8BuildCtx *bc, size_t block_id,
-                                     size_t stop) {
-    size_t continuation = bc->post_idom[block_id];
-    if (continuation != bc->post_root) return continuation;
-    if (stop == SIZE_MAX || stop >= bc->cfg->n_blocks) return SIZE_MAX;
+static bool m8_is_common_reachable_continuation(M8BuildCtx *bc,
+                                                  size_t block_id,
+                                                  size_t target) {
+    if (target >= bc->cfg->n_blocks || target == block_id ||
+        !bc->cfg->blocks[target].active) {
+        return false;
+    }
+    bool saw_edge = false;
     NormEdgeIter it = norm_out_edges(bc->cfg, block_id);
     size_t edge_id;
     while (norm_edge_iter_next(&it, &edge_id)) {
         if (!m8_edge_visible(bc, edge_id)) continue;
-        if (m8_reaches_block(bc, bc->cfg->edges[edge_id].to, stop)) {
-            return stop;
+        saw_edge = true;
+        size_t successor = bc->cfg->edges[edge_id].to;
+        if (successor != target &&
+            !m8_reaches_block(bc, successor, target)) {
+            return false;
         }
     }
-    return SIZE_MAX;
+    return saw_edge;
+}
+
+static size_t m8_nearest_common_continuation(M8BuildCtx *bc,
+                                             size_t block_id,
+                                             size_t limit) {
+    size_t best = SIZE_MAX;
+    for (size_t candidate = 0; candidate < bc->cfg->n_blocks; ++candidate) {
+        if (candidate == block_id || !bc->cfg->blocks[candidate].active) {
+            continue;
+        }
+        if (bc->active_continuations[candidate] && candidate != limit) {
+            continue;
+        }
+        if (limit != SIZE_MAX && candidate != limit &&
+            !m8_reaches_block(bc, candidate, limit)) {
+            continue;
+        }
+        if (!m8_is_common_reachable_continuation(bc, block_id, candidate)) {
+            continue;
+        }
+        if (best == SIZE_MAX ||
+            (candidate != best && m8_reaches_block(bc, candidate, best))) {
+            best = candidate;
+        }
+    }
+    return best;
+}
+
+static size_t m8_select_continuation(M8BuildCtx *bc, size_t block_id,
+                                     size_t stop) {
+    size_t continuation = bc->post_idom[block_id];
+    if (continuation != bc->post_root &&
+        !bc->post_terminal[continuation] &&
+        bc->cfg->blocks[continuation].kind != NORM_BLOCK_LOOP_LATCH) {
+        return continuation;
+    }
+    bool has_local_stop =
+        stop != SIZE_MAX && stop < bc->cfg->n_blocks;
+    size_t limit = has_local_stop
+        ? stop
+        : (continuation != bc->post_root ? continuation : SIZE_MAX);
+    size_t common = m8_nearest_common_continuation(bc, block_id, limit);
+    if (common != SIZE_MAX) return common;
+    if (has_local_stop) {
+        NormEdgeIter it = norm_out_edges(bc->cfg, block_id);
+        size_t edge_id;
+        while (norm_edge_iter_next(&it, &edge_id)) {
+            if (!m8_edge_visible(bc, edge_id)) continue;
+            if (m8_reaches_block(bc, bc->cfg->edges[edge_id].to, stop)) {
+                return stop;
+            }
+        }
+    }
+    return continuation != bc->post_root ? continuation : SIZE_MAX;
 }
 
 static bool m8_plan_transfer(M8BuildCtx *bc, size_t edge_id, size_t stop,
@@ -8990,7 +9050,14 @@ static bool m8_plan_transfer(M8BuildCtx *bc, size_t edge_id, size_t stop,
         return false;
     }
     size_t target_node = SIZE_MAX;
-    if (edge->to != stop &&
+    bool targets_owner_latch =
+        owner_loop < bc->m7->n_loops &&
+        edge->to == bc->m7->loops[owner_loop].latch;
+    bool targets_active_continuation =
+        edge->to < bc->cfg->n_blocks &&
+        bc->active_continuations[edge->to] > 0;
+    if (edge->to != stop && !targets_owner_latch &&
+        !targets_active_continuation &&
         !m8_plan_from(bc, edge->to, stop, owner_loop, &target_node)) {
         return false;
     }
@@ -9049,14 +9116,25 @@ static bool m8_plan_if(M8BuildCtx *bc, size_t block_id, size_t stop,
     }
 
     size_t then_node = SIZE_MAX, else_node = SIZE_MAX;
-    if (!m8_plan_transfer(bc, then_edge, continuation, owner_loop,
-                          &then_node) ||
-        !m8_plan_transfer(bc, else_edge, continuation, owner_loop,
-                          &else_node)) {
-        return false;
+    bool continuation_was_active =
+        continuation != SIZE_MAX &&
+        bc->active_continuations[continuation] > 0;
+    if (continuation != SIZE_MAX) {
+        bc->active_continuations[continuation]++;
     }
+    bool branches_ok =
+        m8_plan_transfer(bc, then_edge, continuation, owner_loop,
+                         &then_node) &&
+        m8_plan_transfer(bc, else_edge, continuation, owner_loop,
+                         &else_node);
+    if (continuation != SIZE_MAX) {
+        bc->active_continuations[continuation]--;
+    }
+    if (!branches_ok) return false;
+
     size_t continuation_node = SIZE_MAX;
     if (continuation != SIZE_MAX && continuation != stop &&
+        !continuation_was_active &&
         !m8_plan_from(bc, continuation, stop, owner_loop,
                       &continuation_node)) {
         return false;
@@ -9131,21 +9209,35 @@ static bool m8_plan_switch(M8BuildCtx *bc, size_t block_id, size_t stop,
     size_t *case_nodes = n_cases
         ? arena_new_array(bc->graph, size_t, n_cases) : NULL;
     if (n_cases > 0 && !case_nodes) return false;
+    bool continuation_was_active =
+        continuation != SIZE_MAX &&
+        bc->active_continuations[continuation] > 0;
+    if (continuation != SIZE_MAX) {
+        bc->active_continuations[continuation]++;
+    }
+    bool transfers_ok = true;
     for (size_t i = 0; i < n_cases; ++i) {
         if (case_edges[i] == SIZE_MAX ||
             !m8_plan_transfer(bc, case_edges[i], continuation, owner_loop,
                               &case_nodes[i])) {
-            return false;
+            transfers_ok = false;
+            break;
         }
     }
     size_t default_node = SIZE_MAX;
-    if (!m8_plan_transfer(bc, default_edge, continuation, owner_loop,
+    if (transfers_ok &&
+        !m8_plan_transfer(bc, default_edge, continuation, owner_loop,
                           &default_node)) {
-        return false;
+        transfers_ok = false;
     }
+    if (continuation != SIZE_MAX) {
+        bc->active_continuations[continuation]--;
+    }
+    if (!transfers_ok) return false;
 
     size_t continuation_node = SIZE_MAX;
     if (continuation != SIZE_MAX && continuation != stop &&
+        !continuation_was_active &&
         !m8_plan_from(bc, continuation, stop, owner_loop,
                       &continuation_node)) {
         return false;
@@ -9242,11 +9334,17 @@ static bool m8_build_structured_plan(CFGInfoScratch *scratch) {
     bc.hidden_edges = arena_new_array(phase, bool, cfg->n_edges);
     bc.reach_epoch = arena_new_array(phase, size_t, cfg->n_blocks);
     bc.reach_stack = arena_new_array(phase, size_t, cfg->n_blocks);
+    bc.active_continuations =
+        arena_new_array(phase, size_t, cfg->n_blocks);
     if (!meta->block_owner_node || (cfg->n_edges > 0 && !bc.hidden_edges)) {
         return false;
     }
-    if (!bc.reach_epoch || !bc.reach_stack) return false;
+    if (!bc.reach_epoch || !bc.reach_stack || !bc.active_continuations) {
+        return false;
+    }
     memset(bc.reach_epoch, 0, cfg->n_blocks * sizeof(size_t));
+    memset(bc.active_continuations, 0,
+           cfg->n_blocks * sizeof(size_t));
     for (size_t i = 0; i < cfg->n_blocks; ++i) {
         meta->block_owner_node[i] = SIZE_MAX;
     }
