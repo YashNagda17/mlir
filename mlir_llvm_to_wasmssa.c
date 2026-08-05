@@ -2935,6 +2935,7 @@ typedef struct {
     size_t           n_base_iterations;
     MLIR_TypeHandle *base_iteration_types;
     MLIR_ValueHandle *base_iteration_values;
+    bool             *base_exit_passes;  /* [n_base * n_exit_edges] */
 
     CFGValueInfo **additional_values;
     size_t         n_additional_values;
@@ -6818,11 +6819,26 @@ static bool m7_build_latch_mux_plan(const NormalizedCFG *cfg,
     return true;
 }
 
-static bool m7_value_in_iteration_basis(const M7CyclePlan *plan,
+static bool m7_value_in_iteration_basis(const NormalizedCFG *cfg,
+                                        const M7CyclePlan *plan,
                                         MLIR_ValueHandle v) {
     if (v == MLIR_INVALID_HANDLE || !plan) return false;
     for (size_t i = 0; i < plan->n_base_iterations; ++i) {
         if (plan->base_iteration_values[i] == v) return true;
+    }
+    if (cfg && !plan->needs_entry_mux &&
+        plan->predicted_header < cfg->n_blocks) {
+        const NormBlock *header = &cfg->blocks[plan->predicted_header];
+        if (header->kind == NORM_BLOCK_ORIGINAL &&
+            header->mlir_block != MLIR_INVALID_HANDLE) {
+            size_t n_args = MLIR_GetBlockNumArgs(header->mlir_block);
+            if (n_args > plan->n_base_iterations) {
+                n_args = plan->n_base_iterations;
+            }
+            for (size_t i = 0; i < n_args; ++i) {
+                if (MLIR_GetBlockArg(header->mlir_block, i) == v) return true;
+            }
+        }
     }
     return false;
 }
@@ -6965,6 +6981,33 @@ static bool m7_snapshot_iteration_basis(const NormalizedCFG *cfg,
     return true;
 }
 
+static bool m7_build_base_exit_passes(const NormalizedCFG *cfg,
+                                      const CFGValueIndex *values,
+                                      const DominanceInfo *dom,
+                                      M7ViewWorkspace *ws,
+                                      M7CyclePlan *plan,
+                                      Arena *phase) {
+    size_t n_base = plan->n_base_iterations;
+    size_t n_exits = plan->edges.n_exit_edges;
+    if (n_base == 0 || n_exits == 0) {
+        plan->base_exit_passes = NULL;
+        return true;
+    }
+    plan->base_exit_passes = arena_new_array(
+        phase, bool, n_base * n_exits);
+    if (!plan->base_exit_passes) return false;
+    for (size_t i = 0; i < n_base; ++i) {
+        const CFGValueInfo *info = cfg_value_index_find(
+            values, plan->base_iteration_values[i]);
+        for (size_t j = 0; j < n_exits; ++j) {
+            size_t pred = cfg->edges[plan->edges.exit_edges[j]].from;
+            plan->base_exit_passes[i * n_exits + j] =
+                info && norm_dominates(dom, ws, info->defining_block, pred);
+        }
+    }
+    return true;
+}
+
 static bool m7_find_additional_live_outs(const NormalizedCFG *cfg,
                                          const SCCInfo *scc,
                                          size_t component,
@@ -7006,7 +7049,7 @@ static bool m7_find_additional_live_outs(const NormalizedCFG *cfg,
                                             info->defining_block)) {
                     continue;
                 }
-                if (m7_value_in_iteration_basis(plan, info->value)) continue;
+                if (m7_value_in_iteration_basis(cfg, plan, info->value)) continue;
 
                 bool escapes = false;
                 for (size_t ui = 0; ui < info->n_use_blocks; ++ui) {
@@ -7041,7 +7084,7 @@ static bool m7_find_additional_live_outs(const NormalizedCFG *cfg,
             if (!m7_member_in_component(scc, component, info->defining_block)) {
                 continue;
             }
-            if (m7_value_in_iteration_basis(plan, info->value)) continue;
+            if (m7_value_in_iteration_basis(cfg, plan, info->value)) continue;
 
             bool escapes = false;
             for (size_t ui = 0; ui < info->n_use_blocks; ++ui) {
@@ -7277,6 +7320,9 @@ static bool m7_prepare_cycle(NormalizedCFG *cfg,
     if (!m7_predict_header(cfg, view, out)) return false;
 
     if (!m7_snapshot_iteration_basis(cfg, out, phase)) return false;
+    if (!m7_build_base_exit_passes(cfg, values, dom, ws, out, phase)) {
+        return false;
+    }
 
     if (!m7_find_additional_live_outs(cfg, scc, component, values, dom, ws,
                                       out, phase)) {
@@ -7305,7 +7351,7 @@ static bool m7_prepare_all_cyclic_components(NormalizedCFG *cfg,
     }
 
     size_t cap = scc->n_components;
-    M7CyclePlan *plans = arena_new_array(phase, M7CyclePlan, cap);
+    M7CyclePlan *plans = cap ? arena_new_array(phase, M7CyclePlan, cap) : NULL;
     size_t n = 0;
     for (size_t c = scc->n_components; c > 0; --c) {
         size_t ci = c - 1;
@@ -7427,6 +7473,7 @@ static bool m7_apply_reduce_interface(NormalizedCFG *cfg,
     NormBlock *hdr = &cfg->blocks[header];
     NormBlock *lch = &cfg->blocks[latch_block];
     NormBlock *disp = &cfg->blocks[dispatch];
+    size_t dispatch_arg_offset = disp->n_args;
 
     for (size_t i = 0; i < plan->n_base_iterations; ++i) {
         MLIR_TypeHandle ty = plan->base_iteration_types[i];
@@ -7537,7 +7584,8 @@ static bool m7_apply_reduce_interface(NormalizedCFG *cfg,
             iv->replacement_source = plan->base_iteration_values[i];
             iv->role = m7_iteration_role_for_index(plan, i);
             iv->exit_argument =
-                norm_operand_block_arg(iv->type, dispatch, i);
+                norm_operand_block_arg(iv->type, dispatch,
+                                       dispatch_arg_offset + i);
             norm_operand_init(&iv->next_value);
         }
     }
@@ -7560,7 +7608,8 @@ static bool m7_build_back_edge_payload(const NormalizedCFG *cfg,
     const NormMuxEntry *he = &latch_mux->entries[hdr_entry];
     const NormBlock *hdr = &cfg->blocks[header];
     size_t n_ops = hdr->n_args;
-    NormOperand *ops = arena_new_array(arena, NormOperand, n_ops);
+    NormOperand *ops = n_ops
+        ? arena_new_array(arena, NormOperand, n_ops) : NULL;
 
     for (size_t j = 0; j < he->n_args; ++j) {
         ops[j] = norm_operand_block_arg(
@@ -7606,6 +7655,12 @@ static bool m7_build_exit_edge_payload(const NormalizedCFG *cfg,
         return true;
     }
     NormOperand *ops = arena_new_array(arena, NormOperand, n_ops);
+    size_t dispatch_arg_offset = latch_mux->extra_arg_offset;
+    if (dispatch_arg_offset > n_ops) return false;
+    for (size_t i = 0; i < dispatch_arg_offset; ++i) {
+        ops[i] = norm_operand_block_arg(
+            cfg->blocks[latch_block].args[i].type, latch_block, i);
+    }
 
     size_t hdr_entry =
         norm_mux_find_entry(latch_mux->entries, latch_mux->n_entries, header);
@@ -7614,16 +7669,17 @@ static bool m7_build_exit_edge_payload(const NormalizedCFG *cfg,
         ? &latch_mux->entries[hdr_entry] : NULL;
 
     for (size_t i = 0; i < plan->n_base_iterations; ++i) {
+        size_t idx = dispatch_arg_offset + i;
         if (he && i < he->n_args) {
-            ops[i] = norm_operand_block_arg(
+            ops[idx] = norm_operand_block_arg(
                 cfg->blocks[latch_mux->mux_block].args[he->arg_offset + i].type,
                 latch_mux->mux_block, he->arg_offset + i);
         } else {
-            ops[i] = norm_operand_undef(plan->base_iteration_types[i]);
+            ops[idx] = norm_operand_undef(plan->base_iteration_types[i]);
         }
     }
     for (size_t i = 0; i < plan->n_additional_values; ++i) {
-        size_t idx = plan->n_base_iterations + i;
+        size_t idx = dispatch_arg_offset + plan->n_base_iterations + i;
         if (plan->additional_forward[i]) {
             ops[idx] = norm_operand_mlir(plan->additional_values[i]->type,
                                          plan->additional_values[i]->value);
@@ -7667,11 +7723,47 @@ static bool m7_create_single_exiting_latch(NormalizedCFG *cfg,
             return false;
         }
     }
+    size_t header_entry = norm_mux_find_entry(
+        latch_mux.entries, latch_mux.n_entries, header);
+    if (header_entry == SIZE_MAX) return false;
+    const NormMuxEntry *header_mux = &latch_mux.entries[header_entry];
     for (size_t i = 0; i < plan->edges.n_exit_edges; ++i) {
+        size_t edge_id = plan->edges.exit_edges[i];
         size_t orig =
             plan->latch_mux.dest_blocks[plan->edges.n_back_edges + i];
-        if (!norm_edge_mux_redirect(cfg, &latch_mux, plan->edges.exit_edges[i],
+        if (!norm_edge_mux_redirect(cfg, &latch_mux, edge_id,
                                     orig, &stop, 1)) {
+            return false;
+        }
+
+        size_t n_ops = norm_edge_payload_num_operands(
+            cfg, &cfg->edges[edge_id].payload);
+        NormOperand *ops = n_ops
+            ? arena_new_array(cfg->phase_arena, NormOperand, n_ops) : NULL;
+        if (n_ops && !ops) return false;
+        for (size_t j = 0; j < n_ops; ++j) {
+            if (!norm_edge_payload_operand(cfg, &cfg->edges[edge_id].payload,
+                                           j, &ops[j])) {
+                return false;
+            }
+        }
+        size_t n_route = plan->n_base_iterations;
+        if (n_route > header_mux->n_args) n_route = header_mux->n_args;
+        for (size_t j = 0; j < n_route; ++j) {
+            size_t idx = header_mux->arg_offset + j;
+            if (idx >= n_ops || j >= cfg->blocks[header].n_args) return false;
+            bool pass_next = plan->base_exit_passes &&
+                plan->base_exit_passes[
+                    j * plan->edges.n_exit_edges + i] &&
+                plan->base_iteration_values[j] != MLIR_INVALID_HANDLE;
+            ops[idx] = pass_next
+                ? norm_operand_mlir(plan->base_iteration_types[j],
+                                    plan->base_iteration_values[j])
+                : norm_operand_block_arg(
+                      cfg->blocks[header].args[j].type, header, j);
+        }
+        if (!normalized_cfg_replace_edge_payload(
+                cfg, cfg->graph_arena, edge_id, ops, n_ops)) {
             return false;
         }
     }
@@ -7685,6 +7777,15 @@ static bool m7_create_single_exiting_latch(NormalizedCFG *cfg,
         cfg, cfg->graph_arena, NORM_BLOCK_LOOP_EXIT_DISPATCH,
         CFG_TERM_NONE, NULL, 0);
     if (dispatch == SIZE_MAX) return false;
+
+    for (size_t i = 0; i < latch_mux.extra_arg_offset; ++i) {
+        MLIR_TypeHandle ty = cfg->blocks[latch_block].args[i].type;
+        NormBlockArgRole role = cfg->blocks[latch_block].args[i].role;
+        if (!norm_block_append_formal_args(&cfg->blocks[dispatch],
+                                           cfg->graph_arena, &ty, 1, role)) {
+            return false;
+        }
+    }
 
     if (!m7_apply_reduce_interface(cfg, plan, latch_block, header, dispatch,
                                    loop)) {
@@ -7832,6 +7933,7 @@ static bool m7_register_replacement_key(M7Result *res, Arena *arena,
 }
 
 static bool m7_register_loop_replacements(M7Result *res, Arena *arena,
+                                          const NormalizedCFG *cfg,
                                           const M7Loop *loop,
                                           const M7CyclePlan *plan) {
     for (size_t i = 0; i < plan->n_base_iterations; ++i) {
@@ -7844,6 +7946,25 @@ static bool m7_register_loop_replacements(M7Result *res, Arena *arena,
             if (!m7_register_replacement_key(res, arena, &key, loop->id,
                                              &iv->exit_argument)) {
                 return false;
+            }
+        }
+        NormValueKey header_key;
+        if (norm_value_key_from_operand(&iv->header_argument, &header_key) &&
+            !m7_register_replacement_key(res, arena, &header_key, loop->id,
+                                         &iv->exit_argument)) {
+            return false;
+        }
+        if (cfg && loop->header < cfg->n_blocks) {
+            const NormBlock *header = &cfg->blocks[loop->header];
+            if (header->kind == NORM_BLOCK_ORIGINAL &&
+                header->mlir_block != MLIR_INVALID_HANDLE &&
+                i < MLIR_GetBlockNumArgs(header->mlir_block)) {
+                NormValueKey key = norm_value_key_mlir(
+                    MLIR_GetBlockArg(header->mlir_block, i));
+                if (!m7_register_replacement_key(res, arena, &key, loop->id,
+                                                 &iv->exit_argument)) {
+                    return false;
+                }
             }
         }
         NormValueKey next_key;
@@ -8369,7 +8490,7 @@ static bool m7_commit_cycle(NormalizedCFG *cfg,
         return false;
     }
 
-    if (!m7_register_loop_replacements(result, arena, loop, plan)) {
+    if (!m7_register_loop_replacements(result, arena, cfg, loop, plan)) {
         return false;
     }
 
