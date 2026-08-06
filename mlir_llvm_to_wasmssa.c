@@ -3807,7 +3807,8 @@ static bool norm_compute_rpo_view(const NormalizedCFG *n,
             break;
         }
         if (!pushed) {
-            order[post_n++] = stack[--sp].bid;
+            sp--;
+            order[post_n++] = stack[sp].bid;
         }
     }
 
@@ -3917,7 +3918,8 @@ static bool norm_compute_scc_view(const NormalizedCFG *cfg,
                 scc_starts_tmp[n_sccs_out] = members_out;
                 size_t scc_size = 0;
                 while (tarjan_top > 0) {
-                    size_t w = tarjan_stk[--tarjan_top];
+                    tarjan_top--;
+                    size_t w = tarjan_stk[tarjan_top];
                     size_t wd = ws->global_to_view[w];
                     if (wd != SIZE_MAX) on_stack[wd] = false;
                     out->component_id[w] = n_sccs_out;
@@ -5695,7 +5697,8 @@ static bool m7_sort_plans_downstream_first(const NormalizedCFG *cfg,
 
     size_t out_n = 0;
     while (qn > 0) {
-        size_t pi = queue[--qn];
+        qn--;
+        size_t pi = queue[qn];
         order[out_n++] = pi;
         for (size_t j = 0; j < n_plans; ++j) {
             if (j == pi) continue;
@@ -6575,7 +6578,8 @@ static bool m8_emit_bind_arg(M8EmitCtx *ec, size_t block_id, size_t arg_index,
 
 static void m8_emit_restore_bindings(M8EmitCtx *ec, size_t checkpoint) {
     while (ec->n_changes > checkpoint) {
-        M8BindingChange *change = &ec->changes[--ec->n_changes];
+        ec->n_changes--;
+        M8BindingChange *change = &ec->changes[ec->n_changes];
         ec->arg_values[change->slot] = change->old_value;
         ec->arg_bound[change->slot] = change->old_bound;
     }
@@ -6814,7 +6818,8 @@ static bool m7_worklist_empty(const M7Result *res) {
 }
 
 static size_t m7_worklist_pop(M7Result *res) {
-    return res->worklist[--res->worklist_n];
+    res->worklist_n--;
+    return res->worklist[res->worklist_n];
 }
 
 static bool m7_push_root_view(const NormalizedCFG *cfg, M7Result *res,
@@ -7352,7 +7357,8 @@ static bool m8_reaches_block(M8BuildCtx *bc, size_t from, size_t target) {
         bc->reach_epoch[target] = epoch;
         bc->reach_stack[sp++] = target;
         while (sp > 0) {
-            size_t block_id = bc->reach_stack[--sp];
+            sp--;
+            size_t block_id = bc->reach_stack[sp];
             NormEdgeIter it = norm_in_edges(bc->cfg, block_id);
             size_t edge_id;
             while (norm_edge_iter_next(&it, &edge_id)) {
