@@ -701,19 +701,19 @@ static bool sroa_leaf_type(MLIR_TypeHandle agg, const int32_t *idx, int n,
     for (int i = 1; i < n; i++) {
         int32_t c = idx[i];
         if (c == (int32_t)0x80000000) return false; // dynamic
-        if (MLIR_IsTypeLLVMStruct(cur)) {
-            size_t nf = MLIR_GetTypeLLVMStructNumFields(cur);
+        if (MLIR_TypeIsStruct(cur, MLIR_DIALECT_LLVM)) {
+            size_t nf = MLIR_GetTypeStructNumFields(cur);
             if (c < 0 || (size_t)c >= nf) return false;
-            cur = MLIR_GetTypeLLVMStructField(cur, (size_t)c);
-        } else if (MLIR_IsTypeLLVMArray(cur)) {
-            uint64_t ne = MLIR_GetTypeLLVMArrayNumElements(cur);
+            cur = MLIR_GetTypeStructField(cur, (size_t)c);
+        } else if (MLIR_TypeIsArray(cur, MLIR_DIALECT_LLVM)) {
+            uint64_t ne = MLIR_GetTypeArrayNumElements(cur);
             if (c < 0 || (uint64_t)c >= ne) return false;
-            cur = MLIR_GetTypeLLVMArrayElement(cur);
+            cur = MLIR_GetTypeArrayElement(cur);
         } else {
             return false; // indexing into a scalar
         }
     }
-    if (MLIR_IsTypeLLVMStruct(cur) || MLIR_IsTypeLLVMArray(cur)) return false;
+    if (MLIR_TypeIsStruct(cur, MLIR_DIALECT_LLVM) || MLIR_TypeIsArray(cur, MLIR_DIALECT_LLVM)) return false;
     *out = cur;
     return true;
 }
@@ -932,7 +932,7 @@ static void sroa_region(MLIR_Context *ctx, MLIR_RegionHandle region) {
             MLIR_AttributeHandle ea = MLIR_GetOpAttributeByName(op, "elem_type");
             if (ea == MLIR_INVALID_HANDLE) continue;
             MLIR_TypeHandle et = MLIR_GetAttributeTypeValue(ea);
-            if (!MLIR_IsTypeLLVMStruct(et) && !MLIR_IsTypeLLVMArray(et)) continue;
+            if (!MLIR_TypeIsStruct(et, MLIR_DIALECT_LLVM) && !MLIR_TypeIsArray(et, MLIR_DIALECT_LLVM)) continue;
             if (s.na == s.acap) {
                 s.acap <<= 1;
                 s.a_op    = realloc(s.a_op,    s.acap * sizeof(*s.a_op));

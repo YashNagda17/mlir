@@ -910,20 +910,6 @@ bool            MLIR_TypeIsArray(MLIR_TypeHandle type, MLIR_Dialect dialect);
 MLIR_TypeHandle MLIR_GetTypeArrayElement(MLIR_TypeHandle type);
 uint64_t        MLIR_GetTypeArrayNumElements(MLIR_TypeHandle type);
 uint32_t        MLIR_GetTypePointerAddressSpace(MLIR_TypeHandle type);
-#define MLIR_IsTypeLLVMStruct(type) \
-    MLIR_TypeIsStruct((type), MLIR_DIALECT_LLVM)
-#define MLIR_GetTypeLLVMStructNumFields(type) \
-    MLIR_GetTypeStructNumFields(type)
-#define MLIR_GetTypeLLVMStructField(type, idx) \
-    MLIR_GetTypeStructField((type), (idx))
-#define MLIR_IsTypeLLVMArray(type) \
-    MLIR_TypeIsArray((type), MLIR_DIALECT_LLVM)
-#define MLIR_GetTypeLLVMArrayElement(type) \
-    MLIR_GetTypeArrayElement(type)
-#define MLIR_GetTypeLLVMArrayNumElements(type) \
-    MLIR_GetTypeArrayNumElements(type)
-#define MLIR_GetTypeLLVMPointerAddressSpace(type) \
-    MLIR_GetTypePointerAddressSpace(type)
 string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle type);
 
 // -----------------------------------------------------------------------------
