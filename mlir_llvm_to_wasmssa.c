@@ -7950,6 +7950,17 @@ static bool m8_emit_transfer(M8EmitCtx *ec, const M8TransferPlan *transfer,
     uint32_t depth;
     M8LabelKind kind;
     if (m8_emit_find_label(ec, transfer->target_block, &depth, &kind)) {
+        if (kind == M8_LABEL_LOOP) {
+            for (size_t i = ec->n_labels; i > 0; --i) {
+                const M8Label *label = &ec->labels[i - 1];
+                if (label->kind != M8_LABEL_LOOP ||
+                    label->target_block != transfer->target_block ||
+                    label->loop_id >= ec->meta->scratch->m7.n_loops) {
+                    continue;
+                }
+                return m8_emit_loop_latch(ec, label->loop_id);
+            }
+        }
         if (kind == M8_LABEL_IF && depth == 0) {
             emit_block_return(ec->F, values, n_values);
         } else {

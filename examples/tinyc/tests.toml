@@ -1367,3 +1367,6 @@ platforms = ["darwin"]
 macho_backends = ["llvm_via_wasm"]
 created_file = "_tinyc_macho_mode.tmp"
 expected_file_mode = 0o644
+name = "loop_continue"
+targets = ["native", "wasm", "macho", "elf"]
+expected_stdout = "10\n"
