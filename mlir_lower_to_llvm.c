@@ -81,8 +81,8 @@ static MLIR_TypeHandle convert_function_type(MLIR_Context *ctx,
 
 static int integer_type_width(MLIR_TypeHandle ty) {
     if (MLIR_IsTypeIndex(ty)) return 64;
-    MLIR_IntegerTypeInfo info;
-    if (MLIR_GetIntegerTypeInfo(ty, &info)) return (int)info.width;
+    uint32_t width = 0;
+    if (MLIR_GetTypeIntegerWidth(ty, &width)) return (int)width;
     return 0;
 }
 

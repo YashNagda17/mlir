@@ -1054,12 +1054,6 @@ extern "C" MLIR_TypeHandle MLIR_CreateTypeFunction(MLIR_Context *,
     for (size_t i = 0; i < n_results; i++) out.push_back(typeF(results[i]));
     return typeH(mlir::FunctionType::get(&ctx, in, out));
 }
-extern "C" void MLIR_SetTypeIntegerProperties(MLIR_TypeHandle, uint32_t, bool) {}
-extern "C" void MLIR_SetTypeFloatProperties(MLIR_TypeHandle, uint32_t, bool) {}
-extern "C" void MLIR_SetTypeTensorProperties(MLIR_TypeHandle, const int64_t *, size_t, MLIR_TypeHandle) {}
-extern "C" void MLIR_SetTypeMemrefProperties(MLIR_TypeHandle, const int64_t *, size_t, MLIR_TypeHandle) {}
-extern "C" void MLIR_SetTypePointerProperties(MLIR_TypeHandle, MLIR_TypeHandle, bool, uint32_t) {}
-
 extern "C" MLIR_TypeKind MLIR_GetTypeKind(MLIR_TypeHandle h) {
     auto t = typeF(h);
     if (!t) return MLIR_TYPE_INVALID;
@@ -1112,22 +1106,32 @@ extern "C" bool MLIR_TypeIs(MLIR_TypeHandle h, MLIR_TypeKind kind, MLIR_Dialect 
     return MLIR_GetTypeKind(h) == kind && MLIR_GetTypeDialect(h) == dialect;
 }
 
-extern "C" bool MLIR_GetIntegerTypeInfo(MLIR_TypeHandle h,
-                                         MLIR_IntegerTypeInfo *out) {
+extern "C" bool MLIR_GetTypeIntegerWidth(MLIR_TypeHandle h, uint32_t *out_width) {
+    if (llvm::isa<mlir::IndexType>(typeF(h))) {
+        if (out_width) *out_width = 64;
+        return true;
+    }
     auto t = llvm::dyn_cast<mlir::IntegerType>(typeF(h));
     if (!t) return false;
-    if (out) *out = { t.getWidth() };
+    if (out_width) *out_width = t.getWidth();
     return true;
 }
 
-extern "C" bool MLIR_GetFloatTypeInfo(MLIR_TypeHandle h,
-                                       MLIR_FloatTypeInfo *out) {
+extern "C" bool MLIR_GetTypeFloatWidth(MLIR_TypeHandle h, uint32_t *out_width) {
+    auto t = llvm::dyn_cast<mlir::FloatType>(typeF(h));
+    if (!t) return false;
+    if (out_width) *out_width = t.getWidth();
+    return true;
+}
+
+extern "C" bool MLIR_GetTypeFloatEncoding(MLIR_TypeHandle h,
+                                          MLIR_FloatEncoding *out_encoding) {
     auto t = llvm::dyn_cast<mlir::FloatType>(typeF(h));
     if (!t) return false;
     MLIR_FloatEncoding encoding = MLIR_FLOAT_ENCODING_IEEE_BINARY;
     if (llvm::isa<mlir::BFloat16Type>(t)) encoding = MLIR_FLOAT_ENCODING_BFLOAT;
     else if (llvm::isa<mlir::Float80Type>(t)) encoding = MLIR_FLOAT_ENCODING_X87_EXTENDED;
-    if (out) *out = { t.getWidth(), encoding };
+    if (out_encoding) *out_encoding = encoding;
     return true;
 }
 
@@ -1316,16 +1320,19 @@ static bool literal_width_supported(uint32_t width) {
     return width > 0 && width <= MLIR_LITERAL_LARGER_BITS_WORDS * 64u;
 }
 
-static llvm::APInt integerLiteralToAPInt(const MLIR_IntegerLiteral &literal,
+static llvm::APInt integerLiteralToAPInt(MLIR_IntegerLiteralHandle literal,
                                          uint32_t width) {
-    if (MLIR_IntegerLiteral_uses_larger_bits(&literal)) {
+    if (MLIR_IntegerLiteral_UsesLargerBits(literal)) {
         uint32_t wc = 0;
-        if (!MLIR_IntegerLiteral_get_larger_bits(&literal, nullptr, 0, &wc) || wc == 0)
+        if (!MLIR_IntegerLiteral_GetLargerBits(literal, nullptr, 0, &wc) || wc == 0)
             return llvm::APInt();
-        return llvm::APInt(width, llvm::ArrayRef(literal.value_larger_bits, wc));
+        uint64_t words[MLIR_LITERAL_LARGER_BITS_WORDS];
+        if (!MLIR_IntegerLiteral_GetLargerBits(literal, words, wc, &wc))
+            return llvm::APInt();
+        return llvm::APInt(width, llvm::ArrayRef(words, wc));
     }
     int64_t v = 0;
-    if (!MLIR_IntegerLiteral_get_value(&literal, &v))
+    if (!MLIR_IntegerLiteral_GetValue(literal, &v))
         return llvm::APInt();
     return llvm::APInt(width, v, true);
 }
@@ -1348,21 +1355,24 @@ static const llvm::fltSemantics *floatSemanticsFor(MLIR_FloatEncoding enc,
     }
 }
 
-static llvm::APFloat floatLiteralToAPFloat(const MLIR_FloatLiteral &literal,
+static llvm::APFloat floatLiteralToAPFloat(MLIR_FloatLiteralHandle literal,
                                            uint32_t width,
                                            MLIR_FloatEncoding encoding) {
     const llvm::fltSemantics *sem = floatSemanticsFor(encoding, width);
     if (!sem)
         return llvm::APFloat::getZero(llvm::APFloat::IEEEsingle());
-    if (MLIR_FloatLiteral_uses_larger_bits(&literal)) {
+    if (MLIR_FloatLiteral_UsesLargerBits(literal)) {
         uint32_t wc = 0;
-        if (!MLIR_FloatLiteral_get_larger_bits(&literal, nullptr, 0, &wc) || wc == 0)
+        if (!MLIR_FloatLiteral_GetLargerBits(literal, nullptr, 0, &wc) || wc == 0)
             return llvm::APFloat(*sem, llvm::APInt::getZero(width));
-        llvm::APInt bits(width, llvm::ArrayRef(literal.value_larger_bits, wc));
+        uint64_t words[MLIR_LITERAL_LARGER_BITS_WORDS];
+        if (!MLIR_FloatLiteral_GetLargerBits(literal, words, wc, &wc))
+            return llvm::APFloat(*sem, llvm::APInt::getZero(width));
+        llvm::APInt bits(width, llvm::ArrayRef(words, wc));
         return llvm::APFloat(*sem, bits);
     }
     double v = 0.0;
-    if (!MLIR_FloatLiteral_get_value(&literal, &v))
+    if (!MLIR_FloatLiteral_GetValue(literal, &v))
         return llvm::APFloat(*sem, llvm::APInt::getZero(width));
     llvm::APFloat apf(v);
     if (sem != &llvm::APFloat::IEEEdouble()) {
@@ -1378,14 +1388,15 @@ extern "C" MLIR_AttributeHandle MLIR_CreateAttributeInteger(MLIR_Context *, stri
                          mlir::IntegerAttr::get(typeF(type), value));
 }
 extern "C" MLIR_AttributeHandle MLIR_CreateAttributeIntegerLiteral(
-    MLIR_Context *, string name, MLIR_TypeHandle type, MLIR_IntegerLiteral literal) {
-    MLIR_IntegerTypeInfo info;
-    if (literal.kind != MLIR_LITERAL_INTEGER ||
-        !MLIR_GetIntegerTypeInfo(type, &info) || literal.width != info.width ||
-        !literal_width_supported(info.width))
+    MLIR_Context *, string name, MLIR_TypeHandle type, MLIR_IntegerLiteralHandle literal) {
+    uint32_t type_width = 0;
+    uint32_t lit_width = 0;
+    if (!literal || !MLIR_IntegerLiteral_GetWidth(literal, &lit_width) ||
+        !MLIR_GetTypeIntegerWidth(type, &type_width) || lit_width != type_width ||
+        !literal_width_supported(type_width))
         return MLIR_INVALID_HANDLE;
-    llvm::APInt apint = integerLiteralToAPInt(literal, info.width);
-    if (apint.getBitWidth() != info.width)
+    llvm::APInt apint = integerLiteralToAPInt(literal, type_width);
+    if (apint.getBitWidth() != type_width)
         return MLIR_INVALID_HANDLE;
     return makeNamedAttr(llvm::StringRef(name.str, name.size),
         mlir::IntegerAttr::get(typeF(type), apint));
@@ -1395,15 +1406,21 @@ extern "C" MLIR_AttributeHandle MLIR_CreateAttributeFloat(MLIR_Context *, string
                          mlir::FloatAttr::get(typeF(type), value));
 }
 extern "C" MLIR_AttributeHandle MLIR_CreateAttributeFloatLiteral(
-    MLIR_Context *, string name, MLIR_TypeHandle type, MLIR_FloatLiteral literal) {
-    MLIR_FloatTypeInfo info;
+    MLIR_Context *, string name, MLIR_TypeHandle type, MLIR_FloatLiteralHandle literal) {
+    uint32_t type_width = 0;
+    uint32_t lit_width = 0;
+    MLIR_FloatEncoding type_encoding = MLIR_FLOAT_ENCODING_IEEE_BINARY;
+    MLIR_FloatEncoding lit_encoding = MLIR_FLOAT_ENCODING_IEEE_BINARY;
     auto ft = llvm::dyn_cast<mlir::FloatType>(typeF(type));
-    if (literal.kind != MLIR_LITERAL_FLOAT || !ft ||
-        !MLIR_GetFloatTypeInfo(type, &info) || literal.width != info.width ||
-        literal.encoding != info.encoding || !literal_width_supported(info.width))
+    if (!literal || !ft || !MLIR_FloatLiteral_GetWidth(literal, &lit_width) ||
+        !MLIR_FloatLiteral_GetEncoding(literal, &lit_encoding) ||
+        !MLIR_GetTypeFloatWidth(type, &type_width) ||
+        !MLIR_GetTypeFloatEncoding(type, &type_encoding) ||
+        lit_width != type_width || lit_encoding != type_encoding ||
+        !literal_width_supported(type_width))
         return MLIR_INVALID_HANDLE;
-    llvm::APFloat apf = floatLiteralToAPFloat(literal, info.width, info.encoding);
-    if (!floatSemanticsFor(info.encoding, info.width))
+    llvm::APFloat apf = floatLiteralToAPFloat(literal, type_width, type_encoding);
+    if (!floatSemanticsFor(type_encoding, type_width))
         return MLIR_INVALID_HANDLE;
     return makeNamedAttr(llvm::StringRef(name.str, name.size),
         mlir::FloatAttr::get(ft, apf));
@@ -1419,12 +1436,15 @@ extern "C" MLIR_AttributeHandle MLIR_CreateAttributeString(MLIR_Context *, strin
                          mlir::StringAttr::get(&ctx, llvm::StringRef(value.str, value.size)));
 }
 extern "C" MLIR_AttributeHandle MLIR_CreateAttributeStringLiteral(
-    MLIR_Context *, string name, MLIR_TypeHandle, MLIR_StringLiteral literal) {
-    if (literal.kind != MLIR_LITERAL_STRING) return MLIR_INVALID_HANDLE;
+    MLIR_Context *, string name, MLIR_TypeHandle, MLIR_StringLiteralHandle literal) {
+    const uint8_t *bytes = nullptr;
+    size_t byte_count = 0;
+    if (!literal || !MLIR_StringLiteral_GetBytes(literal, &bytes, &byte_count))
+        return MLIR_INVALID_HANDLE;
     auto &ctx = globalCtx().mctx;
     return makeNamedAttr(llvm::StringRef(name.str, name.size),
         mlir::StringAttr::get(&ctx, llvm::StringRef(
-            reinterpret_cast<const char *>(literal.bytes), literal.byte_count)));
+            reinterpret_cast<const char *>(bytes), byte_count)));
 }
 extern "C" MLIR_AttributeHandle MLIR_CreateAttributeLLVMLinkageInternal(MLIR_Context *, string name) {
     auto &ctx = globalCtx().mctx;
@@ -1689,64 +1709,66 @@ extern "C" int64_t MLIR_GetAttributeInteger(MLIR_AttributeHandle h) {
 extern "C" double MLIR_GetAttributeFloat(MLIR_AttributeHandle h) {
     return llvm::cast<mlir::FloatAttr>(F<mlir::NamedAttribute>(h)->getValue()).getValueAsDouble();
 }
-extern "C" bool MLIR_GetAttributeIntegerLiteral(MLIR_AttributeHandle h,
-                                                  MLIR_IntegerLiteral *out) {
+extern "C" MLIR_IntegerLiteralHandle MLIR_GetAttributeIntegerLiteral(
+    MLIR_Context *ctx, MLIR_AttributeHandle h) {
     auto attr = llvm::dyn_cast<mlir::IntegerAttr>(F<mlir::NamedAttribute>(h)->getValue());
-    if (!attr) return false;
-    MLIR_IntegerTypeInfo info;
-    if (!MLIR_GetIntegerTypeInfo(typeH(attr.getType()), &info) ||
-        !literal_width_supported(info.width))
-        return false;
-    if (out) {
-        memset(out, 0, sizeof(*out));
-        llvm::APInt apint = attr.getValue();
-        if (info.width <= 64) {
-            if (!MLIR_IntegerLiteral_set_value(out, info.width, apint.getSExtValue()))
-                return false;
-        } else {
-            const uint64_t *raw = apint.getRawData();
-            uint32_t wc = (uint32_t)apint.getNumWords();
-            if (wc > MLIR_LITERAL_LARGER_BITS_WORDS) return false;
-            if (!MLIR_IntegerLiteral_set_larger_bits(out, info.width, raw, wc))
-                return false;
-        }
+    if (!attr) return MLIR_INVALID_LITERAL_HANDLE;
+    uint32_t type_width = 0;
+    if (!MLIR_GetTypeIntegerWidth(typeH(attr.getType()), &type_width) ||
+        !literal_width_supported(type_width))
+        return MLIR_INVALID_LITERAL_HANDLE;
+    MLIR_IntegerLiteralHandle lit = MLIR_CreateIntegerLiteral(ctx);
+    if (!lit) return MLIR_INVALID_LITERAL_HANDLE;
+    llvm::APInt apint = attr.getValue();
+    if (type_width <= 64) {
+        if (!MLIR_IntegerLiteral_SetValue(lit, type_width, apint.getSExtValue()))
+            return MLIR_INVALID_LITERAL_HANDLE;
+    } else {
+        const uint64_t *raw = apint.getRawData();
+        uint32_t wc = (uint32_t)apint.getNumWords();
+        if (wc > MLIR_LITERAL_LARGER_BITS_WORDS) return MLIR_INVALID_LITERAL_HANDLE;
+        if (!MLIR_IntegerLiteral_SetLargerBits(lit, type_width, raw, wc))
+            return MLIR_INVALID_LITERAL_HANDLE;
     }
-    return true;
+    return lit;
 }
-extern "C" bool MLIR_GetAttributeFloatLiteral(MLIR_AttributeHandle h,
-                                                MLIR_FloatLiteral *out) {
+extern "C" MLIR_FloatLiteralHandle MLIR_GetAttributeFloatLiteral(
+    MLIR_Context *ctx, MLIR_AttributeHandle h) {
     auto attr = llvm::dyn_cast<mlir::FloatAttr>(F<mlir::NamedAttribute>(h)->getValue());
-    if (!attr) return false;
-    MLIR_FloatTypeInfo info;
-    if (!MLIR_GetFloatTypeInfo(typeH(attr.getType()), &info) ||
-        !literal_width_supported(info.width))
-        return false;
-    if (out) {
-        memset(out, 0, sizeof(*out));
-        if (info.width <= 64) {
-            if (!MLIR_FloatLiteral_set_value(out, info.width, info.encoding,
-                                             attr.getValueAsDouble()))
-                return false;
-        } else {
-            llvm::APInt bits = attr.getValue().bitcastToAPInt();
-            const uint64_t *raw = bits.getRawData();
-            uint32_t wc = (uint32_t)bits.getNumWords();
-            if (wc > MLIR_LITERAL_LARGER_BITS_WORDS) return false;
-            if (!MLIR_FloatLiteral_set_larger_bits(out, info.width, info.encoding,
-                                                   raw, wc))
-                return false;
-        }
+    if (!attr) return MLIR_INVALID_LITERAL_HANDLE;
+    uint32_t type_width = 0;
+    MLIR_FloatEncoding type_encoding = MLIR_FLOAT_ENCODING_IEEE_BINARY;
+    if (!MLIR_GetTypeFloatWidth(typeH(attr.getType()), &type_width) ||
+        !MLIR_GetTypeFloatEncoding(typeH(attr.getType()), &type_encoding) ||
+        !literal_width_supported(type_width))
+        return MLIR_INVALID_LITERAL_HANDLE;
+    MLIR_FloatLiteralHandle lit = MLIR_CreateFloatLiteral(ctx);
+    if (!lit) return MLIR_INVALID_LITERAL_HANDLE;
+    if (type_width <= 64) {
+        if (!MLIR_FloatLiteral_SetValue(lit, type_width, type_encoding,
+                                        attr.getValueAsDouble()))
+            return MLIR_INVALID_LITERAL_HANDLE;
+    } else {
+        llvm::APInt bits = attr.getValue().bitcastToAPInt();
+        const uint64_t *raw = bits.getRawData();
+        uint32_t wc = (uint32_t)bits.getNumWords();
+        if (wc > MLIR_LITERAL_LARGER_BITS_WORDS) return MLIR_INVALID_LITERAL_HANDLE;
+        if (!MLIR_FloatLiteral_SetLargerBits(lit, type_width, type_encoding, raw, wc))
+            return MLIR_INVALID_LITERAL_HANDLE;
     }
-    return true;
+    return lit;
 }
-extern "C" bool MLIR_GetAttributeStringLiteral(MLIR_AttributeHandle h,
-                                                 MLIR_StringLiteral *out) {
+extern "C" MLIR_StringLiteralHandle MLIR_GetAttributeStringLiteral(
+    MLIR_Context *ctx, MLIR_AttributeHandle h) {
     auto attr = llvm::dyn_cast<mlir::StringAttr>(F<mlir::NamedAttribute>(h)->getValue());
-    if (!attr) return false;
+    if (!attr) return MLIR_INVALID_LITERAL_HANDLE;
     auto value = attr.getValue();
-    if (out) *out = { MLIR_LITERAL_STRING, 8, value.size(),
-                      reinterpret_cast<const uint8_t *>(value.data()), value.size() };
-    return true;
+    MLIR_StringLiteralHandle lit = MLIR_CreateStringLiteral(ctx);
+    if (!lit || !MLIR_StringLiteral_SetBytes(ctx, lit, 8,
+                                             reinterpret_cast<const uint8_t *>(value.data()),
+                                             value.size()))
+        return MLIR_INVALID_LITERAL_HANDLE;
+    return lit;
 }
 extern "C" MLIR_TypeHandle MLIR_GetAttributeType(MLIR_AttributeHandle h) {
     auto attr = F<mlir::NamedAttribute>(h)->getValue();

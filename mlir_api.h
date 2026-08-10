@@ -557,14 +557,6 @@ typedef enum MLIR_FloatEncoding {
     MLIR_FLOAT_ENCODING_PPC_DOUBLE_DOUBLE
 } MLIR_FloatEncoding;
 
-typedef struct MLIR_IntegerTypeInfo {
-    uint32_t width; /* bit width of the integer type (e.g. 32 for i32) */
-} MLIR_IntegerTypeInfo;
-
-typedef struct MLIR_FloatTypeInfo {
-    uint32_t width;              /* bit width of the floating-point type (e.g. 32 for f32) */
-    MLIR_FloatEncoding encoding; /* IEEE binary, bfloat, x87 extended, or PPC double-double */
-} MLIR_FloatTypeInfo;
 
 // -----------------------------------------------------------------------------
 // API lifecycle
@@ -873,15 +865,9 @@ MLIR_TypeHandle MLIR_CreateTypeFunction(MLIR_Context *ctx,
                                          const MLIR_TypeHandle *inputs, size_t n_inputs,
                                          const MLIR_TypeHandle *results, size_t n_results);
 
-// Deprecated compatibility entrypoints. Interned types are immutable; these
-// functions are no-ops in both native and upstream implementations. Construct
-// a new canonical type instead. Identified LLVM struct body initialization is
-// the only supported type mutation.
-void MLIR_SetTypeIntegerProperties(MLIR_TypeHandle type, uint32_t width, bool is_signed);
-void MLIR_SetTypeFloatProperties(MLIR_TypeHandle type, uint32_t width, bool is_bfloat);
-void MLIR_SetTypeTensorProperties(MLIR_TypeHandle type, const int64_t *shape, size_t rank, MLIR_TypeHandle element_type);
-void MLIR_SetTypeMemrefProperties(MLIR_TypeHandle type, const int64_t *shape, size_t rank, MLIR_TypeHandle element_type);
-void MLIR_SetTypePointerProperties(MLIR_TypeHandle type, MLIR_TypeHandle element_type, bool has_address_space, uint32_t address_space);
+// Deprecated compatibility entrypoints removed — construct canonical types via
+// MLIR_CreateType* instead. Identified LLVM struct body initialization remains
+// the only supported type mutation (MLIR_SetTypeStructBody).
 
 // Introspection & formatting
 MLIR_TypeKind MLIR_GetTypeKind(MLIR_TypeHandle type);
@@ -893,8 +879,9 @@ MLIR_Dialect MLIR_GetTypeDialect(MLIR_TypeHandle type);
 // when dispatching on dialect-owned types (pointer, void, array, struct).
 bool MLIR_TypeHasDialect(MLIR_TypeHandle type, MLIR_Dialect dialect);
 bool MLIR_TypeIs(MLIR_TypeHandle type, MLIR_TypeKind kind, MLIR_Dialect dialect);
-bool MLIR_GetIntegerTypeInfo(MLIR_TypeHandle type, MLIR_IntegerTypeInfo *out);
-bool MLIR_GetFloatTypeInfo(MLIR_TypeHandle type, MLIR_FloatTypeInfo *out);
+bool MLIR_GetTypeIntegerWidth(MLIR_TypeHandle type, uint32_t *out_width);
+bool MLIR_GetTypeFloatWidth(MLIR_TypeHandle type, uint32_t *out_width);
+bool MLIR_GetTypeFloatEncoding(MLIR_TypeHandle type, MLIR_FloatEncoding *out_encoding);
 bool MLIR_IsTypeInteger(MLIR_TypeHandle type);
 bool MLIR_IsTypeFloat(MLIR_TypeHandle type);
 bool MLIR_IsTypeTensor(MLIR_TypeHandle type);
@@ -943,62 +930,48 @@ string MLIR_GetTypeString(MLIR_Context *ctx, MLIR_TypeHandle type);
 // Attribute API
 // -----------------------------------------------------------------------------
 
-typedef enum MLIR_LiteralKind {
-    MLIR_LITERAL_INVALID = 0,
-    MLIR_LITERAL_INTEGER,
-    MLIR_LITERAL_FLOAT,
-    MLIR_LITERAL_STRING
-} MLIR_LiteralKind;
+typedef uintptr_t MLIR_IntegerLiteralHandle;
+typedef uintptr_t MLIR_FloatLiteralHandle;
+typedef uintptr_t MLIR_StringLiteralHandle;
 
-typedef struct MLIR_IntegerLiteral {
-    MLIR_LiteralKind kind;
-    uint32_t width;   /* must match the attribute's integer type width */
-    int64_t value;    /* used when is_larger_bits is false (width <= 64) */
-    bool is_larger_bits;
-    uint32_t larger_word_count;
-    uint64_t value_larger_bits[MLIR_LITERAL_LARGER_BITS_WORDS];
-} MLIR_IntegerLiteral;
+#define MLIR_INVALID_LITERAL_HANDLE 0
 
-typedef struct MLIR_FloatLiteral {
-    MLIR_LiteralKind kind;
-    uint32_t width;
-    MLIR_FloatEncoding encoding;
-    double value; /* used when is_larger_bits is false (width <= 64) */
-    bool is_larger_bits;
-    uint32_t larger_word_count;
-    uint64_t value_larger_bits[MLIR_LITERAL_LARGER_BITS_WORDS];
-} MLIR_FloatLiteral;
+MLIR_IntegerLiteralHandle MLIR_CreateIntegerLiteral(MLIR_Context *ctx);
+MLIR_FloatLiteralHandle MLIR_CreateFloatLiteral(MLIR_Context *ctx);
+MLIR_StringLiteralHandle MLIR_CreateStringLiteral(MLIR_Context *ctx);
 
-typedef struct MLIR_StringLiteral {
-    MLIR_LiteralKind kind;
-    uint32_t element_width;
-    uint64_t element_count;
-    const uint8_t *bytes;
-    size_t byte_count;
-} MLIR_StringLiteral;
+bool MLIR_IntegerLiteral_UsesLargerBits(MLIR_IntegerLiteralHandle lit);
+bool MLIR_IntegerLiteral_SetValue(MLIR_IntegerLiteralHandle lit, uint32_t width,
+                                  int64_t value);
+bool MLIR_IntegerLiteral_SetLargerBits(MLIR_IntegerLiteralHandle lit,
+                                       uint32_t width, const uint64_t *words,
+                                       uint32_t word_count);
+bool MLIR_IntegerLiteral_GetWidth(MLIR_IntegerLiteralHandle lit, uint32_t *out_width);
+bool MLIR_IntegerLiteral_GetValue(MLIR_IntegerLiteralHandle lit, int64_t *out);
+bool MLIR_IntegerLiteral_GetLargerBits(MLIR_IntegerLiteralHandle lit,
+                                       uint64_t *words, uint32_t words_cap,
+                                       uint32_t *out_word_count);
 
-bool MLIR_IntegerLiteral_uses_larger_bits(const MLIR_IntegerLiteral *lit);
-bool MLIR_IntegerLiteral_set_value(MLIR_IntegerLiteral *lit, uint32_t width,
-                                   int64_t value);
-bool MLIR_IntegerLiteral_set_larger_bits(MLIR_IntegerLiteral *lit,
-                                         uint32_t width, const uint64_t *words,
-                                         uint32_t word_count);
-bool MLIR_IntegerLiteral_get_value(const MLIR_IntegerLiteral *lit, int64_t *out);
-bool MLIR_IntegerLiteral_get_larger_bits(const MLIR_IntegerLiteral *lit,
-                                         uint64_t *words, uint32_t words_cap,
-                                         uint32_t *out_word_count);
-bool MLIR_FloatLiteral_uses_larger_bits(const MLIR_FloatLiteral *lit);
-bool MLIR_FloatLiteral_set_value(MLIR_FloatLiteral *lit, uint32_t width,
-                                 MLIR_FloatEncoding encoding,
-                                 double value);
-bool MLIR_FloatLiteral_set_larger_bits(MLIR_FloatLiteral *lit, uint32_t width,
+bool MLIR_FloatLiteral_UsesLargerBits(MLIR_FloatLiteralHandle lit);
+bool MLIR_FloatLiteral_SetValue(MLIR_FloatLiteralHandle lit, uint32_t width,
+                                MLIR_FloatEncoding encoding, double value);
+bool MLIR_FloatLiteral_SetLargerBits(MLIR_FloatLiteralHandle lit, uint32_t width,
                                        MLIR_FloatEncoding encoding,
                                        const uint64_t *words,
                                        uint32_t word_count);
-bool MLIR_FloatLiteral_get_value(const MLIR_FloatLiteral *lit, double *out);
-bool MLIR_FloatLiteral_get_larger_bits(const MLIR_FloatLiteral *lit,
+bool MLIR_FloatLiteral_GetWidth(MLIR_FloatLiteralHandle lit, uint32_t *out_width);
+bool MLIR_FloatLiteral_GetEncoding(MLIR_FloatLiteralHandle lit,
+                                   MLIR_FloatEncoding *out_encoding);
+bool MLIR_FloatLiteral_GetValue(MLIR_FloatLiteralHandle lit, double *out);
+bool MLIR_FloatLiteral_GetLargerBits(MLIR_FloatLiteralHandle lit,
                                        uint64_t *words, uint32_t words_cap,
                                        uint32_t *out_word_count);
+
+bool MLIR_StringLiteral_SetBytes(MLIR_Context *ctx, MLIR_StringLiteralHandle lit,
+                                 uint32_t element_width, const uint8_t *bytes,
+                                 size_t byte_count);
+bool MLIR_StringLiteral_GetBytes(MLIR_StringLiteralHandle lit,
+                                 const uint8_t **out_bytes, size_t *out_byte_count);
 
 // Creation & mutation
 //
@@ -1018,12 +991,12 @@ MLIR_AttributeHandle MLIR_CreateAttributeInteger(MLIR_Context *ctx, string name,
 MLIR_AttributeHandle MLIR_CreateAttributeFloat(MLIR_Context *ctx, string name, double value, MLIR_TypeHandle type);
 MLIR_AttributeHandle MLIR_CreateAttributeBool(MLIR_Context *ctx, string name, bool value);
 MLIR_AttributeHandle MLIR_CreateAttributeString(MLIR_Context *ctx, string name, string value);
-MLIR_AttributeHandle MLIR_CreateAttributeIntegerLiteral( MLIR_Context *ctx, string name, MLIR_TypeHandle type,
-    MLIR_IntegerLiteral literal);
-MLIR_AttributeHandle MLIR_CreateAttributeFloatLiteral(MLIR_Context *ctx, string name, MLIR_TypeHandle type,
-    MLIR_FloatLiteral literal);
-MLIR_AttributeHandle MLIR_CreateAttributeStringLiteral(MLIR_Context *ctx, string name, MLIR_TypeHandle llvm_array_type,
-    MLIR_StringLiteral literal);
+MLIR_AttributeHandle MLIR_CreateAttributeIntegerLiteral(MLIR_Context *ctx, string name,
+    MLIR_TypeHandle type, MLIR_IntegerLiteralHandle literal);
+MLIR_AttributeHandle MLIR_CreateAttributeFloatLiteral(MLIR_Context *ctx, string name,
+    MLIR_TypeHandle type, MLIR_FloatLiteralHandle literal);
+MLIR_AttributeHandle MLIR_CreateAttributeStringLiteral(MLIR_Context *ctx, string name,
+    MLIR_TypeHandle llvm_array_type, MLIR_StringLiteralHandle literal);
 MLIR_AttributeHandle MLIR_CreateAttributeLLVMLinkageInternal(MLIR_Context *ctx, string name);
 MLIR_AttributeHandle MLIR_CreateAttributeArray(MLIR_Context *ctx, string name, MLIR_AttributeHandle *elements, size_t count);
 // Dense i32 array attribute (DenseI32ArrayAttr) — used e.g. for
@@ -1258,9 +1231,12 @@ string MLIR_GetAttributeName(MLIR_AttributeHandle attr);
 string MLIR_GetAttributeAsString(MLIR_Context *ctx, MLIR_AttributeHandle attr);
 int64_t MLIR_GetAttributeInteger(MLIR_AttributeHandle attr);
 double MLIR_GetAttributeFloat(MLIR_AttributeHandle attr);
-bool MLIR_GetAttributeIntegerLiteral(MLIR_AttributeHandle attr, MLIR_IntegerLiteral *out);
-bool MLIR_GetAttributeFloatLiteral(MLIR_AttributeHandle attr, MLIR_FloatLiteral *out);
-bool MLIR_GetAttributeStringLiteral(MLIR_AttributeHandle attr, MLIR_StringLiteral *out);
+MLIR_IntegerLiteralHandle MLIR_GetAttributeIntegerLiteral(MLIR_Context *ctx,
+                                                          MLIR_AttributeHandle attr);
+MLIR_FloatLiteralHandle MLIR_GetAttributeFloatLiteral(MLIR_Context *ctx,
+                                                      MLIR_AttributeHandle attr);
+MLIR_StringLiteralHandle MLIR_GetAttributeStringLiteral(MLIR_Context *ctx,
+                                                        MLIR_AttributeHandle attr);
 // For Integer and Float attributes, returns the numeric type. For other
 // attribute kinds, returns MLIR_INVALID_HANDLE.
 MLIR_TypeHandle MLIR_GetAttributeType(MLIR_AttributeHandle attr);

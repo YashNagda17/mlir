@@ -88,9 +88,9 @@ typedef struct IR_Type {
 typedef struct IR_Attribute {
     MLIR_AttrKind kind;
     union {
-        MLIR_IntegerLiteral integer;
-        MLIR_FloatLiteral floating;
-        MLIR_StringLiteral string;
+        MLIR_IntegerLiteralHandle integer;
+        MLIR_FloatLiteralHandle floating;
+        MLIR_StringLiteralHandle string;
         bool bool_value;
         struct {
             MLIR_AttributeHandle *elements;
@@ -533,7 +533,8 @@ static inline string arena_dup_str(MLIR_Context *ctx, string s) {
     return (string){ p, s.size };
 }
 
-static MLIR_StringLiteral string_literal_copy(MLIR_Context *ctx, MLIR_StringLiteral literal);
+static MLIR_StringLiteralHandle make_string_literal(MLIR_Context *ctx, string value);
+static string string_from_literal(MLIR_StringLiteralHandle lit);
 
 static inline MLIR_LocationHandle alloc_loc(MLIR_Context *ctx, IR_Location l) {
     if (!ctx || !ctx->arena) return MLIR_INVALID_HANDLE;
@@ -1347,8 +1348,7 @@ static MLIR_AttributeHandle make_llvm_linkage_attr(MLIR_Context *ctx, string lin
     strbuf_append(ctx->arena, &body, linkage_kind);
     strbuf_append(ctx->arena, &body, str_lit(">"));
     string value = strbuf_to_string(body);
-    a.data.string = string_literal_copy(ctx, (MLIR_StringLiteral){
-        MLIR_LITERAL_STRING, 8, value.size, (const uint8_t *)value.str, value.size });
+    a.data.string = make_string_literal(ctx, value);
     return alloc_attr_obj(ctx, a);
 }
 
@@ -1556,14 +1556,6 @@ uint64_t MLIR_GetTypeArrayNumElements(MLIR_TypeHandle th) {
     return t->data.llvm_array.count;
 }
 
-void MLIR_SetTypeIntegerProperties(MLIR_TypeHandle th, uint32_t width, bool is_signed) {
-    (void)th; (void)width; (void)is_signed;
-}
-
-void MLIR_SetTypeFloatProperties(MLIR_TypeHandle th, uint32_t width, bool is_bfloat) {
-    (void)th; (void)width; (void)is_bfloat;
-}
-
 MLIR_TypeKind MLIR_GetTypeKind(MLIR_TypeHandle th) {
     IR_Type *t = resolve_type(th);
     return t ? t->kind : MLIR_TYPE_INVALID;
@@ -1583,23 +1575,29 @@ bool MLIR_TypeIs(MLIR_TypeHandle th, MLIR_TypeKind kind, MLIR_Dialect dialect) {
     return t && t->kind == kind && t->dialect == dialect;
 }
 
-bool MLIR_GetIntegerTypeInfo(MLIR_TypeHandle th, MLIR_IntegerTypeInfo *out) {
+bool MLIR_GetTypeIntegerWidth(MLIR_TypeHandle th, uint32_t *out_width) {
     IR_Type *t = resolve_type(th);
     if (!t) return false;
     if (t->kind == MLIR_TYPE_INDEX) {
-        if (out) *out = (MLIR_IntegerTypeInfo){ 64 };
+        if (out_width) *out_width = 64;
         return true;
     }
     if (t->kind != MLIR_TYPE_INTEGER) return false;
-    if (out) *out = (MLIR_IntegerTypeInfo){ t->data.integer.width };
+    if (out_width) *out_width = t->data.integer.width;
     return true;
 }
 
-bool MLIR_GetFloatTypeInfo(MLIR_TypeHandle th, MLIR_FloatTypeInfo *out) {
+bool MLIR_GetTypeFloatWidth(MLIR_TypeHandle th, uint32_t *out_width) {
     IR_Type *t = resolve_type(th);
     if (!t || t->kind != MLIR_TYPE_FLOAT) return false;
-    if (out) *out = (MLIR_FloatTypeInfo){ t->data.floating.width,
-                                            t->data.floating.encoding };
+    if (out_width) *out_width = t->data.floating.width;
+    return true;
+}
+
+bool MLIR_GetTypeFloatEncoding(MLIR_TypeHandle th, MLIR_FloatEncoding *out_encoding) {
+    IR_Type *t = resolve_type(th);
+    if (!t || t->kind != MLIR_TYPE_FLOAT) return false;
+    if (out_encoding) *out_encoding = t->data.floating.encoding;
     return true;
 }
 
@@ -1610,42 +1608,30 @@ uint32_t MLIR_GetTypePointerAddressSpace(MLIR_TypeHandle th) {
 }
 
 // Attribute creation
-static MLIR_StringLiteral string_literal_copy(MLIR_Context *ctx,
-                                              MLIR_StringLiteral literal) {
-    if (!ctx || !ctx->arena || !literal.bytes || literal.byte_count == 0)
-        return literal;
-    uint8_t *bytes = arena_new_array(ctx->arena, uint8_t, literal.byte_count);
-    memcpy(bytes, literal.bytes, literal.byte_count);
-    literal.bytes = bytes;
-    return literal;
+static string string_from_literal(MLIR_StringLiteralHandle lit) {
+    const uint8_t *bytes = NULL;
+    size_t byte_count = 0;
+    if (!lit || !MLIR_StringLiteral_GetBytes(lit, &bytes, &byte_count))
+        return str_lit("");
+    return (string){ (char *)bytes, byte_count };
 }
 
-static bool integer_literal_valid(const MLIR_IntegerLiteral *lit) {
-    if (!lit || lit->kind != MLIR_LITERAL_INTEGER || lit->width == 0) return false;
-    if (lit->width > MLIR_LITERAL_LARGER_BITS_WORDS * 64u) return false;
-    if (MLIR_IntegerLiteral_uses_larger_bits(lit)) {
-        uint32_t wc = 0;
-        return MLIR_IntegerLiteral_get_larger_bits(lit, NULL, 0, &wc) && wc > 0;
-    }
-    return lit->width <= 64;
-}
-
-static bool float_literal_valid(const MLIR_FloatLiteral *lit) {
-    if (!lit || lit->kind != MLIR_LITERAL_FLOAT || lit->width == 0) return false;
-    if (lit->width > MLIR_LITERAL_LARGER_BITS_WORDS * 64u) return false;
-    if (MLIR_FloatLiteral_uses_larger_bits(lit)) {
-        uint32_t wc = 0;
-        return MLIR_FloatLiteral_get_larger_bits(lit, NULL, 0, &wc) && wc > 0;
-    }
-    return lit->width <= 64;
+static MLIR_StringLiteralHandle make_string_literal(MLIR_Context *ctx, string value) {
+    MLIR_StringLiteralHandle lit = MLIR_CreateStringLiteral(ctx);
+    if (!lit || !MLIR_StringLiteral_SetBytes(ctx, lit, 8,
+                                             (const uint8_t *)value.str, value.size))
+        return MLIR_INVALID_LITERAL_HANDLE;
+    return lit;
 }
 
 MLIR_AttributeHandle MLIR_CreateAttributeIntegerLiteral(
     MLIR_Context *ctx, string name, MLIR_TypeHandle type,
-    MLIR_IntegerLiteral literal) {
-    MLIR_IntegerTypeInfo info;
-    if (!MLIR_GetIntegerTypeInfo(type, &info) ||
-        literal.width != info.width || !integer_literal_valid(&literal))
+    MLIR_IntegerLiteralHandle literal) {
+    uint32_t type_width = 0;
+    uint32_t lit_width = 0;
+    if (!literal || !MLIR_GetTypeIntegerWidth(type, &type_width) ||
+        !MLIR_IntegerLiteral_GetWidth(literal, &lit_width) ||
+        lit_width != type_width)
         return MLIR_INVALID_HANDLE;
     IR_Attribute a = {0};
     a.kind = MLIR_ATTR_KIND_INTEGER;
@@ -1657,11 +1643,16 @@ MLIR_AttributeHandle MLIR_CreateAttributeIntegerLiteral(
 
 MLIR_AttributeHandle MLIR_CreateAttributeFloatLiteral(
     MLIR_Context *ctx, string name, MLIR_TypeHandle type,
-    MLIR_FloatLiteral literal) {
-    MLIR_FloatTypeInfo info;
-    if (!MLIR_GetFloatTypeInfo(type, &info) ||
-        literal.width != info.width || literal.encoding != info.encoding ||
-        !float_literal_valid(&literal))
+    MLIR_FloatLiteralHandle literal) {
+    uint32_t type_width = 0;
+    uint32_t lit_width = 0;
+    MLIR_FloatEncoding type_encoding = MLIR_FLOAT_ENCODING_IEEE_BINARY;
+    MLIR_FloatEncoding lit_encoding = MLIR_FLOAT_ENCODING_IEEE_BINARY;
+    if (!literal || !MLIR_GetTypeFloatWidth(type, &type_width) ||
+        !MLIR_GetTypeFloatEncoding(type, &type_encoding) ||
+        !MLIR_FloatLiteral_GetWidth(literal, &lit_width) ||
+        !MLIR_FloatLiteral_GetEncoding(literal, &lit_encoding) ||
+        lit_width != type_width || lit_encoding != type_encoding)
         return MLIR_INVALID_HANDLE;
     IR_Attribute a = {0};
     a.kind = MLIR_ATTR_KIND_FLOAT;
@@ -1673,37 +1664,44 @@ MLIR_AttributeHandle MLIR_CreateAttributeFloatLiteral(
 
 MLIR_AttributeHandle MLIR_CreateAttributeStringLiteral(
     MLIR_Context *ctx, string name, MLIR_TypeHandle llvm_array_type,
-    MLIR_StringLiteral literal) {
-    if (literal.kind != MLIR_LITERAL_STRING) return MLIR_INVALID_HANDLE;
+    MLIR_StringLiteralHandle literal) {
+    const uint8_t *bytes = NULL;
+    size_t byte_count = 0;
+    if (!literal || !MLIR_StringLiteral_GetBytes(literal, &bytes, &byte_count))
+        return MLIR_INVALID_HANDLE;
     IR_Attribute a = {0};
     a.kind = MLIR_ATTR_KIND_STRING;
     a.name = arena_dup_str(ctx, name);
     a.type = llvm_array_type;
-    a.data.string = string_literal_copy(ctx, literal);
+    a.data.string = literal;
     return alloc_attr_obj(ctx, a);
 }
 
 MLIR_AttributeHandle MLIR_CreateAttributeInteger(MLIR_Context *ctx, string name, int64_t value, MLIR_TypeHandle type) {
-    MLIR_IntegerTypeInfo info = { 64 };
-    (void)MLIR_GetIntegerTypeInfo(type, &info);
-    MLIR_IntegerLiteral lit;
-    memset(&lit, 0, sizeof(lit));
-    if (!MLIR_IntegerLiteral_set_value(&lit, info.width, value)) return MLIR_INVALID_HANDLE;
+    uint32_t width = 64;
+    (void)MLIR_GetTypeIntegerWidth(type, &width);
+    MLIR_IntegerLiteralHandle lit = MLIR_CreateIntegerLiteral(ctx);
+    if (!lit || !MLIR_IntegerLiteral_SetValue(lit, width, value))
+        return MLIR_INVALID_HANDLE;
     return MLIR_CreateAttributeIntegerLiteral(ctx, name, type, lit);
 }
 
 MLIR_AttributeHandle MLIR_CreateAttributeString(MLIR_Context *ctx, string name, string value) {
-    return MLIR_CreateAttributeStringLiteral(ctx, name, MLIR_INVALID_HANDLE,
-        (MLIR_StringLiteral){ MLIR_LITERAL_STRING, 8, value.size,
-                              (const uint8_t *)value.str, value.size });
+    MLIR_StringLiteralHandle lit = MLIR_CreateStringLiteral(ctx);
+    if (!lit || !MLIR_StringLiteral_SetBytes(ctx, lit, 8,
+                                             (const uint8_t *)value.str, value.size))
+        return MLIR_INVALID_HANDLE;
+    return MLIR_CreateAttributeStringLiteral(ctx, name, MLIR_INVALID_HANDLE, lit);
 }
 
 MLIR_AttributeHandle MLIR_CreateAttributeFloat(MLIR_Context *ctx, string name, double value, MLIR_TypeHandle type) {
-    MLIR_FloatTypeInfo info = { 64, MLIR_FLOAT_ENCODING_IEEE_BINARY };
-    if (!MLIR_GetFloatTypeInfo(type, &info)) return MLIR_INVALID_HANDLE;
-    MLIR_FloatLiteral lit;
-    memset(&lit, 0, sizeof(lit));
-    if (!MLIR_FloatLiteral_set_value(&lit, info.width, info.encoding, value))
+    uint32_t width = 64;
+    MLIR_FloatEncoding encoding = MLIR_FLOAT_ENCODING_IEEE_BINARY;
+    if (!MLIR_GetTypeFloatWidth(type, &width) ||
+        !MLIR_GetTypeFloatEncoding(type, &encoding))
+        return MLIR_INVALID_HANDLE;
+    MLIR_FloatLiteralHandle lit = MLIR_CreateFloatLiteral(ctx);
+    if (!lit || !MLIR_FloatLiteral_SetValue(lit, width, encoding, value))
         return MLIR_INVALID_HANDLE;
     return MLIR_CreateAttributeFloatLiteral(ctx, name, type, lit);
 }
@@ -1752,8 +1750,7 @@ MLIR_AttributeHandle MLIR_CreateAttributeSymbolRef(MLIR_Context *ctx, string nam
     a.kind = MLIR_ATTR_KIND_STRING;
     a.name = name;
     string with_at = format(ctx->arena, str_lit("@{}"), value);
-    a.data.string = string_literal_copy(ctx, (MLIR_StringLiteral){
-        MLIR_LITERAL_STRING, 8, with_at.size, (const uint8_t *)with_at.str, with_at.size });
+    a.data.string = make_string_literal(ctx, with_at);
     return alloc_attr_obj(ctx, a);
 }
 
@@ -1774,8 +1771,7 @@ MLIR_AttributeHandle MLIR_CreateAttributeDenseI32Array(MLIR_Context *ctx, string
     }
     strbuf_append(arena, &s, str_lit(">"));
     string value = strbuf_to_string(s);
-    a.data.string = string_literal_copy(ctx, (MLIR_StringLiteral){
-        MLIR_LITERAL_STRING, 8, value.size, (const uint8_t *)value.str, value.size });
+    a.data.string = make_string_literal(ctx, value);
     return alloc_attr_obj(ctx, a);
 }
 
@@ -1795,8 +1791,7 @@ MLIR_AttributeHandle MLIR_CreateAttributeDenseI64Array(MLIR_Context *ctx, string
     }
     strbuf_append(arena, &s, str_lit(">"));
     string value = strbuf_to_string(s);
-    a.data.string = string_literal_copy(ctx, (MLIR_StringLiteral){
-        MLIR_LITERAL_STRING, 8, value.size, (const uint8_t *)value.str, value.size });
+    a.data.string = make_string_literal(ctx, value);
     return alloc_attr_obj(ctx, a);
 }
 
@@ -1809,8 +1804,7 @@ MLIR_AttributeHandle MLIR_CreateAttributeLLVMLinkageInternal(MLIR_Context *ctx, 
     a.kind = MLIR_ATTR_KIND_STRING;
     a.name = name;
     string value = str_lit("#llvm.linkage<internal>");
-    a.data.string = string_literal_copy(ctx, (MLIR_StringLiteral){
-        MLIR_LITERAL_STRING, 8, value.size, (const uint8_t *)value.str, value.size });
+    a.data.string = make_string_literal(ctx, value);
     return alloc_attr_obj(ctx, a);
 }
 
@@ -1903,7 +1897,7 @@ string MLIR_GetAttributeAsString(MLIR_Context *ctx, MLIR_AttributeHandle ah) {
     // strings). For everything else we return empty — callers must use
     // the typed accessors.
     if (attr->kind == MLIR_ATTR_KIND_STRING) {
-        return (string){ (char *)attr->data.string.bytes, attr->data.string.byte_count };
+        return string_from_literal(attr->data.string);
     }
     return str_lit("");
 }
@@ -1912,14 +1906,14 @@ int64_t MLIR_GetAttributeInteger(MLIR_AttributeHandle ah) {
     IR_Attribute *attr = resolve_attr(ah);
     if (!attr || attr->kind != MLIR_ATTR_KIND_INTEGER) return 0;
     int64_t value = 0;
-    (void)MLIR_IntegerLiteral_get_value(&attr->data.integer, &value);
+    (void)MLIR_IntegerLiteral_GetValue(attr->data.integer, &value);
     return value;
 }
 
 string MLIR_GetAttributeString(MLIR_AttributeHandle ah) {
     IR_Attribute *attr = resolve_attr(ah);
     return (attr && attr->kind == MLIR_ATTR_KIND_STRING)
-        ? (string){ (char *)attr->data.string.bytes, attr->data.string.byte_count }
+        ? string_from_literal(attr->data.string)
         : str_lit("");
 }
 
@@ -1927,32 +1921,32 @@ double MLIR_GetAttributeFloat(MLIR_AttributeHandle ah) {
     IR_Attribute *attr = resolve_attr(ah);
     if (!attr || attr->kind != MLIR_ATTR_KIND_FLOAT) return 0.0;
     double value = 0.0;
-    (void)MLIR_FloatLiteral_get_value(&attr->data.floating, &value);
+    (void)MLIR_FloatLiteral_GetValue(attr->data.floating, &value);
     return value;
 }
 
-bool MLIR_GetAttributeIntegerLiteral(MLIR_AttributeHandle ah,
-                                     MLIR_IntegerLiteral *out) {
+MLIR_IntegerLiteralHandle MLIR_GetAttributeIntegerLiteral(MLIR_Context *ctx,
+                                                          MLIR_AttributeHandle ah) {
+    (void)ctx;
     IR_Attribute *attr = resolve_attr(ah);
-    if (!attr || attr->kind != MLIR_ATTR_KIND_INTEGER) return false;
-    if (out) *out = attr->data.integer;
-    return true;
+    if (!attr || attr->kind != MLIR_ATTR_KIND_INTEGER) return MLIR_INVALID_LITERAL_HANDLE;
+    return attr->data.integer;
 }
 
-bool MLIR_GetAttributeFloatLiteral(MLIR_AttributeHandle ah,
-                                   MLIR_FloatLiteral *out) {
+MLIR_FloatLiteralHandle MLIR_GetAttributeFloatLiteral(MLIR_Context *ctx,
+                                                      MLIR_AttributeHandle ah) {
+    (void)ctx;
     IR_Attribute *attr = resolve_attr(ah);
-    if (!attr || attr->kind != MLIR_ATTR_KIND_FLOAT) return false;
-    if (out) *out = attr->data.floating;
-    return true;
+    if (!attr || attr->kind != MLIR_ATTR_KIND_FLOAT) return MLIR_INVALID_LITERAL_HANDLE;
+    return attr->data.floating;
 }
 
-bool MLIR_GetAttributeStringLiteral(MLIR_AttributeHandle ah,
-                                    MLIR_StringLiteral *out) {
+MLIR_StringLiteralHandle MLIR_GetAttributeStringLiteral(MLIR_Context *ctx,
+                                                        MLIR_AttributeHandle ah) {
+    (void)ctx;
     IR_Attribute *attr = resolve_attr(ah);
-    if (!attr || attr->kind != MLIR_ATTR_KIND_STRING) return false;
-    if (out) *out = attr->data.string;
-    return true;
+    if (!attr || attr->kind != MLIR_ATTR_KIND_STRING) return MLIR_INVALID_LITERAL_HANDLE;
+    return attr->data.string;
 }
 
 MLIR_TypeHandle MLIR_GetAttributeType(MLIR_AttributeHandle ah) {
@@ -2116,36 +2110,6 @@ MLIR_TypeHandle MLIR_CreateTypeOpaque(MLIR_Context *ctx, string name) {
     t.kind = MLIR_TYPE_OPAQUE;
     t.dialect = MLIR_DIALECT_NONE;
     return intern_type(ctx, t);
-}
-
-void MLIR_SetTypeTensorProperties(MLIR_TypeHandle th, const int64_t *shape, size_t rank, MLIR_TypeHandle element_type) {
-    IR_Type *t = resolve_type(th);
-    if (!t) return;
-    t->kind = MLIR_TYPE_TENSOR;
-    t->dialect = MLIR_DIALECT_BUILTIN;
-    t->data.shaped.element_type = element_type;
-    t->data.shaped.shape = (int64_t*)shape;
-    t->data.shaped.rank = (uint32_t)rank;
-}
-
-void MLIR_SetTypeMemrefProperties(MLIR_TypeHandle th, const int64_t *shape, size_t rank, MLIR_TypeHandle element_type) {
-    IR_Type *t = resolve_type(th);
-    if (!t) return;
-    t->kind = MLIR_TYPE_MEMREF;
-    t->dialect = MLIR_DIALECT_BUILTIN;
-    t->data.shaped.element_type = element_type;
-    t->data.shaped.shape = (int64_t*)shape;
-    t->data.shaped.rank = (uint32_t)rank;
-}
-
-void MLIR_SetTypePointerProperties(MLIR_TypeHandle th, MLIR_TypeHandle element_type, bool has_address_space, uint32_t address_space) {
-    IR_Type *t = resolve_type(th);
-    if (!t) return;
-    t->kind = MLIR_TYPE_POINTER;
-    t->dialect = MLIR_DIALECT_NONE;
-    t->data.pointer.element_type = element_type;
-    t->data.pointer.has_address_space = has_address_space;
-    t->data.pointer.address_space = address_space;
 }
 
 // Type introspection
