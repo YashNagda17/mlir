@@ -608,7 +608,7 @@ static MLIR_TypeHandle ptr_for_as(E *e, uint32_t as) {
     for (size_t i = 0; i < e->n_ptr_as_cache; i++) {
         if (e->ptr_as_cache[i].as == as) return e->ptr_as_cache[i].ptr;
     }
-    MLIR_TypeHandle p = MLIR_CreateTypeLLVMPointerInAddressSpace(e->ctx, as);
+    MLIR_TypeHandle p = MLIR_CreateTypePointerInAddressSpace(e->ctx, MLIR_DIALECT_LLVM, as);
     if (e->n_ptr_as_cache == e->cap_ptr_as_cache) {
         size_t nc = e->cap_ptr_as_cache ? e->cap_ptr_as_cache * 2 : 4;
         PtrAsCacheEntry *na = arena_new_array(e->arena, PtrAsCacheEntry, nc);
@@ -1132,7 +1132,7 @@ static SCtx walk_struct_lhs(E *e, Scope *sc, Expr *ex) {
         r.base_ptr = sym_addr(e, s);
         // Source elem is the !llvm.array<N x !llvm.struct<...>>.
         MLIR_TypeHandle struct_ty = find_struct_type(e, s->sdef);
-        r.source_elem = MLIR_CreateTypeLLVMArray(e->ctx, struct_ty, (uint64_t)s->type.array_len);
+        r.source_elem = MLIR_CreateTypeArray(e->ctx, MLIR_DIALECT_LLVM, struct_ty, (uint64_t)s->type.array_len);
         r.sd = s->sdef;
         sctx_push(e, &r, 0);                // step into the alloca's one element
         sctx_push(e, &r, LLVM_GEP_DYN);     // dynamic array index
@@ -1369,8 +1369,8 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                           s->type.kind == TY_ARRAY_PTR_STRUCT)) {
                     MLIR_ValueHandle i_v = emit_expr_i32(e, sc, ex->lhs->rhs);
                     MLIR_ValueHandle j_v = emit_expr_i32(e, sc, ex->rhs);
-                    MLIR_TypeHandle arr_ty = MLIR_CreateTypeLLVMArray(
-                        e->ctx, e->ptr, (uint64_t)s->type.array_len);
+                    MLIR_TypeHandle arr_ty = MLIR_CreateTypeArray(
+                        e->ctx, MLIR_DIALECT_LLVM, e->ptr, (uint64_t)s->type.array_len);
                     int32_t *path1 = arena_new_array(e->arena, int32_t, 2);
                     path1[0] = 0; path1[1] = LLVM_GEP_DYN;
                     MLIR_ValueHandle *dyn1 = arena_new_array(e->arena, MLIR_ValueHandle, 1);
@@ -1436,10 +1436,10 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                 if (s && s->type.kind == TY_ARRAY_I32 && s->type.array_len2 != 0) {
                     MLIR_ValueHandle i_v = emit_expr_i32(e, sc, ex->lhs->rhs);
                     MLIR_ValueHandle j_v = emit_expr_i32(e, sc, ex->rhs);
-                    MLIR_TypeHandle inner_arr = MLIR_CreateTypeLLVMArray(
-                        e->ctx, e->i32, (uint64_t)s->type.array_len2);
-                    MLIR_TypeHandle outer_arr = MLIR_CreateTypeLLVMArray(
-                        e->ctx, inner_arr, (uint64_t)s->type.array_len);
+                    MLIR_TypeHandle inner_arr = MLIR_CreateTypeArray(
+                        e->ctx, MLIR_DIALECT_LLVM, e->i32, (uint64_t)s->type.array_len2);
+                    MLIR_TypeHandle outer_arr = MLIR_CreateTypeArray(
+                        e->ctx, MLIR_DIALECT_LLVM, inner_arr, (uint64_t)s->type.array_len);
                     int32_t *path = arena_new_array(e->arena, int32_t, 3);
                     path[0] = 0; path[1] = LLVM_GEP_DYN; path[2] = LLVM_GEP_DYN;
                     MLIR_ValueHandle *dyn = arena_new_array(e->arena, MLIR_ValueHandle, 2);
@@ -1574,7 +1574,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                 MLIR_TypeHandle st_ty = find_struct_type(e, sd);
                 MLIR_ValueHandle idx_i32 = emit_expr_i32(e, sc, ex->rhs);
                 r.base_ptr = sym_addr(e, s);
-                r.source_elem = MLIR_CreateTypeLLVMArray(e->ctx, st_ty,
+                r.source_elem = MLIR_CreateTypeArray(e->ctx, MLIR_DIALECT_LLVM, st_ty,
                     (uint64_t)s->type.array_len);
                 int32_t *path = arena_new_array(e->arena, int32_t, 2);
                 path[0] = 0; path[1] = LLVM_GEP_DYN;
@@ -1638,7 +1638,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                 s->type.kind == TY_ARRAY_PTR_STRUCT) {
                 MLIR_ValueHandle idx_i32 = emit_expr_i32(e, sc, ex->rhs);
                 r.base_ptr = sym_addr(e, s);
-                r.source_elem = MLIR_CreateTypeLLVMArray(e->ctx, e->ptr, (uint64_t)s->type.array_len);
+                r.source_elem = MLIR_CreateTypeArray(e->ctx, MLIR_DIALECT_LLVM, e->ptr, (uint64_t)s->type.array_len);
                 int32_t *path = arena_new_array(e->arena, int32_t, 2);
                 path[0] = 0; path[1] = LLVM_GEP_DYN;
                 r.const_path = path; r.n_const_path = 2;
@@ -1659,7 +1659,7 @@ static LVal emit_lvalue(E *e, Scope *sc, Expr *ex) {
                                   : s->type.array_elem_is_i8  ? e->i8
                                   : e->i32;
             r.base_ptr = sym_addr(e, s);
-            r.source_elem = MLIR_CreateTypeLLVMArray(e->ctx, aelem, (uint64_t)s->type.array_len);
+            r.source_elem = MLIR_CreateTypeArray(e->ctx, MLIR_DIALECT_LLVM, aelem, (uint64_t)s->type.array_len);
             int32_t *path = arena_new_array(e->arena, int32_t, 2);
             path[0] = 0; path[1] = LLVM_GEP_DYN;
             r.const_path = path; r.n_const_path = 2;
@@ -1800,8 +1800,8 @@ static MLIR_ValueHandle resolve_struct_source(E *e, Scope *sc, Expr *arg, Struct
             if (s && s->type.kind == TY_ARRAY_STRUCT && s->sdef) {
                 MLIR_ValueHandle idx = emit_expr_i32(e, sc, arg->lhs->rhs);
                 MLIR_TypeHandle st_ty = find_struct_type(e, s->sdef);
-                MLIR_TypeHandle arr_ty = MLIR_CreateTypeLLVMArray(
-                    e->ctx, st_ty, (uint64_t)s->type.array_len);
+                MLIR_TypeHandle arr_ty = MLIR_CreateTypeArray(
+                    e->ctx, MLIR_DIALECT_LLVM, st_ty, (uint64_t)s->type.array_len);
                 int32_t path[2] = {0, LLVM_GEP_DYN};
                 MLIR_ValueHandle dyn[1] = {idx};
                 MLIR_ValueHandle p = emit_gep(e, sym_addr(e, s), arr_ty, path, 2, dyn, 1);
@@ -2116,7 +2116,7 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
                 ? (size_t)((type_size(e, at) + 7) / 8) : 1;
         }
         size_t buf_slots = n_slots ? n_slots : 1;  // valid ptr even with 0 args
-        MLIR_TypeHandle buf_ty = MLIR_CreateTypeLLVMArray(e->ctx, e->i64,
+        MLIR_TypeHandle buf_ty = MLIR_CreateTypeArray(e->ctx, MLIR_DIALECT_LLVM, e->i64,
                                                           (uint64_t)buf_slots);
         MLIR_ValueHandle buf = emit_alloca(e, buf_ty);
         size_t slot = 0;
@@ -2158,7 +2158,7 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
                 }
                 int64_t bytes = type_size(e, at);
                 int64_t words = (bytes + 7) / 8;
-                MLIR_TypeHandle warr = MLIR_CreateTypeLLVMArray(e->ctx, e->i64, (uint64_t)words);
+                MLIR_TypeHandle warr = MLIR_CreateTypeArray(e->ctx, MLIR_DIALECT_LLVM, e->i64, (uint64_t)words);
                 for (int64_t w = 0; w < words; w++) {
                     int32_t path[2] = {0, (int32_t)w};
                     MLIR_ValueHandle wp = emit_gep(e, src, warr, path, 2, NULL, 0);
@@ -3917,8 +3917,8 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     t.array_len = n;
                 }
                 MLIR_TypeHandle st_ty = find_struct_type(e, sd);
-                MLIR_TypeHandle arr_ty = MLIR_CreateTypeLLVMArray(
-                    e->ctx, st_ty, (uint64_t)t.array_len);
+                MLIR_TypeHandle arr_ty = MLIR_CreateTypeArray(
+                    e->ctx, MLIR_DIALECT_LLVM, st_ty, (uint64_t)t.array_len);
                 MLIR_ValueHandle addr = emit_alloca(e, arr_ty);
                 for (int64_t i = 0; i < n; i++) {
                     Expr *elem = ex->args.data[i];
@@ -4291,7 +4291,7 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                 // Allocate a 32-byte buffer (sufficient for x86_64-SysV
                 // and aarch64 va_list layouts on Linux/macOS/Windows). We
                 // hand out the pointer; va_start/va_arg/va_end consume it.
-                MLIR_TypeHandle buf_ty = MLIR_CreateTypeLLVMArray(e->ctx, e->i8, 32);
+                MLIR_TypeHandle buf_ty = MLIR_CreateTypeArray(e->ctx, MLIR_DIALECT_LLVM, e->i8, 32);
                 sy->addr = emit_alloca(e, buf_ty);
                 break;
             }
@@ -4358,13 +4358,13 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                                         : e->i32;
                 MLIR_TypeHandle arr_ty;
                 if (st->decl_type.array_len2 != 0) {
-                    MLIR_TypeHandle inner = MLIR_CreateTypeLLVMArray(
-                        e->ctx, elem_ty, (uint64_t)st->decl_type.array_len2);
-                    arr_ty = MLIR_CreateTypeLLVMArray(
-                        e->ctx, inner, (uint64_t)st->decl_type.array_len);
+                    MLIR_TypeHandle inner = MLIR_CreateTypeArray(
+                        e->ctx, MLIR_DIALECT_LLVM, elem_ty, (uint64_t)st->decl_type.array_len2);
+                    arr_ty = MLIR_CreateTypeArray(
+                        e->ctx, MLIR_DIALECT_LLVM, inner, (uint64_t)st->decl_type.array_len);
                 } else {
-                    arr_ty = MLIR_CreateTypeLLVMArray(
-                        e->ctx, elem_ty, (uint64_t)st->decl_type.array_len);
+                    arr_ty = MLIR_CreateTypeArray(
+                        e->ctx, MLIR_DIALECT_LLVM, elem_ty, (uint64_t)st->decl_type.array_len);
                 }
                 sy->addr = emit_alloca(e, arr_ty);
                 if (st->decl_init) {
@@ -4467,8 +4467,8 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                     }
                 }
             } else if (st->decl_type.kind == TY_ARRAY_PTR_CHAR) {
-                MLIR_TypeHandle arr_ty = MLIR_CreateTypeLLVMArray(
-                    e->ctx, e->ptr, (uint64_t)st->decl_type.array_len);
+                MLIR_TypeHandle arr_ty = MLIR_CreateTypeArray(
+                    e->ctx, MLIR_DIALECT_LLVM, e->ptr, (uint64_t)st->decl_type.array_len);
                 sy->addr = emit_alloca(e, arr_ty);
                 if (st->decl_init) {
                     if (st->decl_init->kind != EX_COMPOUND) {
@@ -4521,8 +4521,8 @@ static void emit_stmt(E *e, Scope *sc, Stmt *st) {
                     st->decl_type.array_len = alen;
                     sy->type.array_len = alen;
                 }
-                MLIR_TypeHandle arr_ty = MLIR_CreateTypeLLVMArray(
-                    e->ctx, st_ty, (uint64_t)alen);
+                MLIR_TypeHandle arr_ty = MLIR_CreateTypeArray(
+                    e->ctx, MLIR_DIALECT_LLVM, st_ty, (uint64_t)alen);
                 sy->addr = emit_alloca(e, arr_ty);
                 if (st->decl_init) {
                     if (st->decl_init->kind != EX_COMPOUND) {
@@ -5240,8 +5240,8 @@ static void build_signatures(E *e) {
         {
             MLIR_TypeHandle ret_ty = (sig->n_flat_out == 1)
                 ? sig->flat_out_tys[0]
-                : MLIR_CreateTypeLLVMVoid(e->ctx);
-            sig->llvm_fn_ty = MLIR_CreateTypeLLVMFunction(e->ctx,
+                : MLIR_CreateTypeVoid(e->ctx, MLIR_DIALECT_LLVM);
+            sig->llvm_fn_ty = MLIR_CreateTypeDialectFunction(e->ctx, MLIR_DIALECT_LLVM,
                 ret_ty, sig->flat_in_tys, sig->n_flat_in,
                 /*is_var_arg=*/sig->is_variadic && !sig->cursor_va);
         }
@@ -5752,7 +5752,7 @@ static void init_struct_types(E *e) {
     for (size_t i = 0; i < e->n_struct_types; i++) {
         StructDef *sd = e->program->structs.data[i];
         e->struct_types[i].sd = sd;
-        e->struct_types[i].ty = MLIR_CreateTypeLLVMStructIdentified(e->ctx, sd->name);
+        e->struct_types[i].ty = MLIR_CreateTypeStructIdentified(e->ctx, MLIR_DIALECT_LLVM, sd->name);
     }
     for (size_t i = 0; i < e->n_struct_types; i++) {
         StructDef *sd = e->struct_types[i].sd;
@@ -5766,8 +5766,8 @@ static void init_struct_types(E *e) {
             MLIR_TypeHandle uelem; int64_t ues, uc;
             union_blob_layout(e, sd, &uelem, &ues, &uc);
             MLIR_TypeHandle *ubody = arena_new_array(e->arena, MLIR_TypeHandle, 1);
-            ubody[0] = MLIR_CreateTypeLLVMArray(e->ctx, uelem, (uint64_t)uc);
-            MLIR_SetTypeLLVMStructBody(e->ctx, e->struct_types[i].ty, ubody, 1);
+            ubody[0] = MLIR_CreateTypeArray(e->ctx, MLIR_DIALECT_LLVM, uelem, (uint64_t)uc);
+            MLIR_SetTypeStructBody(e->ctx, e->struct_types[i].ty, ubody, 1);
             continue;
         }
         size_t n = sd->fields.size;
@@ -5793,25 +5793,25 @@ static void init_struct_types(E *e) {
                 else elem = e->i32;
                 MLIR_TypeHandle inner;
                 if (ft.array_len2 != 0) {
-                    MLIR_TypeHandle in2 = MLIR_CreateTypeLLVMArray(
-                        e->ctx, elem, (uint64_t)ft.array_len2);
-                    inner = MLIR_CreateTypeLLVMArray(
-                        e->ctx, in2, (uint64_t)ft.array_len);
+                    MLIR_TypeHandle in2 = MLIR_CreateTypeArray(
+                        e->ctx, MLIR_DIALECT_LLVM, elem, (uint64_t)ft.array_len2);
+                    inner = MLIR_CreateTypeArray(
+                        e->ctx, MLIR_DIALECT_LLVM, in2, (uint64_t)ft.array_len);
                 } else {
-                    inner = MLIR_CreateTypeLLVMArray(
-                        e->ctx, elem, (uint64_t)ft.array_len);
+                    inner = MLIR_CreateTypeArray(
+                        e->ctx, MLIR_DIALECT_LLVM, elem, (uint64_t)ft.array_len);
                 }
                 body[k] = inner;
             } else if (ft.kind == TY_ARRAY_PTR_STRUCT ||
                        ft.kind == TY_ARRAY_PTR_CHAR) {
-                body[k] = MLIR_CreateTypeLLVMArray(
-                    e->ctx, e->ptr, (uint64_t)ft.array_len);
+                body[k] = MLIR_CreateTypeArray(
+                    e->ctx, MLIR_DIALECT_LLVM, e->ptr, (uint64_t)ft.array_len);
             } else {
                 EMIT_ERR(e, "unsupported struct field type in {}", sd->name);
                 body[k] = e->i32;
             }
         }
-        MLIR_SetTypeLLVMStructBody(e->ctx, e->struct_types[i].ty, body, n);
+        MLIR_SetTypeStructBody(e->ctx, e->struct_types[i].ty, body, n);
     }
 }
 
@@ -5829,7 +5829,7 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
     e.f32 = MLIR_CreateTypeFloat(ctx, 32, false);
     e.f64 = MLIR_CreateTypeFloat(ctx, 64, false);
     e.index = MLIR_CreateTypeIndex(ctx);
-    e.ptr = MLIR_CreateTypeLLVMPointer(ctx);
+    e.ptr = MLIR_CreateTypePointerInAddressSpace(ctx, MLIR_DIALECT_LLVM, 0);
     e.target_wasm32 = program->target_wasm32;
     e.size_t_ty = program->target_wasm32 ? e.i32 : e.i64;
     e.loc = MLIR_CreateLocationUnknown(ctx, str_lit(""));
@@ -5985,8 +5985,8 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
                      : g->type.array_elem_is_i8  ? e.i8
                      : e.i32;
             }
-            MLIR_TypeHandle arr_ty = MLIR_CreateTypeLLVMArray(
-                ctx, elem, (uint64_t)g->type.array_len);
+            MLIR_TypeHandle arr_ty = MLIR_CreateTypeArray(
+                ctx, MLIR_DIALECT_LLVM, elem, (uint64_t)g->type.array_len);
             MLIR_OpHandle gop;
             if (g->init_array_data.size > 0 &&
                 g->type.kind == TY_ARRAY_I32) {

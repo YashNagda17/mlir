@@ -1355,7 +1355,7 @@ static MLIR_AttributeHandle make_llvm_linkage_attr(MLIR_Context *ctx, string lin
 MLIR_OpHandle MLIR_CreateLLVMGlobalString(MLIR_Context *ctx, string sym_name,
                                           string bytes, MLIR_LocationHandle loc) {
     MLIR_TypeHandle i8 = MLIR_CreateTypeInteger(ctx, 8, false);
-    MLIR_TypeHandle arr = MLIR_CreateTypeLLVMArray(ctx, i8, bytes.size);
+    MLIR_TypeHandle arr = MLIR_CreateTypeArray(ctx, MLIR_DIALECT_LLVM, i8, bytes.size);
     MLIR_AttributeHandle attrs[5];
     attrs[0] = MLIR_CreateAttributeString(ctx, str_lit("sym_name"), sym_name);
     attrs[1] = MLIR_CreateAttributeType(ctx, str_lit("global_type"), arr);

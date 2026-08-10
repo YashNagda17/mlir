@@ -800,23 +800,6 @@ MLIR_TypeHandle MLIR_CreateTypeDialectFunction(MLIR_Context *ctx,
                                                size_t n_inputs,
                                                bool is_var_arg);
 
-// Backward-compatible LLVM dialect aliases (call the general API above).
-#define MLIR_CreateTypeLLVMPointer(ctx) \
-    MLIR_CreateTypePointerInAddressSpace((ctx), MLIR_DIALECT_LLVM, 0)
-#define MLIR_CreateTypeLLVMPointerInAddressSpace(ctx, as) \
-    MLIR_CreateTypePointerInAddressSpace((ctx), MLIR_DIALECT_LLVM, (as))
-#define MLIR_CreateTypeLLVMVoid(ctx) \
-    MLIR_CreateTypeVoid((ctx), MLIR_DIALECT_LLVM)
-#define MLIR_CreateTypeLLVMArray(ctx, elem, count) \
-    MLIR_CreateTypeArray((ctx), MLIR_DIALECT_LLVM, (elem), (count))
-#define MLIR_CreateTypeLLVMStructIdentified(ctx, name) \
-    MLIR_CreateTypeStructIdentified((ctx), MLIR_DIALECT_LLVM, (name))
-#define MLIR_SetTypeLLVMStructBody(ctx, ty, fields, n) \
-    MLIR_SetTypeStructBody((ctx), (ty), (fields), (n))
-#define MLIR_CreateTypeLLVMFunction(ctx, result, inputs, n, vararg) \
-    MLIR_CreateTypeDialectFunction((ctx), MLIR_DIALECT_LLVM, (result), \
-                                   (inputs), (n), (vararg))
-
 // LLVM-dialect global helpers. Each returns a freshly-created (unattached)
 // op; the caller appends it to the module body. Implemented by the
 // upstream backend; the native backend returns MLIR_INVALID_HANDLE.
