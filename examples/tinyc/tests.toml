@@ -1397,3 +1397,13 @@ expected_stdout = "OK\n"
 name = "static_module_void_ptr_array"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "OK\n"
+
+[[test]]
+name = "unsigned_char_strcmp"
+targets = ["native", "wasm", "macho", "elf"]
+expected_stdout = "255\n1\n-1\n"
+
+[[test]]
+name = "int64_min_to_str"
+targets = ["native", "wasm", "macho", "elf"]
+expected_stdout = "-9223372036854775808\n"

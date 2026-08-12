@@ -2686,6 +2686,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
             if (ck == TY_PTR_I32) { v.ptr_elem = e->i32; v.is_str = false; }
             else if (ck == TY_PTR_CHAR) { v.ptr_elem = e->i8; v.is_str = true; }
             else if (ck == TY_PTR_VOID) { v.ptr_elem = MLIR_INVALID_HANDLE; v.is_str = false; }
+            v.is_unsigned = ex->cast_type.int_unsigned;
             return v;
         }
         case EX_VAR:
