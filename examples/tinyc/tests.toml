@@ -1420,6 +1420,18 @@ wasm_native_emit = "aarch64"
 wasm_native_direct_source = true
 
 [[test]]
+name = "math_const_global_immutability"
+targets = ["wasm"]
+# E007: static const math globals must stay read-only in WasmSSA.
+wasm_upstream_skip = true
+wasm_native_emit = "wasmssa"
+wasm_native_direct_source = true
+wasm_native_emit_regex = [
+  "sym_name = \"math_s0\"[^\n]*is_const = true",
+  "sym_name = \"math_pi\"[^\n]*is_const = true",
+]
+
+[[test]]
 name = "int64_min_to_str"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "-9223372036854775808\n"
