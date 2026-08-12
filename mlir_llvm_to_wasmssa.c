@@ -481,6 +481,18 @@ static MLIR_ValueHandle emit_mul_i32(FnCtx *F, MLIR_ValueHandle lhs, MLIR_ValueH
     o.has_result = true;
     return commit_op(F, &o);
 }
+// Convenience: i32 and.
+static MLIR_ValueHandle emit_and_i32(FnCtx *F, MLIR_ValueHandle lhs, MLIR_ValueHandle rhs) {
+    MLIR_ValueHandle ops[2] = { lhs, rhs };
+    wasmssa_op_t o = {0};
+    o.type = OP_TYPE_WASMSSA_BINOP;
+    o.valtype = WT_I32;
+    o.wasm_opcode = 0x71;  // i32.and
+    o.n_operands = 2;
+    o.operands = ops;
+    o.has_result = true;
+    return commit_op(F, &o);
+}
 // Convenience: i32.wrap_i64 (0xa7) — narrows an i64 SSA value to i32.
 static MLIR_ValueHandle emit_wrap_i64_to_i32(FnCtx *F, MLIR_ValueHandle v) {
     MLIR_ValueHandle ops[1] = { v };
@@ -1148,18 +1160,31 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
     // ---- llvm.trunc / llvm.zext -------------------------------------------
     // i64 -> i32 trunc:    i32.wrap_i64    (0xa7)
     // i32 -> i64 zext:     i64.extend_i32_u(0xad)
-    // smaller-int trunc/zext within i32: no-op (wasm has no sub-i32 reg).
+    // i8  -> i32 zext:     i32.and %v, 255 (wasm has no unsigned extend8)
+    // i32 -> i8 trunc:     no-op on the i32 register (low byte preserved)
     if (name_eq(name, "llvm.trunc") || name_eq(name, "llvm.zext")) {
         bool is_zext = name_eq(name, "llvm.zext");
         if (MLIR_GetOpNumResults(op) != 1 ||
             MLIR_GetOpNumOperands(op) != 1) return false;
         MLIR_ValueHandle r = MLIR_GetOpResult(op, 0);
         MLIR_ValueHandle s = MLIR_GetOpOperand(op, 0);
+        int in_w  = int_bits(F->ctx, MLIR_GetValueType(s));
+        int out_w = int_bits(F->ctx, MLIR_GetValueType(r));
         uint8_t in_vt  = wasm_vt(F->ctx, MLIR_GetValueType(s));
         uint8_t out_vt = wasm_vt(F->ctx, MLIR_GetValueType(r));
         if (in_vt == 0 || out_vt == 0) return false;
         MLIR_ValueHandle sa;
         if (!fn_vmap_get(F, s, &sa)) return false;
+        if (is_zext && in_w == 8 && out_w == 32) {
+            MLIR_ValueHandle mask = emit_const_i32(F, 255);
+            MLIR_ValueHandle idx = emit_and_i32(F, sa, mask);
+            vmap_set(F, r, idx);
+            return true;
+        }
+        if (!is_zext && in_w == 32 && out_w == 8) {
+            vmap_set(F, r, sa);
+            return true;
+        }
         if (in_vt == out_vt) {
             // No-op: result alias of operand.
             vmap_set(F, r, sa);

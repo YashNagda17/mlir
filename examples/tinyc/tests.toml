@@ -1404,6 +1404,14 @@ targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "255\n1\n-1\n"
 
 [[test]]
+name = "unsigned_char_strncmp"
+targets = ["wasm"]
+# E003: base_strncmp must preserve explicit unsigned-char casts in the
+# mismatched-byte return so 0xFF - 0 yields 255, not -1.
+wasm_upstream_skip = true
+expected_stdout = "255\n1\n-1\n"
+
+[[test]]
 name = "int64_min_to_str"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "-9223372036854775808\n"

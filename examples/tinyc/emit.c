@@ -2611,6 +2611,19 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     v.val = emit_trunci_i64_to_i32(e, v.val);
                     v.is_i64 = false;
                 }
+                // Narrow integer casts (e.g. `(unsigned char)x`) must
+                // truncate to the target width then re-extend so loads
+                // that were widened with sign-extension (plain `char`)
+                // do not leak into unsigned-byte arithmetic.
+                if (ex->cast_type.int_bits == 8 && !v.is_float && !v.is_ptr) {
+                    MLIR_ValueHandle as_i32 = v.is_i64
+                        ? emit_trunci_i64_to_i32(e, v.val) : v.val;
+                    MLIR_ValueHandle as_i8 = emit_trunci_to_i8(e, as_i32);
+                    v.val = ex->cast_type.int_unsigned
+                        ? emit_extui_i8_to_i32(e, as_i8)
+                        : emit_extsi_i8_to_i32(e, as_i8);
+                    v.is_i64 = false;
+                }
                 // A cast to an unsigned integer type yields an unsigned
                 // value: subsequent comparisons / div / shr must use the
                 // unsigned form (e.g. `(unsigned long)x >= CONST`).
