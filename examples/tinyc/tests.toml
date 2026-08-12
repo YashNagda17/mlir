@@ -1432,6 +1432,15 @@ wasm_native_emit_regex = [
 ]
 
 [[test]]
+name = "wasmssa_block_arg_printing"
+targets = ["wasm"]
+# E008: operands that are block arguments must print as %argN, not phantom %N.
+wasm_upstream_skip = true
+wasm_native_emit = "wasmssa"
+wasm_native_direct_source = true
+wasm_native_emit_regex = ["wasmssa\\.binop\\(%arg0: i32"]
+
+[[test]]
 name = "int64_min_to_str"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "-9223372036854775808\n"
