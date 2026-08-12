@@ -2176,6 +2176,8 @@ static void emit_flat_call(E *e, Scope *sc, FuncSig *sig, VecExprPtr args,
     }
 }
 
+static int64_t c_sizeof_type(E *e, Type ty);
+
 // Compile-time folder for literal-only integer expressions. Returns
 // true and writes the folded i32 value (sign-extended in int64_t) when
 // `ex` and all its sub-expressions are pure integer-only computations
@@ -2218,7 +2220,7 @@ static bool ast_fold_int(E *e, Scope *sc, Expr *ex, int64_t *out) {
                 if (ex->cast_type.kind == TY_VOID) return false;
                 ty = ex->cast_type;
             }
-            *out = (int64_t)(int32_t)type_size(e, ty);
+            *out = (int64_t)(int32_t)c_sizeof_type(e, ty);
             return true;
         }
         case EX_UN: {
@@ -2558,7 +2560,7 @@ static EVal emit_expr(E *e, Scope *sc, Expr *ex) {
                     r.val = emit_const_i32(e, 1); return r;
                 }
             }
-            r.val = emit_const_i32(e, type_size(e, ty)); return r;
+            r.val = emit_const_i32(e, c_sizeof_type(e, ty)); return r;
         }
         case EX_CAST: {
             EVal v = emit_expr(e, sc, ex->lhs);
@@ -5618,6 +5620,11 @@ static int64_t type_size(E *e, Type t) {
 // matching and other callers) or type_size (which drives struct layout,
 // where scalar char stays a 4-byte i32). All other operands defer to
 // type_size, preserving tinyc's prior sizeof behavior exactly.
+static int64_t c_sizeof_type(E *e, Type ty) {
+    if ((ty.kind == TY_I32 || ty.kind == TY_I64) && ty.int_bits == 8)
+        return 1;
+    return type_size(e, ty);
+}
 static int64_t c_sizeof_expr(E *e, Scope *sc, Expr *ex) {
     if (ex->kind == EX_INDEX) {
         Type base = infer_expr_type(e, sc, ex->lhs);
