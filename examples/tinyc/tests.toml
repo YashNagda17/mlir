@@ -1382,3 +1382,12 @@ expected_stdout = "6\n"
 name = "macho_continue_unconditional_branch"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "10\n"
+
+# --- selfhost_macho_stage1/dumps/errors.md regression test ---
+# errors.md E002: long decimal float literals must not overflow uint64_t mantissa.
+
+[[test]]
+name = "math_pi_dpi_constants"
+targets = ["native", "wasm", "macho", "elf"]
+# `PI_D` / `DPI_D` static doubles from corec/base/math.c.
+expected_stdout = "3142\n6283\n2000\n"
