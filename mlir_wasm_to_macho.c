@@ -2524,6 +2524,11 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 // loop frame: br targets a backward edge already
                 // patched at the branch site; nothing to do here.
                 value_depth = frame->entry_depth + frame->arity;
+                // `end` is a control-flow join. An earlier unconditional br
+                // may have left `mem_count` at the pre-branch depth; after
+                // restoring the validated stack height, make the lazy-stack
+                // spill frontier agree with it before decoding the next op.
+                LAZY_SYNC();
                 break;
             }
             case 0x02:                                // block blocktype
@@ -2620,6 +2625,10 @@ static bool emit_function(const WasmModule *wm, uint32_t fidx,
                 frame->else_jump_site = jump_site;
                 // Reset depth to entry for the else body.
                 value_depth = frame->entry_depth;
+                // The then arm may have ended in an unconditional br. Its
+                // pre-branch spill frontier must not suppress spills in the
+                // independently reachable else arm.
+                LAZY_SYNC();
                 break;
             }
             case 0x0c:                                // br labelidx

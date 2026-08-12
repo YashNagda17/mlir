@@ -1372,3 +1372,13 @@ expected_file_mode = 0o644
 name = "loop_continue"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "10\n"
+
+[[test]]
+name = "macho_multiple_continue"
+targets = ["native", "wasm", "macho", "elf"]
+expected_stdout = "6\n"
+
+[[test]]
+name = "macho_continue_unconditional_branch"
+targets = ["native", "wasm", "macho", "elf"]
+expected_stdout = "10\n"
