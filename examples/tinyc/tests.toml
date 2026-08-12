@@ -1392,3 +1392,8 @@ expected_stdout = "3142\n6283\n2000\n"
 name = "sizeof_char_arena_alloc"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "OK\n"
+
+[[test]]
+name = "static_module_void_ptr_array"
+targets = ["native", "wasm", "macho", "elf"]
+expected_stdout = "OK\n"
