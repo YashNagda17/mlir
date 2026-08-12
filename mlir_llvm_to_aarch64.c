@@ -2071,6 +2071,34 @@ static void lower_op(LowerCtx *L, MLIR_OpHandle op) {
         emit_fmov_gp_v(ctx, blk, false, true, rd, 0);
         fin_val(L, res, rd);
 
+    } else if (name_eq(on, "llvm.intr.wasm.memory.size")) {
+        // `__builtin_wasm_memory_size(0)` from tinyc. When the module
+        // carries a `__wasm_mem_pages` scalar (wasmssa->llvm path), read
+        // it via the x27 globals-cluster pin; otherwise the current memory
+        // size is 0 (direct-source probes with no runtime setup).
+        MLIR_ValueHandle res = MLIR_GetOpResult(op, 0);
+        uint8_t rd = def_val(L, res, 9);
+        uint32_t pages_off = 0;
+        if (L->gm && gmap_get_cstr(L->gm, "__wasm_mem_pages", &pages_off, NULL)) {
+            uint32_t anchor = gfuse_anchor(L->gm);
+            if (pages_off >= anchor) {
+                uint32_t rel = pages_off - anchor;
+                if ((rel & 3u) == 0 && rel / 4u <= 4095u) {
+                    emit_ldst_x(ctx, blk, OP_TYPE_AARCH64_LDR_W, rd, 27, rel);
+                    fin_val(L, res, rd);
+                    return;
+                }
+            }
+            string tgt = str_from_cstr_view("linmem_template");
+            emit_adrp_data(ctx, blk, rd, tgt, pages_off);
+            emit_add_data_lo(ctx, blk, rd, rd, tgt, pages_off);
+            emit_ldst_x(ctx, blk, OP_TYPE_AARCH64_LDR_W, rd, rd, 0);
+            fin_val(L, res, rd);
+            return;
+        }
+        emit_load_imm(ctx, blk, rd, 0, false);
+        fin_val(L, res, rd);
+
     } else {
         LFAIL("llvm->aarch64: unsupported op '%.*s' in '%.*s'\n",
               (int)on.size, on.str, (int)L->sym.size, L->sym.str);

@@ -1412,6 +1412,14 @@ wasm_upstream_skip = true
 expected_stdout = "255\n1\n-1\n"
 
 [[test]]
+name = "wasm_memory_aarch64"
+targets = ["wasm"]
+# E006: __builtin_wasm_memory_size must lower through llvm -> aarch64.
+wasm_upstream_skip = true
+wasm_native_emit = "aarch64"
+wasm_native_direct_source = true
+
+[[test]]
 name = "int64_min_to_str"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "-9223372036854775808\n"
