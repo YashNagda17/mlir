@@ -28,6 +28,13 @@
 #include <base/vector.h>
 
 #include <base/arena.h>
+
+// Set WASMSSA_LOWER_DEBUG=1 to print per-op reject reasons and module-level
+// LLVM ops that are not lowered to wasmssa (func/global only today).
+static bool wasmssa_lower_debug(void) {
+    const char *v = getenv("WASMSSA_LOWER_DEBUG");
+    return v && v[0] && v[0] != '0';
+}
 #include <base/string.h>
 
 // =============================================================================
@@ -665,8 +672,18 @@ static bool lower_op(FnCtx *F, MLIR_OpHandle op) {
     bool ok = lower_op_inner(F, op);
     if (!ok) {
         string n = MLIR_GetOpName(op);
-        fprintf(stderr, "wasmssa-lower: lower_op failed at '%.*s'\n",
-                (int)n.size, n.str);
+        if (wasmssa_lower_debug()) {
+            fprintf(stderr,
+                    "wasmssa-lower: lower_op failed '%.*s' "
+                    "(operands=%zu results=%zu regions=%zu)\n",
+                    (int)n.size, n.str,
+                    MLIR_GetOpNumOperands(op),
+                    MLIR_GetOpNumResults(op),
+                    MLIR_GetOpNumRegions(op));
+        } else {
+            fprintf(stderr, "wasmssa-lower: lower_op failed at '%.*s'\n",
+                    (int)n.size, n.str);
+        }
     }
     return ok;
 }
@@ -1735,6 +1752,13 @@ static bool lower_op_inner(FnCtx *F, MLIR_OpHandle op) {
 
     fprintf(stderr, "wasmssa-lower: unsupported op '%.*s'\n",
             (int)name.size, name.str);
+    if (wasmssa_lower_debug()) {
+        fprintf(stderr,
+                "wasmssa-lower: unsupported op detail: operands=%zu "
+                "results=%zu regions=%zu\n",
+                MLIR_GetOpNumOperands(op), MLIR_GetOpNumResults(op),
+                MLIR_GetOpNumRegions(op));
+    }
     return false;
 }
 
@@ -8204,6 +8228,40 @@ static bool m8_emit_switch_node(M8EmitCtx *ec, const M8SwitchPlan *plan) {
         const M8PlanNode *transfer =
             &ec->meta->nodes[plan->default_node];
         if (transfer->kind != M8_PLAN_TRANSFER) return false;
+
+        // An LLVM switch with no explicit cases still owns a real default
+        // edge. It usually falls through to the local continuation, but it
+        // can also target an enclosing label or an active loop latch. Those
+        // targets require the same structured branch emission as any other
+        // transfer; merely binding their edge values would silently fall
+        // through.
+        bool targets_loop_latch = false;
+        for (size_t i = ec->n_labels; i > 0; --i) {
+            const M8Label *label = &ec->labels[i - 1];
+            if (label->kind != M8_LABEL_LOOP ||
+                label->loop_id >= ec->meta->scratch->m7.n_loops) {
+                continue;
+            }
+            if (ec->meta->scratch->m7.loops[label->loop_id].latch ==
+                transfer->as.transfer.target_block) {
+                targets_loop_latch = true;
+                break;
+            }
+        }
+        uint32_t depth;
+        M8LabelKind kind;
+        if (transfer->as.transfer.target_node != SIZE_MAX ||
+            targets_loop_latch ||
+            m8_emit_find_label(ec, transfer->as.transfer.target_block,
+                               &depth, &kind)) {
+            size_t next_node = SIZE_MAX;
+            if (!m8_emit_transfer(ec, &transfer->as.transfer, &next_node)) {
+                return false;
+            }
+            return next_node == SIZE_MAX ||
+                   m8_emit_plan_node(ec, next_node);
+        }
+
         MLIR_ValueHandle *values = NULL;
         size_t n_values = 0;
         if (!m8_emit_edge_values(ec, transfer->as.transfer.edge_id,
@@ -9273,6 +9331,35 @@ static bool emit_globals_in_region(MLIR_Context *ctx, Arena *arena,
     return true;
 }
 
+// When WASMSSA_LOWER_DEBUG=1, list top-level LLVM ops in the input module
+// that are not lowered (only llvm.func bodies and llvm.mlir.global are
+// consumed; anything else at module scope is intentionally ignored).
+static void warn_skipped_module_ops(MLIR_RegionHandle region) {
+    if (!wasmssa_lower_debug()) return;
+    size_t nb = MLIR_GetRegionNumBlocks(region);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        MLIR_BlockHandle b = MLIR_GetRegionBlock(region, bi);
+        size_t no = MLIR_GetBlockNumOps(b);
+        for (size_t oi = 0; oi < no; ++oi) {
+            MLIR_OpHandle op = MLIR_GetBlockOp(b, oi);
+            if (op_is_builtin_module(op)) {
+                if (MLIR_GetOpNumRegions(op) > 0) {
+                    warn_skipped_module_ops(MLIR_GetOpRegion(op, 0));
+                }
+                continue;
+            }
+            if (op_is_llvm_func(op) || name_eq(MLIR_GetOpName(op), "llvm.mlir.global"))
+                continue;
+            string n = MLIR_GetOpName(op);
+            if (n.size >= 5 && memcmp(n.str, "llvm.", 5) == 0) {
+                fprintf(stderr,
+                        "wasmssa-lower: module-scope LLVM op not lowered: "
+                        "'%.*s'\n", (int)n.size, n.str);
+            }
+        }
+    }
+}
+
 // =============================================================================
 // Public stage 1 entry point: walk the LLVM-dialect module and emit a
 // wasmssa-form `builtin.module` directly. Each function/global is emitted
@@ -9324,6 +9411,8 @@ MLIR_OpHandle mlir_llvm_to_wasmssa(MLIR_Context *ctx, MLIR_OpHandle module) {
     }
 
     cfg_analysis_arena_destroy(&cfg_pool);
+
+    warn_skipped_module_ops(mr);
 
     return out_module;
 }
