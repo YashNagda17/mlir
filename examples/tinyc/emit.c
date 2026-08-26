@@ -5894,7 +5894,7 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
                 gty = e.i32;
             }
             MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, gty,
-                /*is_constant=*/false,
+                /*is_constant=*/g->is_const,
                 /*init_kind=*/4, 0, 0.0, NULL, e.loc);
             MLIR_AppendBlockOp(ctx, mb, gop);
         } else if (g->type.kind == TY_PTR_CHAR) {
@@ -5906,7 +5906,7 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
             // either returns the string addr or a null pointer.
             MLIR_BlockHandle init_blk = MLIR_INVALID_HANDLE;
             MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, e.ptr,
-                /*is_constant=*/false,
+                /*is_constant=*/g->is_const,
                 /*init_kind=*/2, 0, 0.0, &init_blk, e.loc);
             // Build initializer body: %0 = addressof @str ; llvm.return %0
             MLIR_BlockHandle save_blk = e.cur_block;
@@ -5928,13 +5928,13 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
             MLIR_AppendBlockOp(ctx, mb, gop);
         } else if (g->type.kind == TY_F32) {
             MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, e.f32,
-                /*is_constant=*/false,
+                /*is_constant=*/g->is_const,
                 /*init_kind=*/1, 0, g->has_init ? g->init_float : 0.0,
                 NULL, e.loc);
             MLIR_AppendBlockOp(ctx, mb, gop);
         } else if (g->type.kind == TY_F64) {
             MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, e.f64,
-                /*is_constant=*/false,
+                /*is_constant=*/g->is_const,
                 /*init_kind=*/1, 0, g->has_init ? g->init_float : 0.0,
                 NULL, e.loc);
             MLIR_AppendBlockOp(ctx, mb, gop);
@@ -5944,7 +5944,7 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
             // Emit a zero-initialized pointer global.
             MLIR_BlockHandle init_blk = MLIR_INVALID_HANDLE;
             MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, e.ptr,
-                /*is_constant=*/false,
+                /*is_constant=*/g->is_const,
                 /*init_kind=*/2, 0, 0.0, &init_blk, e.loc);
             MLIR_BlockHandle save_blk = e.cur_block;
             bool save_term = e.terminated;
@@ -5996,12 +5996,12 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
                 // (wasm) and emit_global (native) both interpret it as
                 // packed little-endian element bytes.
                 gop = MLIR_CreateLLVMGlobalArrayInit(ctx, g->name, arr_ty,
-                    /*is_constant=*/false,
+                    /*is_constant=*/g->is_const,
                     g->init_array_data, e.loc);
             } else {
                 MLIR_BlockHandle init_blk = MLIR_INVALID_HANDLE;
                 gop = MLIR_CreateLLVMGlobal(ctx, g->name, arr_ty,
-                    /*is_constant=*/false,
+                    /*is_constant=*/g->is_const,
                     /*init_kind=*/2, 0, 0.0, &init_blk, e.loc);
                 MLIR_BlockHandle save_blk = e.cur_block;
                 bool save_term = e.terminated;
@@ -6028,14 +6028,14 @@ MLIR_OpHandle tinyc_emit_module(MLIR_Context *ctx, Program *program) {
             MLIR_AppendBlockOp(ctx, mb, gop);
         } else if (g->type.kind == TY_I64) {
             MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, e.i64,
-                /*is_constant=*/false,
+                /*is_constant=*/g->is_const,
                 /*init_kind=*/0, g->has_init ? g->init_int : 0, 0.0,
                 NULL, e.loc);
             MLIR_AppendBlockOp(ctx, mb, gop);
         } else {
             // i32 (default for plain int)
             MLIR_OpHandle gop = MLIR_CreateLLVMGlobal(ctx, g->name, e.i32,
-                /*is_constant=*/false,
+                /*is_constant=*/g->is_const,
                 /*init_kind=*/0, g->has_init ? g->init_int : 0, 0.0,
                 NULL, e.loc);
             MLIR_AppendBlockOp(ctx, mb, gop);
