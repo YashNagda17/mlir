@@ -1072,6 +1072,11 @@ native_skip = true
 expected_stdout = "42\n"
 
 [[test]]
+name = "wasm_memory_grow"
+targets = ["native", "wasm", "macho", "elf"]
+expected_stdout = "42\n"
+
+[[test]]
 name = "i64_compare_intlit"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "10\n20\n30\n10\n30\n60\n-1\n"
@@ -1392,6 +1397,13 @@ expected_stdout = "3142\n6283\n2000\n"
 name = "unsigned_char_strcmp"
 targets = ["native", "wasm", "macho", "elf"]
 expected_stdout = "255\n1\n-1\n"
+
+[[test]]
+name = "wasm_memory_grow_aarch64"
+targets = ["wasm"]
+wasm_upstream_skip = true
+wasm_native_emit = "aarch64"
+wasm_native_direct_source = true
 
 [[test]]
 name = "math_const_global_immutability"
